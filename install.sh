@@ -49,6 +49,13 @@ log_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+ensure_install_dir() {
+    if [ ! -d "$INSTALL_DIR" ]; then
+        log_info "Creating installation directory at $INSTALL_DIR"
+        mkdir -p "$INSTALL_DIR"
+    fi
+}
+
 version_compare() {
     # Compare two version numbers
     # Returns 0 if $1 >= $2, 1 otherwise
@@ -140,12 +147,9 @@ install_koi() {
     # Install dependencies
     log_info "Installing dependencies (this may take a minute)..."
     # Ensure install directory exists before entering it
-    if [ ! -d "$INSTALL_DIR" ]; then
-        log_info "Creating installation directory at $INSTALL_DIR"
-        mkdir -p "$INSTALL_DIR"
-    fi
+    ensure_install_dir
     cd "$INSTALL_DIR"
-    npm install --production --silent 2>&1 | sed 's/^/  /' || {
+
         log_error "Failed to install dependencies"
         exit 1
     }
