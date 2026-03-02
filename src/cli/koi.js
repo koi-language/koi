@@ -414,6 +414,12 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
   if (verbose) {
     cliLogger.progress('🔨 Transpiling...');
   }
+  // Ensure KOI_RUNTIME_PATH is set so the transpiler emits absolute file:// imports
+  // instead of @koi-language/koi package imports (which require the package in node_modules)
+  if (!process.env.KOI_RUNTIME_PATH) {
+    process.env.KOI_RUNTIME_PATH = path.resolve(__dirname, '../runtime');
+  }
+
   const runtimePath = path.join(__dirname, '../runtime/index.js');
   const transpiler = new KoiTranspiler(path.basename(sourcePath), {
     cacheData,
