@@ -5,6 +5,7 @@
  * Tasks are deduplicated by name. Status auto-clears after completion.
  */
 
+import path from 'path';
 import { cliLogger } from './cli-logger.js';
 
 class BackgroundTaskManager {
@@ -88,33 +89,29 @@ class BackgroundTaskManager {
   }
 
   /**
-   * Helper: start project indexing using VectorStore.
+   * Helper: start semantic code indexing using SemanticIndex + LanceDB.
    * @param {string} projectDir - Project root directory
-   * @param {Function} embedFn - async (text) => number[] embedding function
+   * @param {import('./llm-provider.js').LLMProvider} llmProvider
    */
-  startProjectIndexing(projectDir, embedFn) {
-    return this.run('indexing', async (report) => {
-      const { discoverFiles } = await import('./file-discovery.js');
-      const { getOrCreateVectorStore } = await import('./vector-store.js');
+  startSemanticIndexing(projectDir, llmProvider) {
+    return this.run('semantic-index', async (report) => {
+      const { getSemanticIndex } = await import('./semantic-index.js');
+      const cacheDir = path.join(projectDir, '.koi', 'cache', 'semantic-index');
+      const index = getSemanticIndex(cacheDir, llmProvider);
 
-      const files = discoverFiles(projectDir);
-      if (files.length === 0) return;
-
-      const store = getOrCreateVectorStore(projectDir);
-      if (store.built) return; // Already indexed in this process
-
-      // Fast path: try loading everything from disk cache (no API calls)
-      if (store.tryLoadFromCache(files, projectDir)) {
-        cliLogger.log('background', `Project index loaded from cache: ${files.length} files`);
-        return; // All files cached — no "indexing X/Y" shown
+      if (await index.isUpToDate(projectDir)) {
+        cliLogger.log('background', 'Semantic index up-to-date');
+        // Pre-load cache so searches never need to touch LanceDB
+        await index.ensureCacheLoaded();
+        return;
       }
 
-      // Slow path: some files need (re-)embedding
-      await store.build(files, projectDir, embedFn, (done, total) => {
-        report(`indexing ${done}/${total}`);
+      await index.build(projectDir, (done, total) => {
+        const pct = Math.round((done / total) * 100);
+        report(`indexing ${pct}%`);
       });
 
-      cliLogger.log('background', `Project indexing complete: ${files.length} files`);
+      cliLogger.log('background', 'Semantic indexing complete');
     });
   }
 }

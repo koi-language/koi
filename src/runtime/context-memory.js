@@ -95,7 +95,7 @@ export function classifyFeedback(action, result, error) {
       const answer = result?.answer || '';
       const perm = `User: "${answer}"`;
       // Explicit signal: new user input arrived — focus on THIS, not previous results
-      const newImmediate = `✅${id} prompt_user: User says: "${answer}"\n\nNEW USER INPUT. Answer only this new question. Do not re-print results from previous commands.`;
+      const newImmediate = `✅${id} prompt_user: User says: "${answer}"\n\nAnswer only this new question, but you MUST still follow all tool-usage rules (splitting concepts, parallelization, required fields). Do not re-print results from previous commands.`;
       return { immediate: newImmediate, shortTerm: perm, permanent: perm };
     }
 

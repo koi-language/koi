@@ -5,7 +5,7 @@
  *   1. pattern  — regex grep across file contents
  *   2. glob     — file name matching with glob patterns
  *   3. query    — BM25 ranked full-text search (inverted index, 1-min cache)
- *   4. semantic — vector embeddings via OpenAI text-embedding-3-small
+ *   4. semantic — hierarchical code search via SemanticIndex + LanceDB
  *   5. symbols  — AST-based symbol resolution via tree-sitter
  *   6. impact   — dependency graph analysis (import graph + symbol refs)
  *
@@ -265,51 +265,40 @@ export default {
           const q = action.query;
           if (!q) return { success: false, error: 'semantic mode requires "query" field' };
 
-          const { getOrCreateVectorStore } = await import('../vector-store.js');
-          const store = getOrCreateVectorStore(searchDir);
+          const { getSemanticIndex } = await import('../semantic-index.js');
+          const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+          const cacheDir = path.join(projectRoot, '.koi', 'cache', 'semantic-index');
+          const index = getSemanticIndex(cacheDir, agent.llmProvider);
 
-          // Build index in background if needed — fallback to BM25 while indexing
-          if (!store.built) {
-            if (!store.building) {
-              const embedFn = async (text) => {
-                return await agent.llmProvider.getEmbedding(text);
-              };
-              store.building = true;
-              store.build(files, searchDir, embedFn, (done, total) => {
-                cliLogger.log('search', `Indexing ${done}/${total} files...`);
-              }).then(() => {
-                store.building = false;
-                cliLogger.log('search', 'Semantic index ready');
-              }).catch((err) => {
-                store.building = false;
-                cliLogger.log('search', `Semantic indexing failed: ${err.message}`);
-              });
-            }
-            // Fallback to BM25 while index builds
+          if (index.isBuilding() || !(await index.isReady())) {
+            // Fallback to BM25 while semantic index builds
             const fallbackResults = bm25Search(q, files, searchDir, maxResults);
             return {
               success: true,
               mode: 'query',
-              note: 'Semantic index building in background, used BM25 fallback',
+              note: 'Semantic index not ready yet — used BM25 fallback. Run index_code or wait for background indexing.',
               count: fallbackResults.length,
               results: fallbackResults
             };
           }
 
-          // Embed query and search
           const queryEmb = await agent.llmProvider.getEmbedding(q);
-          const results = store.search(queryEmb, maxResults, 0.3);
+          const results = await index.search(queryEmb, { limit: maxResults });
 
           return {
             success: true,
             mode: 'semantic',
             count: results.length,
             results: results.map(r => ({
-              file: path.relative(searchDir, r.file),
+              type: r.type,
+              name: r.name,
+              file: r.filePath,
               score: Math.round(r.score * 1000) / 1000,
-              startLine: r.startLine,
-              endLine: r.endLine,
-              preview: r.text.substring(0, 200)
+              lineFrom: r.lineFrom,
+              lineTo: r.lineTo,
+              description: r.description,
+              ...(r.signature && { signature: r.signature }),
+              ...(r.className && { className: r.className }),
             }))
           };
         }

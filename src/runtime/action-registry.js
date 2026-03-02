@@ -99,7 +99,11 @@ class ActionRegistry {
 
     if (actions.length === 0) return '';
 
+    // List exact valid intent names upfront so the LLM never invents one
+    const validNames = actions.map(a => a.intent || a.type);
     let doc = '## AVAILABLE ACTIONS\n\n';
+    doc += `Valid intent names: ${validNames.join(', ')}\n`;
+    doc += 'The "intent" field MUST be one of these exact names. Never paraphrase or use free text.\n\n';
     for (const action of actions) {
       doc += this._formatActionEntry(action) + '\n';
     }

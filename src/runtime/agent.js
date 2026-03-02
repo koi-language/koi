@@ -1594,8 +1594,8 @@ export class Agent {
   }
 
   /**
-   * Start background project indexing (fire-and-forget).
-   * Uses BackgroundTaskManager + VectorStore for semantic search pre-warming.
+   * Start background semantic indexing (fire-and-forget).
+   * Uses BackgroundTaskManager + SemanticIndex + LanceDB.
    * @private
    */
   async _startBackgroundIndexing() {
@@ -1604,9 +1604,8 @@ export class Agent {
         this.llmProvider = new LLMProvider(this.llm);
       }
       const projectDir = process.env.KOI_PROJECT_ROOT || process.cwd();
-      const embedFn = async (text) => this.llmProvider.getEmbedding(text);
       const { backgroundTaskManager } = await import('./background-task-manager.js');
-      backgroundTaskManager.startProjectIndexing(projectDir, embedFn);
+      backgroundTaskManager.startSemanticIndexing(projectDir, this.llmProvider);
     } catch (err) {
       cliLogger.log('background', `Indexing start failed: ${err.message}`);
     }
@@ -1654,6 +1653,7 @@ export class Agent {
         case 'grep':
         case 'search':
         case 'read_file':
+        case 'semantic_code_search':
           return { targetPath: rawPath || process.cwd(), level: 'read' };
         case 'edit_file':
         case 'write_file':

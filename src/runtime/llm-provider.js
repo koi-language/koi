@@ -524,10 +524,10 @@ ${taskDescription}`;
    * Lightweight JSON call: send a prompt, get parsed JSON back.
    * No system prompt injection, no streaming, no onAction.
    */
-  async callJSON(prompt, agent = null) {
+  async callJSON(prompt, agent = null, opts = {}) {
     await this._ensureClients();
     const agentName = agent?.name || '';
-    cliLogger.planning(agentName ? `[🤖 ${agentName}] Thinking` : 'Thinking');
+    if (!opts.silent) cliLogger.planning(agentName ? `[🤖 ${agentName}] Thinking` : 'Thinking');
 
     this.logRequest(this.model, 'Return ONLY valid JSON.', prompt, agentName ? `callJSON | Agent: ${agentName}` : 'callJSON');
 
@@ -566,7 +566,7 @@ ${taskDescription}`;
         throw new Error(`Unknown provider: ${_cjProvider}`);
       }
 
-      cliLogger.clear();
+      if (!opts.silent) cliLogger.clear();
       this.logResponse(response, 'callJSON');
 
       if (!response) return { result: '' };
@@ -579,7 +579,7 @@ ${taskDescription}`;
 
       return JSON.parse(cleaned);
     } catch (error) {
-      cliLogger.clear();
+      if (!opts.silent) cliLogger.clear();
       if (error instanceof SyntaxError) {
         return { result: response };
       }
@@ -1721,6 +1721,30 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
 Working directory: ${process.cwd()}
 All file paths (read_file, edit_file, write_file, shell) are relative to this directory unless absolute.
 
+REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.
+
+========================================
+OUTPUT SAFETY (MUST FOLLOW)
+========================================
+- intent is an ENUM: it MUST be exactly one of AVAILABLE ACTIONS. Never invent new intents.
+- NO BARE ACTIONS: never output an action object with only {actionType,intent}. Every intent must include its required fields.
+- If you feel like writing a descriptive phrase in intent, STOP and move that phrase into query / pattern / other params.
+- PREFLIGHT (before emitting JSON):
+  1) For each action: intent ∈ AVAILABLE ACTIONS
+  2) Required fields present:
+     - semantic_code_search => query
+     - search => mode + (query or pattern depending on mode)
+     - grep => pattern
+     - read_file => path
+     - shell => command + description
+     - learn_fact => key + value + category
+  3) If any check fails: FIX the JSON. Do not output invalid actions (invalid output crashes the system).
+- MULTI-CONCEPT RULE (HARD):
+  - If the user request contains 2+ concepts (e.g. contains "y", "and", "also", commas, or multiple nouns),
+    you MUST split into multiple semantic_code_search actions.
+  - NEVER put 2 concepts in the same semantic_code_search.query.
+  - If there are 2+ independent searches, they MUST be inside a single parallel block.
+
 # OUTPUT FORMAT INSTRUCTIONS:
 
 Convert user instructions into executable JSON actions using ONLY the actions and agents listed in AVAILABLE ACTIONS and AVAILABLE AGENTS.
@@ -1728,25 +1752,60 @@ Convert user instructions into executable JSON actions using ONLY the actions an
 ABSOLUTE OUTPUT RULE:
 - Your entire response MUST be a single valid JSON object.
 - Output ONLY JSON. No markdown. No explanations. No extra text.
+- Every action must be complete for its intent (no bare actions).
+- Intent is an enum. If you feel like writing a descriptive phrase in intent, STOP and put that phrase into query instead. Invalid intents crash the system.
 - The response MUST start with { and end with }.
 - If you output anything else, the system will crash.
 
 ACTION FORMAT:
 - Single action:
-  { "actionType": "direct", "intent": "<actionName>", ... }
+  { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication logic" }
 
 - Delegate to agent:
   { "actionType": "delegate", "intent": "agentKey::eventName", "data": { ... } }
 
-- Multiple actions — ALWAYS group independent actions in parallel:
-  { "batch": [ { action1 }, { "parallel": [ { action2 }, { action3 }, { action4 } ] }, { action5 } ] }
-  → action1 runs first, then action2+action3+action4 run CONCURRENTLY, then action5 once all finish.
+- Parallel actions (each action MUST have "actionType" and "intent"):
+  { "batch": [{ "parallel": [
+    { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication logic" },
+    { "actionType": "direct", "intent": "semantic_code_search", "query": "database connection setup" }
+  ]}] }
+    
+  {
+    "batch": [
+      {
+        "parallel": [
+          {
+            "actionType": "direct",
+            "intent": "semantic_code_search",
+            "query": "where semantic code indexing is implemented"
+          },
+          {
+            "actionType": "direct",
+            "intent": "semantic_code_search",
+            "query": "which languages are supported by the semantic index"
+          }
+        ]
+      }
+    ]
+  }
+
   RULE: if two or more actions do not depend on each other's output, they MUST go inside a "parallel" block.
   NEVER put independent actions sequentially in a batch — always parallelize them.
-  EXCEPTION: prompt_user must NEVER be inside a parallel block — it waits for user input and must always be a standalone sequential action.
+  EXCEPTION: prompt_user must NEVER be inside a parallel block.
+
+  // ❌ INVALID (invented intent + missing required fields)
+  { "actionType": "direct", "intent": "semantic index supported languages" }
+
+  // ✅ VALID (use a real intent and put text in query)
+  { "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index supported languages" }    
+
+- Sequential then parallel:
+  { "batch": [ { action1 }, { "parallel": [ { action2 }, { action3 } ] }, { action4 } ] }
+  → action1 runs first, then action2+action3 CONCURRENTLY, then action4.
 
 REQUIREMENTS:
-- "actionType" and "intent" are ALWAYS required.
+- Every action object MUST have "actionType" and "intent".
+- "intent" is a fixed identifier — it MUST be one of the exact names listed in AVAILABLE ACTIONS (e.g. "semantic_code_search", "search", "read_file"). Search text, descriptions, or queries are NEVER valid intents — they go in "query" or other parameter fields.
 - Do NOT nest "intent" inside "data".
 - Delegate intents MUST follow: agentKey::eventName.
 
@@ -2007,7 +2066,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions
 
     // ── INVOCATION SYNTAX ───────────────────────────────────────────────────
     doc += '---\n';
-    doc += 'To execute an action:\n';
+    doc += 'To execute an action (intent MUST be an exact name from AVAILABLE ACTIONS):\n';
     doc += '{ "actionType": "direct", "intent": "print", "message": "Hello" }\n\n';
 
     if (delegateResources.length > 0) {
