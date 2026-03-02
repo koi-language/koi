@@ -151,11 +151,11 @@ export function renderDiffLine(type, lineNum, text, filePath) {
     return padToWidth(raw, termWidth);
   } else if (type === 'remove') {
     const highlighted = syntaxHighlight(text, REMOVE_FG, keywords, true);
-    const raw = `${REMOVE_NUM}${num}${REMOVE_FG} -${highlighted}`;
+    const raw = `${REMOVE_NUM}${num} -${REMOVE_FG}${highlighted}`;
     return `${REMOVE_BG}${padToWidth(raw, termWidth)}\x1b[0m`;
   } else if (type === 'add') {
     const highlighted = syntaxHighlight(text, ADD_FG, keywords, true);
-    const raw = `${ADD_NUM}${num}${ADD_FG} +${highlighted}`;
+    const raw = `${ADD_NUM}${num} +${ADD_FG}${highlighted}`;
     return `${ADD_BG}${ADD_FG}${padToWidth(raw, termWidth)}\x1b[0m`;
   }
   return text;

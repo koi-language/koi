@@ -1068,6 +1068,20 @@ export class Agent {
             Agent._cliHooks?.onBusy?.(true);
             // Track user message for compose template {{userMessage}} variable
             this._lastUserMessage = result?.answer || null;
+
+            // Clear stale tasks from previous requests.
+            // A new user message = fresh task context. Old pending tasks should
+            // not block or confuse the processing of the new request.
+            try {
+              const { taskManager: _tmCleanup } = await import('./task-manager.js');
+              const _staleTasks = _tmCleanup.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
+              if (_staleTasks.length > 0) {
+                cliLogger.log('agent', `${this.name}: Clearing ${_staleTasks.length} stale task(s) on new user input`);
+                _tmCleanup.reset();
+              }
+              // Reset recovery counter for the new request
+              session._recoveryAttempts = 0;
+            } catch { /* non-fatal */ }
           }
 
           // Save input history, dialogue, and context memory after prompt_user
