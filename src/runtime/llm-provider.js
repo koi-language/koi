@@ -1744,6 +1744,17 @@ OUTPUT SAFETY (MUST FOLLOW)
     you MUST split into multiple semantic_code_search actions.
   - NEVER put 2 concepts in the same semantic_code_search.query.
   - If there are 2+ independent searches, they MUST be inside a single parallel block.
+- NEVER ANSWER WITHOUT EVIDENCE (HARD):
+  - Search results (semantic_code_search, search, grep) are LEADS, not answers. They tell you WHERE to look, not WHAT the answer is.
+  - You MUST read_file the actual source code BEFORE answering any question about the codebase.
+  - If search results have a "hint" warning about low confidence, you MUST use additional tools (grep, search, read_file) before responding. NEVER print a speculative answer based on search descriptions alone.
+  - If you cannot find the answer after trying multiple search strategies, say so honestly — do NOT fabricate an answer from irrelevant results.
+- SEMANTIC SEARCH QUERY STYLE (HARD):
+  - Queries MUST be keyword lists, NOT natural language questions.
+  - REMOVE filler words: where, which, how, what, is, the, are, does, find.
+  - EXPAND with synonyms and related technical terms.
+  - BAD: "where is semantic indexing implemented" → GOOD: "semantic index build embed vector store"
+  - BAD: "which languages are supported" → GOOD: "language support parser javascript typescript python"
 
 # OUTPUT FORMAT INSTRUCTIONS:
 
@@ -1759,15 +1770,15 @@ ABSOLUTE OUTPUT RULE:
 
 ACTION FORMAT:
 - Single action:
-  { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication logic" }
+  { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication login session token" }
 
 - Delegate to agent:
   { "actionType": "delegate", "intent": "agentKey::eventName", "data": { ... } }
 
 - Parallel actions (each action MUST have "actionType" and "intent"):
   { "batch": [{ "parallel": [
-    { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication logic" },
-    { "actionType": "direct", "intent": "semantic_code_search", "query": "database connection setup" }
+    { "actionType": "direct", "intent": "semantic_code_search", "query": "authentication login session token" },
+    { "actionType": "direct", "intent": "semantic_code_search", "query": "database connection pool config" }
   ]}] }
     
   {
@@ -1777,12 +1788,12 @@ ACTION FORMAT:
           {
             "actionType": "direct",
             "intent": "semantic_code_search",
-            "query": "where semantic code indexing is implemented"
+            "query": "semantic index build embed vector store"
           },
           {
             "actionType": "direct",
             "intent": "semantic_code_search",
-            "query": "which languages are supported by the semantic index"
+            "query": "language support parser javascript typescript python"
           }
         ]
       }
@@ -1797,7 +1808,7 @@ ACTION FORMAT:
   { "actionType": "direct", "intent": "semantic index supported languages" }
 
   // ✅ VALID (use a real intent and put text in query)
-  { "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index supported languages" }    
+  { "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index language parser support" }    
 
 - Sequential then parallel:
   { "batch": [ { action1 }, { "parallel": [ { action2 }, { action3 } ] }, { action4 } ] }

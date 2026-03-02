@@ -158,7 +158,6 @@ export class SemanticIndex {
           score,
           signature: row.signature ?? undefined,
           className: row.class_name ?? undefined,
-          sourceCode: row.source_code ?? undefined,
         });
       }
     }

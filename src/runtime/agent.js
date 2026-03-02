@@ -879,13 +879,14 @@ export class Agent {
               if (pa.id) {
                 session.actionContext[pa.id] = { output: result };
               }
-              session.recordAction(pa, result);
+              // Do NOT call session.recordAction here — the _parallel_done synthetic
+              // record below already contains all results. Recording individually would
+              // cause the LLM to see each result twice (once per action + once in the summary).
               cliLogger.log('result', `${this.name} [parallel/${paIntent}]: ${JSON.stringify(result).substring(0, 150)}`);
               return { action: pa, result };
             } catch (error) {
               const failedIntent = pa?.intent || pa?.type || 'unknown';
               cliLogger.log('error', `${this.name}: Parallel action "${failedIntent}" failed: ${error.message}`);
-              session.recordAction(pa, null, error);
               return { action: pa, result: null, error };
             }
           }));

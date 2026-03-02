@@ -7,7 +7,6 @@
  * Permission: read
  */
 
-import fs from 'fs';
 import path from 'path';
 import { cliLogger } from '../cli-logger.js';
 import { getFilePermissions } from '../file-permissions.js';
@@ -16,7 +15,7 @@ import { cliSelect } from '../cli-select.js';
 export default {
   type: 'semantic_code_search',
   intent: 'semantic_code_search',
-  description: 'Search the codebase semantically using natural language. Finds files, classes, and functions by meaning, not just text. Fields: "query" (what to search for), "type" (file|class|function — optional filter), "path" (directory scope), "maxResults" (default 20)',
+  description: 'Search the codebase semantically by keywords and concepts. Finds files, classes, and functions by meaning. Write queries as keyword lists (NOT questions): "email validation regex format", "database connection pool setup". Drop filler words (where, which, how). Fields: "query" (keywords), "type" (file|class|function — optional filter), "path" (directory scope), "maxResults" (default 20)',
   thinkingHint: (action) => `Searching: ${action.query ? action.query.slice(0, 40) : 'code'}`,
   permission: 'read',
   hidden: false,
@@ -26,7 +25,7 @@ export default {
     properties: {
       query: {
         type: 'string',
-        description: 'Natural language search query (e.g. "function that validates email addresses")',
+        description: 'Keywords and concepts to search for. Use nouns and domain terms, not questions. E.g. "email validation regex format check"',
       },
       type: {
         type: 'string',
@@ -46,9 +45,9 @@ export default {
   },
 
   examples: [
-    { actionType: 'direct', intent: 'semantic_code_search', query: 'function that validates email addresses' },
-    { actionType: 'direct', intent: 'semantic_code_search', query: 'authentication middleware', type: 'function' },
-    { actionType: 'direct', intent: 'semantic_code_search', query: 'database connection setup', path: 'src/db/' },
+    { actionType: 'direct', intent: 'semantic_code_search', query: 'email validation regex format check' },
+    { actionType: 'direct', intent: 'semantic_code_search', query: 'authentication login session token middleware', type: 'function' },
+    { actionType: 'direct', intent: 'semantic_code_search', query: 'database connection pool setup config', path: 'src/db/' },
   ],
 
   async execute(action, agent) {
@@ -112,42 +111,45 @@ export default {
 
       cliLogger.clear();
 
-      // Include source code for top results so the LLM can analyze actual code.
-      // Only top 5 get source to keep token usage reasonable.
-      const SOURCE_CODE_LIMIT = 5;
-      const FILE_PREVIEW_LINES = 80;
-      const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+      // Two-tier scoring: high confidence (>= 0.35) and low confidence (0.2-0.35).
+      // Below 0.2 is pure noise and gets discarded.
+      const HIGH_SCORE = 0.35;
+      const MIN_SCORE = 0.2;
+      const MAX_RESULTS = 10;
+
+      const aboveMin = results.filter(r => r.score >= MIN_SCORE).slice(0, MAX_RESULTS);
+
+      if (aboveMin.length === 0) {
+        return {
+          success: true,
+          query,
+          count: 0,
+          results: [],
+          hint: 'ZERO RESULTS. DO NOT answer the user — you have no information yet. You MUST search using other tools NOW: grep(pattern:"..."), search(mode:symbols,query:"..."), search(mode:glob,pattern:"*keyword*"). Do NOT print a response until you have found and READ the actual source code.',
+        };
+      }
+
+      const hasHighConfidence = aboveMin.some(r => r.score >= HIGH_SCORE);
+
+      const mapped = aboveMin.map((r) => ({
+        type: r.type,
+        name: r.name,
+        filePath: r.filePath,
+        lineFrom: r.lineFrom,
+        lineTo: r.lineTo,
+        description: r.description,
+        score: Math.round(r.score * 1000) / 1000,
+        ...(r.signature && { signature: r.signature }),
+        ...(r.className && { className: r.className }),
+      }));
 
       return {
         success: true,
         query,
-        count: results.length,
-        results: results.map((r, i) => {
-          let sourceCode = r.sourceCode;
-
-          // For file-type results (no sourceCode stored), read a preview from disk
-          if (i < SOURCE_CODE_LIMIT && !sourceCode && r.filePath) {
-            try {
-              const fullPath = path.isAbsolute(r.filePath) ? r.filePath : path.join(projectRoot, r.filePath);
-              const content = fs.readFileSync(fullPath, 'utf8');
-              const lines = content.split('\n');
-              sourceCode = lines.slice(0, FILE_PREVIEW_LINES).join('\n');
-              if (lines.length > FILE_PREVIEW_LINES) sourceCode += `\n... (${lines.length - FILE_PREVIEW_LINES} more lines)`;
-            } catch { /* file not readable */ }
-          }
-
-          return {
-            type: r.type,
-            name: r.name,
-            filePath: r.filePath,
-            lineFrom: r.lineFrom,
-            lineTo: r.lineTo,
-            description: r.description,
-            score: Math.round(r.score * 1000) / 1000,
-            ...(r.signature && { signature: r.signature }),
-            ...(r.className && { className: r.className }),
-            ...(i < SOURCE_CODE_LIMIT && sourceCode && { sourceCode }),
-          };
+        count: mapped.length,
+        results: mapped,
+        ...(!hasHighConfidence && {
+          hint: 'WARNING: All results have LOW confidence (< 0.35) — they are likely WRONG. DO NOT answer the user based on these descriptions. You MUST verify by using grep, search(mode:symbols), or search(mode:glob) to find the actual files, then read_file to confirm before answering.',
         }),
       };
     } catch (err) {
