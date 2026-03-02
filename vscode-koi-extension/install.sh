@@ -12,6 +12,17 @@ BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Ensure the Koi config directory exists (idempotent)
+# If missing, create it; if creation fails, exit with a clear error.
+KOI_DIR="$HOME/.koi"
+if [ ! -d "$KOI_DIR" ]; then
+    echo -e "${BLUE}Creating Koi directory at ${KOI_DIR}...${NC}"
+    if ! mkdir -p "$KOI_DIR"; then
+        echo -e "${YELLOW}⚠${NC}  Failed to create ${KOI_DIR}. Please check permissions."
+        exit 1
+    fi
+fi
+
 # Detect which editors are installed
 VSCODE_INSTALLED=false
 CURSOR_INSTALLED=false
