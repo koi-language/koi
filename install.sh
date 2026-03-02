@@ -149,7 +149,7 @@ install_koi() {
     # Ensure install directory exists before entering it
     ensure_install_dir
     cd "$INSTALL_DIR"
-
+    npm install --production --silent 2>&1 | sed 's/^/  /' || {
         log_error "Failed to install dependencies"
         exit 1
     }
