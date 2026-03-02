@@ -1,0 +1,7 @@
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <!-- Koi file icon - wave symbol -->
+  <rect width="32" height="32" fill="#1a1e2e" rx="4"/>
+  <path d="M 8 16 Q 12 12, 16 16 T 24 16" stroke="#6dd5ed" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+  <path d="M 8 20 Q 12 16, 16 20 T 24 20" stroke="#a78bfa" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <text x="16" y="10" font-family="Arial, sans-serif" font-size="8" fill="#fbbf24" text-anchor="middle" font-weight="bold">KOI</text>
+</svg>

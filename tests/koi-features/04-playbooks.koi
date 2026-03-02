@@ -1,0 +1,62 @@
+// Test: Playbooks
+// Tests playbook syntax and execution
+role Worker { can execute }
+
+agent PlaybookAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+
+  on simplePlaybook(args: Json) {
+    playbook """
+    Process the input data and return a result.
+
+    Input: ${args.input}
+
+    Steps:
+    1. Take the input value
+    2. Double it
+    3. Return the result
+
+    Return the doubled value as { result: <number> }
+    """
+  }
+
+  on multiStepPlaybook(args: Json) {
+    playbook """
+    Perform a multi-step calculation.
+
+    Input: ${args.number}
+
+    Steps:
+    1. Multiply the number by 2
+    2. Add 10 to the result
+    3. Divide by 2
+    4. Return the final result
+
+    Return { result: <number> }
+    """
+  }
+
+  on dataProcessing(args: Json) {
+    playbook """
+    Process a list of items.
+
+    Items: ${args.items}
+
+    Steps:
+    1. Count the number of items
+    2. Create a summary
+    3. Return { count: <number>, summary: <string> }
+    """
+  }
+}
+
+// Test without LLM (manual implementation)
+agent ManualAgent : Worker {
+  on calculate(args: Json) {
+    const doubled = args.value * 2
+    console.log("Doubled:", doubled)
+    return { result: doubled }
+  }
+}
+
+run ManualAgent.calculate({ value: 21 })

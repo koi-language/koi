@@ -1,0 +1,40 @@
+// Test: Async/Await
+// Tests async/await with various expressions
+role Worker { can execute }
+
+agent AsyncTest : Worker {
+  on helper(args: Json) {
+    return { value: args.input * 2 }
+  }
+
+  on testAwaitSend(args: Json) {
+    // Test await with send
+    const result = await send peers.event("helper").role(Worker).any()({ input: 5 }) timeout 5s
+
+    console.log("Result:", result)
+    return result
+  }
+
+  on testAwaitRegistry(args: Json) {
+    // Test await with registry operations
+    await registry.set("test:key", { data: "test value" })
+    const retrieved = await registry.get("test:key")
+
+    console.log("Retrieved:", retrieved)
+    return { retrieved: retrieved }
+  }
+
+  on testAwaitMultiple(args: Json) {
+    // Multiple await calls
+    await registry.set("counter", { count: 0 })
+    const data1 = await registry.get("counter")
+
+    await registry.set("counter", { count: data1.count + 1 })
+    const data2 = await registry.get("counter")
+
+    console.log("Final count:", data2.count)
+    return { count: data2.count }
+  }
+}
+
+run AsyncTest.testAwaitRegistry({})

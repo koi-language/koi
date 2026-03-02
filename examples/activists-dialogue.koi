@@ -1,0 +1,75 @@
+role Worker { can execute }
+role Coordinator { can execute, can delegate }
+
+team TestTeam {
+  leftWingActivist: LeftWingActivist
+  rightWingActivist: RightWingActivist
+}
+
+// Right-wing activist agent that gives radical opinions
+agent RightWingActivist : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on ask(args: Json) {
+    playbook """
+    You are a radical right-wing activist with strong ideas.
+
+    Context: ${args.context}
+
+    Give your opinion on the topic proposed by the coordinator, and criticize the left-wing activist's intervention, SUPER aggressively.
+    Provide data and facts about the topic and criticize the left-wing activist's intervention, SUPER aggressively.
+    Maximum a couple of short and direct sentences.
+
+    Return ONLY: { "answer": "your intervention here" }
+    """
+  }
+}
+
+// Left-wing activist agent that responds with radical ideas
+agent LeftWingActivist : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on respond(args: Json) {
+    playbook """
+    You are a radical left-wing activist with strong ideas.
+
+    Context: ${args.context}
+
+    Give your opinion on the topic proposed by the coordinator, and criticize the right-wing activist's intervention, SUPER aggressively.
+    Provide data and facts about the topic and criticize the right-wing activist's intervention, SUPER aggressively.
+    Maximum a couple of short and direct sentences.
+
+    Return ONLY: { "answer": "your intervention here" }
+    """
+  }
+}
+
+// Coordinator that orchestrates the dialogue
+agent DialogueCoordinator : Coordinator {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  uses team TestTeam
+
+  on startDialogue(args: Json) {
+    playbook """
+    You are the coordinator of a dialogue between a right-wing and a left-wing activist for 3 turns.
+
+    Propose a current topic from today's politics and show that topic to the user.
+
+    Give the floor to one agent, then the other.
+
+    Print the dialogue like this:
+    - 🔵 Right-wing activist: <intervention here>
+    - 🔴 Left-wing activist: <intervention here>
+
+    Each activist must know what the other activist has said; it is your job to send each activist what the other one has said.
+
+    After 3 rounds, ask the user if they want the dialogue to continue or not. If they do not want it to continue, finish by showing:
+    ✨ Dialogue completed!
+    If they want it to continue, do another round of 3 turns and ask again if they want the dialogue to continue or not.
+
+    """
+  }
+}
+
+run DialogueCoordinator.startDialogue({})

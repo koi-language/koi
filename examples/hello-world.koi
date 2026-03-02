@@ -1,0 +1,16 @@
+// Demo: Iteration Actions (repeat and while)
+// Shows how to repeat actions fixed number of times or until condition
+
+role Worker { can execute }
+
+agent HelloWorldAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on hello_world(args: Json) {
+    playbook """
+    Ask the user for their name, then greet them warmly
+    """
+  }
+}
+
+run Assistant.hello_world({})

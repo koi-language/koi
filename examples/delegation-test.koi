@@ -1,0 +1,50 @@
+role Worker { can execute }
+role Coordinator { can execute, can delegate }
+
+team TestTeam {
+  translator: Translator
+  wordCounter: WordCounter
+}
+
+// Simple translator agent
+agent Translator : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  amnesia = true
+
+  on translate(args: Json) {
+    playbook """
+    Translate "${args.text}" to ${args.language}.
+    Return JSON: { "translated": "translated text here" }
+    """
+  }
+}
+
+// Simple counter agent
+agent WordCounter : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  amnesia = true
+
+  on count(args: Json) {
+    playbook """
+    Count words in: "${args.text}"
+    Return JSON: { "wordCount": number }
+    """
+  }
+}
+
+// Orchestrator that chains tasks
+agent Orchestrator : Coordinator {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  uses team TestTeam
+
+  on processText(args: Json) {
+    playbook """
+    Prompt the user to enter a sentence.
+    Translate the sentence to Spanish.
+    Count the words in the translation.
+    Print the original sentence, the translation, and the word count.
+    """
+  }
+}
+
+run Orchestrator.processText({ text: "hello world" })

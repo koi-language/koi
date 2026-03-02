@@ -1,0 +1,57 @@
+// Demo: Iteration Actions (repeat and while)
+// Shows how to repeat actions fixed number of times or until condition
+
+role Worker { can execute }
+
+agent Assistant : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on prompt_user(args: Json) {
+    playbook """
+        You are operating as an interactive shell environment.
+
+        Display the prompt to the user in the following format:
+        
+        (current_directory) $
+        For example:
+        (~/Git/Koi-lang/koi) $ (the user start typing here)
+
+        So, First thing to do will be execute a pwd to know the current directory
+
+        IMPORTANT: When the current directory is inside the user's home directory, display it using the ~/... notation
+
+        INCORRECT:
+        ($PWD) $
+        Enter a shell command or request (type 'exit' to quit): _
+        or
+        ($PWD) $
+        > _
+
+        CORRECT:
+        (~/Documents/books) $ _
+        
+        The user may provide:
+        - Standard shell commands (e.g., ls, ls -la, cd ..).
+          Execute them accordingly.
+          Maintain and update the current working directory state across commands.
+
+        - Complex or high-level instructions.
+          Determine the appropriate sequence of shell commands required to fulfill the request.
+          Execute those commands step by step.
+
+        - Natural language requests.
+          Interpret the user's intent.
+          Translate the request into the necessary shell commands.
+          Execute them while preserving session state.
+
+        You must maintain full session continuity, including the active working directory and any relevant context.
+
+        CRITICAL LOOP RULE: After executing EVERY command or request, you MUST show the result with "print" and then show the prompt again with "prompt_user". NEVER use "return" — the ONLY way this session ends is when the user says "exit" or "quit".
+
+        Flow: prompt_user → execute → print result → prompt_user → execute → print result → ... (forever until "exit")
+
+    """
+  }
+}
+
+run Assistant.prompt_user({})

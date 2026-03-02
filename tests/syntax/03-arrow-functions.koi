@@ -1,0 +1,56 @@
+// Test: Arrow Functions
+// Tests arrow function syntax
+role Worker { can execute }
+
+agent ArrowFunctionTest : Worker {
+  on testBasicArrow(args: Json) {
+    // Simple arrow function
+    const double = x => x * 2
+    const result = double(5)
+
+    console.log("Double of 5:", result)
+    return { result: result }
+  }
+
+  on testMultiParam(args: Json) {
+    // Arrow function with multiple parameters
+    const add = (a, b) => a + b
+    const result = add(10, 20)
+
+    console.log("10 + 20:", result)
+    return { result: result }
+  }
+
+  on testWithBlock(args: Json) {
+    // Arrow function with block body
+    const processNumber = n => {
+      const squared = n * n
+      const doubled = squared * 2
+      return doubled
+    }
+
+    const result = processNumber(3)
+    console.log("Process 3:", result)
+    return { result: result }
+  }
+
+  on testWithMap(args: Json) {
+    // Arrow function with array methods
+    const numbers = [1, 2, 3, 4, 5]
+    const squared = numbers.map(n => n * n)
+
+    console.log("Squared:", squared)
+    return { squared: squared }
+  }
+
+  on testWithFilter(args: Json) {
+    // Arrow function with filter
+    const numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    const evens = numbers.filter(n => n % 2 == 0)
+
+    console.log("Evens:", evens)
+    return { evens: evens }
+  }
+}
+
+run ArrowFunctionTest.testBasicArrow({})

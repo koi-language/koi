@@ -1,0 +1,83 @@
+// Test: Send Patterns
+// Tests send with timeout, role filters, selection modes
+role Worker { can execute }
+role Manager { can execute, can delegate }
+
+agent Worker1 : Worker {
+  on process(args: Json) {
+    console.log("[Worker1] Processing:", args.data)
+    return { agent: "Worker1", data: args.data, processed: true }
+  }
+}
+
+agent Worker2 : Worker {
+  on process(args: Json) {
+    console.log("[Worker2] Processing:", args.data)
+    return { agent: "Worker2", data: args.data, processed: true }
+  }
+}
+
+agent Boss : Manager {
+  on coordinate(args: Json) {
+    console.log("[Boss] Coordinating:", args.task)
+    return { agent: "Boss", role: "Manager", task: args.task }
+  }
+}
+
+team TestTeam {
+  w1 = Worker1
+  w2 = Worker2
+  boss = Boss
+}
+
+agent Coordinator : Manager {
+  uses team TestTeam
+
+  on testAnyWorker(args: Json) {
+    // Send to any worker (random selection)
+    const result = await send peers.event("process").role(Worker).any()({
+      data: "Task A"
+    }) timeout 5s
+
+    console.log("Result from:", result.agent)
+    return result
+  }
+
+  on testWithTimeout(args: Json) {
+    // Send with timeout
+    const result = await send peers.event("process").role(Worker).any()({
+      data: "Task B"
+    }) timeout 10s
+
+    return result
+  }
+
+  on testToManager(args: Json) {
+    // Send to specific role
+    const result = await send peers.event("coordinate").role(Manager).any()({
+      task: "Coordinate team"
+    }) timeout 5s
+
+    return result
+  }
+
+  on testEventFilter(args: Json) {
+    // Test event-based routing
+    const result = await send peers.event("process").role(Worker).any()({
+      data: "Filtered task"
+    }) timeout 5s
+
+    return result
+  }
+}
+
+agent Standalone : Worker {
+  on testDirectCall(args: Json) {
+    // Direct agent call (no team)
+    const result = await Worker1.handle("process", { data: "Direct call" })
+    console.log("Direct result:", result.agent)
+    return result
+  }
+}
+
+run Coordinator.testAnyWorker({})

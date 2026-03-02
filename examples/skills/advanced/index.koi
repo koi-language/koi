@@ -1,0 +1,93 @@
+// ============================================================
+// Advanced Skills Package
+// Entry point that exports all skills from this directory
+// ============================================================
+
+// Re-export from other files in this directory
+// (In a future version, we could support automatic re-export)
+
+// For now, we define everything here as the main entry point
+
+role DataScientist { can analyze }
+
+// ============================================================
+// Statistical Analysis Skill
+// ============================================================
+
+skill StatisticalAnalysis {
+  affordance """
+  Perform statistical analysis including mean, median, standard deviation
+  """
+
+  export async function calculateMean(args: any): Promise<any> {
+    const numbers = args.numbers || [];
+    if (numbers.length === 0) {
+      return { error: "No numbers provided" };
+    }
+
+    const sum = numbers.reduce((a, b) => a + b, 0);
+    const mean = sum / numbers.length;
+
+    return {
+      operation: "mean",
+      numbers: numbers,
+      result: mean
+    };
+  }
+
+  export async function calculateMedian(args: any): Promise<any> {
+    const numbers = args.numbers || [];
+    if (numbers.length === 0) {
+      return { error: "No numbers provided" };
+    }
+
+    const sorted = [...numbers].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 === 0
+      ? (sorted[mid - 1] + sorted[mid]) / 2
+      : sorted[mid];
+
+    return {
+      operation: "median",
+      numbers: numbers,
+      result: median
+    };
+  }
+
+  export async function calculateStdDev(args: any): Promise<any> {
+    const numbers = args.numbers || [];
+    if (numbers.length === 0) {
+      return { error: "No numbers provided" };
+    }
+
+    const mean = numbers.reduce((a, b) => a + b, 0) / numbers.length;
+    const variance = numbers.reduce((sum, num) => sum + Math.pow(num - mean, 2), 0) / numbers.length;
+    const stdDev = Math.sqrt(variance);
+
+    return {
+      operation: "stddev",
+      numbers: numbers,
+      mean: mean,
+      variance: variance,
+      result: stdDev
+    };
+  }
+}
+
+// ============================================================
+// Data Analysis Agent
+// ============================================================
+
+agent DataAnalyzer : DataScientist {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 400 }
+  uses skill StatisticalAnalysis
+
+  on analyze(args: Json) {
+    playbook """
+    Analyze this data: ${JSON.stringify(args)}
+
+    Use the available statistical tools to compute mean, median, and standard deviation.
+    Return a comprehensive analysis as JSON.
+    """
+  }
+}

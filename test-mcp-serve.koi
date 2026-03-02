@@ -1,0 +1,20 @@
+role Reviewer { can review,
+                can analyze }
+
+agent CodeReviewer : Reviewer {
+  expose mcp
+
+  on review(args: Json) {
+    affordance "Review code for quality, style, and potential bugs"
+    playbook "Review the following code and provide feedback on quality, style, and potential bugs: ${args.code}"
+  }
+
+  on analyze(args: Json) {
+    affordance "Analyze code complexity and suggest improvements"
+    playbook "Analyze the complexity of this code and suggest improvements: ${args.code}"
+  }
+
+  private on internal_step(args: Json) {
+    playbook "This is an internal step that should not be exposed via MCP"
+  }
+}

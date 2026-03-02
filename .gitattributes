@@ -1,0 +1,20 @@
+# KOI Language Configuration for GitHub Linguist
+# See LINGUIST.md for details on adding KOI to GitHub Linguist
+
+# Use JavaScript syntax highlighting until KOI is officially added to Linguist
+# This provides decent highlighting as KOI syntax is JavaScript-like
+*.koi linguist-language=JavaScript
+
+# Ensure .koi files are counted in language statistics
+*.koi linguist-detectable=true
+
+# Ensure .koi files are not treated as vendor/generated code
+*.koi linguist-vendored=false
+*.koi linguist-generated=false
+
+# Documentation files
+*.md linguist-documentation=true
+doc/*.md linguist-documentation=true
+
+# Vendor directory
+vendor/** linguist-vendored=true

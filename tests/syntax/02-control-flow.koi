@@ -1,0 +1,67 @@
+// Test: Control Flow
+// Tests if, else, while, for loops
+role Worker { can execute }
+
+agent ControlFlowTest : Worker {
+  on testIf(args: Json) {
+    const x = 10
+
+    if (x > 5) {
+      console.log("x is greater than 5")
+      return { result: "greater" }
+    } else {
+      console.log("x is not greater than 5")
+      return { result: "not greater" }
+    }
+  }
+
+  on testWhile(args: Json) {
+    let count = 0
+    const results = []
+
+    while (count < 5) {
+      results.push(count)
+      count = count + 1
+    }
+
+    console.log("While loop results:", results)
+    return { results: results }
+  }
+
+  on testForOf(args: Json) {
+    const items = [1, 2, 3, 4, 5]
+    const doubled = []
+
+    for (const item of items) {
+      doubled.push(item * 2)
+    }
+
+    console.log("For-of results:", doubled)
+    return { doubled: doubled }
+  }
+
+  on testForIn(args: Json) {
+    const obj = { a: 1, b: 2, c: 3 }
+    const keys = []
+
+    for (const key in obj) {
+      keys.push(key)
+    }
+
+    console.log("For-in keys:", keys)
+    return { keys: keys }
+  }
+
+  on testFor(args: Json) {
+    const results = []
+
+    for (let i = 0; i < 5; i = i + 1) {
+      results.push(i * i)
+    }
+
+    console.log("For loop results:", results)
+    return { results: results }
+  }
+}
+
+run ControlFlowTest.testIf({})

@@ -1,0 +1,66 @@
+role Worker { can execute }
+role Coordinator { can execute, can delegate }
+
+team TestTeam {
+  philosopher: Philosopher
+  poet: Poet
+}
+
+// Philosopher agent that asks deep questions
+agent Philosopher : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on ask(args: Json) {
+    playbook """
+    You are a philosopher who asks deep questions.
+
+    Context: ${args.context}
+
+    Generate ONE brief philosophical question (maximum 2 sentences).
+
+    Return ONLY: { "question": "your question here" }
+    """
+  }
+}
+
+// Poet agent that responds in a poetic manner
+agent Poet : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on respond(args: Json) {
+    playbook """
+    You are a poet who responds in a metaphorical way.
+
+    Question: "${args.question}"
+
+    Respond poetically (maximum 2 sentences).
+
+    Return ONLY: { "answer": "your answer here" }
+    """
+  }
+}
+
+// Coordinator that orchestrates the dialogue
+agent DialogueCoordinator : Coordinator {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  uses team TestTeam
+
+  on startDialogue(args: Json) {
+    playbook """
+    Coordinate a dialogue between Philosopher and Poet for 3 turns.
+
+    In each turn:
+    First have the philosopher ask a question and then have the poet respond to that question.
+    Print the dialogue like this:
+    - 🤔 Philosopher: <question here>
+    - 🎭 Poet: <answer here>
+
+    After 3 rounds, finish by showing:
+    ✨ Dialogue completed!
+
+    """
+  }
+}
+
+run DialogueCoordinator.startDialogue({})

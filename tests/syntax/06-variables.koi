@@ -1,0 +1,45 @@
+// Test: Variables and Constants
+// Tests var, let, const declarations
+role Worker { can execute }
+
+agent VariableTest : Worker {
+  on testConst(args: Json) {
+    const x = 10
+    const y = 20
+    const sum = x + y
+
+    console.log("Const sum:", sum)
+    return { sum: sum }
+  }
+
+  on testLet(args: Json) {
+    let counter = 0
+    counter = counter + 1
+    counter = counter + 1
+
+    console.log("Counter:", counter)
+    return { counter: counter }
+  }
+
+  on testMultipleDeclarations(args: Json) {
+    const a = 1
+    const b = 2
+    const c = 3
+    const total = a + b + c
+
+    console.log("Total:", total)
+    return { total: total }
+  }
+
+  on testDestructuring(args: Json) {
+    // Note: This might not be supported yet
+    const obj = { x: 10, y: 20 }
+    const x = obj.x
+    const y = obj.y
+
+    console.log("x:", x, "y:", y)
+    return { x: x, y: y }
+  }
+}
+
+run VariableTest.testConst({})

@@ -1,0 +1,32 @@
+// ============================================================
+// Koi — Mobile MCP Demo
+// Controls a mobile device via the mobile-mcps MCP server.
+// Requires: Android emulator/device or iOS simulator running.
+// Usage: GEMINI_API_KEY=... koi run examples/mobile-mcp-demo.koi
+// ============================================================
+
+role Worker { can execute }
+
+mcp mobile = {
+  command: "node",
+  args: ["/path/to/mcp-server.js"],
+  //env: { "GEMINI_API_KEY": "" }
+}
+
+agent MobileAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  uses mcp mobile
+
+  on automate(args: Json) {
+    playbook """
+    Automate the mobile device to accomplish this goal: "${args.goal}"
+    1. List available devices to find a target.
+    2. Start the agent with the goal on the first available device.
+    3. Return the agent result.
+    """
+  }
+}
+
+run MobileAgent.automate({ goal: "Open maps and search for Rome, then in Rome find the street where the Trevi Fountain is located and show a photo" })
+
+

@@ -1,0 +1,73 @@
+{
+  "name": "koi-lang",
+  "displayName": "Koi Language Support",
+  "description": "Syntax highlighting and language support for Koi - Agent-first orchestration language",
+  "version": "1.0.4",
+  "publisher": "koi-lang",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "koi",
+    "agent",
+    "orchestration",
+    "multi-agent",
+    "llm"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:koi"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "koi",
+        "aliases": [
+          "Koi",
+          "koi"
+        ],
+        "extensions": [
+          ".koi"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/file-icon.svg",
+          "dark": "./images/file-icon.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "koi",
+        "scopeName": "source.koi",
+        "path": "./syntaxes/koi.tmLanguage.json"
+      }
+    ],
+    "themes": [
+      {
+        "label": "Koi Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/koi-dark.json"
+      },
+      {
+        "label": "Koi Dark+",
+        "uiTheme": "vs-dark",
+        "path": "./themes/koi-dark-plus.json"
+      },
+      {
+        "label": "Koi Dark Modern",
+        "uiTheme": "vs-dark",
+        "path": "./themes/koi-dark-modern.json"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koi-language/Koi"
+  },
+  "license": "MIT"
+}

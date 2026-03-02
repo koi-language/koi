@@ -1,0 +1,16 @@
+{
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [
+      {
+        "name": "Koi Playbook Content - Bright Yellow",
+        "scope": [
+          "string.quoted.triple.playbook.koi",
+          "string.quoted.triple.affordance.koi"
+        ],
+        "settings": {
+          "foreground": "#F7DF1E"
+        }
+      }
+    ]
+  }
+}

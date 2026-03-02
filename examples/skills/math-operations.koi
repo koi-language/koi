@@ -1,0 +1,67 @@
+// ============================================================
+// Math Operations Skill
+// A reusable skill that provides math operations
+// ============================================================
+
+skill MathOperations {
+  affordance """
+  Perform mathematical operations like addition, subtraction, multiplication, and division
+  """
+
+  export async function add(args: any): Promise<any> {
+    const a = args.a || 0;
+    const b = args.b || 0;
+    console.log(`[add] ${a} + ${b} = ${a + b}`);
+    return {
+      operation: "addition",
+      a: a,
+      b: b,
+      result: a + b
+    };
+  }
+
+  export async function subtract(args: any): Promise<any> {
+    const a = args.a || 0;
+    const b = args.b || 0;
+    console.log(`[subtract] ${a} - ${b} = ${a - b}`);
+    return {
+      operation: "subtraction",
+      a: a,
+      b: b,
+      result: a - b
+    };
+  }
+
+  export async function multiply(args: any): Promise<any> {
+    const a = args.a || 0;
+    const b = args.b || 0;
+    console.log(`[multiply] ${a} × ${b} = ${a * b}`);
+    return {
+      operation: "multiplication",
+      a: a,
+      b: b,
+      result: a * b
+    };
+  }
+
+  export async function divide(args: any): Promise<any> {
+    const a = args.a || 0;
+    const b = args.b || 1;
+    if (b === 0) {
+      console.error(`[divide] Error: Division by zero`);
+      return {
+        operation: "division",
+        a: a,
+        b: b,
+        error: "Division by zero"
+      };
+    }
+    console.log(`[divide] ${a} ÷ ${b} = ${a / b}`);
+    return {
+      operation: "division",
+      a: a,
+      b: b,
+      result: a / b
+    };
+  }
+}

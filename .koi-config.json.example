@@ -1,0 +1,9 @@
+{
+  "registry": {
+    "backend": "local",
+    "options": {
+      "path": ".koi/registry",
+      "autoSaveInterval": 5000
+    }
+  }
+}

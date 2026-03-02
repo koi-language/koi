@@ -1,0 +1,142 @@
+role Calculator { can calculate }
+role Coordinator { can coordinate, can delegate }
+
+// Agent with multiple event handlers
+// Each handler has its own affordance (from the playbook)
+agent StatisticsCalculator : Calculator {
+  llm default = {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    temperature: 0.1
+  }
+
+  // Event handler to calculate the mean
+  on mean(args: Json) {
+    playbook """
+    Calculate the arithmetic mean (average) of the numbers: ${JSON.stringify(args.numbers)}
+
+    Sum all numbers and divide by the count.
+    IMPORTANT: Actually perform the calculation and return ONLY: { "operation": "mean", "result": <numeric_value> }
+    """
+  }
+
+  // Event handler to calculate the median
+  on median(args: Json) {
+    playbook """
+    Calculate the median (middle value) of ${JSON.stringify(args.numbers)}
+
+    Sort numbers, find middle. If even count, average two middle values.
+    Return: { "operation": "median", "result": <numeric_value> }
+    """
+  }
+
+  // Event handler to calculate the standard deviation
+  on stddev(args: Json) {
+    playbook """
+    Calculate the standard deviation for ${JSON.stringify(args.numbers)}
+
+    DO NOT return a plan. Perform the actual calculation and return only the result.
+    Formula: sqrt(sum((x - mean)²) / n)
+    Return ONLY: { "operation": "stddev", "result": <numeric_result> }
+    """
+  }
+}
+
+team CalculatorTeam {
+  calculator: StatisticsCalculator
+}
+
+// Orchestrator that decides which event to send based on intent
+agent Orchestrator : Coordinator {
+  llm default = {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    temperature: 0.1
+  }
+
+  uses team CalculatorTeam
+
+  on process(args: Json) {
+    playbook """
+    Process this statistical request: ${JSON.stringify(args)}
+
+    You have access to Calculator agents with these event handlers:
+    - "mean" event: Calculate arithmetic mean/average
+    - "median" event: Calculate median (middle value)
+    - "stddev" event: Calculate standard deviation (measure of spread)
+
+    Based on the user's request description in "operation", determine which statistical calculation is needed.
+    Then delegate by returning an action:
+
+    {
+      "actions": [
+        {
+          "title": "Calculating <operation>",
+          "intent": "<choose: calculate mean | calculate median | calculate standard deviation>",
+          "data": { "numbers": ${JSON.stringify(args.numbers)} }
+        }
+      ]
+    }
+
+    The system will route to the appropriate event handler based on the intent.
+    """
+  }
+}
+
+team OrchestratorTeam {
+  orchestrator: Orchestrator
+}
+
+agent Main : Coordinator {
+  uses team OrchestratorTeam
+
+  on start(args: Json) {
+    console.log("╔════════════════════════════════════════════╗")
+    console.log("║  Multi Event Handler Test                  ║")
+    console.log("║  Semantic routing to event handlers        ║")
+    console.log("╚════════════════════════════════════════════╝\n")
+
+    // Test 1: Request mean calculation
+    console.log("📋 Test 1: Calculate average of numbers")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    const meanResult =
+      await send peers.event("process").role(Coordinator).any()({
+        operation: "calculate the average",
+        numbers: [10, 20, 30, 40, 50]
+      }) timeout 30s
+
+    console.log("Result:", JSON.stringify(meanResult, null, 2))
+
+    // Test 2: Request median calculation
+    console.log("\n📋 Test 2: Find the middle value")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    const medianResult =
+      await send peers.event("process").role(Coordinator).any()({
+        operation: "find the middle value",
+        numbers: [1, 3, 5, 7, 9, 11]
+      }) timeout 30s
+
+    console.log("Result:", JSON.stringify(medianResult, null, 2))
+
+    // Test 3: Request standard deviation
+    console.log("\n📋 Test 3: Calculate spread of data")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    const stddevResult =
+      await send peers.event("process").role(Coordinator).any()({
+        operation: "measure how spread out the numbers are",
+        numbers: [10, 20, 30, 40, 50]
+      }) timeout 30s
+
+    console.log("Result:", JSON.stringify(stddevResult, null, 2))
+
+    return {
+      success: true,
+      tests_completed: 3
+    }
+  }
+}
+
+run Main.start({})

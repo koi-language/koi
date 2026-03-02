@@ -1,0 +1,83 @@
+{
+  "name": "@koi-language/koi",
+  "version": "1.1.0",
+  "description": "Koi - Agent-first language. Calm orchestration.",
+  "type": "module",
+  "main": "src/runtime/index.js",
+  "exports": {
+    ".": "./src/runtime/index.js",
+    "./runtime": "./src/runtime/index.js",
+    "./router": "./src/runtime/router.js",
+    "./src/*": "./src/*"
+  },
+  "bin": {
+    "koi": "./src/cli/koi.js"
+  },
+  "files": [
+    "src/",
+    "examples/",
+    "README.md",
+    "QUICKSTART.md",
+    "SETUP_LLM.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:grammar": "peggy --format es -o src/compiler/parser.js src/grammar/koi.pegjs",
+    "compile": "node src/cli/koi.js compile",
+    "run": "node src/cli/koi.js run",
+    "dev": "node --inspect src/cli/koi.js run",
+    "test": "node src/cli/koi.js test"
+  },
+  "keywords": [
+    "koi",
+    "agent-first",
+    "multi-agent",
+    "orchestration",
+    "transpiler",
+    "role-based",
+    "calm",
+    "llm",
+    "ai-agents",
+    "playbook",
+    "agent-orchestration"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koi-language/Koi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/koi-language/Koi/issues"
+  },
+  "homepage": "https://github.com/koi-language/Koi#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@keyv/sqlite": "^4.0.1",
+    "better-sqlite3": "^11.8.1",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.2.3",
+    "keyv": "^5.1.1",
+    "lodash": "^4.17.23",
+    "node-fetch": "^3.3.2",
+    "node-pty": "^1.1.0",
+    "openai": "^6.16.0",
+    "peggy": "^5.0.6",
+    "prompts": "^2.4.2",
+    "sharp": "^0.34.5",
+    "source-map": "^0.7.6",
+    "tree-sitter": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.0.10",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6"
+  }
+}

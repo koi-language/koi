@@ -1,0 +1,74 @@
+// ============================================================
+// Skill Import Test
+// Tests importing Skills from external files
+// ============================================================
+
+// Import the Math Operations skill
+import "./skills/math-operations.koi"
+
+role Calculator { can execute }
+
+// Agent that uses the imported MathOperations skill
+agent MathAgent : Calculator {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+  uses skill MathOperations
+
+  on calculate(args: Json) {
+    playbook """
+    Perform the following calculation: ${JSON.stringify(args)}
+
+    Use the available math tools to compute the result.
+    Return the result as JSON with the operation and result fields.
+    """
+  }
+}
+
+// Create a team
+team MathTeam {
+  calculator: MathAgent
+}
+
+// Demo runner
+agent DemoRunner : Calculator {
+  uses team MathTeam
+
+  on runTest(args: Json) {
+    console.log("╔════════════════════════════════════════════╗")
+    console.log("║  Skill Import Test                         ║")
+    console.log("║  Testing imported Math Operations          ║")
+    console.log("╚════════════════════════════════════════════╝\n")
+
+    // Test 1: Addition
+    console.log("📋 Test 1: Addition (5 + 3)")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    const result1 =
+      await send peers.event("calculate").role(Calculator).any()({
+        operation: "add",
+        a: 5,
+        b: 3
+      }) timeout 10s
+
+    console.log("Result:", JSON.stringify(result1, null, 2))
+
+    // Test 2: Multiplication
+    console.log("\n📋 Test 2: Multiplication (7 × 6)")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    const result2 =
+      await send peers.event("calculate").role(Calculator).any()({
+        operation: "multiply",
+        a: 7,
+        b: 6
+      }) timeout 10s
+
+    console.log("Result:", JSON.stringify(result2, null, 2))
+
+    return {
+      success: true,
+      tests_completed: 2
+    }
+  }
+}
+
+run DemoRunner.runTest({})

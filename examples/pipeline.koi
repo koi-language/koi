@@ -1,0 +1,160 @@
+// ============================================================
+// Koi — Data Pipeline Example
+// Shows multi-stage data processing
+// ============================================================
+
+role Worker   { can execute }
+role Reviewer { can critique }
+role Lead     { can delegate }
+
+agent Extractor : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.3, max_tokens: 300 }
+
+  on extract(args: Json) {
+    playbook """
+    You are a data extraction specialist. Extract and structure the raw input data from args.raw.
+
+    Your task:
+    1. Parse the raw input text
+    2. Identify key information (content, metadata, timestamp)
+    3. Calculate the text length
+    4. Structure it into a clean data object
+
+    Return ONLY this exact JSON structure (no markdown, no explanations):
+    {
+      "extracted": true,
+      "data": {
+        "text": "the raw text content",
+        "length": 42,
+        "timestamp": "2026-01-21"
+      }
+    }
+
+    Use the current date for timestamp. Be precise and thorough.
+    """
+  }
+}
+
+agent Transformer : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.3, max_tokens: 300 }
+
+  on transform(args: Json) {
+    playbook """
+    You are a data transformation specialist. Transform the extracted data from args.data into an enriched format.
+
+    Your task:
+    1. Take the extracted data (text, length, timestamp)
+    2. Apply business rules and enrichments
+    3. Add a "processed_at" field with the timestamp
+    4. Mark the data as enriched
+
+    Return ONLY this exact JSON structure (no markdown, no explanations):
+    {
+      "transformed": true,
+      "data": {
+        "text": "the original text",
+        "length": 42,
+        "enriched": true,
+        "processed_at": "timestamp from args.data"
+      }
+    }
+
+    Preserve all original data fields while adding enrichment.
+    """
+  }
+}
+
+agent Validator : Reviewer {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+
+  on validate(args: Json) {
+    playbook """
+    You are a data quality validator. Validate that the transformed data in args.data meets quality requirements.
+
+    Your validation rules:
+    1. Check that "enriched" field is true
+    2. Ensure all required fields are present (text, length, enriched, processed_at)
+    3. Verify data types are correct
+    4. Check that text is not empty and length is positive
+
+    Return ONLY this exact JSON structure (no markdown, no explanations):
+    {
+      "valid": true,
+      "message": "Data passes validation"
+    }
+
+    OR if validation fails:
+    {
+      "valid": false,
+      "message": "Specific reason for failure"
+    }
+
+    Be strict but fair in validation.
+    """
+  }
+}
+
+agent Loader : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.2, max_tokens: 250 }
+
+  on load(args: Json) {
+    playbook """
+    You are a data loading specialist. Load the validated data from args.data into the final destination.
+
+    Your task:
+    1. Take the validated data
+    2. Prepare it for storage in the database
+    3. Return metadata about the load operation
+    4. Include the full data in the response
+
+    Return ONLY this exact JSON structure (no markdown, no explanations):
+    {
+      "loaded": true,
+      "records": 1,
+      "destination": "database",
+      "data": { ...the full data from args.data... }
+    }
+
+    Confirm successful loading with appropriate metadata.
+    """
+  }
+}
+
+team Pipeline {
+  extractor: Extractor
+  transformer: Transformer
+  validator: Validator
+  loader: Loader
+}
+
+agent Orchestrator : Lead {
+  uses team Pipeline
+
+  on start(args: Json) {
+    const raw = args.input
+
+    const extracted =
+      await send peers.event("extract").role(Worker).any()({ raw: raw }) timeout 30s
+
+    const transformed =
+      await send peers.event("transform").role(Worker).any()({ data: extracted.data }) timeout 30s
+
+    const validation =
+      await send peers.event("validate").role(Reviewer).any()({ data: transformed.data }) timeout 30s
+
+    if validation.valid == false {
+      return { ok: false, error: validation.message }
+    }
+
+    const loaded =
+      await send peers.event("load").role(Worker).any()({ data: transformed.data }) timeout 30s
+
+    return {
+      ok: true,
+      pipeline: "complete",
+      result: loaded
+    }
+  }
+}
+
+run Orchestrator.start({ input: "Sample data to process through pipeline" })

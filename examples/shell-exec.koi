@@ -1,0 +1,18 @@
+// Demo: Prompt User Action
+// Shows how agents can ask users for input during execution
+
+role Worker { can execute }
+
+agent FileCounter : Worker {
+  llm default = { provider: "auto", model: "auto" }
+
+  on count_files(args: Json) {
+    playbook """
+    Count the files in the current working directory and 
+    show the user a summary of how many there are and 
+    how much space they occupy.
+    """
+  }
+}
+
+run FileCounter.count_files({})

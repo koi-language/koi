@@ -1,0 +1,72 @@
+// Test: Registry Operations
+// Tests registry.set, get, delete, keys, search
+role Worker { can execute }
+
+agent RegistryTest : Worker {
+  on testSetAndGet(args: Json) {
+    // Set a value
+    await registry.set("test:key1", { value: "Hello Registry!" })
+    console.log("✓ Set key1")
+
+    // Get the value
+    const result = await registry.get("test:key1")
+    console.log("✓ Get key1:", result.value)
+
+    return { retrieved: result }
+  }
+
+  on testMultipleKeys(args: Json) {
+    // Set multiple keys
+    await registry.set("user:001", { name: "Alice", age: 30 })
+    await registry.set("user:002", { name: "Bob", age: 25 })
+    await registry.set("user:003", { name: "Charlie", age: 35 })
+
+    console.log("✓ Created 3 users")
+
+    // List keys with prefix
+    const userKeys = await registry.keys("user:")
+    console.log("✓ Found", userKeys.length, "user keys")
+
+    return { count: userKeys.length, keys: userKeys }
+  }
+
+  on testSearch(args: Json) {
+    // Set test data
+    await registry.set("person:1", { name: "Alice", age: 30, city: "NYC" })
+    await registry.set("person:2", { name: "Bob", age: 25, city: "LA" })
+    await registry.set("person:3", { name: "Charlie", age: 35, city: "NYC" })
+
+    // Search with query
+    const adults = await registry.search({ age: { $gte: 30 } })
+    console.log("✓ Found", adults.length, "adults (age >= 30)")
+
+    return { adults: adults }
+  }
+
+  on testDelete(args: Json) {
+    // Set and delete
+    await registry.set("temp:data", { value: "temporary" })
+    console.log("✓ Created temp data")
+
+    const deleted = await registry.delete("temp:data")
+    console.log("✓ Deleted temp data:", deleted)
+
+    // Verify deleted
+    const check = await registry.get("temp:data")
+    console.log("✓ Verify deleted (should be null):", check)
+
+    return { deleted: deleted, verified: check === null }
+  }
+
+  on testStats(args: Json) {
+    const stats = await registry.stats()
+    console.log("✓ Registry stats:")
+    console.log("  Backend:", stats.backend)
+    console.log("  Entries:", stats.count)
+    console.log("  File:", stats.file)
+
+    return stats
+  }
+}
+
+run RegistryTest.testSetAndGet({})

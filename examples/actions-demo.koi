@@ -1,0 +1,176 @@
+// ============================================================
+// Koi — Actions Demo
+// Demonstrates playbook-based action system:
+// - update_state: Modify agent state
+// - call_skill: Execute skills
+// - send_message: Send events to peers
+// - return: Return results
+// ============================================================
+
+role Worker { can execute }
+role Coordinator { can execute, can delegate }
+role LoggerRole { can execute }
+
+agent Logger : LoggerRole {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 150 }
+
+  state {
+    logCount: Int = 0
+  }
+
+  on log(args: Json) {
+    playbook """
+    You are a logger agent. Increment the log count and return confirmation.
+
+    Current logCount: ${state.logCount}
+    Message to log: ${JSON.stringify(args)}
+
+    Return this JSON with state_updates:
+    {
+      "state_updates": {
+        "logCount": [logCount + 1]
+      },
+      "logged": true,
+      "count": [new logCount]
+    }
+    """
+  }
+
+  on getLogs(args: Json) {
+    playbook """
+    Return the current log count.
+
+    Current logCount: ${state.logCount}
+
+    Return ONLY:
+    {
+      "count": ${state.logCount}
+    }
+    """
+  }
+}
+
+agent TaskProcessor : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.2, max_tokens: 300 }
+
+  state {
+    tasksProcessed: Int = 0
+  }
+
+  on processTask(args: Json) {
+    playbook """
+    You are a task processing agent. Process the incoming task and execute actions.
+
+    Current state:
+    - tasksProcessed: ${state.tasksProcessed}
+
+    Incoming task: ${JSON.stringify(args)}
+
+    Your job is to plan and return a list of actions to:
+    1. Update the state (increment tasksProcessed)
+    2. Return the final result
+
+    Return ONLY this exact JSON structure (no markdown, no explanations):
+    {
+      "actions": [
+        {
+          "type": "update_state",
+          "updates": {
+            "tasksProcessed": [current tasksProcessed + 1]
+          }
+        },
+        {
+          "type": "return",
+          "data": {
+            "success": true,
+            "task": "[task description from args.task]",
+            "tasksProcessed": [new count]
+          }
+        }
+      ]
+    }
+
+    Example if args = {"task": "analyze data", "priority": "high"}:
+    {
+      "actions": [
+        {
+          "type": "update_state",
+          "updates": {
+            "tasksProcessed": 1
+          }
+        },
+        {
+          "type": "return",
+          "data": {
+            "success": true,
+            "task": "analyze data",
+            "tasksProcessed": 1
+          }
+        }
+      ]
+    }
+    """
+  }
+
+  on getStatus(args: Json) {
+    playbook """
+    Return the current status of the task processor.
+
+    Current state:
+    - tasksProcessed: ${state.tasksProcessed}
+
+    Return ONLY:
+    {
+      "tasksProcessed": ${state.tasksProcessed}
+    }
+    """
+  }
+}
+
+team LoggingTeam {
+  logger: Logger
+  processor: TaskProcessor
+}
+
+agent Orchestrator : Coordinator {
+  uses team LoggingTeam
+
+  on start(args: Json) {
+    console.log("🎯 Actions Demo Starting...")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    // Process first task
+    console.log("\n📋 Processing Task 1: Analyze User Data")
+    const task1 =
+      await send peers.event("processTask").role(Worker).any()({
+        task: "analyze user data",
+        priority: "high"
+      }) timeout 15s
+    console.log("✓ Task 1 result:", task1)
+
+    // Process second task
+    console.log("\n📋 Processing Task 2: Generate Report")
+    const task2 =
+      await send peers.event("processTask").role(Worker).any()({
+        task: "generate monthly report",
+        priority: "medium"
+      }) timeout 15s
+    console.log("✓ Task 2 result:", task2)
+
+    // Get processor status
+    console.log("\n📊 Getting processor status...")
+    const status =
+      await send peers.event("getStatus").role(Worker).any()({}) timeout 10s
+    console.log("✓ Status:", status)
+
+    console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    return {
+      message: "Actions demo complete ✓",
+      summary: {
+        tasksProcessed: status.tasksProcessed
+      }
+    }
+  }
+}
+
+run Orchestrator.start({})

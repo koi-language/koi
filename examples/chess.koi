@@ -1,0 +1,19 @@
+// Demo: Iteration Actions (repeat and while)
+// Shows how to repeat actions fixed number of times or until condition
+
+role Worker { can execute }
+
+agent Assistant : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on test_while(args: Json) {
+    playbook """
+    Play chess with the user.
+    On each turn you show the board, and the user says where to move with a combination like A2 to A4, B3 to C3
+    Then you make your move and show the board as it looks after your move.
+    End the game when someone wins or if the user expresses their wish to stop.
+    """
+  }
+}
+
+run Assistant.test_while({})

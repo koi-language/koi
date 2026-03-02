@@ -1,0 +1,217 @@
+{
+  "name": "Koi Dark",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1a1e2e",
+    "editor.foreground": "#c5d4dd",
+    "editorCursor.foreground": "#6dd5ed",
+    "editor.lineHighlightBackground": "#2a2e3e",
+    "editorLineNumber.foreground": "#4a5568",
+    "editor.selectionBackground": "#3d4758",
+    "editor.inactiveSelectionBackground": "#2d3748"
+  },
+  "tokenColors": [
+    {
+      "name": "Comments",
+      "scope": [
+        "comment",
+        "punctuation.definition.comment"
+      ],
+      "settings": {
+        "foreground": "#6B7280",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "Koi Keywords (role, Agent, Team, etc.)",
+      "scope": [
+        "keyword.control.role.koi",
+        "keyword.control.agent.koi",
+        "keyword.control.team.koi",
+        "keyword.control.skill.koi",
+        "keyword.control.package.koi"
+      ],
+      "settings": {
+        "foreground": "#a78bfa",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi Event & Playbook",
+      "scope": [
+        "keyword.control.on.koi",
+        "keyword.control.playbook.koi",
+        "keyword.control.affordance.koi"
+      ],
+      "settings": {
+        "foreground": "#fb923c",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi LLM & Send",
+      "scope": [
+        "keyword.control.llm.koi",
+        "keyword.control.run.koi"
+      ],
+      "settings": {
+        "foreground": "#34d399",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Control Flow",
+      "scope": [
+        "keyword.control.flow.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Prompt Directives",
+      "scope": [
+        "keyword.control.directive.koi",
+        "punctuation.definition.directive.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Storage (const, let, var)",
+      "scope": [
+        "storage.type.koi"
+      ],
+      "settings": {
+        "foreground": "#818cf8"
+      }
+    },
+    {
+      "name": "Agent Names",
+      "scope": [
+        "entity.name.class.agent.koi",
+        "entity.name.class.team.koi",
+        "entity.name.class.skill.koi"
+      ],
+      "settings": {
+        "foreground": "#fbbf24",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Role Names",
+      "scope": [
+        "entity.name.type.role.koi"
+      ],
+      "settings": {
+        "foreground": "#c084fc"
+      }
+    },
+    {
+      "name": "Function & Event Names",
+      "scope": [
+        "entity.name.function.koi",
+        "entity.name.function.event.koi"
+      ],
+      "settings": {
+        "foreground": "#6dd5ed"
+      }
+    },
+    {
+      "name": "Prompt Fragment References",
+      "scope": [
+        "entity.name.function.fragment.koi"
+      ],
+      "settings": {
+        "foreground": "#6dd5ed"
+      }
+    },
+    {
+      "name": "Types",
+      "scope": [
+        "entity.name.type.koi"
+      ],
+      "settings": {
+        "foreground": "#60a5fa"
+      }
+    },
+    {
+      "name": "Strings",
+      "scope": [
+        "string.quoted"
+      ],
+      "settings": {
+        "foreground": "#86efac"
+      }
+    },
+    {
+      "name": "Playbook & Affordance Strings",
+      "scope": [
+        "string.quoted.triple.playbook.koi",
+        "string.quoted.triple.affordance.koi"
+      ],
+      "settings": {
+        "foreground": "#F7DF1E",
+        "fontStyle": ""
+      }
+    },
+    {
+      "name": "Prompt Interpolation",
+      "scope": [
+        "meta.interpolation.koi",
+        "variable.other.koi",
+        "punctuation.section.embedded.begin.koi",
+        "punctuation.section.embedded.end.koi"
+      ],
+      "settings": {
+        "foreground": "#F7DF1E"
+      }
+    },
+    {
+      "name": "Numbers",
+      "scope": [
+        "constant.numeric"
+      ],
+      "settings": {
+        "foreground": "#fca5a5"
+      }
+    },
+    {
+      "name": "Constants",
+      "scope": [
+        "constant.language.koi"
+      ],
+      "settings": {
+        "foreground": "#f87171"
+      }
+    },
+    {
+      "name": "Operators",
+      "scope": [
+        "keyword.operator"
+      ],
+      "settings": {
+        "foreground": "#c5d4dd"
+      }
+    },
+    {
+      "name": "Properties",
+      "scope": [
+        "variable.other.property.koi"
+      ],
+      "settings": {
+        "foreground": "#93c5fd"
+      }
+    },
+    {
+      "name": "Parameters",
+      "scope": [
+        "variable.parameter.koi"
+      ],
+      "settings": {
+        "foreground": "#fcd34d"
+      }
+    }
+  ]
+}

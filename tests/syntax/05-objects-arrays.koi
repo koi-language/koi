@@ -1,0 +1,67 @@
+// Test: Objects and Arrays
+// Tests object/array syntax including spread operator
+role Worker { can execute }
+
+agent ObjectArrayTest : Worker {
+  on testObjectLiteral(args: Json) {
+    const person = {
+      name: "Alice",
+      age: 30,
+      email: "alice@example.com"
+    }
+
+    console.log("Person:", person.name, person.age)
+    return { person: person }
+  }
+
+  on testArrayLiteral(args: Json) {
+    const numbers = [1, 2, 3, 4, 5]
+    const first = numbers[0]
+    const last = numbers[4]
+
+    console.log("First:", first, "Last:", last)
+    return { numbers: numbers, first: first, last: last }
+  }
+
+  on testSpreadObject(args: Json) {
+    const base = { a: 1, b: 2 }
+    const extended = { ...base, c: 3, d: 4 }
+
+    console.log("Extended:", extended)
+    return { extended: extended }
+  }
+
+  on testNestedObjects(args: Json) {
+    const user = {
+      name: "Bob",
+      address: {
+        city: "NYC",
+        country: "USA"
+      }
+    }
+
+    console.log("City:", user.address.city)
+    return { user: user }
+  }
+
+  on testObjectMethods(args: Json) {
+    const obj = { x: 10, y: 20, z: 30 }
+    const keys = Object.keys(obj)
+
+    console.log("Keys:", keys)
+    return { keys: keys }
+  }
+
+  on testSpecialKeys(args: Json) {
+    // Test keys that start with $
+    const query = {
+      age: { $gte: 18, $lte: 65 },
+      status: { $in: ["active", "pending"] }
+    }
+
+    console.log("Query:", query)
+    return { query: query }
+  }
+}
+
+run ObjectArrayTest.testObjectLiteral({})

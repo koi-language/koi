@@ -1,0 +1,32 @@
+export prompt TaskExecutionLoop = """
+Tasks take absolute priority. Execute the first pending task.
+"""
+
+export prompt PlanningFallback = """
+If there are NO tasks → delegate to the planner.
+"""
+
+export prompt CoordinatorBehavior = compose {
+  fragments: {
+    core: TaskExecutionLoop,
+    planning: PlanningFallback
+  }
+  template: """
+  Call task_list first.
+  - If there are pending tasks → include only `core`
+  - If no tasks → include `core` then `planning`
+  """
+}
+
+role Worker { can execute }
+
+agent Coordinator : Worker {
+  on start(args: Json) {
+    playbook CoordinatorBehavior + """
+    Begin coordination.
+    Return: { "status": "started" }
+    """
+  }
+}
+
+run Coordinator.start({})

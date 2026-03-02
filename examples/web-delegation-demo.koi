@@ -1,0 +1,163 @@
+// ============================================================
+// Web Delegation Demo
+// Demonstrates delegation with indentation and loop detection
+// ============================================================
+
+role Worker { can execute }
+role Assistant { can help, can delegate }
+
+// ============================================================
+// Skills - JavaScript functions agents can use
+// ============================================================
+
+skill WebFetching {
+  affordance """
+  Fetch content from web URLs
+  """
+
+  export async function fetchUrl(args: any): Promise<any> {
+    const url = args.url;
+    console.log("[fetchUrl] Fetching: " + url);
+
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; KoiBot/1.0)"
+        }
+      });
+
+      if (!response.ok) {
+        return {
+          url: url,
+          content: "Failed to fetch: " + response.status + " " + response.statusText,
+          status: "error",
+          error: true
+        };
+      }
+
+      const html = await response.text();
+      return {
+        url: url,
+        content: html,
+        status: "success",
+        length: html.length
+      };
+    } catch (error) {
+      console.error("[fetchUrl] Error:", error.message);
+      return {
+        url: url,
+        content: "Error fetching page: " + error.message,
+        status: "error",
+        error: true
+      };
+    }
+  }
+}
+
+// ============================================================
+// Worker Agents with Specialized Capabilities
+// ============================================================
+
+agent WebFetcher : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.2, max_tokens: 500 }
+  uses skill WebFetching
+
+  on fetchWebPage(args: Json) {
+    playbook """
+    Download the web page from this URL: ${JSON.stringify(args.url)}
+
+    Use the available fetchUrl tool to download the content, then return the result.
+    """
+  }
+}
+
+agent ContentSummarizer : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.3, max_tokens: 300 }
+
+  on summarize(args: Json) {
+    playbook """
+    Summarize the following content in 1-2 sentences:
+    ${JSON.stringify(args.content || args.text)}
+
+    Return your summary as JSON with a "summary" field containing the text.
+    """
+  }
+}
+
+agent WordCounter : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+
+  on count(args: Json) {
+    playbook """
+    Count the number of words in this text: ${JSON.stringify(args.text || args.summary)}
+
+    Return JSON with "wordCount" field containing the number of words.
+    """
+  }
+}
+
+// ============================================================
+// Orchestrator Agent
+// ============================================================
+
+agent TaskOrchestrator : Assistant {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.3, max_tokens: 800 }
+
+  //don't change this agent!!! It is the one responsible for delegating the task. Don't change its playbook!!!!
+  on processWebTask(args: Json) {
+    playbook """
+    User request: ${args.request}
+
+    You MUST execute the user request and return the result as JSON. Print also the plan you followed to execute the request.
+    """
+  }
+}
+
+// ============================================================
+// Team
+// ============================================================
+
+team WorkerTeam {
+  orchestrator: TaskOrchestrator
+  webFetcher: WebFetcher
+  summarizer: ContentSummarizer
+  counter: WordCounter
+}
+
+// ============================================================
+// Demo Runner
+// ============================================================
+
+agent DemoRunner : Assistant {
+  uses team WorkerTeam
+
+  on runDemo(args: Json) {
+    console.log("╔════════════════════════════════════════════╗")
+    console.log("║  Web Delegation Demo                       ║")
+    console.log("║  Indented Delegation + Loop Detection      ║")
+    console.log("╚════════════════════════════════════════════╝\n")
+
+    // ============================================================
+    // Test 1: Web → Summarize → Count (requires delegation)
+    // ============================================================
+    console.log("📋 Test 1: Fetch Web → Summarize → Count Words")
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    console.log('Request: "Fetch web content, summarize it, then count the words in the summary"\n')
+
+    const test1 = await send peers.event("processWebTask").role(Assistant).any()({
+      request: "Fetch web content, summarize it, then count the words in the summary",
+      url: "https://soloprogramadores.com",
+      topic: "artificial intelligence"
+    }) timeout 60s
+
+    console.log("✅ Final Result:")
+    console.log(JSON.stringify(test1, null, 2))
+
+    return {
+      success: true,
+      tests_completed: 1
+    }
+  }
+}
+
+run DemoRunner.runDemo({})

@@ -1,0 +1,54 @@
+// ============================================================
+// String Operations Skill
+// A reusable skill for string manipulation
+// ============================================================
+
+skill StringOperations {
+  affordance """
+  Perform string operations like uppercase, lowercase, reverse, and length
+  """
+
+  export async function toUpperCase(args: any): Promise<any> {
+    const text = args.text || "";
+    const result = text.toUpperCase();
+    console.log(`[toUpperCase] "${text}" → "${result}"`);
+    return {
+      operation: "toUpperCase",
+      original: text,
+      result: result
+    };
+  }
+
+  export async function toLowerCase(args: any): Promise<any> {
+    const text = args.text || "";
+    const result = text.toLowerCase();
+    console.log(`[toLowerCase] "${text}" → "${result}"`);
+    return {
+      operation: "toLowerCase",
+      original: text,
+      result: result
+    };
+  }
+
+  export async function reverse(args: any): Promise<any> {
+    const text = args.text || "";
+    const result = text.split('').reverse().join('');
+    console.log(`[reverse] "${text}" → "${result}"`);
+    return {
+      operation: "reverse",
+      original: text,
+      result: result
+    };
+  }
+
+  export async function getLength(args: any): Promise<any> {
+    const text = args.text || "";
+    const length = text.length;
+    console.log(`[getLength] "${text}" has ${length} characters`);
+    return {
+      operation: "length",
+      text: text,
+      length: length
+    };
+  }
+}

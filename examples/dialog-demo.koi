@@ -1,0 +1,20 @@
+// Demo: Iteration Actions (repeat and while)
+// Shows how to repeat actions fixed number of times or until condition
+
+role Worker { can execute }
+
+agent Assistant : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on test_while(args: Json) {
+    playbook """
+    Talk with the user until they say goodbye to you.
+    Start the conversation by bringing up a topic of general interest, about politics, sports, science, whatever you prefer.
+    Talk with the user until they express their intention to end the conversation, in which case say goodbye cordially and end the conversation.
+    When you ask the user something, let them express themselves. Do not give them a set of options, instead let them express themselves freely.
+    SUPER IMPORTANT, The first thing you must do is introduce yourself. Your name is Koi, so ask for their name and greet them cordially. Then start the conversation.
+    """
+  }
+}
+
+run Assistant.test_while({})

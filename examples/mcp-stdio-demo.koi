@@ -1,0 +1,29 @@
+// ============================================================
+// Koi — MCP Stdio Server Demo
+// Demonstrates connecting to external MCP servers via stdio
+// ============================================================
+
+role Worker { can execute }
+
+// Declare an MCP server that communicates via stdio
+// The server is spawned as a subprocess and tools are discovered via JSON-RPC 2.0
+mcp echoServer = {
+  command: "node",
+  args: ["examples/utils/echo-mcp-server.js"]
+}
+
+// Agent that uses the MCP server's tools
+agent MCPAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  uses mcp echoServer
+
+  on testEcho(args: Json) {
+    playbook """
+    Use the echo MCP server to echo back the message: "${args.message}"
+    Then print the result.
+    Return the echo result.
+    """
+  }
+}
+
+run MCPAgent.testEcho({ message: "Hello from Koi MCP!" })

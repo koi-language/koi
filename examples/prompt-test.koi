@@ -1,0 +1,40 @@
+// prompt-test.koi - Test de prompts como ciudadanos de primera clase
+
+// Prompt simple: constante de texto reutilizable
+export prompt FormalTone = """
+Responde siempre en tono formal y profesional. Usa un lenguaje claro y estructurado.
+"""
+
+// Prompt parametrizado: genera texto con parámetros dinámicos
+export prompt Persona(name: String, role: String) = """
+Eres ${name}, un ${role} experto con muchos años de experiencia.
+"""
+
+role Worker {
+  can execute
+}
+
+agent TestAgent : Worker {
+  on simplePrompt(args: Json) {
+    playbook FormalTone + """
+    Di hola y presenta brevemente qué puedes hacer.
+    Devuelve: { "greeting": "<tu saludo>" }
+    """
+  }
+
+  on composedPrompt(args: Json) {
+    playbook FormalTone + Persona(args.name, args.role) + """
+    Responde brevemente a la pregunta: ${args.question}
+    Devuelve: { "answer": "<tu respuesta>" }
+    """
+  }
+
+  on inlinePrompt(args: Json) {
+    playbook """
+    Saluda a ${args.name} de forma amigable.
+    Devuelve: { "greeting": "<saludo>" }
+    """
+  }
+}
+
+run TestAgent.composedPrompt({ "name": "Claude", "role": "asistente de IA", "question": "¿Cuál es tu especialidad?" })

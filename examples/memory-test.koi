@@ -1,0 +1,49 @@
+role Worker { can execute }
+role Coordinator { can execute, can delegate }
+
+team MemoryTeam {
+  assistant: MemoryAssistant
+}
+
+// Agent that should remember previous interactions
+agent MemoryAssistant : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on ask(args: Json) {
+    playbook """
+    ${args.question}
+
+    IMPORTANT: If you have memory of previous conversations, EXPLICITLY mention what you were asked before and what you answered.
+    If it's your first time, say that this is your first interaction.
+
+    Respond in English, maximum 2 sentences.
+
+    Return ONLY: { "answer": "your response here" }
+    """
+  }
+}
+
+// Coordinator that calls the assistant 3 times to test memory
+agent MemoryCoordinator : Coordinator {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  uses team MemoryTeam
+
+  on start(args: Json) {
+    playbook """
+    You will ask the MemoryAssistant 3 questions, one by one, to check if it remembers the previous ones.
+
+    1. Ask it: "What is the capital of France?"
+    2. Print its response with: Response 1: <response>
+    3. Ask it: "And the capital of Germany?"
+    4. Print its response with: Response 2: <response>
+    5. Ask it: "What have I asked you before? List the previous questions and your answers."
+    6. Print its response with: Response 3 (memory test): <response>
+
+    At the end print:
+    Memory test completed
+    """
+  }
+}
+
+run MemoryCoordinator.start({})

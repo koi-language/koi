@@ -1,0 +1,66 @@
+// Test: Basic Operators
+// Tests all JavaScript/TypeScript operators
+role Worker { can execute }
+
+agent OperatorTest : Worker {
+  on testArithmetic(args: Json) {
+    // Arithmetic operators
+    const addition = 5 + 3
+    const subtraction = 10 - 4
+    const multiplication = 6 * 7
+    const division = 20 / 4
+    const modulo = 17 % 5
+
+    console.log("Arithmetic:", addition, subtraction, multiplication, division, modulo)
+
+    return {
+      addition: addition,
+      subtraction: subtraction,
+      multiplication: multiplication,
+      division: division,
+      modulo: modulo
+    }
+  }
+
+  on testComparison(args: Json) {
+    // Comparison operators
+    const eq = 5 == 5
+    const neq = 5 != 3
+    const eqStrict = 5 === 5
+    const neqStrict = 5 !== "5"
+    const gt = 10 > 5
+    const gte = 10 >= 10
+    const lt = 3 < 7
+    const lte = 5 <= 5
+
+    console.log("Comparison:", eq, neq, eqStrict, neqStrict, gt, gte, lt, lte)
+
+    return {
+      eq: eq,
+      neq: neq,
+      eqStrict: eqStrict,
+      neqStrict: neqStrict,
+      gt: gt,
+      gte: gte,
+      lt: lt,
+      lte: lte
+    }
+  }
+
+  on testLogical(args: Json) {
+    // Logical operators
+    const and = true && true
+    const or = false || true
+    const not = !false
+
+    console.log("Logical:", and, or, not)
+
+    return {
+      and: and,
+      or: or,
+      not: not
+    }
+  }
+}
+
+run OperatorTest.testArithmetic({})

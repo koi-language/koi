@@ -1,0 +1,61 @@
+// Test: Skills
+// Tests skill definitions and usage with LLM
+role Worker { can execute }
+
+// Skill definition with affordance
+skill MathUtils {
+  affordance "Perform mathematical calculations on numbers"
+
+  export function add(args: Json): Json {
+    const result = args.a + args.b
+    return { result: result }
+  }
+
+  export function multiply(args: Json): Json {
+    const result = args.a * args.b
+    return { result: result }
+  }
+
+  export function calculate(args: Json): Json {
+    const x = args.x
+    const y = args.y
+    const sum = x + y
+    const product = x * y
+    return { sum: sum, product: product }
+  }
+}
+
+skill StringUtils {
+  affordance "Manipulate and process strings"
+
+  export function uppercase(args: Json): Json {
+    return { result: args.text.toUpperCase() }
+  }
+
+  export function concat(args: Json): Json {
+    return { result: args.a + args.b }
+  }
+}
+
+// Agent using skills with LLM
+agent Calculator : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+  uses skill MathUtils
+  uses skill StringUtils
+
+  on compute(args: Json) {
+    playbook """
+    Add the numbers 10 and 20 together.
+    Return the result as JSON with a 'result' field.
+    """
+  }
+
+  on processText(args: Json) {
+    playbook """
+    Convert the text "hello" to uppercase.
+    Return the result as JSON with a 'result' field.
+    """
+  }
+}
+
+run Calculator.compute({})

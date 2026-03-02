@@ -1,0 +1,61 @@
+// Test: Teams
+// Tests team definitions and communication
+role Worker { can execute }
+role Manager { can execute, can delegate }
+
+// Agents for team
+agent Alice : Worker {
+  on work(args: Json) {
+    console.log("[Alice] Working on task:", args.task)
+    return { agent: "Alice", completed: true, task: args.task }
+  }
+}
+
+agent Bob : Worker {
+  on work(args: Json) {
+    console.log("[Bob] Working on task:", args.task)
+    return { agent: "Bob", completed: true, task: args.task }
+  }
+}
+
+agent Charlie : Manager {
+  on manage(args: Json) {
+    console.log("[Charlie] Managing task:", args.task)
+    return { agent: "Charlie", role: "Manager", task: args.task }
+  }
+}
+
+// Team definition
+team DevTeam {
+  alice = Alice
+  bob = Bob
+  charlie = Charlie
+}
+
+// Orchestrator using team
+agent Orchestrator : Manager {
+  uses team DevTeam
+
+  on delegateWork(args: Json) {
+    console.log("Orchestrator delegating work...")
+
+    // Send to any worker
+    const result = await send peers.event("work").role(Worker).any()({
+      task: "Build feature"
+    }) timeout 5s
+
+    console.log("Work result:", result.agent)
+    return result
+  }
+
+  on delegateToManager(args: Json) {
+    // Send to manager
+    const result = await send peers.event("manage").role(Manager).any()({
+      task: "Coordinate team"
+    }) timeout 5s
+
+    return result
+  }
+}
+
+run Orchestrator.delegateWork({})

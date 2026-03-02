@@ -1,0 +1,111 @@
+// Test: Data Types and JSON
+// Tests Json type, type annotations, data handling
+role Worker { can execute }
+
+agent DataTypeTest : Worker {
+  on testJsonParameter(args: Json) {
+    // Json type can hold any structure
+    console.log("Received JSON:", args)
+
+    const name = args.name
+    const age = args.age
+    const active = args.active
+
+    return {
+      name: name,
+      age: age,
+      active: active,
+      type: "json"
+    }
+  }
+
+  on testNestedJson(args: Json) {
+    // Nested JSON structures
+    const user = {
+      id: 1,
+      profile: {
+        name: "Alice",
+        email: "alice@example.com",
+        settings: {
+          theme: "dark",
+          notifications: true
+        }
+      }
+    }
+
+    console.log("User:", user.profile.name)
+    console.log("Theme:", user.profile.settings.theme)
+
+    return user
+  }
+
+  on testArrays(args: Json) {
+    // Arrays
+    const numbers = [1, 2, 3, 4, 5]
+    const strings = ["hello", "world"]
+    const mixed = [1, "two", 3, "four", true, null]
+
+    return {
+      numbers: numbers,
+      strings: strings,
+      mixed: mixed
+    }
+  }
+
+  on testTypeAnnotations(args: Json) {
+    // Variables with type values (Koi uses Json type)
+    const count = 42
+    const message = "Hello"
+    const flag = true
+
+    return {
+      count: count,
+      message: message,
+      flag: flag
+    }
+  }
+
+  on testNullAndUndefined(args: Json) {
+    const nullValue = null
+    const emptyObject = {}
+    const emptyArray = []
+
+    return {
+      nullValue: nullValue,
+      emptyObject: emptyObject,
+      emptyArray: emptyArray
+    }
+  }
+
+  on testBooleans(args: Json) {
+    const trueValue = true
+    const falseValue = false
+    const computed = 5 > 3
+
+    return {
+      true: trueValue,
+      false: falseValue,
+      computed: computed
+    }
+  }
+
+  on testNumbers(args: Json) {
+    const integer = 42
+    const float = 3.14
+    const negative = -10
+    const zero = 0
+
+    return {
+      integer: integer,
+      float: float,
+      negative: negative,
+      zero: zero
+    }
+  }
+}
+
+run DataTypeTest.testJsonParameter({
+  name: "Test User",
+  age: 25,
+  active: true
+})

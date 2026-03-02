@@ -1,0 +1,155 @@
+{
+  "name": "Koi Dark+",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1e1e1e",
+    "editor.foreground": "#d4d4d4"
+  },
+  "tokenColors": [
+    {
+      "name": "Koi - Playbook & Affordance Content (Bright Yellow)",
+      "scope": [
+        "string.quoted.triple.playbook.koi",
+        "string.quoted.triple.affordance.koi"
+      ],
+      "settings": {
+        "foreground": "#F7DF1E"
+      }
+    },
+    {
+      "name": "Koi - Prompt Interpolation",
+      "scope": [
+        "meta.interpolation.koi",
+        "variable.other.koi",
+        "punctuation.section.embedded.begin.koi",
+        "punctuation.section.embedded.end.koi"
+      ],
+      "settings": {
+        "foreground": "#F7DF1E"
+      }
+    },
+    {
+      "name": "Koi - Keywords (Agent, Team, Skill, role, etc.)",
+      "scope": [
+        "keyword.control.role.koi",
+        "keyword.control.agent.koi",
+        "keyword.control.team.koi",
+        "keyword.control.skill.koi",
+        "keyword.control.package.koi"
+      ],
+      "settings": {
+        "foreground": "#C586C0",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi - Prompt Directives",
+      "scope": [
+        "keyword.control.directive.koi",
+        "punctuation.definition.directive.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Koi - Event & Playbook Keywords",
+      "scope": [
+        "keyword.control.on.koi",
+        "keyword.control.playbook.koi",
+        "keyword.control.affordance.koi"
+      ],
+      "settings": {
+        "foreground": "#CE9178",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi - LLM & Run Keywords",
+      "scope": [
+        "keyword.control.llm.koi",
+        "keyword.control.run.koi"
+      ],
+      "settings": {
+        "foreground": "#4EC9B0",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi - Agent/Team/Skill Names",
+      "scope": [
+        "entity.name.class.agent.koi",
+        "entity.name.class.team.koi",
+        "entity.name.class.skill.koi"
+      ],
+      "settings": {
+        "foreground": "#DCDCAA",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Koi - Role Names",
+      "scope": [
+        "entity.name.type.role.koi"
+      ],
+      "settings": {
+        "foreground": "#4EC9B0"
+      }
+    },
+    {
+      "name": "Koi - Function & Event Names",
+      "scope": [
+        "entity.name.function.koi",
+        "entity.name.function.event.koi"
+      ],
+      "settings": {
+        "foreground": "#DCDCAA"
+      }
+    },
+    {
+      "name": "Koi - Prompt Fragment References",
+      "scope": [
+        "entity.name.function.fragment.koi"
+      ],
+      "settings": {
+        "foreground": "#6dd5ed"
+      }
+    },
+    {
+      "name": "Koi - Types",
+      "scope": [
+        "entity.name.type.koi"
+      ],
+      "settings": {
+        "foreground": "#4EC9B0"
+      }
+    },
+    {
+      "name": "Koi - Properties",
+      "scope": [
+        "variable.other.property.koi"
+      ],
+      "settings": {
+        "foreground": "#9CDCFE"
+      }
+    },
+    {
+      "name": "Koi - Parameters",
+      "scope": [
+        "variable.parameter.koi"
+      ],
+      "settings": {
+        "foreground": "#9CDCFE"
+      }
+    },
+    {
+      "name": "Koi - Capabilities",
+      "scope": [
+        "entity.name.function.capability.koi"
+      ],
+      "settings": {
+        "foreground": "#DCDCAA"
+      }
+    }
+  ]
+}

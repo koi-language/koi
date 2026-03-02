@@ -1,0 +1,70 @@
+// Test file for playbook and affordance colors
+package "test.colors"
+
+role Worker { can execute }
+
+// Test 1: Playbook in Agent
+agent TestPlaybook : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+
+  on test(args: Json) {
+    playbook """
+    Este es un playbook de prueba.
+    Todo el texto aquí debería ser amarillo oro (#fbbf24).
+    No debería haber colores diferentes dentro.
+    - Ni listas
+    - Ni otros colores
+    Simplemente todo amarillo oro uniforme.
+    """
+  }
+}
+
+// Test 2: Affordance in Skill
+skill TestSkill {
+  affordance """
+  Esta es una descripción de affordance.
+  Todo el texto aquí también debería ser amarillo oro (#fbbf24).
+  Sin resaltado de markdown.
+  Sin colores internos.
+  Solo amarillo oro uniforme en todo el bloque.
+  """
+
+  agent Internal : Worker {
+    on process(args: Json) {
+      playbook """
+      Otro playbook dentro de un Skill.
+      También todo en amarillo oro.
+      Sin cursiva, sin markdown, solo amarillo oro sólido.
+      """
+      return { ok: true }
+    }
+  }
+
+  team T {
+    internal: Internal
+  }
+
+  export async function run(input: any): Promise<any> {
+    return { result: "test" }
+  }
+}
+
+// Test 3: Multiple playbooks
+agent MultiPlaybook : Worker {
+  on first(args: Json) {
+    playbook """
+    Primer playbook - todo amarillo oro.
+    """
+  }
+
+  on second(args: Json) {
+    playbook """
+    Segundo playbook - también todo amarillo oro.
+    # No debería haber color diferente en esto
+    **Ni en esto**
+    `Ni en esto`
+    """
+  }
+}
+
+run TestPlaybook.test({})

@@ -1,0 +1,20 @@
+// Demo: Prompt User Action
+// Shows how agents can ask users for input during execution
+
+role Worker { can execute }
+
+agent Assistant : Worker {
+  llm default = { provider: "openai", model: "gpt-5.2" }
+
+  on greet(args: Json) {
+    playbook """
+    
+    Ask the user for their name, then ask if they want to continue,
+    and if they do, ask which color they prefer among yellow, blue, or red, and then ask for their age.
+
+    Finally, give them a greeting and joke about their age however you like.
+    """
+  }
+}
+
+run Assistant.greet({})

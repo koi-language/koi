@@ -1,0 +1,111 @@
+// Test: Advanced Features
+// Tests MCP, multiple teams, etc.
+role Worker { can execute }
+role Specialist { can execute, can analyze }
+
+// Agents
+agent AgentA : Worker {
+  on work(args: Json) {
+    console.log("[AgentA] Working")
+    return { agent: "A", task: args.task }
+  }
+}
+
+agent AgentB : Worker {
+  on work(args: Json) {
+    console.log("[AgentB] Working")
+    return { agent: "B", task: args.task }
+  }
+}
+
+agent SpecialistAgent : Specialist {
+  on analyze(args: Json) {
+    console.log("[Specialist] Analyzing")
+    return { agent: "Specialist", analysis: "Complete" }
+  }
+}
+
+// Multiple teams
+team TeamAlpha {
+  a = AgentA
+}
+
+team TeamBeta {
+  b = AgentB
+}
+
+team SpecialTeam {
+  specialist = SpecialistAgent
+}
+
+// Agent using multiple teams
+agent MultiTeamCoordinator : Worker {
+  uses team TeamAlpha
+  uses team TeamBeta
+  uses team SpecialTeam
+
+  on coordinateAcrossTeams(args: Json) {
+    // Send to any worker across all teams
+    const result = await send peers.event("work").role(Worker).any()({
+      task: "Cross-team task"
+    }) timeout 5s
+
+    console.log("Result from:", result.agent)
+    return result
+  }
+
+  on useSpecialist(args: Json) {
+    // Send to specialist
+    const result = await send peers.event("analyze").role(Specialist).any()({
+      data: "Data to analyze"
+    }) timeout 5s
+
+    return result
+  }
+}
+
+// Agent with complex state
+agent StatefulComplex : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+  state {
+    counter = 0
+    items = []
+    config = { enabled: true }
+  }
+
+  on updateState(args: Json) {
+    playbook """
+    Update the state counter by incrementing it by 1.
+
+    Current state: counter = ${state.counter}
+
+    Return ONLY:
+    {
+      "state_updates": {
+        "counter": ${state.counter + 1}
+      },
+      "counter": ${state.counter + 1}
+    }
+    """
+  }
+
+  on getFullState(args: Json) {
+    playbook """
+    Return the full state.
+
+    Current state:
+    - counter = ${state.counter}
+    - items = ${JSON.stringify(state.items)}
+    - config = ${JSON.stringify(state.config)}
+
+    Return ONLY:
+    {
+      "counter": ${state.counter},
+      "items": ${JSON.stringify(state.items)},
+      "config": ${JSON.stringify(state.config)}
+    }
+    """
+  }
+}
+
+run MultiTeamCoordinator.coordinateAcrossTeams({})

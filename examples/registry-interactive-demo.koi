@@ -1,0 +1,140 @@
+// Registry with Natural Language Playbooks Demo
+// Shows how agents can use registry operations naturally in playbooks
+
+role Worker { can execute, can registry }
+role Manager { can execute, can delegate }
+
+// Agent that uses natural language to interact with registry
+agent UserManager : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  amnesia = true
+
+  on createAllUser(args: Json) {
+    playbook """
+    Create all given users via args, with the following attributes
+    - name, age, email
+
+    Save all to registry with key "user:id being id an unique identifier".
+    Include all fields plus a createdAt timestamp.
+    Return: { "success": true, "message": "Users created" }
+
+    DO NOT add print actions - just return the data. 
+    """
+  }
+
+  on createUser(args: Json) {
+    playbook """
+    Create a new user with:
+    - name: ${args.name}
+    - age: ${args.age}
+    - email: ${args.email}
+
+    Save to registry with key "user:${args.id}".
+    Include all fields plus a createdAt timestamp.
+    Return: { "success": true, "message": "User created" }
+
+    DO NOT add print actions - just return the data.
+    """
+  }
+
+  on getUser(args: Json) {
+    playbook """
+    Get user ${args.id} from registry.
+
+    Use registry_get with key "user:${args.id}".
+    Extract the .value field from the registry_get result (which contains the user data).
+    Return ONLY the user data object (name, age, email, createdAt) without any wrapper.
+    """
+  }
+
+  on listAllUsers(args: Json) {
+    playbook """
+    List all users in the registry.
+
+    EXACT STEPS:
+    1. Use registry_search with an empty query {} to get ALL users, store with ID "a1"
+    2. Extract just the user data (the .value field) from each result
+    3. Return: { "count": <count from a1>, "users": <array of user value objects, NOT the full {key, value} wrappers> }
+
+    Example: If a1.output.results = [{key: "user:001", value: {name: "Alice", age: 30}}, ...]
+    Then return: { "count": 2, "users": [{name: "Alice", age: 30}, ...] }
+
+    CRITICAL: Extract ONLY the .value objects so caller can access with .users[0].name directly
+    DO NOT use format action - return a real array!
+    """
+  }
+
+  on findAdults(args: Json) {
+    playbook """
+    Find all users aged 18 or older using registry search with query: { "age": { "$gte": 18 } }
+
+    EXACT STEPS:
+    1. Use registry_search with query: { "age": { "$gte": 18 } }
+    2. Return: { "count": [count from search], "adults": [results array] }
+
+    DO NOT add print actions - just return the data!
+    """
+  }
+
+  on updateUserAge(args: Json) {
+    playbook """
+    Update user ${args.id}'s age to ${args.age}.
+
+    EXACT STEPS:
+    1. Use registry_get with key "user:${args.id}", store with ID "a1"
+    2. Take the full user object from \${a1.output.value}
+    3. Modify ONLY the age field to ${args.age}, keep all other fields (name, email, createdAt, etc.)
+    4. Use registry_set with key "user:${args.id}" and the complete updated object
+    5. Return: { "success": true, "message": "Age updated" }
+
+    CRITICAL: Preserve ALL existing fields when saving!
+    """
+  }
+
+  on deleteUser(args: Json) {
+    playbook """
+    Delete the user from the registry with ID ${args.id}.
+
+    EXACT STEPS:
+    1. Use registry_delete with key "user:\${args.id}"
+    2. Return: { "success": true, "message": "User deleted" }
+    """
+  }
+}
+
+// Team that groups our agents
+team RegistryTeam {
+  userManager: UserManager
+}
+
+// Orchestrator - uses playbook, router finds UserManager automatically!
+agent Demo : Manager {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  uses team RegistryTeam
+
+  on start(args: Json) {
+    //SUPER IMPORTANT: DO NOT CHANGE THE FOLLOWING PROMPT AT ALL!!!!!!
+    playbook """
+    Run a user registry demo.
+
+    Show the header (just the very first time):
+    ╔══════════════════════════════════════════════════╗
+    ║  Registry with Playbook Demo                     ║
+    ╚══════════════════════════════════════════════════╝
+
+    Them ask the user what it wants: create / consult / modify / delete any user and do what the user wants.
+    Aks as many info as you need to the user to perform the action the user wants from you.
+
+    After performing an action, ask the user if it want to continuer, and in that case ask again what it wants (loop)
+
+    If the user wnats to list the users, for each one show in a markdown table: Mr or Ms depending on whether they are male or female (deduce this from the name) and then {the user's name}, age {their age}"
+
+    Before exiting, print:
+    ╔══════════════════════════════════════════════════╗
+    ║  Demo completed successfully!                    ║
+    ╚══════════════════════════════════════════════════╝
+    """
+  }
+}
+
+run Demo.start({})

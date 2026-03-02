@@ -1,0 +1,80 @@
+// Test: Roles and Agents
+// Tests role definitions and agent basics
+// Role definitions with capabilities
+role Worker { can execute }
+role Manager { can execute, can delegate }
+role Admin { can execute, can delegate, can manage }
+
+// Basic agent
+agent SimpleAgent : Worker {
+  on greet(args: Json) {
+    console.log("Hello from SimpleAgent!")
+    return { message: "Hello!" }
+  }
+}
+
+// Agent with state (used in playbook)
+agent StatefulAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini", temperature: 0.1, max_tokens: 200 }
+  state {
+    counter = 0
+    name = "Agent"
+  }
+
+  on increment(args: Json) {
+    playbook """
+    You are a stateful agent. Increment the counter by 1.
+
+    Current state: counter = ${state.counter}, name = ${state.name}
+
+    Return this JSON with state_updates:
+    {
+      "state_updates": {
+        "counter": ${state.counter + 1}
+      },
+      "counter": ${state.counter + 1}
+    }
+    """
+  }
+
+  on getState(args: Json) {
+    playbook """
+    Return the current state.
+
+    Current state: counter = ${state.counter}, name = ${state.name}
+
+    Return ONLY:
+    {
+      "counter": ${state.counter},
+      "name": "${state.name}"
+    }
+    """
+  }
+}
+
+// Agent with LLM config
+agent AIAgent : Worker {
+  llm default = { provider: "openai", model: "gpt-4o-mini" }
+
+  on simple(args: Json) {
+    console.log("AI Agent ready")
+    return { ready: true }
+  }
+}
+
+// Agent with multiple handlers
+agent MultiHandler : Manager {
+  on task1(args: Json) {
+    return { task: 1 }
+  }
+
+  on task2(args: Json) {
+    return { task: 2 }
+  }
+
+  on task3(args: Json) {
+    return { task: 3 }
+  }
+}
+
+run SimpleAgent.greet({})

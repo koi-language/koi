@@ -1,0 +1,49 @@
+// Test: Template Literals
+// Tests template string syntax
+role Worker { can execute }
+
+agent TemplateLiteralTest : Worker {
+  on testBasic(args: Json) {
+    const name = "World"
+    const greeting = `Hello, ${name}!`
+
+    console.log(greeting)
+    return { greeting: greeting }
+  }
+
+  on testMultipleExpressions(args: Json) {
+    const a = 5
+    const b = 10
+    const message = `${a} + ${b} = ${a + b}`
+
+    console.log(message)
+    return { message: message }
+  }
+
+  on testNested(args: Json) {
+    const user = { name: "Alice", age: 30 }
+    const info = `User: ${user.name}, Age: ${user.age}`
+
+    console.log(info)
+    return { info: info }
+  }
+
+  on testMultiline(args: Json) {
+    const text = `This is
+a multiline
+template literal`
+
+    console.log(text)
+    return { text: text }
+  }
+
+  on testWithFunctions(args: Json) {
+    const double = n => n * 2
+    const message = `Double of 7 is ${double(7)}`
+
+    console.log(message)
+    return { message: message }
+  }
+}
+
+run TemplateLiteralTest.testBasic({})

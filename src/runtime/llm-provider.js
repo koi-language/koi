@@ -1,0 +1,2286 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
+import dotenv from 'dotenv';
+import { cliLogger } from './cli-logger.js';
+import { actionRegistry } from './action-registry.js';
+import { classifyFeedback, classifyResponse } from './context-memory.js';
+import { costCenter, getModelCaps } from './cost-center.js';
+import { DEFAULT_TASK_PROFILE, selectAutoModel, getAvailableProviders } from './auto-model-selector.js';
+
+// Load .env file but don't override existing environment variables
+// Silent by default - dotenv will not log unless there's an error
+const originalWrite = process.stdout.write;
+process.stdout.write = () => {}; // Temporarily silence stdout
+dotenv.config({ override: false });
+process.stdout.write = originalWrite; // Restore stdout
+
+/**
+ * Format prompt text with > prefix for each line (for debug output)
+ */
+function formatPromptForDebug(text) {
+  return text.split('\n').map(line => `> \x1b[90m${line}\x1b[0m`).join('\n');
+}
+
+/**
+ * Truncate long base64-like strings in debug output.
+ * Matches runs of ≥60 base64 chars (A-Z a-z 0-9 + / =) and replaces with
+ * first 20 chars … last 10 chars so the output stays readable.
+ */
+function _truncB64Debug(str) {
+  return str.replace(/[A-Za-z0-9+/]{60,}={0,2}/g, m => `${m.slice(0, 20)}\u2026${m.slice(-10)}`);
+}
+
+// Default models per provider
+const DEFAULT_MODELS = {
+  openai:    'gpt-4o-mini',
+  anthropic: 'claude-sonnet-4-6',
+  gemini:    'gemini-2.0-flash',
+};
+
+// Short aliases for Anthropic models
+const ANTHROPIC_ALIASES = {
+  'sonnet':       'claude-sonnet-4-6',
+  'sonnet-4':     'claude-sonnet-4-6',
+  'opus':         'claude-opus-4-6',
+  'opus-4':       'claude-opus-4-6',
+  'haiku':        'claude-haiku-4-5-20251001',
+  'haiku-4':      'claude-haiku-4-5-20251001',
+};
+
+export class LLMProvider {
+  constructor(config = {}) {
+    const _providerIsAuto = config.provider === 'auto';
+    const _modelIsAuto    = config.model === 'auto';
+    this._autoMode = _providerIsAuto || _modelIsAuto;
+    // When provider is fixed but model is auto, selection is constrained to that provider only
+    this._lockedProvider = (!_providerIsAuto && _modelIsAuto) ? config.provider : null;
+
+    this.temperature = config.temperature ?? 0.1; // Low temperature for deterministic results
+    this.maxTokens = config.max_tokens || 8000; // Increased to avoid truncation of long responses
+
+    // Auto mode: dynamically pick the best model per task
+    if (this._autoMode) {
+      this.provider = 'auto';
+      this.model = 'auto';
+      this.openai = null;
+      this.anthropic = null;
+
+      if (this._lockedProvider) {
+        // provider fixed, model auto — only use clients for the locked provider
+        // Client is created lazily if the key is missing (see _ensureClients).
+        this._availableProviders = [this._lockedProvider];
+        if (this._lockedProvider === 'openai' && process.env.OPENAI_API_KEY) {
+          this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        } else if (this._lockedProvider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
+          this._ac = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        } else if (this._lockedProvider === 'gemini' && process.env.GEMINI_API_KEY) {
+          this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+        }
+      } else {
+        // both provider and model are auto — use all available providers.
+        // If no keys are configured yet, _availableProviders stays empty and the
+        // user will be prompted on first use (see _ensureClients).
+        this._availableProviders = getAvailableProviders();
+        if (process.env.OPENAI_API_KEY)    this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        if (process.env.ANTHROPIC_API_KEY) this._ac = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        if (process.env.GEMINI_API_KEY)    this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+      }
+      return;
+    }
+
+    this.provider = config.provider || 'openai';
+
+    // Resolve model: alias expansion + per-provider defaults
+    let model = config.model;
+    if (this.provider === 'anthropic' && model && ANTHROPIC_ALIASES[model]) {
+      model = ANTHROPIC_ALIASES[model];
+    }
+    this.model = model || DEFAULT_MODELS[this.provider];
+
+    // Initialize clients — deferred if key is missing (user will be prompted on first use).
+    if (this.provider === 'openai') {
+      if (process.env.OPENAI_API_KEY) this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    } else if (this.provider === 'anthropic') {
+      if (process.env.ANTHROPIC_API_KEY) this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    } else if (this.provider === 'gemini') {
+      if (process.env.GEMINI_API_KEY) {
+        this.openai = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+      }
+    }
+  }
+
+  // =========================================================================
+  // API KEY MANAGEMENT — lazy client initialization
+  // =========================================================================
+
+  /**
+   * Ensure all required clients are ready before making any LLM call.
+   * Prompts the user for missing API keys, saves them to .env, and creates clients.
+   */
+  async _ensureClients() {
+    if (this._autoMode) {
+      if (this._lockedProvider) {
+        await this._ensureLockedProviderClient();
+      } else {
+        await this._ensureAnyProvider();
+      }
+    } else {
+      await this._ensureExplicitClient();
+    }
+  }
+
+  /**
+   * For auto mode with no locked provider: ensure at least one provider client exists.
+   * If none are configured, let the user pick a provider and enter the key.
+   */
+  async _ensureAnyProvider() {
+    if (this._availableProviders.length > 0) return;
+
+    const { cliLogger } = await import('./cli-logger.js');
+    const { cliSelect } = await import('./cli-select.js');
+    const { ensureApiKey } = await import('./api-key-manager.js');
+
+    cliLogger.print('No API key configured. Select a provider to use:');
+    const provider = await cliSelect('Select provider', [
+      { title: 'OpenAI (GPT-4o, GPT-4o-mini…)', value: 'openai' },
+      { title: 'Anthropic (Claude Sonnet, Haiku…)', value: 'anthropic' },
+      { title: 'Google Gemini (gemini-2.0-flash…)', value: 'gemini' },
+    ]);
+
+    if (!provider) throw new Error('No provider selected — cannot continue without an API key');
+
+    const apiKey = await ensureApiKey(provider);
+
+    if (provider === 'openai') {
+      this._oa = new OpenAI({ apiKey });
+    } else if (provider === 'anthropic') {
+      this._ac = new Anthropic({ apiKey });
+    } else if (provider === 'gemini') {
+      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+    }
+
+    this._availableProviders = [provider];
+  }
+
+  /**
+   * For auto mode with a locked provider: ensure the client for that provider exists.
+   */
+  async _ensureLockedProviderClient() {
+    const p = this._lockedProvider;
+    const hasClient = (p === 'openai' && this._oa) ||
+                      (p === 'anthropic' && this._ac) ||
+                      (p === 'gemini' && this._gc);
+    if (hasClient) return;
+
+    const { ensureApiKey } = await import('./api-key-manager.js');
+    const apiKey = await ensureApiKey(p);
+
+    if (p === 'openai') {
+      this._oa = new OpenAI({ apiKey });
+    } else if (p === 'anthropic') {
+      this._ac = new Anthropic({ apiKey });
+    } else if (p === 'gemini') {
+      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+    }
+  }
+
+  /**
+   * For explicit (non-auto) provider: ensure the client exists.
+   */
+  async _ensureExplicitClient() {
+    if (this.openai || this.anthropic) return;
+
+    const { ensureApiKey } = await import('./api-key-manager.js');
+    const apiKey = await ensureApiKey(this.provider);
+
+    if (this.provider === 'openai') {
+      this.openai = new OpenAI({ apiKey });
+    } else if (this.provider === 'anthropic') {
+      this.anthropic = new Anthropic({ apiKey });
+    } else if (this.provider === 'gemini') {
+      this.openai = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+    }
+  }
+
+  /**
+   * Format text for debug output with gray color.
+   * Truncates long base64-like payloads so they don't flood the console.
+   */
+  formatDebugText(text) {
+    const str = Array.isArray(text)
+      ? text.map(p => p.type === 'text' ? p.text : `[${p.type}]`).join('\n')
+      : String(text ?? '');
+    const lines = _truncB64Debug(str).split('\n');
+    return lines.map(line => `> \x1b[90m${line}\x1b[0m`).join('\n');
+  }
+
+  /**
+   * Log LLM request (system + user prompts)
+   */
+  logRequest(model, systemPrompt, userPrompt, context = '') {
+    if (process.env.KOI_DEBUG_LLM !== '1') return;
+
+    console.error('─'.repeat(80));
+    console.error(`[LLM Debug] Request - Model: ${model}${context ? ' | ' + context : ''}`);
+    console.error('System Prompt:');
+    console.error(this.formatDebugText(systemPrompt));
+    console.error('============');
+    console.error('User Prompt:');
+    console.error('============');
+    console.error(this.formatDebugText(userPrompt));
+    console.error('─'.repeat(80));
+  }
+
+  /**
+   * Log LLM response
+   */
+  logResponse(content, context = '') {
+    if (process.env.KOI_DEBUG_LLM !== '1') return;
+
+    console.error(`\n[LLM Debug] Response${context ? ' - ' + context : ''} (${content.length} chars)`);
+    console.error('─'.repeat(80));
+
+    // Try to format JSON for better readability
+    let formattedContent = content;
+    try {
+      const parsed = JSON.parse(content);
+      formattedContent = JSON.stringify(parsed, null, 2);
+    } catch (e) {
+      // Not JSON, use as is
+    }
+
+    const lines = _truncB64Debug(formattedContent).split('\n');
+    for (const line of lines) {
+      console.error(`< \x1b[90m${line}\x1b[0m`);
+    }
+    console.error('─'.repeat(80));
+  }
+
+  /**
+   * Log simple message
+   */
+  logDebug(message) {
+    if (process.env.KOI_DEBUG_LLM !== '1') return;
+    console.error(`[LLM Debug] ${message}`);
+  }
+
+  /**
+   * Log error
+   */
+  logError(message, error) {
+    if (process.env.KOI_DEBUG_LLM !== '1') return;
+    console.error(`[LLM Debug] ERROR: ${message}`);
+    if (error) {
+      console.error(error.stack || error.message);
+    }
+  }
+
+  /**
+   * Simple chat completion for build-time tasks (descriptions, summaries).
+   * No system prompt injection, no JSON mode, with timeout.
+   */
+  async simpleChat(prompt, { timeoutMs = 15000 } = {}) {
+    await this._ensureClients();
+    const messages = [{ role: 'user', content: prompt }];
+
+    if (this.provider === 'openai' || this.provider === 'gemini') {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const completion = await this.openai.chat.completions.create(
+          this.buildApiParams({
+            model: this.model,
+            messages,
+            temperature: 0.1,
+            max_tokens: this.maxTokens || 150
+          }),
+          { signal: controller.signal }
+        );
+        return completion.choices[0].message.content?.trim() || '';
+      } finally {
+        clearTimeout(timer);
+      }
+    } else if (this.provider === 'anthropic') {
+      const message = await this.anthropic.messages.create({
+        model: this.model,
+        max_tokens: this.maxTokens || 150,
+        temperature: 0.1,
+        messages
+      });
+      return message.content[0].text.trim();
+    }
+    return '';
+  }
+
+  /**
+   * Call OpenAI with logging
+   * @param {Object} options - { model, messages, temperature, max_tokens, stream, response_format }
+   * @param {string} context - Context description for logging
+   * @returns {Promise} - OpenAI completion response
+   */
+  async callOpenAI(options, context = '') {
+    const { model, messages, temperature = 0, max_tokens = 4000, stream = false, response_format } = options;
+
+    // Extract prompts for logging
+    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    const userPrompt = messages.find(m => m.role === 'user')?.content || '';
+
+    // Log request
+    this.logRequest(model, systemPrompt, userPrompt, context);
+
+    // Make API call with buildApiParams to handle gpt-5.2
+    const completion = await this.openai.chat.completions.create(
+      this.buildApiParams({
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        stream,
+        ...(response_format && { response_format })
+      })
+    );
+
+    // If not streaming, log response immediately
+    if (!stream) {
+      const content = completion.choices[0].message.content;
+      this.logResponse(content, context);
+    }
+
+    return completion;
+  }
+
+  /**
+   * Strip unsupported params based on model capabilities.
+   * Consults MODEL_DB flags: noTemperature, noMaxTokens.
+   */
+  buildApiParams(baseParams) {
+    const caps = getModelCaps(baseParams.model);
+    let params = { ...baseParams };
+    if (caps.noTemperature) delete params.temperature;
+    if (caps.noMaxTokens)   delete params.max_tokens;
+    return params;
+  }
+
+  async executePlanning(prompt) {
+    try {
+      let response;
+
+      if (this.provider === 'openai') {
+        const completion = await this.openai.chat.completions.create(
+          this.buildApiParams({
+            model: 'gpt-5.2',  // Force best model for planning
+            messages: [
+              { role: 'system', content: 'Planning assistant. JSON only.' },
+              { role: 'user', content: prompt }
+            ],
+            temperature: 0,
+          })
+        );
+        response = completion.choices[0].message.content.trim();
+      } else if (this.provider === 'anthropic') {
+        const completion = await this.anthropic.messages.create({
+          model: 'claude-3-haiku-20240307',  // Force fastest Anthropic model
+          max_tokens: 800,
+          temperature: 0,  // Use 0 for maximum determinism
+          messages: [{ role: 'user', content: prompt }],
+          system: 'Planning assistant. JSON only.'
+        });
+        response = completion.content[0].text.trim();
+      } else {
+        throw new Error(`Unknown provider: ${this.provider}`);
+      }
+
+      // Parse JSON
+      return JSON.parse(response);
+    } catch (error) {
+      throw new Error(`Planning failed: ${error.message}`);
+    }
+  }
+
+
+  /**
+   * Classify a task using the fastest/cheapest available model.
+   * Returns { taskType: 'code'|'planning'|'reasoning', difficulty: 1-10 }.
+   * Falls back to keyword heuristic if the LLM call fails.
+   */
+  async _inferTaskProfile(playbookText, args, agentName) {
+    const taskDescription = [
+      agentName ? `Agent: ${agentName}` : '',
+      playbookText ? `Role: ${playbookText}` : '',
+      args ? 'Task: ' + JSON.stringify(args).substring(0, 400) : '',
+    ].filter(Boolean).join('\n');
+
+    const prompt = `Reply ONLY with valid JSON (no markdown in the output):
+{"taskType":"code"|"planning"|"reasoning","difficulty":1-10}
+
+## TASK TYPE
+
+- **"code"**: writing, editing, debugging, refactoring, analysing or generating code, scripts, queries, configs, tests, or file operations. Includes implementation tasks even if design is required.
+- **"planning"**: system design, architecture, task decomposition, requirement analysis, specifications, workflows or strategy definition — when NO code is produced.
+- **"reasoning"**: logic, math, research, classification, summarisation, comparison, or conceptual analysis without producing runnable code.
+
+If multiple apply, choose the dominant expected output. Producing code → always "code".
+
+## DIFFICULTY
+
+Code tasks are inherently complex. Most real programming tasks are 7+.
+
+- **1-2 trivial** — echo a value, list files, read a single config key
+- **3-4 easy** — change a string/label/constant, rename a variable, fix a typo, add a log line
+- **5-6 moderate** — implement a self-contained function or script with no existing codebase to understand; build a simple landing page or basic CRUD app from scratch
+- **7 standard** — ANY task that requires reading and understanding existing code before making changes; add a feature to an existing module; fix a non-obvious bug in an existing system; integrate a new library into an existing project
+- **8 hard** — multi-file refactor; changes that ripple across several modules; implement a non-trivial algorithm; debug a subtle race condition or state issue; design and implement a new subsystem within an existing architecture
+- **9-10 legendary (rare)** — distributed systems, compilers, cryptography, kernel/low-level, novel research, formal proofs
+
+**KEY RULE**: if the agent must first explore or read the codebase to understand context, minimum difficulty is 7. Greenfield code (no existing codebase) may be 5-6.
+
+## ADJUSTMENTS
+
+Increase difficulty (+1 to +2) if:
+- High ambiguity or underspecified requirements
+- Security-sensitive logic
+- Strict correctness guarantees or complex edge cases
+- Concurrency, distributed state, or performance-critical constraints
+
+Default to **7** for code tasks when unsure.
+Use **9-10** only for genuinely expert-level tasks.
+
+## PROGRAMMING EXAMPLES
+
+**6** — Add a loading spinner to existing API calls without breaking layout · Fix a mobile CSS overflow issue in a production page · Add client-side form validation to an existing form · Implement pagination in an already working list view · Add sorting to a table component · Extract duplicated frontend logic into a shared utility · Add a confirmation modal before delete actions · Introduce basic unit tests into an untested component · Add debouncing to a search input · Fix a minor state synchronization bug
+
+**7** — Refactor a 500+ LOC React component into smaller components · Introduce TypeScript gradually into a JS frontend · Fix a race condition in concurrent API requests · Add optimistic UI updates with rollback on failure · Implement code splitting to reduce bundle size · Add JWT authentication middleware to an API · Optimize a slow SQL query with proper indexing · Implement rate limiting using Redis · Add background job processing with retry logic · Containerize an existing application with Docker
+
+**8** — Migrate class-based React components to hooks · Remove jQuery from a legacy frontend without regressions · Improve Lighthouse score from 60 to 90+ · Add full accessibility compliance (WCAG AA) · Introduce caching layer without breaking consistency · Implement distributed locking mechanism · Design a plugin system with dynamic module loading · Implement SSR with proper hydration handling · Add observability (logs + metrics + tracing) to a backend · Build a GraphQL gateway aggregating multiple services
+
+**9** — Replace REST calls with GraphQL in a production frontend · Design event-driven architecture with outbox pattern · Implement idempotent webhook processing · Build a real-time dashboard using WebSockets · Implement deep linking with routing + attribution (mobile) · Design zero-downtime database migration strategy · Build a scalable ETL pipeline with incremental loads · Implement collaborative editing backend (presence + patches) · Introduce multi-tenant isolation with per-tenant encryption · Implement vector search with embeddings + reranking
+
+**10** — Implement a CRDT for distributed state synchronization · Build a distributed task scheduler with fault tolerance · Design a multi-tenant architecture with strict isolation guarantees · Implement end-to-end encrypted messaging protocol · Build a horizontally scalable API gateway with dynamic routing · Create a static code analyzer with AST parsing and rule engine · Implement a custom ORM abstraction layer · Design a distributed tracing system from scratch · Build a micro-frontend platform with shared runtime · Implement a fault-tolerant distributed queue with exactly-once semantics
+
+---
+
+Classify the following task:
+${taskDescription}`;
+
+    const _debug = !!process.env.KOI_DEBUG_LLM;
+
+    // Ordered fallback candidates for classification (cheapest/fastest first)
+    const _candidates = [
+      ...(this._gc ? [
+        { client: this._gc, model: 'gemini-2.0-flash', provider: 'gemini' },
+      ] : []),
+      ...(this._oa ? [{ client: this._oa, model: 'gpt-4o-mini', provider: 'openai' }] : []),
+      ...(this._ac ? [{ client: null, model: 'claude-haiku-4-5-20251001', provider: 'anthropic' }] : []),
+    ];
+
+    if (_candidates.length === 0) {
+      if (_debug) console.error(`[Auto] No client for classification — using default profile`);
+      return DEFAULT_TASK_PROFILE;
+    }
+
+    for (const candidate of _candidates) {
+      if (_debug) console.error(`[Auto] Classifying with ${candidate.model}...`);
+      try {
+        let content, inputTokens = 0, outputTokens = 0;
+        if (candidate.provider === 'anthropic') {
+          const resp = await this._ac.messages.create({
+            model: candidate.model, max_tokens: 50, temperature: 0,
+            messages: [{ role: 'user', content: prompt }]
+          });
+          content = resp.content[0].text.trim();
+          inputTokens  = resp.usage?.input_tokens  || 0;
+          outputTokens = resp.usage?.output_tokens || 0;
+        } else {
+          const resp = await candidate.client.chat.completions.create({
+            model: candidate.model, max_tokens: 50, temperature: 0,
+            messages: [{ role: 'user', content: prompt }]
+          });
+          content = resp.choices[0].message.content.trim();
+          inputTokens  = resp.usage?.prompt_tokens     || 0;
+          outputTokens = resp.usage?.completion_tokens || 0;
+        }
+        costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
+        if (_debug) console.error(`[Auto] Classification: ${content} (${inputTokens}↑ ${outputTokens}↓)`);
+        const _stripped = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        const json = JSON.parse(_stripped);
+        if (json.taskType && json.difficulty) {
+          const profile = { taskType: json.taskType, difficulty: Math.min(10, Math.max(1, Number(json.difficulty))) };
+          if (_debug) console.error(`[Auto] Profile: ${profile.taskType} difficulty=${profile.difficulty}/10`);
+          return profile;
+        }
+        if (_debug) console.error(`[Auto] Invalid shape from ${candidate.model}, trying next...`);
+      } catch (e) {
+        if (_debug) console.error(`[Auto] ${candidate.model} failed: ${e.message} — trying next...`);
+      }
+    }
+    if (_debug) console.error(`[Auto] All candidates failed — using default profile`);
+    return DEFAULT_TASK_PROFILE;
+  }
+
+  /**
+   * Lightweight JSON call: send a prompt, get parsed JSON back.
+   * No system prompt injection, no streaming, no onAction.
+   */
+  async callJSON(prompt, agent = null) {
+    await this._ensureClients();
+    const agentName = agent?.name || '';
+    cliLogger.planning(agentName ? `[🤖 ${agentName}] Thinking` : 'Thinking');
+
+    this.logRequest(this.model, 'Return ONLY valid JSON.', prompt, agentName ? `callJSON | Agent: ${agentName}` : 'callJSON');
+
+    // In auto mode, use the first available provider for callJSON
+    const _cjProvider = this._autoMode ? this._availableProviders[0] : this.provider;
+    const _cjModel    = this._autoMode ? (DEFAULT_MODELS[_cjProvider] || this._availableProviders[0]) : this.model;
+    const _cjOpenai   = this._autoMode ? (this._oa || this._gc) : this.openai;
+    const _cjAnthropic = this._autoMode ? this._ac : this.anthropic;
+
+    let response;
+    try {
+      if (_cjProvider === 'openai' || _cjProvider === 'gemini') {
+        const completion = await _cjOpenai.chat.completions.create(
+          this.buildApiParams({
+            model: _cjModel,
+            messages: [
+              { role: 'system', content: 'Return ONLY valid JSON. No markdown, no explanations.' },
+              { role: 'user', content: prompt }
+            ],
+            temperature: 0,
+            max_tokens: this.maxTokens,
+            response_format: { type: 'json_object' }
+          })
+        );
+        response = completion.choices[0].message.content?.trim() || '';
+      } else if (_cjProvider === 'anthropic') {
+        const message = await _cjAnthropic.messages.create({
+          model: _cjModel,
+          max_tokens: this.maxTokens,
+          temperature: 0,
+          system: 'Return ONLY valid JSON. No markdown, no explanations.',
+          messages: [{ role: 'user', content: prompt }]
+        });
+        response = message.content[0].text.trim();
+      } else {
+        throw new Error(`Unknown provider: ${_cjProvider}`);
+      }
+
+      cliLogger.clear();
+      this.logResponse(response, 'callJSON');
+
+      if (!response) return { result: '' };
+
+      // Clean markdown code blocks if present
+      let cleaned = response;
+      if (cleaned.startsWith('```')) {
+        cleaned = cleaned.replace(/^\`\`\`(?:json)?\n?/, '').replace(/\n?\`\`\`$/, '').trim();
+      }
+
+      return JSON.parse(cleaned);
+    } catch (error) {
+      cliLogger.clear();
+      if (error instanceof SyntaxError) {
+        return { result: response };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Utility LLM call for lightweight background tasks (commit summaries, etc.).
+   * Always selects the cheapest available model via selectAutoModel (difficulty=1).
+   * Tokens are recorded in costCenter so they appear in /cost reports.
+   */
+  async callUtility(system, user, maxTokens = 150) {
+    await this._ensureClients();
+    const selected = selectAutoModel('reasoning', 1, this._availableProviders);
+    if (!selected) throw new Error('No LLM provider available');
+    const { provider, model } = selected;
+
+    const t0 = Date.now();
+    let inputTokens = 0, outputTokens = 0, text = '';
+
+    if (provider === 'openai' || provider === 'gemini') {
+      const client = provider === 'gemini' ? this._gc : this._oa;
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: user }
+        ]
+      });
+      text         = completion.choices[0].message.content?.trim() || '';
+      inputTokens  = completion.usage?.prompt_tokens     || 0;
+      outputTokens = completion.usage?.completion_tokens || 0;
+    } else if (provider === 'anthropic') {
+      const message = await this._ac.messages.create({
+        model,
+        max_tokens: maxTokens,
+        temperature: 0,
+        system,
+        messages: [{ role: 'user', content: user }]
+      });
+      text         = (message.content.find(b => b.type === 'text')?.text ?? '').trim();
+      inputTokens  = message.usage?.input_tokens  || 0;
+      outputTokens = message.usage?.output_tokens || 0;
+    } else {
+      throw new Error(`Unknown provider: ${provider}`);
+    }
+
+    costCenter.recordUsage(model, provider, inputTokens, outputTokens, Date.now() - t0);
+    return text;
+  }
+
+  // =========================================================================
+  // REACTIVE AGENTIC LOOP METHODS
+  // =========================================================================
+
+  /**
+   * Execute one iteration of the reactive playbook loop.
+   * The LLM returns ONE action per call, receives feedback, and adapts.
+   *
+   * @param {Object} params
+   * @param {string} params.playbook - The playbook text
+   * @param {Object} params.context - Context with args and state
+   * @param {string} params.agentName - Agent name for logging
+   * @param {PlaybookSession} params.session - Session tracking state
+   * @param {Object} params.agent - Agent instance
+   * @param {ContextMemory} params.contextMemory - Tiered memory manager
+   * @returns {Object} A single action object
+   */
+  async executePlaybookReactive({ playbook, playbookResolver = null, context, agentName, session, agent, contextMemory, isFirstCall = false, thinkingHint = 'Thinking', isDelegate = false, abortSignal = null }) {
+    // Ensure API keys / clients are ready (prompts user if missing)
+    await this._ensureClients();
+
+    const planningPrefix = agentName ? `[🤖 ${agentName}]` : '';
+
+    // For non-auto mode the model is fixed — show it right away (before LLM call)
+    if (!this._autoMode) cliLogger.setInfo('model', this.model);
+
+    cliLogger.planning(`${planningPrefix} ${thinkingHint || 'Thinking'}`);
+    cliLogger.log('llm', `Reactive call: ${agentName} (iteration ${session.iteration + 1}, firstCall=${isFirstCall})`);
+
+    // Age memories each iteration
+    await contextMemory.tick();
+
+    // Rebuild the system prompt when:
+    // - First call or no history yet (fresh/resumed session), OR
+    // - A playbookResolver exists — meaning the playbook contains dynamic compose blocks
+    //   that depend on runtime state (task list, registry, etc.) and must be re-evaluated
+    //   on every LLM call so the system prompt is never stale.
+    if (isFirstCall || !contextMemory.hasHistory() || playbookResolver) {
+      const freshPlaybook = playbookResolver ? await playbookResolver() : playbook;
+      const systemPrompt = await this._buildReactiveSystemPrompt(agent, freshPlaybook);
+      contextMemory.setSystem(systemPrompt);
+      // Reset userMessage after compose resolver has consumed it —
+      // it should only be non-null on the turn the user actually typed something.
+      agent._lastUserMessage = null;
+      // If the compose resolver produced images (e.g. mobile screenshot),
+      // inject them into the session's pending image queue for the next LLM call.
+      // REPLACE (not accumulate) — compose images are always a fresh capture and
+      // should not stack with stale action-result images from previous iterations.
+      if (playbookResolver?._pendingImages?.length > 0) {
+        session._pendingMcpImages = [...playbookResolver._pendingImages];
+        playbookResolver._pendingImages = null;
+      }
+    }
+
+    // Decide what message to add based on how many actions have been executed.
+    // Use session.iteration (action count) rather than contextMemory.hasHistory() so
+    // that the fast-greeting path (which skips the first LLM call but executes
+    // print + prompt_user) is treated as "subsequent" rather than "fresh start".
+    if (session.iteration === 0) {
+      // No actions executed yet — fresh start, resumed session, task resumption, or ask_parent re-invocation.
+
+      // ask_parent is now handled inline in the reactive loop (agent.js) — no re-invocation.
+      // The answer is injected into contextMemory directly without restarting the session.
+      if (session._resumingTasks) {
+        // User confirmed they want to continue the pending task plan.
+        // Build the task list inline so the model sees it immediately without
+        // needing to call task_list first (codex tends to explore/ask otherwise).
+        let taskListStr = '';
+        try {
+          const { taskManager } = await import('./task-manager.js');
+          const allTasks = taskManager.list();
+          const pending = allTasks.filter(t => t.status !== 'completed');
+          if (pending.length > 0) {
+            taskListStr = '\n\nPending tasks:\n' + pending.map(t => {
+              const icon = t.status === 'in_progress' ? '●' : '☐';
+              const desc = t.description ? ` — ${t.description}` : '';
+              return `  [${t.id}] ${icon} ${t.subject}${desc}`;
+            }).join('\n');
+          }
+        } catch { /* non-fatal — fall back to generic instruction */ }
+
+        contextMemory.add(
+          'user',
+          `The user confirmed: resume the previous task plan.${taskListStr}\n\nExecute these tasks now, in order, starting with the first in_progress or pending one. Do NOT ask the user any questions. Do NOT explore files or run any commands before starting. Execute the first task immediately.`,
+          'Resume tasks.',
+          null
+        );
+      } else if (contextMemory.hasHistory() && !isDelegate && !session._isContinuation) {
+        // Session resumed from disk (--resume): tell the LLM to wait for user input.
+        // Delegates are excluded — their prior context is valid working history.
+        // Continuations (feedback-triggered restarts) are excluded — they should
+        // pick up where they left off, not reset.
+        // ephemeral: true → not persisted to conversation file, so it doesn't
+        // accumulate across multiple resume cycles.
+        contextMemory.add(
+          'user',
+          `SESSION RESUMED. The conversation history above is your complete history with this user — use it to assist them.
+
+Your ONLY next action is: { "intent": "prompt_user" } — greet the user and wait for their instruction.
+
+Do NOT automatically continue or restart any previous task. Wait for the user to explicitly ask.`,
+          'Session resumed.',
+          null,
+          { ephemeral: true }
+        );
+      } else {
+        // Include MCP connection errors so the LLM can diagnose
+        let mcpErrorStr = '';
+        if (session.mcpErrors && Object.keys(session.mcpErrors).length > 0) {
+          const errors = Object.entries(session.mcpErrors)
+            .map(([name, cause]) => `- MCP "${name}" server output:\n${cause}`)
+            .join('\n');
+          mcpErrorStr = `\n\n⚠️ MCP SERVER ERRORS — The following MCP servers crashed on startup. Do NOT call them.\nAnalyze the server output below, identify the root cause, and use "print" to tell the user:\n1. What went wrong (the specific error, not the raw output)\n2. How to fix it (e.g. "run npm install in /path/to/project")\nThen "return" with an error.\n\n${errors}`;
+        }
+
+        // For delegate invocations: expose task spec fields explicitly so the agent
+        // cannot miss them (they're nested under context.args, which can be easy to overlook).
+        // For the main agent: fall back to the raw JSON context blob.
+        let contextStr = '';
+        const _args = context.args;
+        const _specFields = ['taskId','subject','description','instruction','userRequest','context','planSummary','completedTasks','blockedTasks'];
+        if (isDelegate && _args && (_args.description || _args.subject)) {
+          const _specLines = _specFields
+            .filter(k => _args[k] != null && _args[k] !== '')
+            .map(k => `  ${k}: ${typeof _args[k] === 'string' ? _args[k] : JSON.stringify(_args[k])}`)
+            .join('\n');
+          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
+        } else if (Object.keys(context).length > 0) {
+          contextStr = `\nContext: ${JSON.stringify(context)}`;
+        }
+
+        // Playbook is now in the system prompt; first user message just starts execution
+        const startMsg = `Return your FIRST action.${contextStr}${mcpErrorStr}`;
+        // Mark the initial task spec as permanent so it survives memory eviction.
+        // For long-running agents (e.g. mobile navigator with many observe-act cycles),
+        // the goal details (dates, times, names) must never be lost.
+        const permSpec = contextStr ? contextStr.substring(0, 800) : null;
+        contextMemory.add('user', startMsg, 'Instruction.', permSpec);
+      }
+    } else {
+      // Actions have been executed — feed ALL new results as feedback (not just the last).
+      // This ensures that when a batch contains multiple prompt_user calls, every
+      // question/answer pair is visible to the LLM, not only the final one.
+      const fromIdx = session._lastFeedbackIdx ?? 0;
+      const newEntries = session.actionHistory.slice(fromIdx);
+      session._lastFeedbackIdx = session.actionHistory.length;
+
+      if (newEntries.length > 0) {
+        // Add intermediate entries (all except last) as plain messages without "Continue."
+        for (let i = 0; i < newEntries.length - 1; i++) {
+          const entry = newEntries[i];
+          const classified = classifyFeedback(entry.action, entry.result, entry.error);
+          contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent);
+        }
+
+        // Process the last entry with full handling (commit context, hydrate, images, "Continue.")
+        const lastEntry = newEntries[newEntries.length - 1];
+        const classified = classifyFeedback(lastEntry.action, lastEntry.result, lastEntry.error);
+
+        // Inject relevant commit context when user just spoke (after prompt_user)
+        let commitContext = '';
+        if (!lastEntry.error) {
+          const lastIntent = lastEntry.action.intent || lastEntry.action.type;
+          if (lastIntent === 'prompt_user' && lastEntry.result?.answer != null) {
+            const _answerText = typeof lastEntry.result.answer === 'string'
+              ? lastEntry.result.answer
+              : (lastEntry.result.answer?.text ?? '');
+            if (_answerText) {
+              commitContext = await this._searchRelevantCommits(_answerText);
+              await contextMemory.hydrate(_answerText);
+            }
+            // Capture image attachments so we can inject them into the next LLM message
+            const _atts = Array.isArray(lastEntry.result.attachments)
+              ? lastEntry.result.attachments.filter(a => a.type === 'image' && fs.existsSync(a.path))
+              : [];
+            session._pendingImages = _atts.length > 0 ? _atts : null;
+          }
+        }
+
+        // Build the immediate content (full detail + commit context + continue)
+        const immediate = `${classified.immediate}${commitContext}\nContinue.`;
+        contextMemory.add('user', immediate, classified.shortTerm, classified.permanent);
+
+        // Queue MCP image results for multimodal injection into the next LLM call.
+        // Skip if the compose resolver already injected images (e.g. frame_server_state
+        // screenshot) — those are always fresher than action-result images from the
+        // previous iteration, and stacking both causes duplicate images.
+        if (classified.imageBlocks?.length > 0 && !session._pendingMcpImages?.length) {
+          session._pendingMcpImages = [];
+
+          if (process.env.KOI_DEBUG_LLM) {
+            const tool = lastEntry.action.tool || 'mcp';
+            classified.imageBlocks.forEach((block, i) => {
+              const ext = (block.mimeType || 'image/png').split('/')[1] || 'png';
+              const tmpFile = path.join(os.tmpdir(), `koi-${tool}-${Date.now()}-${i}.${ext}`);
+              fs.writeFileSync(tmpFile, Buffer.from(block.data, 'base64'));
+              console.error(`[MCP Image] ${tool} → ${tmpFile}`);
+              block._debugPath = tmpFile; // used at send-time for attachment log
+            });
+          }
+
+          session._pendingMcpImages.push(...classified.imageBlocks);
+        }
+      }
+    }
+
+    // Check abort before making the call
+    if (abortSignal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    // Resolve auto model.
+    // Re-classify only on first call or when returning from a delegation — not every iteration.
+    let _autoRestore = null;
+    if (this._autoMode) {
+      const _lastAction = session.actionHistory.at(-1);
+      const _isDelegateReturn = _lastAction?.action?.actionType === 'delegate';
+      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn;
+
+      if (_shouldReclassify) {
+        session._autoProfile = await this._inferTaskProfile(agent?.description, context?.args, agentName);
+        if (process.env.KOI_DEBUG_LLM) {
+          const _reason = isFirstCall ? 'first call' : _isDelegateReturn ? 'delegate returned' : 'no cached profile';
+          console.error(`[Auto] Reclassifying (${_reason})`);
+        }
+      }
+      const profile = session._autoProfile;
+
+      // Escalate difficulty when the SAME error type repeats 3+ times.
+      // Normalize messages to strip variable parts (line numbers, column numbers)
+      // so "Hunk at line 9" and "Hunk at line 18" both count as the same error.
+      // Skip intervening success entries (e.g. read_file between failed edit_file calls)
+      // rather than breaking, so the count accumulates correctly.
+      const _normalizeErrMsg = (msg) => {
+        if (!msg) return msg;
+        return msg.replace(/\b(line|lines?)\s+\d+(-\d+)?\b/gi, 'line N')
+                  .replace(/\bcolumn\s+\d+\b/gi, 'column N')
+                  .replace(/\bat\s+\d+\b/gi, 'at N');
+      };
+      let _sameErrorCount = 0;
+      const _lastMsg = session.lastError?.message;
+      const _lastMsgNorm = _normalizeErrMsg(_lastMsg);
+      const _maxLookback = 12;
+      if (_lastMsg) {
+        for (let _i = session.actionHistory.length - 1; _i >= 0 && _i >= session.actionHistory.length - _maxLookback; _i--) {
+          const _e = session.actionHistory[_i];
+          const _msg = _e.error?.message ?? (_e.result?.success === false ? _e.result.error : null);
+          if (!_msg) continue;  // success entry — skip but keep counting further back
+          if (_normalizeErrMsg(_msg) !== _lastMsgNorm) break; // different error type — stop
+          _sameErrorCount++;
+        }
+      }
+      const _difficultyBoost     = _sameErrorCount >= 3 ? Math.min(Math.floor(_sameErrorCount / 3), 3) : 0;
+      const _loopBoost           = session._loopBoost || 0;
+
+      // Escalate when the agent is stuck in varied failures (different errors/URLs but
+      // consistently failing). _sameErrorCount misses this because it resets on any success
+      // (even empty stdout). Trigger when ≥60% of the last 8 actions failed.
+      const _recentWindow    = session.actionHistory.slice(-8);
+      const _recentFailCount = _recentWindow.filter(
+        e => e.error || (e.result?.success === false && e.result.error)
+      ).length;
+      const _failRateBoost   = (_recentWindow.length >= 5 && _recentFailCount >= Math.ceil(_recentWindow.length * 0.6))
+        ? Math.min(Math.floor(_recentFailCount / 3), 2)
+        : 0;
+
+      const _effectiveDifficulty = Math.min(10, profile.difficulty + _difficultyBoost + _loopBoost + _failRateBoost);
+
+      // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
+      const _requiresImage = !!(session._pendingImages?.length > 0) ||
+        !!(session._pendingMcpImages?.length > 0) ||
+        session.actionHistory.some(
+          e => e.action?.intent === 'prompt_user' &&
+               Array.isArray(e.result?.attachments) &&
+               e.result.attachments.some(a => a.type === 'image')
+        );
+      if (this._availableProviders.length === 0) {
+        throw new Error('NO_PROVIDERS: No LLM providers available — all API keys are missing or invalid. Please set a valid OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY in your .env file.');
+      }
+      const selected = selectAutoModel(profile.taskType, _effectiveDifficulty, this._availableProviders, { requiresImage: _requiresImage });
+      const _resolvedProvider = selected?.provider || this._availableProviders[0];
+      const _resolvedModel    = selected?.model    || DEFAULT_MODELS[_resolvedProvider];
+
+      const _boostParts = [];
+      if (_difficultyBoost > 0) _boostParts.push(`same error ×${_sameErrorCount}`);
+      if (_loopBoost > 0)       _boostParts.push(`loop ×${_loopBoost}`);
+      if (_failRateBoost > 0)   _boostParts.push(`fail-rate ${_recentFailCount}/${_recentWindow.length}`);
+      const _totalBoost = _difficultyBoost + _loopBoost + _failRateBoost;
+      const _boostNote  = _totalBoost > 0 ? ` [escalated +${_totalBoost}: ${_boostParts.join(', ')}]` : '';
+      cliLogger.log('llm', `[auto] ${agentName || 'agent'} → ${_resolvedProvider}/${_resolvedModel} | ${profile.taskType}:${_effectiveDifficulty}/10${_boostNote}`);
+      if (process.env.KOI_DEBUG_LLM) console.error(`[Auto] ${agentName || 'agent'} → ${_resolvedProvider}/${_resolvedModel} (${profile.taskType} ${_effectiveDifficulty}/10${_boostNote})`);
+
+      // Show model in footer immediately (before LLM call)
+      cliLogger.setInfo('model', _resolvedModel);
+
+      // Store for cost tracking after the finally block restores this.model → 'auto'
+      session._autoProvider = _resolvedProvider;
+      session._autoModel    = _resolvedModel;
+
+      // Temporarily set provider/model/client for this call
+      _autoRestore = { provider: this.provider, model: this.model, openai: this.openai, anthropic: this.anthropic };
+      this.provider  = _resolvedProvider;
+      this.model     = _resolvedModel;
+      if (_resolvedProvider === 'openai')     this.openai    = this._oa;
+      else if (_resolvedProvider === 'gemini') this.openai   = this._gc;
+      else if (_resolvedProvider === 'anthropic') this.anthropic = this._ac;
+    }
+
+    // Build messages from tiered memory
+    const messages = contextMemory.toMessages();
+
+    // Track attachments for debug logging
+    const _debugAttachPaths = [];
+
+    // Inject image attachments into the last user message when the user sent images
+    if (session._pendingImages?.length > 0) {
+      const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+      if (lastUserIdx >= 0) {
+        const textContent = typeof messages[lastUserIdx].content === 'string'
+          ? messages[lastUserIdx].content : '';
+        const imageParts = session._pendingImages.map(att => {
+          const ext = path.extname(att.path).toLowerCase().slice(1);
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          const b64 = fs.readFileSync(att.path).toString('base64');
+          return { mime, b64, path: att.path };
+        });
+        if (this.provider === 'anthropic') {
+          messages[lastUserIdx] = {
+            role: 'user',
+            content: [
+              ...imageParts.map(p => ({ type: 'image', source: { type: 'base64', media_type: p.mime, data: p.b64 } })),
+              { type: 'text', text: textContent }
+            ]
+          };
+        } else {
+          // OpenAI / Gemini (OpenAI-compatible)
+          messages[lastUserIdx] = {
+            role: 'user',
+            content: [
+              { type: 'text', text: textContent },
+              ...imageParts.map(p => ({ type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.b64}` } }))
+            ]
+          };
+        }
+        if (process.env.KOI_DEBUG_LLM) {
+          _debugAttachPaths.push(...imageParts.map(p => p.path));
+        }
+      }
+      session._pendingImages = null; // consume — don't re-send in subsequent calls
+    }
+
+    // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks
+    if (session._pendingMcpImages?.length > 0) {
+      const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+      if (lastUserIdx >= 0) {
+        const existing = messages[lastUserIdx].content;
+        const textContent = typeof existing === 'string' ? existing
+          : Array.isArray(existing) ? existing.find(p => p.type === 'text')?.text ?? '' : '';
+        if (this.provider === 'anthropic') {
+          messages[lastUserIdx] = {
+            role: 'user',
+            content: [
+              ...session._pendingMcpImages.map(p => ({
+                type: 'image', source: { type: 'base64', media_type: p.mimeType, data: p.data }
+              })),
+              { type: 'text', text: textContent },
+            ]
+          };
+        } else {
+          // OpenAI / Gemini (OpenAI-compatible)
+          messages[lastUserIdx] = {
+            role: 'user',
+            content: [
+              { type: 'text', text: textContent },
+              ...session._pendingMcpImages.map(p => ({
+                type: 'image_url', image_url: { url: `data:${p.mimeType};base64,${p.data}` }
+              })),
+            ]
+          };
+        }
+        if (process.env.KOI_DEBUG_LLM) {
+          _debugAttachPaths.push(...session._pendingMcpImages.map(p => p._debugPath || `[${p.mimeType || 'image'}]`));
+        }
+      }
+      session._pendingMcpImages = null; // consume — don't re-send in subsequent calls
+    }
+
+    // Prune image blocks from all messages EXCEPT the last user message.
+    // This prevents old screenshots from accumulating in the conversation
+    // (e.g. from merged multimodal messages or batched image results).
+    // User-provided images are always in the last user message, so they're preserved.
+    {
+      const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+      let _pruned = 0;
+      for (let i = 0; i < messages.length; i++) {
+        if (i === lastUserIdx) continue; // keep current images
+        const c = messages[i].content;
+        if (!Array.isArray(c)) continue;
+        const hasImages = c.some(p => p.type === 'image' || p.type === 'image_url');
+        if (!hasImages) continue;
+        // Strip image blocks, keep text
+        const textOnly = c.filter(p => p.type === 'text');
+        const imgCount = c.length - textOnly.length;
+        _pruned += imgCount;
+        const textContent = textOnly.map(p => p.text).join('\n');
+        messages[i] = { role: messages[i].role, content: textContent + ` [${imgCount} image(s) pruned]` };
+      }
+      if (_pruned > 0 && process.env.KOI_DEBUG_LLM) {
+        console.error(`[image-prune] Stripped ${_pruned} old image(s) from conversation history`);
+      }
+    }
+
+    // Debug: log what attachments (if any) are being sent to the LLM
+    if (process.env.KOI_DEBUG_LLM) {
+      if (_debugAttachPaths.length > 0) {
+        console.error(`📎 Attachments → LLM (${_debugAttachPaths.length}):`);
+        _debugAttachPaths.forEach(p => console.error(`   ${p}`));
+      } else {
+        console.error(`📎 No attachments`);
+      }
+    }
+
+    const msgCount = messages.filter(m => m.role === 'user' || m.role === 'assistant').length;
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+    const lastUserMsgText = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : JSON.stringify(lastUserMsg?.content || '');
+    cliLogger.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, last user msg: ${lastUserMsgText.length} chars)`);
+    cliLogger.log('llm', `Last user msg preview: ${lastUserMsgText.substring(0, 300)}${lastUserMsgText.length > 300 ? '...' : ''}`);
+
+    // Real-time streaming callback: updates the token footer as chunks arrive
+    const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    const _onStreamChunk = (_delta, estOutTokens) => {
+      cliLogger.setInfo('tokens', `↓${_fmtTk(estOutTokens)} tokens`);
+    };
+
+    // Per-call timeout: abort the streaming request if no response within 90s.
+    // Catches hung streams (providers occasionally stall mid-stream without closing
+    // the connection or throwing an error, leaving the agent blocked indefinitely).
+    const LLM_CALL_TIMEOUT_MS = 90_000;
+    const _llmTimeoutCtrl = new AbortController();
+    const _llmTimeoutTimer = setTimeout(() => _llmTimeoutCtrl.abort(), LLM_CALL_TIMEOUT_MS);
+    // Merged signal: fires when either the user aborts OR the 90s timeout fires
+    const _llmSignal = (() => {
+      const ctrl = new AbortController();
+      if (abortSignal) {
+        if (abortSignal.aborted) { ctrl.abort(abortSignal.reason); }
+        else abortSignal.addEventListener('abort', () => ctrl.abort(abortSignal.reason), { once: true });
+      }
+      _llmTimeoutCtrl.signal.addEventListener('abort', () => ctrl.abort(_llmTimeoutCtrl.signal.reason), { once: true });
+      return ctrl.signal;
+    })();
+
+    let response;
+    const _t0 = Date.now();
+    try {
+      if (this.provider === 'openai') {
+        const caps = getModelCaps(this.model);
+        if (caps.api === 'responses') {
+          response = await this._callOpenAIResponsesReactive(messages, agent, _llmSignal, _onStreamChunk);
+        } else {
+          response = await this._callOpenAIReactive(messages, agent, _llmSignal, _onStreamChunk);
+        }
+      } else if (this.provider === 'gemini') {
+        response = await this._callGeminiReactive(messages, agent, _llmSignal, _onStreamChunk);
+      } else if (this.provider === 'anthropic') {
+        response = await this._callAnthropicReactive(messages, agent, _llmSignal, _onStreamChunk);
+      } else {
+        throw new Error(`Unknown provider: ${this.provider}`);
+      }
+    } catch (_callErr) {
+      // Convert timeout abort to a recognizable error so agent retry logic kicks in
+      // Note: message must contain 'timeout' to match the isTimeout check in agent.js
+      if (_llmTimeoutCtrl.signal.aborted && !abortSignal?.aborted) {
+        cliLogger.log('llm', `HTTP request timeout after ${LLM_CALL_TIMEOUT_MS / 1000}s`);
+        throw new Error(`LLM call timeout after ${LLM_CALL_TIMEOUT_MS / 1000}s`);
+      }
+      // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
+      // model is unavailable. Remove that provider from candidates so we don't hammer it
+      // on every retry iteration — the agent would otherwise loop forever with the same error.
+      if (_autoRestore && this._autoMode) {
+        const _status = _callErr.status ?? _callErr.statusCode;
+        if (typeof _status === 'number' && _status >= 400 && _status < 500) {
+          const _badProvider = this.provider;
+          const _idx = this._availableProviders.indexOf(_badProvider);
+          if (_idx !== -1) {
+            this._availableProviders.splice(_idx, 1);
+            cliLogger.log('llm', `[auto] Provider "${_badProvider}" excluded — HTTP ${_status} (key may be invalid or model unavailable)`);
+          }
+        }
+      }
+      throw _callErr;
+    } finally {
+      clearTimeout(_llmTimeoutTimer);
+      // Restore auto state so subsequent calls can re-resolve cleanly
+      if (_autoRestore) {
+        this.provider  = _autoRestore.provider;
+        this.model     = _autoRestore.model;
+        this.openai    = _autoRestore.openai;
+        this.anthropic = _autoRestore.anthropic;
+      }
+    }
+    const _apiMs = Date.now() - _t0;
+
+    const responseText = response.text;
+    const usage = response.usage;
+
+    // Use the effective model/provider for cost tracking (resolved from session cache if auto)
+    const _effectiveModel    = session._autoModel    || this.model;
+    const _effectiveProvider = session._autoProvider || this.provider;
+
+    // Accumulate token usage on session (printed as summary before prompt_user)
+    if (!session.tokenAccum) session.tokenAccum = { input: 0, output: 0, calls: 0 };
+    session.tokenAccum.input += usage.input;
+    session.tokenAccum.output += usage.output;
+    session.tokenAccum.calls++;
+    // Store last call's usage for per-request display
+    session.lastUsage = { input: usage.input, output: usage.output };
+
+    // Record to global cost center
+    costCenter.recordUsage(_effectiveModel, _effectiveProvider, usage.input, usage.output, _apiMs);
+
+    // Update token display with final accurate counts (only show ↑ when input > 0)
+    {
+      const _parts = [];
+      if (usage.input > 0) _parts.push(`↑${_fmtTk(usage.input)}`);
+      if (usage.output > 0) _parts.push(`↓${_fmtTk(usage.output)}`);
+      if (_parts.length > 0) cliLogger.setInfo('tokens', _parts.join(' '));
+    }
+
+    cliLogger.log('llm', `Response (${responseText.length} chars, ↑${usage.input} ↓${usage.output} tokens): ${responseText.substring(0, 200)}${responseText.length > 200 ? '...' : ''}`);
+
+    // Parse the response into a single action
+    const action = this._parseReactiveResponse(responseText);
+
+    // Add assistant message to memory with classification
+    const assistantClassified = classifyResponse(responseText, action);
+    contextMemory.add('assistant', assistantClassified.immediate, assistantClassified.shortTerm, assistantClassified.permanent);
+
+    return action;
+  }
+
+  /**
+   * Search commit embeddings for context relevant to user text.
+   * Returns a string to inject into the LLM context, or '' if nothing relevant.
+   * @private
+   */
+  async _searchRelevantCommits(userText) {
+    try {
+      const { sessionTracker } = await import('./session-tracker.js');
+      if (!sessionTracker) return '';
+
+      const { commits } = sessionTracker.loadCommitEmbeddings();
+      const hashes = Object.keys(commits);
+      if (hashes.length === 0) return '';
+
+      const userEmbedding = await this.getEmbedding(userText);
+      if (!userEmbedding) return '';
+
+      const { SessionTracker } = await import('./session-tracker.js');
+
+      // Score each commit
+      const allScored = hashes.map(hash => ({
+        hash,
+        summary: commits[hash].summary,
+        score: SessionTracker.cosineSimilarity(userEmbedding, commits[hash].embedding)
+      }));
+
+      cliLogger.log('llm', `Commit search: ${allScored.length} commits scored against "${userText.substring(0, 60)}"`);
+      for (const c of allScored) {
+        cliLogger.log('llm', `  [${c.hash}] score=${c.score.toFixed(3)} ${c.score >= 0.35 ? '✓' : '✗'} "${c.summary}"`);
+      }
+
+      const matched = allScored
+        .filter(c => c.score >= 0.35)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
+
+      if (matched.length === 0) {
+        cliLogger.log('llm', `Commit search: no matches above threshold (0.35)`);
+        return '';
+      }
+
+      cliLogger.log('llm', `Commit search: injecting ${matched.length} relevant commit(s)`);
+
+      // Build context with truncated diffs
+      const parts = matched.map(c => {
+        let diff = '';
+        try {
+          diff = sessionTracker.getCommitDiff(c.hash);
+        } catch { /* no diff */ }
+        return `[${c.hash}] "${c.summary}"${diff ? `\nDiff:\n${diff}` : ''}`;
+      });
+
+      return `\n\nRELEVANT SESSION CHANGES:\n${parts.join('\n\n')}`;
+    } catch (err) {
+      cliLogger.log('llm', `Commit search failed: ${err.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * Build system prompt for reactive mode.
+   * Prepends the agent's playbook (persona/instructions) before the
+   * generic execution engine rules and available actions.
+   */
+  async _buildReactiveSystemPrompt(agent, playbook = null) {
+    const base = await this._buildSystemPrompt(agent);
+    if (!playbook?.trim()) return base;
+    return `${playbook.trim()}\n\n${base}`;
+  }
+
+  /**
+   * Call OpenAI for a reactive loop iteration.
+   * Uses the full conversation history for multi-turn context.
+   * Streams response token-by-token; calls onChunk(delta, estOutputTokens) in real time.
+   * Returns early once a complete JSON object is detected in the buffer.
+   */
+  async _callOpenAIReactive(messages, agent, abortSignal = null, onChunk = null) {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY not set in environment');
+    }
+
+    const agentInfo = agent ? `Agent: ${agent.name}` : '';
+    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    this.logRequest(this.model, systemPrompt, messages.filter(m => m.role === 'user').pop()?.content || '', `Reactive ${agentInfo}`);
+
+    cliLogger.log('llm', `HTTP request starting (streaming)...`);
+
+    let buffer = '';
+    let usage = { input: 0, output: 0 };
+    let outChars = 0;
+
+    try {
+      const params = this.buildApiParams({
+        model: this.model,
+        messages,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        stream: true,
+        stream_options: { include_usage: true }
+      });
+      const options = abortSignal ? { signal: abortSignal } : {};
+      const stream = await this.openai.chat.completions.create(params, options);
+
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) break;
+        const delta = chunk.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          buffer += delta;
+          outChars += delta.length;
+          onChunk?.(delta, Math.ceil(outChars / 4));
+          // Early parse: once buffer is valid JSON we have the complete response
+          if (buffer.trimEnd().endsWith('}')) {
+            try { JSON.parse(buffer.trim()); break; } catch {}
+          }
+        }
+        if (chunk.usage) {
+          usage = {
+            input: chunk.usage.prompt_tokens || 0,
+            output: chunk.usage.completion_tokens || 0
+          };
+        }
+      }
+    } catch (httpError) {
+      cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
+      throw httpError;
+    }
+
+    // If we exited early before the usage chunk, estimate output tokens
+    if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+
+    cliLogger.log('llm', `HTTP request completed (streamed ${outChars} chars)`);
+
+    const content = buffer.trim();
+    if (!content) throw new Error(`OpenAI returned no content`);
+    this.logResponse(content, `Reactive ${agentInfo}`);
+
+    return { text: content, usage };
+  }
+
+  /**
+   * Call OpenAI Responses API (used by codex/reasoning models that don't
+   * support the chat completions endpoint).
+   * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
+   * Returns early once a complete JSON object is detected in the buffer.
+   */
+  async _callOpenAIResponsesReactive(messages, agent, abortSignal = null, onChunk = null) {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY not set in environment');
+    }
+
+    const agentInfo = agent ? `Agent: ${agent.name}` : '';
+    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop()?.content || '';
+    this.logRequest(this.model, systemPrompt, lastUserMsg, `Reactive ${agentInfo}`);
+
+    // Build input: user + assistant turns (system becomes instructions)
+    let inputMessages = messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: m.content }));
+
+    // The Responses API requires the word "json" to appear somewhere in the
+    // input messages (not just in instructions) when using json_object format.
+    // Append a reminder to the last user message if it's missing.
+    const lastUserIdx = inputMessages.map(m => m.role).lastIndexOf('user');
+    if (lastUserIdx >= 0) {
+      const _luc = inputMessages[lastUserIdx].content;
+      const _lucText = Array.isArray(_luc)
+        ? _luc.filter(p => p.type === 'text').map(p => p.text).join(' ')
+        : String(_luc || '');
+      if (!_lucText.toLowerCase().includes('json')) {
+        const _reminder = '\n\nRespond with a valid JSON object only.';
+        inputMessages = inputMessages.map((m, i) => {
+          if (i !== lastUserIdx) return m;
+          if (Array.isArray(m.content)) {
+            const hasText = m.content.some(p => p.type === 'text');
+            if (hasText) {
+              return { ...m, content: m.content.map(p => p.type === 'text' ? { ...p, text: p.text + _reminder } : p) };
+            }
+            return { ...m, content: [...m.content, { type: 'text', text: _reminder }] };
+          }
+          return { ...m, content: m.content + _reminder };
+        });
+      }
+    }
+
+    cliLogger.log('llm', `HTTP request starting (streaming)...`);
+
+    let buffer = '';
+    let usage = { input: 0, output: 0 };
+    let outChars = 0;
+
+    try {
+      const params = {
+        model: this.model,
+        instructions: systemPrompt,
+        input: inputMessages,
+        text: { format: { type: 'json_object' } },
+        stream: true
+      };
+      const options = abortSignal ? { signal: abortSignal } : {};
+      const stream = await this.openai.responses.create(params, options);
+
+      for await (const event of stream) {
+        if (abortSignal?.aborted) break;
+
+        // Text delta: { type: 'response.output_text.delta', delta: '...' }
+        if (event.type === 'response.output_text.delta') {
+          const delta = event.delta || '';
+          if (delta) {
+            buffer += delta;
+            outChars += delta.length;
+            onChunk?.(delta, Math.ceil(outChars / 4));
+            // Early parse: once buffer is valid JSON we have the complete response
+            if (buffer.trimEnd().endsWith('}')) {
+              try { JSON.parse(buffer.trim()); break; } catch {}
+            }
+          }
+        }
+
+        // Final event with usage: { type: 'response.completed', response: { usage: { ... } } }
+        if (event.type === 'response.completed' && event.response?.usage) {
+          usage = {
+            input:  event.response.usage.input_tokens  || 0,
+            output: event.response.usage.output_tokens || 0
+          };
+        }
+      }
+    } catch (httpError) {
+      cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
+      throw httpError;
+    }
+
+    // If we exited early before the usage event, estimate output tokens
+    if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+
+    cliLogger.log('llm', `HTTP request completed (streamed ${outChars} chars)`);
+
+    const text = buffer.trim();
+    if (!text) throw new Error(`OpenAI Responses API returned no content`);
+    this.logResponse(text, `Reactive ${agentInfo}`);
+
+    return { text, usage };
+  }
+
+  /**
+   * Call Anthropic for a reactive loop iteration.
+   * Extracts system prompt from sentinel and uses multi-turn messages.
+   * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
+   * Returns early once a complete JSON object is detected in the buffer.
+   */
+  async _callAnthropicReactive(messages, agent, abortSignal = null, onChunk = null) {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      throw new Error('ANTHROPIC_API_KEY not set in environment');
+    }
+
+    // Anthropic needs system prompt separate from messages
+    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    const chatMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+
+    // Append a JSON-only reminder to the last user message.
+    // Anthropic models tend to add preamble text in long conversations despite
+    // system prompt instructions — a reminder on the last user turn is much more effective.
+    const lastUserIdx = chatMessages.map(m => m.role).lastIndexOf('user');
+    const _jsonReminder = '\n\nRespond with ONLY a valid JSON object. No text, no explanation, no preamble. Start with {';
+    const messagesWithReminder = chatMessages.map((m, i) => {
+      if (i !== lastUserIdx) return m;
+      if (Array.isArray(m.content)) {
+        const hasText = m.content.some(p => p.type === 'text');
+        if (hasText) {
+          return { ...m, content: m.content.map(p => p.type === 'text' ? { ...p, text: p.text + _jsonReminder } : p) };
+        }
+        return { ...m, content: [...m.content, { type: 'text', text: _jsonReminder }] };
+      }
+      return { ...m, content: m.content + _jsonReminder };
+    });
+
+    const agentInfo = agent ? `Agent: ${agent.name}` : '';
+    this.logRequest(this.model, systemPrompt, messagesWithReminder.filter(m => m.role === 'user').pop()?.content || '', `Reactive ${agentInfo}`);
+
+    cliLogger.log('llm', `HTTP request starting (streaming)...`);
+
+    const createParams = {
+      model: this.model,
+      max_tokens: 8192,
+      temperature: 0,
+      system: systemPrompt,
+      messages: messagesWithReminder,
+      stream: true
+    };
+
+    let buffer = '';
+    let usage = { input: 0, output: 0 };
+    let outChars = 0;
+
+    try {
+      const options = abortSignal ? { signal: abortSignal } : {};
+      const stream = await this.anthropic.messages.create(createParams, options);
+
+      for await (const event of stream) {
+        if (abortSignal?.aborted) break;
+
+        if (event.type === 'message_start') {
+          usage.input = event.message?.usage?.input_tokens || 0;
+        } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+          const delta = event.delta.text || '';
+          if (delta) {
+            buffer += delta;
+            outChars += delta.length;
+            onChunk?.(delta, Math.ceil(outChars / 4));
+            // Early parse: once buffer is valid JSON we have the complete response
+            if (buffer.trimEnd().endsWith('}')) {
+              try { JSON.parse(buffer.trim()); break; } catch {}
+            }
+          }
+        } else if (event.type === 'message_delta') {
+          usage.output = event.usage?.output_tokens || 0;
+        }
+      }
+    } catch (httpError) {
+      cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
+      throw httpError;
+    }
+
+    // If we exited early before the usage event, estimate output tokens
+    if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+
+    cliLogger.log('llm', `HTTP request completed (streamed ${outChars} chars)`);
+
+    const content = buffer.trim();
+    if (!content) throw new Error(`Anthropic returned no content`);
+    this.logResponse(content, `Reactive ${agentInfo}`);
+
+    return { text: content, usage };
+  }
+
+  /**
+   * Call Gemini for a reactive loop iteration.
+   * Uses the OpenAI SDK pointed at Gemini's OpenAI-compatible API.
+   * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
+   * Returns early once a complete JSON object is detected in the buffer.
+   */
+  async _callGeminiReactive(messages, agent, abortSignal = null, onChunk = null) {
+    const agentInfo = agent ? `Agent: ${agent.name}` : '';
+    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    this.logRequest(this.model, systemPrompt, messages.filter(m => m.role === 'user').pop()?.content || '', `GeminiReactive ${agentInfo}`);
+
+    cliLogger.log('llm', `HTTP request starting (streaming)...`);
+
+    // Note: stream_options not included — not supported by Gemini's OpenAI-compatible API
+    const geminiParams = this.buildApiParams({
+      model: this.model,
+      messages,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      stream: true
+    });
+    const geminiOptions = abortSignal ? { signal: abortSignal } : {};
+
+    let buffer = '';
+    let usage = { input: 0, output: 0 };
+    let outChars = 0;
+
+    try {
+      const stream = await this.openai.chat.completions.create(geminiParams, geminiOptions);
+
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) break;
+        const delta = chunk.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          buffer += delta;
+          outChars += delta.length;
+          onChunk?.(delta, Math.ceil(outChars / 4));
+          // Early parse: once buffer is valid JSON we have the complete response
+          if (buffer.trimEnd().endsWith('}')) {
+            try { JSON.parse(buffer.trim()); break; } catch {}
+          }
+        }
+        if (chunk.usage) {
+          usage = {
+            input: chunk.usage.prompt_tokens || 0,
+            output: chunk.usage.completion_tokens || 0
+          };
+        }
+      }
+    } catch (httpError) {
+      cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
+      throw httpError;
+    }
+
+    // If we exited early without a usage chunk, estimate output tokens
+    if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+
+    cliLogger.log('llm', `HTTP request completed (streamed ${outChars} chars)`);
+
+    const content = buffer.trim();
+    if (!content) throw new Error(`Gemini returned no content`);
+    this.logResponse(content, `GeminiReactive ${agentInfo}`);
+
+    return { text: content, usage };
+  }
+
+  /**
+   * Parse the LLM response from reactive mode into a single action object.
+   * Handles edge cases like markdown wrapping or legacy array format.
+   */
+  _parseReactiveResponse(responseText) {
+    // Clean markdown code blocks
+    let cleaned = responseText.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    }
+
+    // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
+    // Find the first { and discard everything before it.
+    const braceIdx = cleaned.indexOf('{');
+    if (braceIdx > 0) cleaned = cleaned.substring(braceIdx);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      // Fallback 1: LLM returned multiple JSON objects on separate lines
+      const lines = cleaned.split('\n').map(l => l.trim()).filter(l => l.startsWith('{'));
+      if (lines.length > 1) {
+        try {
+          const actions = lines.map(l => JSON.parse(l));
+          return actions.map(a => this._normalizeReactiveAction(a));
+        } catch (e2) {
+          // Fall through
+        }
+      }
+      // Fallback 2: concatenated objects without newline: {...}{...}
+      try {
+        const asArray = JSON.parse(`[${cleaned.replace(/\}\s*\{/g, '},{')}]`);
+        if (Array.isArray(asArray) && asArray.length > 0) {
+          return asArray.map(a => this._normalizeReactiveAction(a));
+        }
+      } catch (e3) {
+        // Fall through
+      }
+      // Fallback 3: truncated response — try to parse just the first complete JSON object
+      const firstObjMatch = cleaned.match(/^\{[\s\S]*?\}(?=\s*[\{$]|\s*$)/);
+      if (firstObjMatch) {
+        try {
+          const firstObj = JSON.parse(firstObjMatch[0]);
+          return this._normalizeReactiveAction(firstObj);
+        } catch (e4) {
+          // Fall through
+        }
+      }
+      throw new Error(`Failed to parse reactive LLM response as JSON: ${e.message}\nResponse: ${cleaned.substring(0, 200)}`);
+    }
+
+    // Handle batched actions: { "batch": [action1, action2, ...] }
+    // Items may be regular actions OR { "parallel": [...] } groups.
+    if (parsed.batch && Array.isArray(parsed.batch) && parsed.batch.length > 0) {
+      this.logDebug(`Reactive response batched ${parsed.batch.length} actions`);
+      const actions = parsed.batch.map(a => this._normalizeBatchItem(a));
+      return actions.length === 1 ? actions[0] : actions;
+    }
+
+    // Handle raw array (in case json_object mode is not used)
+    if (Array.isArray(parsed)) {
+      if (parsed.length === 0) {
+        throw new Error('Reactive response was an empty array');
+      }
+      const actions = parsed.map(a => this._normalizeReactiveAction(a));
+      return actions.length === 1 ? actions[0] : actions;
+    }
+
+    // If LLM returned legacy format { "actions": [...] }, extract as batch
+    if (parsed.actions && Array.isArray(parsed.actions) && parsed.actions.length > 0) {
+      this.logDebug('Reactive response used legacy {actions:[...]} format, extracting as batch');
+      const actions = parsed.actions.map(a => this._normalizeReactiveAction(a));
+      return actions.length === 1 ? actions[0] : actions;
+    }
+
+    // Handle top-level parallel group: { "parallel": [...] }
+    // The LLM sometimes returns a parallel block as the root object (without a batch wrapper).
+    // Without this check, _normalizeReactiveAction sees no intent/actionType/type and
+    // wraps the whole parallel block as `{ intent: 'return', data: { parallel: [...] } }`,
+    // causing all parallel actions to be silently discarded as return data.
+    if (parsed.parallel && Array.isArray(parsed.parallel) && parsed.parallel.length > 0) {
+      this.logDebug('Reactive response was a top-level parallel group, normalizing inner actions');
+      return { parallel: parsed.parallel.map(a => this._normalizeReactiveAction(a)) };
+    }
+
+    return this._normalizeReactiveAction(parsed);
+  }
+
+  /**
+   * Normalize a single item from a batch array.
+   * If it's a { parallel: [...] } group, normalize each inner action.
+   * Otherwise treat it as a regular action.
+   */
+  _normalizeBatchItem(item) {
+    if (item && Array.isArray(item.parallel)) {
+      return { parallel: item.parallel.map(a => this._normalizeReactiveAction(a)) };
+    }
+    return this._normalizeReactiveAction(item);
+  }
+
+  /**
+   * Normalize a single action object from a reactive response.
+   */
+  _normalizeReactiveAction(parsed) {
+    // Safety net: if actionType is not "direct"/"delegate", the LLM put the intent there
+    if (parsed.actionType && parsed.actionType !== 'direct' && parsed.actionType !== 'delegate') {
+      if (!parsed.intent) {
+        parsed.intent = parsed.actionType;
+      }
+      parsed.actionType = 'direct';
+    }
+
+    // Validate minimal structure — if no action fields, treat as raw return data
+    if (!parsed.intent && !parsed.actionType && !parsed.type) {
+      if (Object.keys(parsed).length > 0) {
+        this.logDebug('Reactive response was raw data, wrapping as return action');
+        return { actionType: 'direct', intent: 'return', data: parsed };
+      }
+      throw new Error(`Invalid reactive action: missing "intent" or "actionType". Got: ${JSON.stringify(parsed).substring(0, 200)}`);
+    }
+
+    return parsed;
+  }
+
+  // =========================================================================
+  // UNIFIED SYSTEM PROMPT - shared rules for all execution modes
+  // =========================================================================
+
+  /**
+   * Build the system prompt for all agents.
+   * Single unified prompt — only the available intents change per agent.
+   * @param {Agent} agent - The agent
+   * @returns {string} Complete system prompt
+   */
+  async _buildSystemPrompt(agent) {
+    const hasTeams = agent && agent.usesTeams && agent.usesTeams.length > 0;
+    const resourceSection = await this._buildSmartResourceSection(agent);
+    const intentNesting = hasTeams ? '\nIMPORTANT: Do NOT nest "intent" inside "data". The "intent" field must be at the top level.' : '';
+    const koiMd = agent.hasPermission('read_koi_md') ? this._loadKoiMd() : '';
+
+    return `
+# ENVIRONMENT
+Working directory: ${process.cwd()}
+All file paths (read_file, edit_file, write_file, shell) are relative to this directory unless absolute.
+
+# OUTPUT FORMAT INSTRUCTIONS:
+
+Convert user instructions into executable JSON actions using ONLY the actions and agents listed in AVAILABLE ACTIONS and AVAILABLE AGENTS.
+
+ABSOLUTE OUTPUT RULE:
+- Your entire response MUST be a single valid JSON object.
+- Output ONLY JSON. No markdown. No explanations. No extra text.
+- The response MUST start with { and end with }.
+- If you output anything else, the system will crash.
+
+ACTION FORMAT:
+- Single action:
+  { "actionType": "direct", "intent": "<actionName>", ... }
+
+- Delegate to agent:
+  { "actionType": "delegate", "intent": "agentKey::eventName", "data": { ... } }
+
+- Multiple actions — ALWAYS group independent actions in parallel:
+  { "batch": [ { action1 }, { "parallel": [ { action2 }, { action3 }, { action4 } ] }, { action5 } ] }
+  → action1 runs first, then action2+action3+action4 run CONCURRENTLY, then action5 once all finish.
+  RULE: if two or more actions do not depend on each other's output, they MUST go inside a "parallel" block.
+  NEVER put independent actions sequentially in a batch — always parallelize them.
+  EXCEPTION: prompt_user must NEVER be inside a parallel block — it waits for user input and must always be a standalone sequential action.
+
+REQUIREMENTS:
+- "actionType" and "intent" are ALWAYS required.
+- Do NOT nest "intent" inside "data".
+- Delegate intents MUST follow: agentKey::eventName.
+
+EXECUTION FLOW:
+- Return ONE JSON object per step: either a single action or a { "batch": [...] } with multiple steps.
+- After each response, you receive the results and decide the next step.
+- Continue step-by-step until the task is fully completed.
+- Only when EVERYTHING is done, return: { "actionType": "direct", "intent": "return", "data": { ... } }
+- CRITICAL: Static content (headers, banners, labels) that does NOT depend on any result MUST be included in the FIRST response — never deferred to a later step. Combine them in a batch with other first actions.
+- If you are a delegate agent and have a doubt you cannot resolve by reading the codebase, use: { "actionType": "direct", "intent": "ask_parent", "question": "..." }. The runtime will ask the invoking agent and re-call you with args.answer set to the response.
+- If args.answer is present, it is the parent agent's answer to your previous ask_parent — use it to continue.
+
+RULES:
+1. Never answer in natural language.
+2. Never explain reasoning.
+3. Never describe what you will do — execute it.
+4. If an action fails, choose a different valid action — EXCEPT for "command not found" / exit code 127, which must be handled by rule 11, not skipped.
+5. If the user denies permission (🚫), do not retry the same action.
+6. If instructions say to repeat N times, execute ALL N iterations.
+7. Do not duplicate content (e.g., do not print before prompt_user).
+8. PARALLELISM IS MANDATORY: within a batch, whenever 2 or more actions do not depend on each other's output, they MUST go inside a "parallel" block. It is WRONG to list independent actions sequentially in a batch — always parallelize them. EXCEPTION: prompt_user is always sequential and must never be in a parallel block.
+9. NEVER return before ALL steps are done. Delegating/reading/exploring is NOT completing a task — you must also execute every follow-up action (edits, writes, prints, etc.) that the task requires. Only emit { "intent": "return" } when every required change has been applied and verified.
+10. ONE QUESTION PER prompt_user: Never list multiple questions in a single prompt_user. If you need N pieces of information, use N sequential prompt_user actions, one question each. After the last answer, continue with the next step — do NOT add a "submit" or summary prompt.
+11. ⚠️ MISSING TOOLS (overrides rule 4): If any shell command returns "command not found" or exit code 127, the required tool is not installed. You MUST immediately stop the current task and use prompt_user (with options ["Yes", "No"]) to ask the user for permission to install it. Example: { "intent": "prompt_user", "prompt": "Flutter is not installed. Install it now? (brew install flutter) → ", "options": ["Yes", "No"] }. If Yes, install it first, then continue the original task. If No, tell the user what to install and stop. Never skip this step and continue with the task.
+12. QUESTIONS: When gathering information from the user, always use prompt_user with a "question" field. The question is displayed above the input area. Never use a preceding print to show a question. Example: { "intent": "prompt_user", "question": "What is the app's main purpose?" }
+14. BACKGROUND PROCESSES: Commands that launch apps, emulators, or dev servers (e.g. "flutter run", "open -a Simulator", "npm start", "python server.py") MUST use "background": true in the shell action. These processes run indefinitely — do not wait for them to finish.
+13. NEVER ask the user something you can verify yourself with a shell command or file read. Run the check first, then act on the result. Examples: do NOT ask "Is Flutter installed?" — run "which flutter" or "flutter --version". Do NOT ask "Does this file exist?" — read it. Only ask the user for things that are genuinely unknowable without their input (e.g. project name, desired behavior, credentials).
+
+All available capabilities are defined below. Use them exactly as specified.
+
+${resourceSection}${intentNesting}
+
+CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions. No markdown. Remember: static headers/labels go in the FIRST response; parallelize independent actions; never return until ALL steps are done.${koiMd}`;
+
+  }
+
+  /**
+   * Load KOI.md from the project root (cwd) if it exists.
+   * Similar to CLAUDE.md — project-specific instructions appended to the system prompt.
+   */
+  _loadKoiMd() {
+    const candidates = [
+      path.join(process.cwd(), 'KOI.md'),
+      path.join(process.cwd(), 'koi.md'),
+    ];
+    for (const filePath of candidates) {
+      if (fs.existsSync(filePath)) {
+        try {
+          const content = fs.readFileSync(filePath, 'utf8').trim();
+          if (content) {
+            return `\n\nPROJECT INSTRUCTIONS (from KOI.md):\n${content}`;
+          }
+        } catch { /* ignore read errors */ }
+      }
+    }
+    return '';
+  }
+
+  // =========================================================================
+  // SMART RESOURCE SECTION
+  // =========================================================================
+
+  /**
+   * Build a smart resource section for system prompts.
+   * THE RULE:
+   *   - If total intents across ALL resources <= 25: show everything (1-step)
+   *   - If total > 25: collapse resources with > 3 intents to summaries (2-step)
+   *
+   * @param {Agent} agent - The agent
+   * @returns {string} Resource documentation for system prompt
+   */
+  async _buildSmartResourceSection(agent) {
+    // 1. Collect ALL resources with their intents
+    const resources = [];
+
+    // Direct actions (from action registry)
+    const directActions = actionRegistry.getAll().filter(a => {
+      if (a.hidden) return false;
+      if (!a.permission) return true;
+      return agent.hasPermission(a.permission);
+    });
+    if (directActions.length > 0) {
+      resources.push({
+        type: 'direct',
+        name: 'Built-in Actions',
+        intents: directActions.map(a => ({
+          name: a.intent || a.type,
+          description: a.description,
+          schema: a.schema,
+          _actionDef: a
+        }))
+      });
+    }
+
+    // Team members (delegation targets)
+    const peerIntents = this._collectPeerIntents(agent);
+    for (const peer of peerIntents) {
+      resources.push({
+        type: 'delegate',
+        name: peer.agentName,
+        agentPureName: peer.agentPureName,
+        agentDescription: peer.agentDescription,
+        intents: peer.handlers.map(h => ({
+          name: h.name,
+          description: h.description,
+          params: h.params
+        }))
+      });
+    }
+
+    // MCP servers — only if agent has call_mcp permission
+    if (agent.hasPermission('call_mcp')) {
+      if (globalThis.mcpRegistry?.globalReady) {
+        await globalThis.mcpRegistry.globalReady;
+      }
+      const mcpSummaries = agent.getMCPToolsSummary?.() || [];
+      for (const mcp of mcpSummaries) {
+        resources.push({
+          type: 'mcp',
+          name: mcp.name,
+          intents: mcp.tools.map(t => ({
+            name: t.name,
+            description: t.description || t.name,
+            inputSchema: t.inputSchema
+          }))
+        });
+      }
+    }
+
+    // 2. Count total intents
+    const totalIntents = resources.reduce((sum, r) => sum + r.intents.length, 0);
+
+    if (process.env.KOI_DEBUG_LLM) {
+      console.error(`[SmartPrompt] Total intents: ${totalIntents} across ${resources.length} resources`);
+      for (const r of resources) {
+        console.error(`  [${r.type}] ${r.name}: ${r.intents.length} intents`);
+      }
+    }
+
+    // Always expand all resources (1-step)
+    return this._buildExpandedResourceSection(resources, agent);
+  }
+
+  /**
+   * Collect peer intents (handler names + descriptions) from accessible teams.
+   * @param {Agent} agent
+   * @returns {Array<{agentName, handlers: Array<{name, description}>}>}
+   */
+  _collectPeerIntents(agent) {
+    const result = [];
+    const processedAgents = new Set();
+
+    const collectFrom = (memberKey, member, teamName) => {
+      if (!member || member === agent || processedAgents.has(member.name)) return;
+      processedAgents.add(member.name);
+
+      if (!member.handlers || Object.keys(member.handlers).length === 0) return;
+
+      const handlers = [];
+      for (const [handlerName, handlerFn] of Object.entries(member.handlers)) {
+        let description = `Handle ${handlerName}`;
+        let params = [];
+
+        // Prefer LLM-generated description from build cache
+        if (handlerFn?.__description__) {
+          description = handlerFn.__description__;
+        } else if (handlerFn?.__playbook__) {
+          // Fallback: first line of playbook
+          const firstLine = handlerFn.__playbook__.split('\n')[0].trim();
+          description = firstLine.replace(/\$\{[^}]+\}/g, '...').substring(0, 80);
+        }
+
+        // Extract required params from ${args.X} patterns in playbook
+        if (handlerFn?.__playbook__) {
+          const paramMatches = handlerFn.__playbook__.matchAll(/\$\{args\.(\w+)/g);
+          params = [...new Set([...paramMatches].map(m => m[1]))];
+        }
+
+        handlers.push({ name: handlerName, description, params });
+      }
+
+      result.push({
+        agentName: teamName ? `${memberKey} (${teamName})` : memberKey,
+        agentPureName: memberKey,
+        agentDescription: member.description || null,
+        handlers
+      });
+    };
+
+    // Peers team
+    if (agent.peers?.members) {
+      for (const [name, member] of Object.entries(agent.peers.members)) {
+        collectFrom(name, member, agent.peers.name);
+      }
+    }
+
+    // Uses teams
+    for (const team of (agent.usesTeams || [])) {
+      if (team?.members) {
+        for (const [name, member] of Object.entries(team.members)) {
+          collectFrom(name, member, team.name);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Build expanded resource section - show all intents directly.
+   * This is the normal behavior when total intents <= 25.
+   */
+  _buildExpandedResourceSection(resources, agent) {
+    let doc = '';
+
+    // ── AVAILABLE ACTIONS ───────────────────────────────────────────────────
+    for (const resource of resources) {
+      if (resource.type === 'direct') {
+        doc += actionRegistry.generatePromptDocumentation(agent);
+      }
+    }
+
+    // ── AVAILABLE AGENTS ────────────────────────────────────────────────────
+    const delegateResources = resources.filter(r => r.type === 'delegate');
+    if (delegateResources.length > 0) {
+      doc += '## AVAILABLE AGENTS\n\n';
+      for (const resource of delegateResources) {
+        doc += `### ${resource.agentPureName}\n`;
+        if (resource.agentDescription) {
+          doc += `${resource.agentDescription}\n`;
+        }
+        for (const handler of resource.intents) {
+          doc += ` - ${handler.name}: ${handler.description}\n`;
+          if (handler.params?.length > 0) {
+            doc += `    In: { ${handler.params.map(p => `"${p}"`).join(', ')} }\n`;
+          }
+        }
+        doc += '\n';
+      }
+    }
+
+    // ── AVAILABLE MCP TOOLS ─────────────────────────────────────────────────
+    const mcpResources = resources.filter(r => r.type === 'mcp');
+    if (mcpResources.length > 0) {
+      doc += '## AVAILABLE MCP TOOLS\n\n';
+      for (const resource of mcpResources) {
+        doc += `### ${resource.name}\n`;
+        for (const tool of resource.intents) {
+          doc += ` - ${tool.name}: ${tool.description || tool.name}\n`;
+          if (tool.inputSchema?.properties) {
+            const keys = Object.keys(tool.inputSchema.properties);
+            if (keys.length > 0) doc += `    In: ${keys.map(k => `"${k}"`).join(', ')}\n`;
+          }
+        }
+        doc += '\n';
+      }
+    }
+
+    // ── INVOCATION SYNTAX ───────────────────────────────────────────────────
+    doc += '---\n';
+    doc += 'To execute an action:\n';
+    doc += '{ "actionType": "direct", "intent": "print", "message": "Hello" }\n\n';
+
+    if (delegateResources.length > 0) {
+      const ex = delegateResources[0];
+      const exEvent = ex.intents[0]?.name ?? 'handle';
+      doc += 'To call an agent:\n';
+      doc += `{ "actionType": "delegate", "intent": "${ex.agentPureName}::${exEvent}", "data": { ... } }\n\n`;
+      doc += 'The intent for a delegate action must use the format agentKey::eventName\n';
+    }
+
+    if (mcpResources.length > 0) {
+      const ex = mcpResources[0];
+      const exTool = ex.intents[0]?.name ?? 'tool_name';
+      doc += '\nTo call an MCP tool (ALWAYS use this format — NEVER use delegate for MCP tools):\n';
+      doc += `{ "actionType": "direct", "intent": "call_mcp", "mcp": "${ex.name}", "tool": "${exTool}", "input": { ... } }\n`;
+    }
+
+    return doc;
+  }
+
+  // =========================================================================
+  // COMPOSE PROMPT EXECUTION
+  // =========================================================================
+
+  /**
+   * Execute a compose block: call an LLM to dynamically assemble a prompt
+   * from named fragments, optionally calling runtime actions (e.g. task_list)
+   * to make the decision.
+   *
+   * @param {Object} composeDef - { fragments, template, model }
+   * @param {Agent} agent - The agent requesting composition
+   * @returns {string} The assembled prompt text
+   */
+  /**
+   * Infer the LLM provider from a model name.
+   * Used by executeCompose when a model is explicitly specified.
+   */
+  static _inferProviderFromModel(model) {
+    if (!model) return 'openai';
+    if (model.startsWith('gemini-')) return 'gemini';
+    if (model.startsWith('claude-')) return 'anthropic';
+    // gpt-*, o1*, o3*, o4*, codex → openai
+    return 'openai';
+  }
+
+  async executeCompose(composeDef, agent) {
+    const { fragments, template, model } = composeDef;
+
+    // Resolve fragment values (may be strings or functions from parameterized prompts)
+    const resolvedFragments = {};
+    for (const [name, value] of Object.entries(fragments)) {
+      resolvedFragments[name] = typeof value === 'function' ? value() : (value || '');
+    }
+
+    const callAction = async (intent, data = {}) => {
+      // Special compose-only actions
+      if (intent === 'frame_server_state') {
+        return await agent._getFrameServerState();
+      }
+      const actionDef = actionRegistry.get(intent);
+      if (!actionDef) return null;
+      return await actionDef.execute({ intent, ...data }, agent);
+    };
+
+    // ── Fast path: use cached execution plan (no LLM call) ──
+    // The plan is generated once by the LLM, then replayed on every subsequent call.
+    // This is critical because compose blocks inside playbooks are re-evaluated on
+    // every reactive loop iteration — calling an LLM each time would be prohibitive.
+    if (composeDef._cachedPlan) {
+      return await this._executeComposePlan(composeDef._cachedPlan, resolvedFragments, callAction);
+    }
+
+    // ── First call: use LLM to generate the execution plan ──
+    const provider = model
+      ? new LLMProvider({ provider: LLMProvider._inferProviderFromModel(model), model })
+      : this;
+
+    // Build available actions list for the compose LLM
+    // Include hidden actions too — compose resolvers need access to actions like
+    // action_history that are hidden from the main LLM but available to compose.
+    const directActions = actionRegistry.getAll().filter(a => {
+      if (!a.permission) return true;
+      return agent.hasPermission(a.permission);
+    });
+    const actionDocs = directActions
+      .map(a => `- ${a.intent || a.type}: ${a.description || ''}`)
+      .join('\n');
+
+    const fragmentNames = Object.keys(resolvedFragments).join(', ');
+
+    const systemPrompt = `You are a prompt composer. Generate an execution plan for assembling a prompt from fragments and runtime data.
+
+## AVAILABLE FRAGMENTS
+${fragmentNames}
+
+## AVAILABLE ACTIONS (callable at runtime to get dynamic data)
+${actionDocs}
+
+## COMPOSITION TEMPLATE
+${template}
+
+## OUTPUT FORMAT
+Return a JSON execution plan — an ordered array of steps. Each step is one of:
+- { "fragment": "name" } — include this fragment's text
+- { "call": "action_name", "data": {}, "field": "fieldName", "prefix": "optional text before the result" } — call an action at runtime, extract \`result[field]\` (usually "summary"), and include it as text. "prefix" is optional static text prepended before the action result.
+- { "text": "static text to include" } — include literal text
+- { "image_call": "frame_server_state", "textField": "elements", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "optional text" } — call an action that returns both text and an image. The text is included in the prompt, and the image is injected into the LLM call. Only works with 'frame_server_state'.
+
+Example:
+[
+  { "fragment": "planning" },
+  { "fragment": "template" },
+  { "call": "action_history", "data": { "count": 15 }, "field": "summary", "prefix": "## Action History\\n\\nReview the actions below. If you see the same action repeated 3+ times, you are stuck in a loop — change strategy immediately.\\n\\n" },
+  { "image_call": "frame_server_state", "textField": "elements", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "## Current Mobile Screen\\n\\n" }
+]
+
+Output ONLY the JSON array, no explanation.`;
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: 'Generate the execution plan now.' }
+    ];
+
+    try {
+      const plan = await provider._callJSONWithMessages(messages);
+
+      if (Array.isArray(plan) && plan.length > 0) {
+        // Cache the plan on the composeDef so subsequent calls skip the LLM
+        composeDef._cachedPlan = plan;
+
+        if (process.env.KOI_DEBUG_LLM) {
+          console.error(`[Compose] Generated plan (${plan.length} steps):`, JSON.stringify(plan));
+        }
+
+        return await this._executeComposePlan(plan, resolvedFragments, callAction);
+      }
+    } catch (error) {
+      if (process.env.KOI_DEBUG_LLM) {
+        console.error(`[Compose] Plan generation failed: ${error.message}`);
+      }
+    }
+
+    // Fallback: concatenate all fragments
+    if (process.env.KOI_DEBUG_LLM) {
+      console.error('[Compose] Falling back to concatenated fragments');
+    }
+    return Object.values(resolvedFragments).join('\n\n');
+  }
+
+  /**
+   * Execute a cached compose plan — no LLM call, just fragment concatenation
+   * and runtime action calls.
+   */
+  async _executeComposePlan(plan, resolvedFragments, callAction) {
+    const parts = [];
+    const images = [];
+
+    for (const step of plan) {
+      if (step.fragment && resolvedFragments[step.fragment] !== undefined) {
+        parts.push(resolvedFragments[step.fragment]);
+      } else if (step.image_call) {
+        // Multimodal step: call action, extract text + image
+        try {
+          const result = await callAction(step.image_call, step.data || {});
+          if (result) {
+            const textValue = step.textField ? result[step.textField] : null;
+            if (textValue) parts.push((step.prefix || '') + textValue);
+            const imageData = step.imageField ? result[step.imageField] : null;
+            const mimeType = step.mimeTypeField ? result[step.mimeTypeField] : 'image/jpeg';
+            if (imageData) images.push({ data: imageData, mimeType });
+          }
+        } catch (err) {
+          if (process.env.KOI_DEBUG_LLM) {
+            console.error(`[Compose] Image action ${step.image_call} failed: ${err.message}`);
+          }
+        }
+      } else if (step.call) {
+        try {
+          const result = await callAction(step.call, step.data || {});
+          const value = step.field ? result?.[step.field] : JSON.stringify(result);
+          if (value) {
+            parts.push((step.prefix || '') + value);
+          }
+        } catch (err) {
+          if (process.env.KOI_DEBUG_LLM) {
+            console.error(`[Compose] Action ${step.call} failed: ${err.message}`);
+          }
+        }
+      } else if (step.text) {
+        parts.push(step.text);
+      }
+    }
+
+    const text = parts.filter(Boolean).join('\n\n');
+    // Return multimodal format if images were collected, otherwise plain text
+    if (images.length > 0) {
+      return { text, images };
+    }
+    return text;
+  }
+
+  /**
+   * Call the LLM with a full messages array and return a parsed JSON object.
+   * Used by executeCompose for multi-turn composition.
+   *
+   * @param {Array} messages - Array of { role, content } message objects
+   * @returns {Object} Parsed JSON response
+   */
+  async _callJSONWithMessages(messages) {
+    try {
+      if (this.provider === 'openai' || this.provider === 'gemini') {
+        const completion = await this.openai.chat.completions.create({
+          model: this.model,
+          messages,
+          temperature: 0,
+          max_tokens: 4096,
+          response_format: { type: 'json_object' }
+        });
+        return JSON.parse(completion.choices[0].message.content?.trim() || '{}');
+      } else if (this.provider === 'anthropic') {
+        const [sys, ...rest] = messages;
+        const msg = await this.anthropic.messages.create({
+          model: this.model,
+          max_tokens: 4096,
+          temperature: 0,
+          system: sys.content,
+          messages: rest
+        });
+        return JSON.parse(msg.content[0].text.trim());
+      }
+    } catch (e) {
+      if (process.env.KOI_DEBUG_LLM) {
+        console.error('[Compose] _callJSONWithMessages error:', e.message);
+      }
+      return {};
+    }
+    return {};
+  }
+
+  /**
+   * Generate embeddings for semantic search
+   * Uses OpenAI's text-embedding-3-small for fast, cheap embeddings
+   */
+  async getEmbedding(text) {
+    // Validate input
+    if (!text || typeof text !== 'string' || text.trim() === '') {
+      throw new Error('getEmbedding requires non-empty text input');
+    }
+
+    if (this.provider === 'openai' || this.provider === 'anthropic' || this.provider === 'gemini' || this.provider === 'auto') {
+      // Always use OpenAI for embeddings (Anthropic/Gemini don't have compatible embeddings API)
+      if (!process.env.OPENAI_API_KEY) {
+        throw new Error('OPENAI_API_KEY required for embeddings');
+      }
+
+      // Use a dedicated OpenAI client for embeddings (Gemini's openai client points elsewhere)
+      if (!this._embeddingClient) {
+        this._embeddingClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      }
+
+      try {
+        const response = await this._embeddingClient.embeddings.create({
+          model: 'text-embedding-3-small',
+          input: text.trim()
+        });
+
+        return response.data[0].embedding;
+      } catch (error) {
+        console.error(`[LLM] Error generating embedding:`, error.message);
+        throw error;
+      }
+    }
+
+    throw new Error(`Embeddings not supported for provider: ${this.provider}`);
+  }
+}
