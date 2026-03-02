@@ -25,37 +25,11 @@ curl -fsSL https://raw.githubusercontent.com/koi-language/Koi/main/install.sh | 
 
 ### Key Concepts
 
-- **Playbook**: Natural language instructions that define agent behavior
 - **Agent**: Autonomous worker with a role, executes playbooks
-- **Role**: Abstract capabilities (can delegate, can execute, can critique)
+- **Playbook**: Natural language instructions that define agent behavior
+- **Role**: Abstract capabilities (can delegate, can execute, can read, ...)
 - **Team**: Agent composition that enables collaboration
-- **Skill**: Reusable capability with internal logic and agents
-- **Registry**: Shared data store for agent coordination and state persistence
-- **Automatic Routing**: Routes by role+capability, NEVER by agent name
-
-### 🆕 Automatic Intelligent Routing + Task Chaining
-
-Write agent behavior in **natural language** - the system handles everything else:
-
-- **Playbook-driven** - Write WHAT you want in plain language, not HOW to do it
-- **Automatic decomposition** - Complex tasks break into atomic actions automatically
-- **Task chaining** - Output of each action becomes input for the next
-- **Intelligent routing** - Each action finds the right agent via semantic matching
-- **Zero orchestration** - No manual wiring, no hardcoded workflows
-- **Self-organizing** - Agents discover and collaborate automatically
-
-See [doc/07-routing.md](doc/07-routing.md) and [doc/08-task-chaining.md](doc/08-task-chaining.md) for details.
-
-### Execution Flow
-
-1. **Playbook Execution**: Agent receives natural language instructions
-2. **Automatic Planning**: System decomposes complex tasks into atomic actions
-3. **Action Resolution**: For each action, cascading logic determines execution:
-   - Can I handle it myself? (check own handlers)
-   - Do I have a skill for this? (check local skills)
-   - Is it simple enough to execute directly? (direct execution)
-   - Can a team member handle it? (intelligent semantic routing)
-4. **Result Chaining**: Output from each action flows to the next automatically
+- **Skills**: Reusable capability with internal logic and agents
 
 ## Installation
 
