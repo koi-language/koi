@@ -52,6 +52,23 @@ const ANTHROPIC_ALIASES = {
 
 export class LLMProvider {
   constructor(config = {}) {
+    const envModelOverride = process.env.KOI_DEFAULT_MODEL;
+    const envProviderOverride = process.env.KOI_DEFAULT_PROVIDER;
+    if ((config.model === 'auto' || config.model == null) && envModelOverride && envModelOverride !== 'auto') {
+      const inferredProvider = LLMProvider._inferProviderFromModel(envModelOverride);
+      config = {
+        ...config,
+        model: envModelOverride,
+        provider: envProviderOverride || inferredProvider || config.provider,
+      };
+    } else if ((config.provider === 'auto' || config.provider == null) && envProviderOverride && envProviderOverride !== 'auto') {
+      // Provider override without model override: keep model as auto but lock the provider
+      config = {
+        ...config,
+        provider: envProviderOverride,
+      };
+    }
+
     const _providerIsAuto = config.provider === 'auto';
     const _modelIsAuto    = config.model === 'auto';
     this._autoMode = _providerIsAuto || _modelIsAuto;
