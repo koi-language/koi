@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import path from 'node:path';
 import { LLMProvider } from './llm-provider.js';
 import { cliLogger, withSlot, registerSlotMeta, unregisterSlotMeta, getCurrentSlotId, clearSlotById } from './cli-logger.js';
 import { actionRegistry } from './action-registry.js';
@@ -116,6 +117,8 @@ export class Agent {
   static _cliBootstrapped = false;
   static _indexingStarted = false;
   static _lastActiveAgent = null;
+  /** The root (System) agent — set once, used by slash commands like /memory. */
+  static _rootAgent = null;
 
   /** Set CLI hooks from the bootstrap layer. */
   static setCliHooks(hooks) {
@@ -291,17 +294,18 @@ export class Agent {
     // Fire-and-forget: start project indexing in background (once per process)
     if (process.env.KOI_CLI_MODE === '1' && !Agent._indexingStarted) {
       Agent._indexingStarted = true;
+      cliLogger.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);
       this._startBackgroundIndexing();
     }
 
     if (!_fromDelegation) {
-      cliLogger.progress(`[🤖 ${this.name}] ${eventName}...`);
+      cliLogger.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${eventName}...\x1b[0m`);
     }
 
     const handler = this.handlers[eventName];
     if (!handler) {
       cliLogger.clear();
-      cliLogger.error(`[🤖 ${this.name}] No handler for event: ${eventName}`);
+      cliLogger.error(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m No handler for event: ${eventName}`);
       throw new Error(`Agent ${this.name} has no handler for event: ${eventName}`);
     }
 
@@ -413,8 +417,7 @@ export class Agent {
       : (this.amnesia ? null : this.contextMemoryState);
     if (process.env.KOI_DEBUG_LLM) {
       const entryCount = memoryState?.entries?.length || 0;
-      const latentCount = memoryState?.latentPool?.length || 0;
-      console.error(`[Agent:${this.name}] 🧠 Memory check: amnesia=${this.amnesia}, entries=${entryCount}, latent=${latentCount}`);
+      console.error(`[Agent:${this.name}] 🧠 Memory check: amnesia=${this.amnesia}, entries=${entryCount}, latent=LanceDB`);
     }
 
     // If a compose-based playbookFn is provided, create a resolver that re-evaluates
@@ -455,6 +458,11 @@ export class Agent {
       );
     }
 
+    // Track the root (non-delegate) agent for slash commands like /memory
+    if (!isDelegate) {
+      Agent._rootAgent = this;
+    }
+
     const session = new PlaybookSession({
       playbook: interpolatedPlaybook,
       agentName: this.name
@@ -477,11 +485,17 @@ export class Agent {
     // implement) and must not forget file contents mid-task. The default TTL of 6
     // causes re-reading loops where the agent reads schema.ts 10+ times because
     // it compressed the content after 6 LLM calls.
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    const sessionId = process.env.KOI_SESSION_ID;
+    const latentDbPath = (projectRoot && sessionId)
+      ? path.join(projectRoot, '.koi', 'sessions', sessionId, 'latent-lancedb')
+      : null;
     const contextMemory = new ContextMemory({
       agentName: this.name,
       llmProvider: this.llmProvider,
       shortTermTTL: isDelegate ? 20 : 6,
       mediumTermTTL: isDelegate ? 60 : 20,
+      latentDbPath,
     });
     this._activeContextMemory = contextMemory;
     // Also store per-slot so parallel delegates don't race on this._activeContextMemory
@@ -505,11 +519,10 @@ export class Agent {
       // Restore context memory from previous session
       try {
         const savedState = sessionTracker.loadConversation(this.name);
-        if (savedState && (savedState.version === 1 || (Array.isArray(savedState) && savedState.length > 0))) {
+        if (savedState && (savedState.version >= 1 || (Array.isArray(savedState) && savedState.length > 0))) {
           contextMemory.restore(savedState);
           const entryCount = contextMemory.entries.length;
-          const latentCount = contextMemory.latentPool.length;
-          cliLogger.log('session', `Restored context memory for ${this.name} (${entryCount} entries, ${latentCount} latent)`);
+          cliLogger.log('session', `Restored context memory for ${this.name} (${entryCount} entries, latent in LanceDB)`);
         }
       } catch { /* non-fatal */ }
 
@@ -675,9 +688,15 @@ export class Agent {
         const canPivot = session.pivot();
         if (!canPivot) break;
         cliLogger.log('agent', `${this.name}: pivot #${session._pivotCount} after ${session.maxConsecutiveErrors} consecutive errors`);
+        // Remind the agent of its original task on pivot so it doesn't lose context
+        // after a long series of errors. Especially important for delegate agents.
+        const _pivotArgs = args && typeof args === 'object' ? args : {};
+        const _taskReminder = (_pivotArgs.description || _pivotArgs.subject || _pivotArgs.instruction || _pivotArgs.userRequest)
+          ? `\n\nYour original task (DO NOT forget it): ${_pivotArgs.subject || ''}${_pivotArgs.description ? ' — ' + _pivotArgs.description : ''}${_pivotArgs.instruction ? '\nInstruction: ' + _pivotArgs.instruction : ''}`.trim()
+          : '';
         contextMemory.add(
           'user',
-          `CRITICAL — PIVOT REQUIRED (attempt ${session._pivotCount}/3): You have been stuck in a failing loop. You MUST completely abandon your current approach and try something entirely different. Do NOT repeat any strategy that already failed. If you are truly blocked and cannot find another approach, use prompt_user to ask the user for guidance.`,
+          `CRITICAL — PIVOT REQUIRED (attempt ${session._pivotCount}/3): You have been stuck in a failing loop. You MUST completely abandon your current approach and try something entirely different. Do NOT repeat any strategy that already failed. If you are truly blocked and cannot find another approach, use ${isDelegate ? 'ask_parent' : 'prompt_user'} to ask for guidance.${_taskReminder}`,
           'Pivot: forced strategy change.',
           null
         );
@@ -717,39 +736,17 @@ export class Agent {
           cliLogger.setInfo('tokens', `↑${fmt(inputTk)}`);
         }
 
-        let sysTk = est(contextMemory.systemPrompt), longTk = 0, midTk = 0, shortTk = 0, latentTk = 0;
+        let sysTk = est(contextMemory.systemPrompt), longTk = 0, midTk = 0, shortTk = 0;
         for (const e of contextMemory.entries) {
           if (e.tier === 'long-term') longTk += est(e.permanent);
           else if (e.tier === 'medium-term') midTk += est(e.shortTerm);
           else if (e.tier === 'short-term') shortTk += est(e.immediate);
         }
-        for (const m of contextMemory.latentPool) latentTk += est(m.summary);
-        const totalCtx = sysTk + longTk + midTk + shortTk + latentTk;
+        const totalCtx = sysTk + longTk + midTk + shortTk;
         if (totalCtx > 0) {
-          cliLogger.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${fmt(latentTk)} latent`);
-        }
-      }
-
-      // Stall detector: if the agent has been only reading/searching for too many
-      // iterations without any write action, inject a forced intervention message.
-      if (isDelegate && session.iteration > 0) {
-        const _STALL_THRESHOLD = 15; // read-only iterations before intervention
-        const _WRITE_INTENTS = new Set(['edit_file', 'write_file', 'shell', 'return', 'ask_parent', 'prompt_user', 'print',
-          'mobile_tap', 'mobile_type', 'mobile_swipe', 'mobile_key']);
-        const _recent = session.actionHistory.slice(-_STALL_THRESHOLD);
-        if (_recent.length >= _STALL_THRESHOLD) {
-          const _hasWrite = _recent.some(e => _WRITE_INTENTS.has(e.action?.intent || e.action?.type || ''));
-          if (!_hasWrite) {
-            if (process.env.KOI_DEBUG_LLM) {
-              cliLogger.log('agent', `${this.name}: stall detected (${_STALL_THRESHOLD} read-only iterations) — injecting intervention`);
-            }
-            contextMemory.add(
-              'user',
-              `⚠️ INTERVENTION: You have performed ${_STALL_THRESHOLD}+ read/search actions without writing or modifying anything.\n\nYou already have all the information you need. STOP exploring. Implement the task NOW:\n- Call write_file or edit_file to create/modify the required files.\n- If you are genuinely blocked, call ask_parent with a specific question.\n- Do NOT read any more files. Do NOT search again. ACT.`,
-              `Stall intervention at iteration ${session.iteration}`,
-              null
-            );
-          }
+          const latentTk = (contextMemory._latentCount || 0) * 300;
+          const latentLabel = `${fmt(latentTk)} latent`;
+          cliLogger.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${latentLabel}`);
         }
       }
 
@@ -820,6 +817,10 @@ export class Agent {
       // Normalize actions: collect stray fields into "data" when missing
       for (const act of actionBatch) {
         this._normalizeActionData(act);
+        // Also normalize delegate actions inside parallel blocks
+        if (act.parallel && Array.isArray(act.parallel)) {
+          for (const pa of act.parallel) this._normalizeActionData(pa);
+        }
       }
 
       // ── SAFETY: split observe+tap(element) batches ──────────────────────
@@ -872,10 +873,19 @@ export class Agent {
           // the same directory — pre-granting here ensures they only ask once.
           await this._preflightParallelPermissions(group);
 
+          // Per-delegate timeout: if a delegate hangs (no LLM response, stuck permission, etc.)
+          // it should not block the entire parallel group forever.
+          const PARALLEL_DELEGATE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
           const parallelResults = await Promise.all(group.map(async (pa) => {
             const paIntent = pa.intent || pa.type || 'unknown';
+            cliLogger.log('action', `${this.name}: Starting parallel delegate: ${paIntent}`);
             try {
-              const { result } = await this._executeAction(pa, pa, session.actionContext);
+              const delegatePromise = this._executeAction(pa, pa, session.actionContext);
+              const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`Parallel delegate "${paIntent}" timed out after ${PARALLEL_DELEGATE_TIMEOUT_MS / 1000}s`)), PARALLEL_DELEGATE_TIMEOUT_MS)
+              );
+              const { result } = await Promise.race([delegatePromise, timeoutPromise]);
               if (pa.id) {
                 session.actionContext[pa.id] = { output: result };
               }
@@ -907,7 +917,11 @@ export class Agent {
             if (classified.imageBlocks?.length > 0) {
               parallelImageBlocks.push(...classified.imageBlocks);
             }
-            return classified.immediate;
+            // Prefix with [task:X] when available so the System LLM can identify
+            // which task each result belongs to (especially important for failures).
+            const taskId = r.action.data?.taskId;
+            const prefix = taskId ? `[task:${taskId}] ` : '';
+            return prefix + classified.immediate;
           }).join('\n');
 
           // Inject a synthetic "parallel group done" record so executePlaybookReactive
@@ -1019,6 +1033,8 @@ export class Agent {
                 null
               );
               thinkingHint = 'Thinking';
+              // Show spinner immediately so there's no gap before next callReactive
+              cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint}\x1b[0m`);
               // Continue the loop — LLM will be called again and should prompt_user
               continue;
             }
@@ -1030,6 +1046,52 @@ export class Agent {
           session.terminate(returnData);
           terminated = true;
           break;
+        }
+
+        // ── AUTO-RECOVERY: intercept prompt_user when tasks are still pending ──
+        // The LLM sometimes forgets to execute all tasks before prompting the user.
+        // Cap at 3 attempts to avoid blocking legitimate prompt_user calls
+        // (e.g. when the LLM needs to ask the user about a failed task).
+        // Note: only intercept for PENDING tasks — in_progress tasks may be
+        // legitimately waiting for the user (delegate returned { success: false }).
+        if (intent === 'prompt_user' && process.env.KOI_CLI_MODE === '1' && !isDelegate) {
+          if (!session._promptUserRecoveryAttempts) session._promptUserRecoveryAttempts = 0;
+          if (session._promptUserRecoveryAttempts < 3) {
+            try {
+              const { taskManager: _tm2 } = await import('./task-manager.js');
+              const _pendingOnly = _tm2.list().filter(t => t.status === 'pending');
+              if (_pendingOnly.length > 0) {
+                session._promptUserRecoveryAttempts++;
+                const _pendingList = _pendingOnly.map(t => `  [${t.id}] ${t.subject}`).join('\n');
+                cliLogger.log('agent', `${this.name}: Auto-recovery: prompt_user intercepted — ${_pendingOnly.length} task(s) still pending (attempt ${session._promptUserRecoveryAttempts}/3)`);
+                session.recordAction(action, { answer: '__tasks_pending__' });
+                contextMemory.add(
+                  'user',
+                  `AUTO-RECOVERY: You called prompt_user but the following tasks are still PENDING (not yet delegated or executed):\n${_pendingList}\n\nDo NOT call prompt_user. Call task_list immediately and continue delegating and executing all remaining tasks. Mark completed tasks as "completed". Never leave tasks pending.`,
+                  `Unfinished pending tasks (${_pendingOnly.length})`,
+                  null
+                );
+                thinkingHint = 'Resuming plan';
+                continue;
+              } else {
+                session._promptUserRecoveryAttempts = 0;
+              }
+            } catch { /* non-fatal */ }
+          }
+        }
+        // ────────────────────────────────────────────────────────────────────
+
+        // Delegates must NEVER prompt the user directly — convert to ask_parent.
+        // Only the root (System) agent should talk to the user.
+        if ((intent === 'prompt_user' || intent === 'prompt_form') && isDelegate && _parentAnswerFn) {
+          const question = action.question || action.prompt || action.title || 'Need clarification';
+          cliLogger.log('agent', `${this.name}: Redirecting ${intent} → ask_parent: "${question.substring(0, 80)}"`);
+          const _answer = await _parentAnswerFn(question);
+          const _answerMsg = `✅ ask_parent answered: "${_answer}"\n\nContinue your task using this answer.`;
+          session.recordAction(action, { answer: _answer });
+          contextMemory.add('user', _answerMsg, `Parent answered: "${_answer}"`, null);
+          thinkingHint = 'Reviewing answer';
+          continue;
         }
 
         // Release busy state before giving control to the user.
@@ -1066,6 +1128,8 @@ export class Agent {
           // Re-enter busy state after prompt_user resolves
           if (intent === 'prompt_user') {
             Agent._cliHooks?.onBusy?.(true);
+            // Immediately show thinking spinner so the user sees the agent is working
+            cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             // Track user message for compose template {{userMessage}} variable
             this._lastUserMessage = result?.answer || null;
 
@@ -1156,18 +1220,20 @@ export class Agent {
           // Update thinking hint based on what just happened
           if (result && result.success === false) {
             thinkingHint = 'Retrying';
-            // Mobile actions: stop batch on failure — screen state diverged,
-            // subsequent actions would operate on wrong state.
+            // Stop batch on failure for stateful actions — screen/page state
+            // diverged, so subsequent actions would operate on wrong state.
             const intent = action?.intent || '';
-            if (intent.startsWith('mobile_')) {
+            if (intent.startsWith('mobile_') || intent.startsWith('browser_')) {
               if (process.env.KOI_DEBUG_LLM) {
-                console.error(`[Agent:${this.name}] ⛔ Mobile action "${intent}" failed — stopping batch.`);
+                console.error(`[Agent:${this.name}] ⛔ Action "${intent}" failed — stopping batch.`);
               }
               break;
             }
           } else {
             thinkingHint = this._describeNextStep(action, result) || 'Thinking';
           }
+          // Immediately update spinner so there's no gap between action end and next LLM call
+          cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint}\x1b[0m`);
         } catch (error) {
           cliLogger.clear();
           const failedIntent = action?.intent || action?.type || 'unknown';
@@ -1518,7 +1584,9 @@ export class Agent {
 
     try {
       cliLogger.progress('\x1b[2mplease wait...\x1b[0m');
-      const result = await command.execute(this, args);
+      // Slash commands always run against the root (System) agent, not the delegate
+      const targetAgent = Agent._rootAgent || this;
+      const result = await command.execute(targetAgent, args);
       cliLogger.clearProgress();
       // Add executed slash command to input history (navigable with up/down arrows)
       const { addToHistory } = await import('./cli-input.js');
@@ -1551,21 +1619,22 @@ export class Agent {
     }
 
     // Update context slot with memory breakdown
-    let sysTk = est(contextMemory.systemPrompt), longTk = 0, midTk = 0, shortTk = 0, latentTk = 0;
+    let sysTk = est(contextMemory.systemPrompt), longTk = 0, midTk = 0, shortTk = 0;
     for (const e of contextMemory.entries) {
       if (e.tier === 'long-term') longTk += est(e.permanent);
       else if (e.tier === 'medium-term') midTk += est(e.shortTerm);
       else if (e.tier === 'short-term') shortTk += est(e.immediate);
     }
-    for (const m of contextMemory.latentPool) latentTk += est(m.summary);
-    const totalCtx = sysTk + longTk + midTk + shortTk + latentTk;
+    const totalCtx = sysTk + longTk + midTk + shortTk;
     if (totalCtx > 0) {
-      cliLogger.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${fmt(latentTk)} latent`);
+      const latentTk = (contextMemory._latentCount || 0) * 300;
+      const latentLabel = `${fmt(latentTk)} latent`;
+      cliLogger.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${latentLabel}`);
     }
 
     if (reset) {
       const accum = session.tokenAccum;
-      if (accum) session.tokenAccum = { input: 0, output: 0, calls: 0 };
+      if (accum) session.tokenAccum = { input: 0, output: 0, thinking: 0, calls: 0 };
     }
   }
 
@@ -1748,18 +1817,62 @@ export class Agent {
       // Auto-mark the associated task as in_progress before delegating,
       // and completed/failed after — so the UI always reflects the real state
       // regardless of whether the LLM remembered to call task_update.
-      const _taskId = action.data?.taskId ?? resolvedAction.data?.taskId;
+      let _taskId = action.data?.taskId ?? resolvedAction.data?.taskId;
+      // Fallback: if taskId was omitted, find the task by matching subject.
+      // This covers cases where the LLM forgot to include taskId in the delegate data.
+      if (!_taskId) {
+        const _subject = action.data?.subject ?? resolvedAction.data?.subject;
+        if (_subject) {
+          try {
+            const { taskManager: _tmFb } = await import('./task-manager.js');
+            const _norm = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+            const _ns = _norm(_subject);
+            const _match = _tmFb.list().find(t =>
+              (t.status === 'pending' || t.status === 'in_progress') &&
+              (_norm(t.subject) === _ns || _ns.includes(_norm(t.subject)) || _norm(t.subject).includes(_ns))
+            );
+            if (_match) _taskId = _match.id;
+          } catch { /* non-fatal */ }
+        }
+      }
+      // Derive owner from the delegate intent ("ApiDeveloper::handle" → "ApiDeveloper").
+      // This is set on the task before the sub-agent starts so my_task() always finds it.
+      const _intentAgentKey = (action.intent || '').split('::')[0];
+      const _intentAgentName = _intentAgentKey
+        ? _intentAgentKey.charAt(0).toUpperCase() + _intentAgentKey.slice(1)
+        : null;
       if (_taskId) {
         try {
           const { taskManager } = await import('./task-manager.js');
           const _task = taskManager.get(String(_taskId));
           if (_task && _task.status === 'pending') {
-            taskManager.update(String(_taskId), { status: 'in_progress' });
+            taskManager.update(String(_taskId), {
+              status: 'in_progress',
+              ...(_intentAgentName && { owner: _intentAgentName }),
+            });
+          } else if (_task && _intentAgentName && !_task.owner) {
+            // Already in_progress but owner was never set — fix it now
+            taskManager.update(String(_taskId), { owner: _intentAgentName });
           }
         } catch { /* non-fatal */ }
       }
 
-      result = await this.resolveAction(resolvedAction, context);
+      try {
+        result = await this.resolveAction(resolvedAction, context);
+      } catch (err) {
+        // Delegate threw — revert task to pending so System can see it and retry/ask user.
+        // (Distinguish from a deliberate { success: false } return, which stays in_progress.)
+        if (_taskId) {
+          try {
+            const { taskManager: _tm } = await import('./task-manager.js');
+            const _t = _tm.get(String(_taskId));
+            if (_t && _t.status === 'in_progress') {
+              _tm.update(String(_taskId), { status: 'pending' });
+            }
+          } catch { /* non-fatal */ }
+        }
+        throw err;
+      }
 
       if (_taskId) {
         try {
@@ -1806,12 +1919,42 @@ export class Agent {
               } else {
                 if (!this._pendingProgressUpdates) this._pendingProgressUpdates = [];
                 this._pendingProgressUpdates.push({ action, update });
+
+                // Fire-and-forget LLM classification of shell output.
+                // If the process hit a fatal error, kill it via iter.return() which
+                // triggers the generator's finally block (process cleanup).
+                // We set _shellKilledByClassifier so we can provide a synthetic error result.
+                const outputSoFar = update.output_so_far || '';
+                const cmd = update.command || resolvedAction.command || '';
+                if (outputSoFar.length > 50 && intent === 'shell' && !this._shellClassifyInFlight) {
+                  this._shellClassifyInFlight = true;
+                  this._classifyShellOutput(outputSoFar, cmd).then(verdict => {
+                    this._shellClassifyInFlight = false;
+                    if (verdict === 'kill') {
+                      cliLogger.log('shell', `[${this.name}] LLM classified output as fatal error — killing process`);
+                      this._shellKilledByClassifier = outputSoFar;
+                      iter.return(); // triggers generator finally → proc.kill()
+                    }
+                    // 'ask' verdict is handled naturally by the _inputNeeded path
+                    // when the process goes silent after asking for input
+                  }).catch(() => { this._shellClassifyInFlight = false; });
+                }
+
                 item = await iter.next();
               }
             } else {
               result = update;
               item = await iter.next();
             }
+          }
+          // If the classifier killed the process, provide a synthetic error result
+          // so the agent knows the command failed and can see the output.
+          if (!result && this._shellKilledByClassifier) {
+            const killedOutput = this._shellKilledByClassifier;
+            this._shellKilledByClassifier = null;
+            const truncOut = killedOutput.length > 3000 ? killedOutput.slice(-3000) : killedOutput;
+            result = { success: false, exitCode: 1, stdout: '', stderr: truncOut,
+              error: 'Process killed — LLM analysis detected a fatal error in the output. Review stderr and fix the issue.' };
           }
         } else {
           result = await maybeGen;
@@ -1831,6 +1974,46 @@ export class Agent {
     }
 
     return { result, shouldExitLoop };
+  }
+
+  /**
+   * Classify streaming shell output using a fast/cheap LLM call.
+   * @returns {'wait'|'kill'|{ask: string}} — wait (keep going), kill (fatal error), or ask (needs user input)
+   */
+  async _classifyShellOutput(output, command) {
+    if (!this.llmProvider) return 'wait';
+    const _ANSI_STRIP = /\x1b\[[0-9;]*[mABCDEFGHJKLMPSTfhinsu]/g;
+    const clean = output.replace(_ANSI_STRIP, '').trim();
+    const lastLines = clean.split('\n').slice(-40).join('\n');
+    if (!lastLines) return 'wait';
+
+    try {
+      const system = 'Classify shell output. Return ONLY valid JSON, no markdown.';
+      const user = `A shell command is running and has produced output. Classify the situation.
+
+Command: ${command}
+Last output:
+\`\`\`
+${lastLines.slice(-1500)}
+\`\`\`
+
+Respond with ONE of:
+- {"action":"wait"} — process is running normally (compiling, downloading, starting up, showing logs, warnings). Keep waiting.
+- {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash). It should be killed so the agent can fix the problem.
+- {"action":"ask","question":"what to ask the user"} — process is interactively asking for input (a question, a prompt, a confirmation). The question field should contain what the process is asking.
+
+IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warnings, deprecation notices, and info messages are NOT fatal — return "wait".`;
+
+      const raw = await this.llmProvider.callSummary(system, user);
+      const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim());
+
+      if (parsed?.action === 'kill') return 'kill';
+      if (parsed?.action === 'ask') return { ask: parsed.question || 'Please provide input' };
+      return 'wait';
+    } catch (err) {
+      cliLogger.log('shell', `_classifyShellOutput failed: ${err.message}`);
+      return 'wait';
+    }
   }
 
   /**
@@ -1902,9 +2085,14 @@ export class Agent {
         return String(parsed.autoAnswer);
       }
 
-      // Need user input — call prompt_user action directly so it uses the same
-      // inline question UI as any other agent-initiated prompt.
+      // Need user input — use cliInput directly for secret support (asterisks)
       const label = parsed.label || 'Please enter a value';
+      if (parsed.isSecret) {
+        const { cliInput: _cliInput } = await import('./cli-input.js');
+        const answer = await _cliInput(label, { secret: true });
+        return answer ?? null;
+      }
+      // Non-secret: use prompt_user action for full UI integration
       const promptUserDef = actionRegistry.get('prompt_user');
       if (promptUserDef) {
         const res = await promptUserDef.execute(
@@ -2012,7 +2200,7 @@ export class Agent {
       const action = actions[i];
       const intent = action.intent || action.type || action.description;
 
-      cliLogger.progress(`[${this.name}] Thinking...`);
+      cliLogger.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185mThinking...\x1b[0m`);
 
       const { result, shouldExitLoop } = await this._executeAction(action, action, context);
       finalResult = result;
@@ -2094,7 +2282,11 @@ export class Agent {
 
           // Unique slot ID so each parallel delegation shows its own spinner row.
           const _delegateSlot = `${teamMember.agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-          const _parentSlotId = getCurrentSlotId();
+          // getCurrentSlotId() returns undefined when the parent runs outside any
+          // withSlot context (e.g. the top-level System agent). The main spinner
+          // slot uses null as its key, so map undefined → null so clearSlotById
+          // actually clears it and the parent spinner doesn't show alongside the delegate.
+          const _parentSlotId = getCurrentSlotId() ?? null;
           registerSlotMeta(_delegateSlot, {
             agentName: teamMember.agent.name,
             subject: currentData?.subject || null,
@@ -2109,9 +2301,12 @@ export class Agent {
           // Hide the parent's spinner — it's waiting for the delegate to finish.
           // The parent will re-show naturally when it resumes after this await.
           clearSlotById(_parentSlotId);
-          result = await withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
-
-          unregisterSlotMeta(_delegateSlot);
+          try {
+            result = await withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
+          } finally {
+            clearSlotById(_delegateSlot);
+            unregisterSlotMeta(_delegateSlot);
+          }
           return result;
         }
       } else if (intent && typeof intent === 'string' && intent.trim() !== '') {
@@ -2126,17 +2321,21 @@ export class Agent {
           const best = matches[0];
           const actionTitle = action.title || intent;
           const _routerSlot = `${best.agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-          const _routerParentSlotId = getCurrentSlotId();
+          const _routerParentSlotId = getCurrentSlotId() ?? null;
           const _routerData = action.data || action.input || {};
           registerSlotMeta(_routerSlot, {
             agentName: best.agent.name,
             subject: _routerData?.subject || null,
           });
           clearSlotById(_routerParentSlotId);
-          const result = await withSlot(_routerSlot, () => best.agent.handle(best.event, _routerData, true));
-          unregisterSlotMeta(_routerSlot);
-
-          return result;
+          let routerResult;
+          try {
+            routerResult = await withSlot(_routerSlot, () => best.agent.handle(best.event, _routerData, true));
+          } finally {
+            clearSlotById(_routerSlot);
+            unregisterSlotMeta(_routerSlot);
+          }
+          return routerResult;
         }
       }
 
@@ -2321,7 +2520,9 @@ export class Agent {
           const handlerFn = agent.handlers[handler];
           let description = '';
 
-          if (handlerFn && handlerFn.__playbook__) {
+          if (handlerFn && handlerFn.__description__) {
+            description = handlerFn.__description__;
+          } else if (handlerFn && handlerFn.__playbook__) {
             const playbook = handlerFn.__playbook__;
             const firstLine = playbook.split('\n')[0].trim();
             description = firstLine.replace(/\$\{[^}]+\}/g, '...').substring(0, 60);
@@ -2554,18 +2755,64 @@ Execute this task and return the result as JSON.
       this.llmProvider = new LLMProvider(this.llm);
     }
 
+    // Gather all available context so System can answer intelligently
     const contextStr = delegateData ? JSON.stringify(delegateData, null, 2) : '(none)';
-    const prompt = `A delegate agent you invoked has a question and cannot continue without your answer.
+
+    // Include shared session knowledge (facts discovered by any agent)
+    let knowledgeStr = '';
+    try {
+      const { sessionKnowledge: _sk } = await import('./session-knowledge.js');
+      const formatted = _sk.format();
+      if (formatted) knowledgeStr = `\n\nShared session knowledge (facts discovered so far):\n${formatted}`;
+    } catch { /* non-fatal */ }
+
+    // Include System's own memory context (long-term + medium-term entries)
+    let memoryStr = '';
+    try {
+      const ctxMem = this._activeContextMemory;
+      if (ctxMem?.entries) {
+        const relevant = ctxMem.entries
+          .filter(e => e.tier === 'long-term' || e.tier === 'medium-term')
+          .map(e => e.permanent || e.shortTerm)
+          .filter(Boolean)
+          .slice(-20); // Last 20 entries max
+        if (relevant.length > 0) memoryStr = `\n\nYour conversation memory (recent):\n${relevant.join('\n')}`;
+      }
+    } catch { /* non-fatal */ }
+
+    // Include project root for orientation
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+
+    const prompt = `A delegate agent (${delegateName}) you invoked has a question and cannot continue without your answer.
 
 Question: "${question}"
 
 Task context that was given to the delegate:
 ${contextStr}
 
-Answer this question as the coordinating agent. Be specific and concise.
-Return JSON: { "answer": "your answer here" }`;
+Project root: ${projectRoot}
+${knowledgeStr}${memoryStr}
+
+INSTRUCTIONS:
+1. First check if the answer is in your session knowledge or conversation memory above.
+2. If you know the answer, respond: { "answer": "your answer here" }
+3. If you DON'T know but the answer could be found by exploring the filesystem (e.g. checking sibling directories, reading config files), respond: { "answer": "Try looking at [specific suggestion based on project structure]" }
+4. ONLY if the answer requires information that truly only the user knows (credentials, business decisions, external service details), respond: { "askUser": true, "question": "clear, specific question for the user" }
+
+Be specific and concise. Never ask the user for things you or the delegate can discover by exploring.`;
 
     const response = await this.llmProvider.callJSON(prompt, this);
+
+    // If the parent says "ask the user", prompt directly
+    if (response?.askUser === true) {
+      const userQuestion = response.question || question;
+      cliLogger.print(`💬 ${this.name} → user: \x1b[2m${userQuestion}\x1b[0m`);
+      const { cliInput } = await import('./cli-input.js');
+      const userAnswer = await cliInput(userQuestion);
+      cliLogger.print(`💬 User: \x1b[2m${userAnswer}\x1b[0m`);
+      return userAnswer;
+    }
+
     const rawAnswer = response?.answer ?? response;
     const answer = (rawAnswer !== null && typeof rawAnswer === 'object')
       ? JSON.stringify(rawAnswer)

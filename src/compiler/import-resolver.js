@@ -214,11 +214,13 @@ export class ImportResolver {
       } catch (error) {
         // Preserve location info from PEG.js parse errors so the top-level
         // handler can print file + line/column instead of a generic message.
+        // Use the innermost sourceFile/location so nested import errors always
+        // point to the file where the actual syntax error is, not the importer.
         const loc = error.location;
         const locStr = loc ? ` (Line ${loc.start.line}, Column ${loc.start.column})` : '';
         const err = new Error(`Failed to import from "${resolvedPath}"${locStr}: ${error.message}`);
         if (loc) err.location = loc;
-        err.sourceFile = resolvedPath;
+        err.sourceFile = error.sourceFile || resolvedPath;
         throw err;
       }
     }

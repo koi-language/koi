@@ -35,6 +35,12 @@ export default {
   async execute(action, agent) {
     const message = action.message || action.text || action.data || '';
 
+    if (action._alreadyStreamed) {
+      // Clear the streaming area first, then commit the formatted version.
+      // This swaps the raw streamed text for the markdown-formatted version
+      // in one visual step, avoiding the "shown twice" effect.
+      cliLogger.printStreamingEnd();
+    }
     cliLogger.print(`\x1b[0m${renderMarkdown(message)}`);
 
     return { printed: true, message };

@@ -2,19 +2,19 @@
   "_comment": "Model pricing and capability database. Edit this file to add/update models. Prices in USD per 1M tokens. contextK in thousands (0 = unknown). Capability scores (code/planning/reasoning/speed) use 1-10 scale — models without scores are excluded from auto selection.",
 
   "openai": {
-    "gpt-5.2":               { "inputPer1M": 1.75, "outputPer1M": 14.00, "contextK": 400, "outputType": "text", "inputImage": true, "speed": 6,  "code": 6,  "planning": 8,  "reasoning": 9 },
-    "gpt-5.1":               { "inputPer1M": 1.25, "outputPer1M": 10.00, "contextK": 400, "outputType": "text", "inputImage": true, "speed": 7,  "code": 5,  "planning": 7,  "reasoning": 7 },
+    "gpt-5.2":               { "inputPer1M": 1.75, "outputPer1M": 14.00, "contextK": 400, "outputType": "text", "inputImage": true, "speed": 6,  "code": 6,  "planning": 8,  "reasoning": 9,  "thinking": true },
+    "gpt-5.1":               { "inputPer1M": 1.25, "outputPer1M": 10.00, "contextK": 400, "outputType": "text", "inputImage": true, "speed": 7,  "code": 5,  "planning": 7,  "reasoning": 7,  "thinking": true },
     "gpt-5":                 { "inputPer1M": 1.25, "outputPer1M": 10.00, "contextK": 400, "outputType": "text", "inputImage": true },
     "gpt-5-mini":            { "inputPer1M": 0.25, "outputPer1M": 2.00,  "contextK": 400, "outputType": "text", "inputImage": true },
     "gpt-5-nano":            { "inputPer1M": 0.05, "outputPer1M": 0.40,  "contextK": 400,  "noTemperature": true, "outputType": "text", "inputImage": true },
     "gpt-5.2-chat-latest":   { "inputPer1M": 1.75, "outputPer1M": 14.00, "contextK": 128,  "noTemperature": true, "outputType": "text", "inputImage": true },
     "gpt-5.1-chat-latest":   { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 128, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
     "gpt-5-chat-latest":     { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 128, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
-    "gpt-5.2-codex":         { "inputPer1M": 1.75,  "outputPer1M": 14.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "speed": 6,  "code": 7,  "planning": 8,  "reasoning": 8 },
-    "gpt-5.1-codex-max":     { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses" },
-    "gpt-5.1-codex":         { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses" },
-    "gpt-5-codex":           { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses" },
-    "gpt-5.2-pro":           { "inputPer1M":21.00,  "outputPer1M":168.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "speed": 4, "code": 10,  "planning": 10,  "reasoning": 10 },
+    "gpt-5.2-codex":         { "inputPer1M": 1.75,  "outputPer1M": 14.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "speed": 6,  "code": 7,  "planning": 7,  "reasoning": 8,  "thinking": true },
+    "gpt-5.1-codex-max":     { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
+    "gpt-5.1-codex":         { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
+    "gpt-5-codex":           { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
+    "gpt-5.2-pro":           { "inputPer1M":21.00,  "outputPer1M":168.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "speed": 4, "code": 9,  "planning": 8,  "reasoning": 9,  "thinking": true },
     "gpt-5-pro":             { "inputPer1M":15.00,  "outputPer1M":120.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
     "gpt-5.1-codex-mini":    { "inputPer1M": 0.25,  "outputPer1M":  2.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
     "codex-mini-latest":     { "inputPer1M": 1.50,  "outputPer1M":  6.00,  "contextK": 200, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": false },
@@ -48,8 +48,8 @@
   },
 
   "anthropic": {
-    "claude-opus-4-6":            { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 5,  "code": 8,  "planning": 9,  "reasoning": 9  },
-    "claude-sonnet-4-6":          { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 7,  "code": 7,  "planning": 7,  "reasoning": 7  },
+    "claude-opus-4-6":            { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 5,  "code": 8,  "planning": 9,  "reasoning": 9,  "thinking": true },
+    "claude-sonnet-4-6":          { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 7,  "code": 7,  "planning": 7,  "reasoning": 7,  "thinking": true },
     "claude-haiku-4-5-20251001":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "outputType": "text", "inputImage": true },
     "claude-3-5-sonnet-20241022": { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "outputType": "text", "inputImage": true },
     "claude-3-5-haiku-20241022":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "outputType": "text", "inputImage": true },
@@ -58,13 +58,13 @@
 
   "gemini": {
     "gemini-2.0-flash":       { "inputPer1M": 0.10,  "outputPer1M":  0.40, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9, "code": 4,  "planning": 5,  "reasoning": 5  },
-    "gemini-2.0-flash-lite":  { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 3,  "planning": 3,  "reasoning": 3  },
-    "gemini-2.5-flash":       { "inputPer1M": 0.15,  "outputPer1M":  0.60, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9,  "code": 5,  "planning": 6,  "reasoning": 6  },
-    "gemini-2.5-pro":         { "inputPer1M": 1.25,  "outputPer1M": 10.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 6,  "code": 6,  "planning": 8,  "reasoning": 8  },
-    "gemini-1.5-pro":         { "inputPer1M": 1.25,  "outputPer1M":  5.00, "contextK": 2000, "outputType": "text",  "inputImage": true,  "speed": 6,  "code": 6,  "planning": 6,  "reasoning": 7  },
-    "gemini-1.5-flash":       { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9,  "code": 4,  "planning": 4,  "reasoning": 4  },
-    "gemini-3-pro":           { "inputPer1M": 2.00,  "outputPer1M": 12.00, "contextK": 1000, "outputType": "text",  "inputImage": true  },
-    "gemini-3-flash-preview": { "inputPer1M": 0.50,  "outputPer1M":  3.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 6,  "planning": 7,  "reasoning": 7   },
+    "gemini-2.0-flash-lite":  { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 1,  "planning": 3,  "reasoning": 3  },
+    "gemini-2.5-flash":       { "inputPer1M": 0.15,  "outputPer1M":  0.60, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9,  "code": 4,  "planning": 5,  "reasoning": 5,  "thinking": true },
+    "gemini-2.5-pro":         { "inputPer1M": 1.25,  "outputPer1M": 10.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 6,  "code": 5,  "planning": 5,  "reasoning": 6,  "thinking": true },
+    "gemini-1.5-pro":         { "inputPer1M": 1.25,  "outputPer1M":  5.00, "contextK": 2000, "outputType": "text",  "inputImage": true },
+    "gemini-1.5-flash":       { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true },
+    "gemini-3-pro":           { "inputPer1M": 2.00,  "outputPer1M": 12.00, "contextK": 1000, "outputType": "text",  "inputImage": true },
+    "gemini-3-flash-preview": { "inputPer1M": 0.50,  "outputPer1M":  3.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 5,  "planning": 6,  "reasoning": 6,  "thinking": true },
     "gemini-2.5-flash-image": { "inputPer1M": 0.20,  "outputPer1M":  0.80, "contextK":  256, "outputType": "image", "inputImage": true  },
     "gemini-3-pro-image":     { "inputPer1M": 1.00,  "outputPer1M":  8.00, "contextK":  256, "outputType": "image", "inputImage": true  }
   }

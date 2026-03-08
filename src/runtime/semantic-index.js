@@ -61,13 +61,16 @@ export class SemanticIndex {
     this._cachePromise = null;
 
     try {
+      cliLogger.log('semantic-index', `build() started — projectDir: ${projectDir}`);
       fs.mkdirSync(this.cacheDir, { recursive: true });
       await this._ensureDb();
       this._loadManifest();
 
       const supportedExts = getSupportedExtensions();
+      cliLogger.log('semantic-index', `Supported extensions: ${[...supportedExts].join(', ')}`);
       const files = this._discoverFiles(projectDir, supportedExts);
       const total = files.length;
+      cliLogger.log('semantic-index', `Discovered ${total} files to consider`);
 
       await this._cleanupDeleted(files, projectDir);
 
@@ -101,6 +104,7 @@ export class SemanticIndex {
 
       this._saveManifest();
       this._ready = true;
+      cliLogger.log('semantic-index', `build() done — indexed: ${indexed}, skipped: ${skipped}, total: ${total}`);
 
       // Pre-load cache so first search is instant (skip _building guard)
       await this._loadCacheFromDb(true);
@@ -307,10 +311,25 @@ export class SemanticIndex {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
     this._dbPromise = (async () => {
-      const lancedb = await import('@lancedb/lancedb');
+      cliLogger.log('semantic-index', 'Loading @lancedb/lancedb...');
+      let lancedb;
+      try {
+        lancedb = await import('@lancedb/lancedb');
+        cliLogger.log('semantic-index', '@lancedb/lancedb loaded OK');
+      } catch (err) {
+        cliLogger.log('semantic-index', `@lancedb/lancedb FAILED to load: ${err.message}`);
+        throw err;
+      }
       const dbPath = path.join(this.cacheDir, 'lancedb');
       fs.mkdirSync(dbPath, { recursive: true });
-      this._db = await lancedb.connect(dbPath);
+      cliLogger.log('semantic-index', `Connecting to LanceDB at: ${dbPath}`);
+      try {
+        this._db = await lancedb.connect(dbPath);
+        cliLogger.log('semantic-index', 'LanceDB connected OK');
+      } catch (err) {
+        cliLogger.log('semantic-index', `LanceDB connect FAILED: ${err.message}`);
+        throw err;
+      }
     })();
     await this._dbPromise;
   }
@@ -606,17 +625,37 @@ File: ${filePath}
 
 // ─── Singleton ──────────────────────────────────────────────────────────
 
-let _instance = null;
-let _instanceDir = null;
+const _instances = new Map(); // cacheDir → SemanticIndex
 
 export function getSemanticIndex(cacheDir, llmProvider) {
-  if (_instance && _instanceDir === cacheDir) {
-    if (llmProvider) _instance.llmProvider = llmProvider;
-    return _instance;
+  if (_instances.has(cacheDir)) {
+    const inst = _instances.get(cacheDir);
+    if (llmProvider) inst.llmProvider = llmProvider;
+    return inst;
   }
-  _instance = new SemanticIndex(cacheDir, llmProvider);
-  _instanceDir = cacheDir;
-  return _instance;
+  const inst = new SemanticIndex(cacheDir, llmProvider);
+  _instances.set(cacheDir, inst);
+  return inst;
+}
+
+/**
+ * Given an absolute path, find the nearest ancestor directory that contains
+ * a `.koi/cache/semantic-index` folder (i.e. has been indexed).
+ * Returns the cacheDir path, or null if none found.
+ */
+export function findProjectCacheDir(absPath) {
+  let dir = fs.existsSync(absPath) && fs.statSync(absPath).isDirectory()
+    ? absPath
+    : path.dirname(absPath);
+  // Walk up max 6 levels to find a .koi dir
+  for (let i = 0; i < 6; i++) {
+    const candidate = path.join(dir, '.koi', 'cache', 'semantic-index');
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

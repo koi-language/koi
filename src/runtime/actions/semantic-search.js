@@ -57,7 +57,7 @@ export default {
       return { success: false, error: 'semantic_code_search requires a "query" field' };
     }
 
-    const projectDir = path.resolve(action.path ? path.dirname(action.path) : (process.env.KOI_PROJECT_ROOT || process.cwd()));
+    const projectDir = path.resolve(action.path || (process.env.KOI_PROJECT_ROOT || process.cwd()));
     const pathPrefix = action.path || undefined;
 
     // Permission check
@@ -74,11 +74,28 @@ export default {
     }
 
     try {
-      const { getSemanticIndex } = await import('../semantic-index.js');
-      const cacheDir = path.join(
-        process.env.KOI_PROJECT_ROOT || process.cwd(),
-        '.koi', 'cache', 'semantic-index'
-      );
+      const { getSemanticIndex, findProjectCacheDir } = await import('../semantic-index.js');
+
+      // Determine which project's index to use.
+      // If action.path points outside KOI_PROJECT_ROOT, look for a .koi index there.
+      const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+      const searchPath = action.path ? path.resolve(projectRoot, action.path) : projectRoot;
+      const isExternal = !searchPath.startsWith(projectRoot + path.sep) && searchPath !== projectRoot;
+
+      let cacheDir;
+      let indexProjectRoot = projectRoot;
+      if (isExternal) {
+        const externalCache = findProjectCacheDir(searchPath);
+        if (externalCache) {
+          cacheDir = externalCache;
+          // The project root is 3 levels up from .koi/cache/semantic-index
+          indexProjectRoot = path.resolve(externalCache, '..', '..', '..');
+        }
+      }
+      if (!cacheDir) {
+        cacheDir = path.join(projectRoot, '.koi', 'cache', 'semantic-index');
+      }
+
       const index = getSemanticIndex(cacheDir, agent.llmProvider);
 
       if (index.isBuilding()) {
@@ -125,6 +142,7 @@ export default {
           query,
           count: 0,
           results: [],
+          ...(isExternal && { projectRoot: indexProjectRoot }),
           hint: 'ZERO RESULTS. DO NOT answer the user — you have no information yet. You MUST search using other tools NOW: grep(pattern:"..."), search(mode:symbols,query:"..."), search(mode:glob,pattern:"*keyword*"). Do NOT print a response until you have found and READ the actual source code.',
         };
       }
@@ -148,6 +166,7 @@ export default {
         query,
         count: mapped.length,
         results: mapped,
+        ...(isExternal && { projectRoot: indexProjectRoot }),
         ...(!hasHighConfidence && {
           hint: 'WARNING: All results have LOW confidence (< 0.35) — they are likely WRONG. DO NOT answer the user based on these descriptions. You MUST verify by using grep, search(mode:symbols), or search(mode:glob) to find the actual files, then read_file to confirm before answering.',
         }),

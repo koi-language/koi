@@ -81,10 +81,10 @@ export function loadHistory(entries) {
  * @param {string} promptText - The prompt prefix (shown in bold white)
  * @returns {Promise<string>} The user's input text
  */
-export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit = false, onCancel = null, fixedRow = 0, zone = null } = {}) {
+export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit = false, onCancel = null, fixedRow = 0, zone = null, secret = false } = {}) {
   // If an input provider is set (e.g. Ink), delegate to it
   if (_inputProvider) {
-    return _inputProvider(promptText);
+    return _inputProvider(promptText, { secret });
   }
 
   return new Promise((resolve) => {
@@ -301,10 +301,16 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
     const CHIP_START = '\x1b[0m\x1b[48;5;236m\x1b[38;5;110m';
     const CHIP_END = '\x1b[0m\x1b[36m';
 
+    /** Return display text: asterisks in secret mode, real text otherwise. */
+    function displayText() {
+      return secret ? '*'.repeat(text.length) : text;
+    }
+
     /**
      * Style a text segment, wrapping any paste markers in chip style.
      */
     function styleSegment(segment) {
+      if (secret) return segment; // no markers in secret mode
       if (pastedChunks.length === 0) return segment;
 
       let result = segment;
@@ -319,6 +325,7 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
     function render() {
       // Effective fixed row: zone overrides fixedRow (read dynamically each render)
       const effectiveFixedRow = zone ? zone.startRow : fixedRow;
+      const dText = displayText(); // asterisks in secret mode
 
       // --- Fixed row mode (with optional multi-line via zone) ---
       if (effectiveFixedRow > 0) {
@@ -327,7 +334,7 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
 
         // With zone: support multi-line wrapping
         if (zone) {
-          const numRows = text.length <= flc ? 1 : 1 + Math.ceil((text.length - flc) / c);
+          const numRows = dText.length <= flc ? 1 : 1 + Math.ceil((dText.length - flc) / c);
           if (numRows !== prevLineCount && prevLineCount > 0) {
             zone.onHeightChange(numRows);
           }
@@ -342,14 +349,14 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
             let lineStart, lineEnd;
             if (r === 0) {
               lineStart = 0;
-              lineEnd = Math.min(text.length, flc);
+              lineEnd = Math.min(dText.length, flc);
               stdout.write(`\x1b[${row + r};1H\x1b[K\x1b[1m${prompt}\x1b[0m`);
             } else {
               lineStart = flc + (r - 1) * c;
-              lineEnd = Math.min(text.length, lineStart + c);
+              lineEnd = Math.min(dText.length, lineStart + c);
               stdout.write(`\x1b[${row + r};1H\x1b[K`);
             }
-            const lineText = lineStart < text.length ? text.substring(lineStart, lineEnd) : '';
+            const lineText = lineStart < dText.length ? dText.substring(lineStart, lineEnd) : '';
 
             if (r === curRow) {
               const before = lineText.substring(0, curCol);
@@ -371,7 +378,7 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
 
         // Without zone: single-line fixed row (original behavior)
         const maxChars = c - promptLen;
-        const visibleText = text.length > maxChars ? text.substring(0, maxChars) : text;
+        const visibleText = dText.length > maxChars ? dText.substring(0, maxChars) : dText;
         const curCol = Math.min(cursor, visibleText.length);
 
         stdout.write('\x1b7'); // save cursor (DEC)
@@ -412,14 +419,14 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
         let lineStart, lineEnd;
         if (r === 0) {
           lineStart = 0;
-          lineEnd = Math.min(text.length, flc);
+          lineEnd = Math.min(dText.length, flc);
           stdout.write(`\x1b[1m${prompt}\x1b[0m`);
         } else {
           lineStart = flc + (r - 1) * c;
-          lineEnd = Math.min(text.length, lineStart + c);
+          lineEnd = Math.min(dText.length, lineStart + c);
         }
 
-        const lineText = (lineStart < text.length) ? text.substring(lineStart, lineEnd) : '';
+        const lineText = (lineStart < dText.length) ? dText.substring(lineStart, lineEnd) : '';
 
         if (r === curRow) {
           // Render with blinking underscore cursor
@@ -619,7 +626,7 @@ export function cliInput(promptText, { skipFinalRender = false, clearAfterSubmit
       }
 
       // Write final output with marker version (concise display)
-      stdout.write(`\x1b[1m${prompt}\x1b[0m\x1b[36m${text}\x1b[0m\n`);
+      stdout.write(`\x1b[1m${prompt}\x1b[0m\x1b[36m${secret ? '*'.repeat(text.length) : text}\x1b[0m\n`);
       resolve(submitText.trim());
     }
 

@@ -625,8 +625,8 @@ export class KoiTranspiler {
         flushText();
         const [, varName, expr] = letMatch;
         jsLines.push(`const ${varName} = await ${expr};`);
-        // Auto-collect images for frame_server_state
-        if (expr.includes('frame_server_state')) {
+        // Auto-collect images for frame_server_state and browser_observe
+        if (expr.includes('frame_server_state') || expr.includes('browser_observe')) {
           jsLines.push(`if (${varName}?.screenshot) {`);
           jsLines.push(`  __images.push({ data: ${varName}.screenshot, mimeType: ${varName}.mimeType || 'image/jpeg' });`);
           jsLines.push(`}`);

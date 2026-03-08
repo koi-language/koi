@@ -1,20 +1,33 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { createRequire } from 'module';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
+
+// undici (Node.js built-in fetch) has a default headersTimeout of 30s.
+// Thinking/reasoning models buffer internal tokens before sending the first
+// response byte, causing the 30s idle timeout to fire before any data arrives.
+// Raise headersTimeout and bodyTimeout to 10 minutes to match our LLM timeout.
+try {
+  const _undici = createRequire(import.meta.url)('undici');
+  _undici.setGlobalDispatcher(new _undici.Agent({ headersTimeout: 10 * 60 * 1000, bodyTimeout: 10 * 60 * 1000 }));
+} catch {
+  // undici not available — fetch will use its own defaults
+}
 import { cliLogger } from './cli-logger.js';
 import { actionRegistry } from './action-registry.js';
 import { classifyFeedback, classifyResponse } from './context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
-import { DEFAULT_TASK_PROFILE, selectAutoModel, getAvailableProviders } from './auto-model-selector.js';
+import { DEFAULT_TASK_PROFILE, selectAutoModel, getAvailableProviders, markProviderTimeout, clearProviderCooldown } from './auto-model-selector.js';
 
-// Load .env file but don't override existing environment variables
-// Silent by default - dotenv will not log unless there's an error
+// Load .env files but don't override existing environment variables.
+// Priority: process.env > local .env > global ~/.koi/.env
 const originalWrite = process.stdout.write;
 process.stdout.write = () => {}; // Temporarily silence stdout
-dotenv.config({ override: false });
+dotenv.config({ path: path.join(os.homedir(), '.koi', '.env'), override: false });
+dotenv.config({ override: false }); // local .env takes priority over global
 process.stdout.write = originalWrite; // Restore stdout
 
 /**
@@ -77,6 +90,7 @@ export class LLMProvider {
 
     this.temperature = config.temperature ?? 0.1; // Low temperature for deterministic results
     this.maxTokens = config.max_tokens || 8000; // Increased to avoid truncation of long responses
+    this._useThinking = false; // Set to true by auto-selector when thinking variant wins
 
     // Auto mode: dynamically pick the best model per task
     if (this._autoMode) {
@@ -90,20 +104,20 @@ export class LLMProvider {
         // Client is created lazily if the key is missing (see _ensureClients).
         this._availableProviders = [this._lockedProvider];
         if (this._lockedProvider === 'openai' && process.env.OPENAI_API_KEY) {
-          this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
         } else if (this._lockedProvider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
           this._ac = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         } else if (this._lockedProvider === 'gemini' && process.env.GEMINI_API_KEY) {
-          this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+          this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
         }
       } else {
         // both provider and model are auto — use all available providers.
         // If no keys are configured yet, _availableProviders stays empty and the
         // user will be prompted on first use (see _ensureClients).
         this._availableProviders = getAvailableProviders();
-        if (process.env.OPENAI_API_KEY)    this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        if (process.env.OPENAI_API_KEY)    this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
         if (process.env.ANTHROPIC_API_KEY) this._ac = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        if (process.env.GEMINI_API_KEY)    this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+        if (process.env.GEMINI_API_KEY)    this._gc = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
       }
       return;
     }
@@ -119,12 +133,12 @@ export class LLMProvider {
 
     // Initialize clients — deferred if key is missing (user will be prompted on first use).
     if (this.provider === 'openai') {
-      if (process.env.OPENAI_API_KEY) this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      if (process.env.OPENAI_API_KEY) this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
     } else if (this.provider === 'anthropic') {
       if (process.env.ANTHROPIC_API_KEY) this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     } else if (this.provider === 'gemini') {
       if (process.env.GEMINI_API_KEY) {
-        this.openai = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+        this.openai = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
       }
     }
   }
@@ -172,11 +186,11 @@ export class LLMProvider {
     const apiKey = await ensureApiKey(provider);
 
     if (provider === 'openai') {
-      this._oa = new OpenAI({ apiKey });
+      this._oa = new OpenAI({ apiKey, maxRetries: 0 });
     } else if (provider === 'anthropic') {
       this._ac = new Anthropic({ apiKey });
     } else if (provider === 'gemini') {
-      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
     }
 
     this._availableProviders = [provider];
@@ -196,11 +210,11 @@ export class LLMProvider {
     const apiKey = await ensureApiKey(p);
 
     if (p === 'openai') {
-      this._oa = new OpenAI({ apiKey });
+      this._oa = new OpenAI({ apiKey, maxRetries: 0 });
     } else if (p === 'anthropic') {
       this._ac = new Anthropic({ apiKey });
     } else if (p === 'gemini') {
-      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+      this._gc = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
     }
   }
 
@@ -214,11 +228,11 @@ export class LLMProvider {
     const apiKey = await ensureApiKey(this.provider);
 
     if (this.provider === 'openai') {
-      this.openai = new OpenAI({ apiKey });
+      this.openai = new OpenAI({ apiKey, maxRetries: 0 });
     } else if (this.provider === 'anthropic') {
       this.anthropic = new Anthropic({ apiKey });
     } else if (this.provider === 'gemini') {
-      this.openai = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
+      this.openai = new OpenAI({ apiKey, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
     }
   }
 
@@ -498,27 +512,40 @@ ${taskDescription}`;
       return DEFAULT_TASK_PROFILE;
     }
 
+    const _timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms));
+
+    // Skip classification for startup (empty args) — no task to classify yet
+    const _hasTask = args && Object.keys(args).length > 0;
+    if (!_hasTask) {
+      if (_debug) console.error(`[Auto] No task args — using default profile`);
+      return DEFAULT_TASK_PROFILE;
+    }
+
     for (const candidate of _candidates) {
       if (_debug) console.error(`[Auto] Classifying with ${candidate.model}...`);
       try {
         let content, inputTokens = 0, outputTokens = 0;
+        let apiCall;
         if (candidate.provider === 'anthropic') {
-          const resp = await this._ac.messages.create({
+          apiCall = this._ac.messages.create({
             model: candidate.model, max_tokens: 50, temperature: 0,
             messages: [{ role: 'user', content: prompt }]
+          }).then(resp => {
+            content = resp.content[0].text.trim();
+            inputTokens  = resp.usage?.input_tokens  || 0;
+            outputTokens = resp.usage?.output_tokens || 0;
           });
-          content = resp.content[0].text.trim();
-          inputTokens  = resp.usage?.input_tokens  || 0;
-          outputTokens = resp.usage?.output_tokens || 0;
         } else {
-          const resp = await candidate.client.chat.completions.create({
+          apiCall = candidate.client.chat.completions.create({
             model: candidate.model, max_tokens: 50, temperature: 0,
             messages: [{ role: 'user', content: prompt }]
+          }).then(resp => {
+            content = resp.choices[0].message.content.trim();
+            inputTokens  = resp.usage?.prompt_tokens     || 0;
+            outputTokens = resp.usage?.completion_tokens || 0;
           });
-          content = resp.choices[0].message.content.trim();
-          inputTokens  = resp.usage?.prompt_tokens     || 0;
-          outputTokens = resp.usage?.completion_tokens || 0;
         }
+        await Promise.race([apiCall, _timeout(3000)]);
         costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
         if (_debug) console.error(`[Auto] Classification: ${content} (${inputTokens}↑ ${outputTokens}↓)`);
         const _stripped = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
@@ -544,7 +571,7 @@ ${taskDescription}`;
   async callJSON(prompt, agent = null, opts = {}) {
     await this._ensureClients();
     const agentName = agent?.name || '';
-    if (!opts.silent) cliLogger.planning(agentName ? `[🤖 ${agentName}] Thinking` : 'Thinking');
+    if (!opts.silent) cliLogger.planning(agentName ? `🤖 \x1b[1m\x1b[38;2;173;218;228m${agentName}\x1b[0m \x1b[38;2;185;185;185mThinking\x1b[0m` : 'Thinking');
 
     this.logRequest(this.model, 'Return ONLY valid JSON.', prompt, agentName ? `callJSON | Agent: ${agentName}` : 'callJSON');
 
@@ -602,6 +629,53 @@ ${taskDescription}`;
       }
       throw error;
     }
+  }
+
+  /**
+   * Summarization LLM call: cheapest+fastest model (speed taskType, difficulty=1).
+   * Tokens are recorded in costCenter so they appear in /cost reports.
+   * Returns the raw text response (caller is responsible for JSON parsing).
+   */
+  async callSummary(system, user) {
+    await this._ensureClients();
+    const selected = selectAutoModel('speed', 1, this._availableProviders);
+    if (!selected) throw new Error('No LLM provider available');
+    const { provider, model } = selected;
+
+    const t0 = Date.now();
+    let inputTokens = 0, outputTokens = 0, text = '';
+
+    if (provider === 'openai' || provider === 'gemini') {
+      const client = provider === 'gemini' ? this._gc : this._oa;
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0,
+        max_tokens: 300,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: user }
+        ]
+      });
+      text         = completion.choices[0].message.content?.trim() || '';
+      inputTokens  = completion.usage?.prompt_tokens     || 0;
+      outputTokens = completion.usage?.completion_tokens || 0;
+    } else if (provider === 'anthropic') {
+      const message = await this._ac.messages.create({
+        model,
+        max_tokens: 300,
+        temperature: 0,
+        system,
+        messages: [{ role: 'user', content: user }]
+      });
+      text         = (message.content.find(b => b.type === 'text')?.text ?? '').trim();
+      inputTokens  = message.usage?.input_tokens  || 0;
+      outputTokens = message.usage?.output_tokens || 0;
+    } else {
+      throw new Error(`Unknown provider: ${provider}`);
+    }
+
+    costCenter.recordUsage(model, provider, inputTokens, outputTokens, Date.now() - t0);
+    return text;
   }
 
   /**
@@ -672,12 +746,13 @@ ${taskDescription}`;
     // Ensure API keys / clients are ready (prompts user if missing)
     await this._ensureClients();
 
-    const planningPrefix = agentName ? `[🤖 ${agentName}]` : '';
+    const planningPrefix = agentName ? `🤖 \x1b[1m\x1b[38;2;173;218;228m${agentName}\x1b[0m` : '';
 
     // For non-auto mode the model is fixed — show it right away (before LLM call)
     if (!this._autoMode) cliLogger.setInfo('model', this.model);
 
-    cliLogger.planning(`${planningPrefix} ${thinkingHint || 'Thinking'}`);
+    const _hint = thinkingHint || 'Thinking';
+    cliLogger.planning(planningPrefix ? `${planningPrefix} \x1b[38;2;185;185;185m${_hint}\x1b[0m` : _hint);
     cliLogger.log('llm', `Reactive call: ${agentName} (iteration ${session.iteration + 1}, firstCall=${isFirstCall})`);
 
     // Age memories each iteration
@@ -782,13 +857,12 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
           contextStr = `\nContext: ${JSON.stringify(context)}`;
         }
 
-        // Playbook is now in the system prompt; first user message just starts execution
+        // Playbook is now in the system prompt; first user message just starts execution.
         const startMsg = `Return your FIRST action.${contextStr}${mcpErrorStr}`;
-        // Mark the initial task spec as permanent so it survives memory eviction.
-        // For long-running agents (e.g. mobile navigator with many observe-act cycles),
-        // the goal details (dates, times, names) must never be lost.
-        const permSpec = contextStr ? contextStr.substring(0, 800) : null;
-        contextMemory.add('user', startMsg, 'Instruction.', permSpec);
+        // Place directly in long-term so it never ages out — the agent must always know its task.
+        // permanent must be non-null since long-term entries render via entry.permanent in toMessages().
+        const permSpec = contextStr ? contextStr.substring(0, 800) : startMsg.substring(0, 500);
+        contextMemory.add('user', startMsg, permSpec, permSpec, { directLongTerm: true });
       }
     } else {
       // Actions have been executed — feed ALL new results as feedback (not just the last).
@@ -803,7 +877,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         for (let i = 0; i < newEntries.length - 1; i++) {
           const entry = newEntries[i];
           const classified = classifyFeedback(entry.action, entry.result, entry.error);
-          contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent);
+          contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent, classified);
         }
 
         // Process the last entry with full handling (commit context, hydrate, images, "Continue.")
@@ -832,7 +906,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
 
         // Build the immediate content (full detail + commit context + continue)
         const immediate = `${classified.immediate}${commitContext}\nContinue.`;
-        contextMemory.add('user', immediate, classified.shortTerm, classified.permanent);
+        contextMemory.add('user', immediate, classified.shortTerm, classified.permanent, classified);
 
         // Queue MCP image results for multimodal injection into the next LLM call.
         // Skip if the compose resolver already injected images (e.g. frame_server_state
@@ -879,6 +953,17 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       }
       const profile = session._autoProfile;
 
+      // Infrastructure errors (LLM timeout / HTTP 4xx-5xx) are NOT the LLM's fault —
+      // they must not inflate difficulty boosts that select more expensive models.
+      const _isInfraError = (entry) => {
+        if (entry.action?.intent === '_llm_error') return true;
+        const status = entry.error?.status ?? entry.error?.statusCode;
+        if (typeof status === 'number' && status >= 400) return true;
+        const msg = entry.error?.message || '';
+        if (/timed?\s*out|timeout/i.test(msg)) return true;
+        return false;
+      };
+
       // Escalate difficulty when the SAME error type repeats 3+ times.
       // Normalize messages to strip variable parts (line numbers, column numbers)
       // so "Hunk at line 9" and "Hunk at line 18" both count as the same error.
@@ -891,12 +976,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
                   .replace(/\bat\s+\d+\b/gi, 'at N');
       };
       let _sameErrorCount = 0;
-      const _lastMsg = session.lastError?.message;
+      // Don't boost if last error was infrastructure — skip boost calculation entirely
+      const _lastErrorIsInfra = session.lastError && _isInfraError({ error: session.lastError, action: session.actionHistory.at(-1)?.action });
+      const _lastMsg = _lastErrorIsInfra ? null : session.lastError?.message;
       const _lastMsgNorm = _normalizeErrMsg(_lastMsg);
       const _maxLookback = 12;
       if (_lastMsg) {
         for (let _i = session.actionHistory.length - 1; _i >= 0 && _i >= session.actionHistory.length - _maxLookback; _i--) {
           const _e = session.actionHistory[_i];
+          if (_isInfraError(_e)) continue; // skip infra errors — not LLM reasoning failures
           const _msg = _e.error?.message ?? (_e.result?.success === false ? _e.result.error : null);
           if (!_msg) continue;  // success entry — skip but keep counting further back
           if (_normalizeErrMsg(_msg) !== _lastMsgNorm) break; // different error type — stop
@@ -909,7 +997,8 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       // Escalate when the agent is stuck in varied failures (different errors/URLs but
       // consistently failing). _sameErrorCount misses this because it resets on any success
       // (even empty stdout). Trigger when ≥60% of the last 8 actions failed.
-      const _recentWindow    = session.actionHistory.slice(-8);
+      // Exclude infrastructure errors — they indicate provider issues, not bad LLM reasoning.
+      const _recentWindow    = session.actionHistory.slice(-8).filter(e => !_isInfraError(e));
       const _recentFailCount = _recentWindow.filter(
         e => e.error || (e.result?.success === false && e.result.error)
       ).length;
@@ -940,7 +1029,8 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       if (_failRateBoost > 0)   _boostParts.push(`fail-rate ${_recentFailCount}/${_recentWindow.length}`);
       const _totalBoost = _difficultyBoost + _loopBoost + _failRateBoost;
       const _boostNote  = _totalBoost > 0 ? ` [escalated +${_totalBoost}: ${_boostParts.join(', ')}]` : '';
-      cliLogger.log('llm', `[auto] ${agentName || 'agent'} → ${_resolvedProvider}/${_resolvedModel} | ${profile.taskType}:${_effectiveDifficulty}/10${_boostNote}`);
+      const _thinkingNote = (selected?.useThinking) ? ' [thinking]' : '';
+      cliLogger.log('llm', `[auto] ${agentName || 'agent'} → ${_resolvedProvider}/${_resolvedModel}${_thinkingNote} | ${profile.taskType}:${_effectiveDifficulty}/10${_boostNote}`);
       if (process.env.KOI_DEBUG_LLM) console.error(`[Auto] ${agentName || 'agent'} → ${_resolvedProvider}/${_resolvedModel} (${profile.taskType} ${_effectiveDifficulty}/10${_boostNote})`);
 
       // Show model in footer immediately (before LLM call)
@@ -951,9 +1041,10 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       session._autoModel    = _resolvedModel;
 
       // Temporarily set provider/model/client for this call
-      _autoRestore = { provider: this.provider, model: this.model, openai: this.openai, anthropic: this.anthropic };
-      this.provider  = _resolvedProvider;
-      this.model     = _resolvedModel;
+      _autoRestore = { provider: this.provider, model: this.model, openai: this.openai, anthropic: this.anthropic, _useThinking: this._useThinking };
+      this.provider     = _resolvedProvider;
+      this.model        = _resolvedModel;
+      this._useThinking = selected?.useThinking ?? false;
       if (_resolvedProvider === 'openai')     this.openai    = this._oa;
       else if (_resolvedProvider === 'gemini') this.openai   = this._gc;
       else if (_resolvedProvider === 'anthropic') this.anthropic = this._ac;
@@ -1079,26 +1170,168 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     cliLogger.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, last user msg: ${lastUserMsgText.length} chars)`);
     cliLogger.log('llm', `Last user msg preview: ${lastUserMsgText.substring(0, 300)}${lastUserMsgText.length > 300 ? '...' : ''}`);
 
-    // Real-time streaming callback: updates the token footer as chunks arrive
+    // Real-time streaming callback: updates the token footer as chunks arrive.
+    // Also detects print intent and streams the message content to the UI in real-time.
     const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-    const _onStreamChunk = (_delta, estOutTokens) => {
-      cliLogger.setInfo('tokens', `↓${_fmtTk(estOutTokens)} tokens`);
+
+    // Streaming print state machine
+    let _spState = 'init';       // 'init' | 'found_print' | 'streaming' | 'done' | 'skip'
+    let _spBuf = '';             // accumulated raw JSON text
+    let _spMsgOffset = -1;      // offset where message string content starts
+    let _spInEscape = false;     // inside a \ escape
+    let _spPendingUnicode = null; // collecting \uXXXX hex digits
+    let _printStreamed = false;  // true once streaming print was active
+    let _lineBuf = '';           // line buffer — holds partial line until \n
+
+    // Flush complete lines from _lineBuf to the UI.
+    // If flush=true, also emit the remaining partial line (end of message).
+    const _flushLines = (flush = false) => {
+      let idx;
+      while ((idx = _lineBuf.indexOf('\n')) !== -1) {
+        const line = _lineBuf.slice(0, idx + 1); // include the \n
+        _lineBuf = _lineBuf.slice(idx + 1);
+        cliLogger.printStreaming(line);
+      }
+      // Flush remaining partial line (only at end of message)
+      if (flush && _lineBuf) {
+        cliLogger.printStreaming(_lineBuf);
+        _lineBuf = '';
+      }
     };
 
-    // Per-call timeout: abort the streaming request if no response within 90s.
-    // Catches hung streams (providers occasionally stall mid-stream without closing
-    // the connection or throwing an error, leaving the agent blocked indefinitely).
-    const LLM_CALL_TIMEOUT_MS = 90_000;
-    const _llmTimeoutCtrl = new AbortController();
-    const _llmTimeoutTimer = setTimeout(() => _llmTimeoutCtrl.abort(), LLM_CALL_TIMEOUT_MS);
-    // Merged signal: fires when either the user aborts OR the 90s timeout fires
+    // Process a delta chunk while in 'streaming' state — unescape JSON string chars
+    // and buffer by line. Detects the closing " to transition to 'done'.
+    const _processStreamingChars = (delta) => {
+      for (let i = 0; i < delta.length; i++) {
+        if (_spState !== 'streaming') break;
+        const ch = delta[i];
+
+        if (_spPendingUnicode !== null) {
+          _spPendingUnicode += ch;
+          if (_spPendingUnicode.length === 4) {
+            _lineBuf += String.fromCharCode(parseInt(_spPendingUnicode, 16));
+            _spPendingUnicode = null;
+          }
+          continue;
+        }
+
+        if (_spInEscape) {
+          _spInEscape = false;
+          if (ch === 'n') _lineBuf += '\n';
+          else if (ch === 'r') _lineBuf += '\r';
+          else if (ch === 't') _lineBuf += '\t';
+          else if (ch === '"') _lineBuf += '"';
+          else if (ch === '\\') _lineBuf += '\\';
+          else if (ch === '/') _lineBuf += '/';
+          else if (ch === 'u') { _spPendingUnicode = ''; }
+          else _lineBuf += ch;
+          continue;
+        }
+
+        if (ch === '\\') { _spInEscape = true; continue; }
+        if (ch === '"') {
+          // End of JSON string value — flush any remaining partial line
+          _flushLines(true);
+          _spState = 'done';
+          _printStreamed = true;
+          // Don't call printStreamingEnd here — the print action will clear
+          // the streaming area when it commits the markdown-formatted text,
+          // avoiding a visual "double display".
+          break;
+        }
+        _lineBuf += ch;
+      }
+      // After processing the delta, emit any complete lines we've accumulated
+      if (_spState === 'streaming') _flushLines(false);
+    };
+
+    // Transition to streaming state: emit any buffered message content
+    const _startStreaming = () => {
+      _spState = 'streaming';
+      const buffered = _spBuf.slice(_spMsgOffset);
+      if (buffered) _processStreamingChars(buffered);
+    };
+
+    const _onStreamChunk = (_delta, estOutTokens) => {
+      _markContentReceived(); // Real content arrived — cancel total timeout
+      _resetTimer();          // Reset inactivity timer
+      cliLogger.setInfo('tokens', `↓${_fmtTk(estOutTokens)} tokens`);
+
+      if (_spState === 'done' || _spState === 'skip') return;
+
+      _spBuf += _delta;
+
+      if (_spState === 'init') {
+        // Wait for intent field
+        const intentMatch = _spBuf.match(/"intent"\s*:\s*"([^"]*)"/);
+        if (intentMatch) {
+          if (intentMatch[1] === 'print') {
+            _spState = 'found_print';
+            // Check if message value already started
+            const msgMatch = _spBuf.match(/"message"\s*:\s*"/);
+            if (msgMatch) {
+              _spMsgOffset = msgMatch.index + msgMatch[0].length;
+              _startStreaming();
+            }
+          } else {
+            _spState = 'skip';
+          }
+        } else if (_spBuf.length > 300) {
+          _spState = 'skip';
+        }
+      } else if (_spState === 'found_print') {
+        // Intent is print — waiting for message field
+        const msgMatch = _spBuf.match(/"message"\s*:\s*"/);
+        if (msgMatch) {
+          _spMsgOffset = msgMatch.index + msgMatch[0].length;
+          _startStreaming();
+        }
+      } else if (_spState === 'streaming') {
+        // Already streaming — process new delta characters only
+        _processStreamingChars(_delta);
+      }
+    };
+
+    // Inactivity timeout: abort if no chunks (content OR thinking) arrive for 30s.
+    // Resets on every chunk — as long as data flows, the stream lives.
+    // No total timeout needed: inactivity is the only watchdog.
+    const STREAM_INACTIVITY_MS = 30_000;
+    const _inactivityCtrl = new AbortController();
+    let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
+    let _firstContentReceived = false;
+    let _thinkingTokens = 0; // Accumulated thinking/reasoning tokens (for cost tracking)
+    const _resetTimer = () => {
+      clearTimeout(_inactivityTimer);
+      _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
+    };
+    // Mark that real content has started flowing (called from _onStreamChunk only)
+    const _markContentReceived = () => {
+      _firstContentReceived = true;
+    };
+    // Called by streaming methods on any chunk (including empty/thinking) to signal liveness.
+    // thinkingTk: estimated thinking tokens so far (0 if not tracking).
+    const _heartbeat = (thinkingTk) => {
+      _resetTimer();
+      if (!_firstContentReceived && thinkingTk > 0) {
+        _thinkingTokens = thinkingTk;
+        cliLogger.setInfo('tokens', `thinking ${_fmtTk(thinkingTk)} tokens`);
+      }
+    };
+
+    // Merged signal: fires when user aborts OR inactivity timeout
+    // _abortHandler is stored so it can be removed in finally (prevents MaxListenersExceededWarning
+    // when abortSignal is long-lived and accumulates listeners across 100+ LLM calls).
+    let _abortHandler = null;
     const _llmSignal = (() => {
       const ctrl = new AbortController();
       if (abortSignal) {
         if (abortSignal.aborted) { ctrl.abort(abortSignal.reason); }
-        else abortSignal.addEventListener('abort', () => ctrl.abort(abortSignal.reason), { once: true });
+        else {
+          _abortHandler = () => ctrl.abort(abortSignal.reason);
+          abortSignal.addEventListener('abort', _abortHandler, { once: true });
+        }
       }
-      _llmTimeoutCtrl.signal.addEventListener('abort', () => ctrl.abort(_llmTimeoutCtrl.signal.reason), { once: true });
+      _inactivityCtrl.signal.addEventListener('abort', () => ctrl.abort(_inactivityCtrl.signal.reason), { once: true });
       return ctrl.signal;
     })();
 
@@ -1108,24 +1341,28 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       if (this.provider === 'openai') {
         const caps = getModelCaps(this.model);
         if (caps.api === 'responses') {
-          response = await this._callOpenAIResponsesReactive(messages, agent, _llmSignal, _onStreamChunk);
+          response = await this._callOpenAIResponsesReactive(messages, agent, _llmSignal, _onStreamChunk, _heartbeat);
         } else {
-          response = await this._callOpenAIReactive(messages, agent, _llmSignal, _onStreamChunk);
+          response = await this._callOpenAIReactive(messages, agent, _llmSignal, _onStreamChunk, _heartbeat);
         }
       } else if (this.provider === 'gemini') {
-        response = await this._callGeminiReactive(messages, agent, _llmSignal, _onStreamChunk);
+        response = await this._callGeminiReactive(messages, agent, _llmSignal, _onStreamChunk, _heartbeat);
       } else if (this.provider === 'anthropic') {
-        response = await this._callAnthropicReactive(messages, agent, _llmSignal, _onStreamChunk);
+        response = await this._callAnthropicReactive(messages, agent, _llmSignal, _onStreamChunk, _heartbeat);
       } else {
         throw new Error(`Unknown provider: ${this.provider}`);
       }
     } catch (_callErr) {
-      // Convert timeout abort to a recognizable error so agent retry logic kicks in
+      // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
-      if (_llmTimeoutCtrl.signal.aborted && !abortSignal?.aborted) {
-        cliLogger.log('llm', `HTTP request timeout after ${LLM_CALL_TIMEOUT_MS / 1000}s`);
-        throw new Error(`LLM call timeout after ${LLM_CALL_TIMEOUT_MS / 1000}s`);
+      if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {
+        cliLogger.log('llm', `Stream inactivity timeout — no chunks for ${STREAM_INACTIVITY_MS / 1000}s`);
+        if (this._autoMode) markProviderTimeout(this.provider);
+        throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_MS / 1000}s (no chunks received)`);
       }
+      // Circuit breaker: any timeout error (including provider-side) puts provider on cooldown
+      const _isTimeout = /timed?\s*out|timeout/i.test(_callErr.message || '');
+      if (_isTimeout && this._autoMode) markProviderTimeout(this.provider);
       // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
       // model is unavailable. Remove that provider from candidates so we don't hammer it
       // on every retry iteration — the agent would otherwise loop forever with the same error.
@@ -1142,13 +1379,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       }
       throw _callErr;
     } finally {
-      clearTimeout(_llmTimeoutTimer);
+      clearTimeout(_inactivityTimer);
+      if (_abortHandler) abortSignal.removeEventListener('abort', _abortHandler);
       // Restore auto state so subsequent calls can re-resolve cleanly
       if (_autoRestore) {
-        this.provider  = _autoRestore.provider;
-        this.model     = _autoRestore.model;
-        this.openai    = _autoRestore.openai;
-        this.anthropic = _autoRestore.anthropic;
+        this.provider     = _autoRestore.provider;
+        this.model        = _autoRestore.model;
+        this.openai       = _autoRestore.openai;
+        this.anthropic    = _autoRestore.anthropic;
+        this._useThinking = _autoRestore._useThinking;
       }
     }
     const _apiMs = Date.now() - _t0;
@@ -1160,22 +1399,33 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     const _effectiveModel    = session._autoModel    || this.model;
     const _effectiveProvider = session._autoProvider || this.provider;
 
+    // Successful call — reset circuit breaker for this provider
+    if (this._autoMode) clearProviderCooldown(_effectiveProvider);
+
+    // Include thinking tokens in cost tracking.
+    // _thinkingTokens is our streaming estimate. Set usage.thinking so it's added to cost.
+    if (_thinkingTokens > 0) {
+      usage.thinking = _thinkingTokens;
+    }
+
     // Accumulate token usage on session (printed as summary before prompt_user)
-    if (!session.tokenAccum) session.tokenAccum = { input: 0, output: 0, calls: 0 };
+    if (!session.tokenAccum) session.tokenAccum = { input: 0, output: 0, thinking: 0, calls: 0 };
     session.tokenAccum.input += usage.input;
     session.tokenAccum.output += usage.output;
+    session.tokenAccum.thinking += (usage.thinking || 0);
     session.tokenAccum.calls++;
     // Store last call's usage for per-request display
-    session.lastUsage = { input: usage.input, output: usage.output };
+    session.lastUsage = { input: usage.input, output: usage.output, thinking: usage.thinking || 0 };
 
-    // Record to global cost center
-    costCenter.recordUsage(_effectiveModel, _effectiveProvider, usage.input, usage.output, _apiMs);
+    // Record to global cost center (thinking tokens count as output for billing)
+    costCenter.recordUsage(_effectiveModel, _effectiveProvider, usage.input, usage.output, _apiMs, usage.thinking || 0);
 
     // Update token display with final accurate counts (only show ↑ when input > 0)
     {
       const _parts = [];
       if (usage.input > 0) _parts.push(`↑${_fmtTk(usage.input)}`);
       if (usage.output > 0) _parts.push(`↓${_fmtTk(usage.output)}`);
+      if (usage.thinking > 0) _parts.push(`💭${_fmtTk(usage.thinking)}`);
       if (_parts.length > 0) cliLogger.setInfo('tokens', _parts.join(' '));
     }
 
@@ -1184,9 +1434,20 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     // Parse the response into a single action
     const action = this._parseReactiveResponse(responseText);
 
+    // If streaming print was active but didn't see closing quote, finalize now
+    if (_spState === 'streaming') {
+      cliLogger.printStreamingEnd();
+    }
+
+    // Mark that the print was already streamed — the print action should skip
+    // its own cliLogger.print() to avoid showing the message twice.
+    if (_printStreamed && action) {
+      action._alreadyStreamed = true;
+    }
+
     // Add assistant message to memory with classification
     const assistantClassified = classifyResponse(responseText, action);
-    contextMemory.add('assistant', assistantClassified.immediate, assistantClassified.shortTerm, assistantClassified.permanent);
+    contextMemory.add('assistant', assistantClassified.immediate, assistantClassified.shortTerm, assistantClassified.permanent, assistantClassified);
 
     return action;
   }
@@ -1267,7 +1528,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
    * Streams response token-by-token; calls onChunk(delta, estOutputTokens) in real time.
    * Returns early once a complete JSON object is detected in the buffer.
    */
-  async _callOpenAIReactive(messages, agent, abortSignal = null, onChunk = null) {
+  async _callOpenAIReactive(messages, agent, abortSignal = null, onChunk = null, onHeartbeat = null) {
     if (!process.env.OPENAI_API_KEY) {
       throw new Error('OPENAI_API_KEY not set in environment');
     }
@@ -1294,24 +1555,47 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.openai.chat.completions.create(params, options);
 
-      for await (const chunk of stream) {
-        if (abortSignal?.aborted) break;
-        const delta = chunk.choices?.[0]?.delta?.content || '';
-        if (delta) {
-          buffer += delta;
-          outChars += delta.length;
-          onChunk?.(delta, Math.ceil(outChars / 4));
-          // Early parse: once buffer is valid JSON we have the complete response
-          if (buffer.trimEnd().endsWith('}')) {
-            try { JSON.parse(buffer.trim()); break; } catch {}
+      // Race stream iteration against abort signal (same pattern as Gemini)
+      const _abortRace = abortSignal
+        ? new Promise((_, reject) => {
+            if (abortSignal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+            abortSignal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          })
+        : null;
+
+      let _thinkChars = 0; // Track reasoning/thinking chars for token estimation
+      const _iterate = async () => {
+        for await (const chunk of stream) {
+          if (abortSignal?.aborted) break;
+          // Detect reasoning/thinking content (OpenAI reasoning models emit these)
+          const _reasoning = chunk.choices?.[0]?.delta?.reasoning_content
+            || chunk.choices?.[0]?.delta?.reasoning
+            || '';
+          if (_reasoning) _thinkChars += _reasoning.length;
+          onHeartbeat?.(_thinkChars ? Math.ceil(_thinkChars / 4) : 0);
+          const delta = chunk.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            buffer += delta;
+            outChars += delta.length;
+            onChunk?.(delta, Math.ceil(outChars / 4));
+            // Early parse: once buffer is valid JSON we have the complete response
+            if (buffer.trimEnd().endsWith('}')) {
+              try { JSON.parse(buffer.trim()); break; } catch {}
+            }
+          }
+          if (chunk.usage) {
+            usage = {
+              input: chunk.usage.prompt_tokens || 0,
+              output: chunk.usage.completion_tokens || 0
+            };
           }
         }
-        if (chunk.usage) {
-          usage = {
-            input: chunk.usage.prompt_tokens || 0,
-            output: chunk.usage.completion_tokens || 0
-          };
-        }
+      };
+
+      if (_abortRace) {
+        await Promise.race([_iterate(), _abortRace]);
+      } else {
+        await _iterate();
       }
     } catch (httpError) {
       cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
@@ -1336,7 +1620,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
    * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
    * Returns early once a complete JSON object is detected in the buffer.
    */
-  async _callOpenAIResponsesReactive(messages, agent, abortSignal = null, onChunk = null) {
+  async _callOpenAIResponsesReactive(messages, agent, abortSignal = null, onChunk = null, onHeartbeat = null) {
     if (!process.env.OPENAI_API_KEY) {
       throw new Error('OPENAI_API_KEY not set in environment');
     }
@@ -1393,30 +1677,52 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.openai.responses.create(params, options);
 
-      for await (const event of stream) {
-        if (abortSignal?.aborted) break;
+      // Race stream iteration against abort signal
+      const _abortRace = abortSignal
+        ? new Promise((_, reject) => {
+            if (abortSignal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+            abortSignal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          })
+        : null;
 
-        // Text delta: { type: 'response.output_text.delta', delta: '...' }
-        if (event.type === 'response.output_text.delta') {
-          const delta = event.delta || '';
-          if (delta) {
-            buffer += delta;
-            outChars += delta.length;
-            onChunk?.(delta, Math.ceil(outChars / 4));
-            // Early parse: once buffer is valid JSON we have the complete response
-            if (buffer.trimEnd().endsWith('}')) {
-              try { JSON.parse(buffer.trim()); break; } catch {}
+      let _thinkChars = 0;
+      const _iterate = async () => {
+        for await (const event of stream) {
+          if (abortSignal?.aborted) break;
+          // Track reasoning summary tokens (Responses API emits these for reasoning models)
+          if (event.type === 'response.reasoning_summary_text.delta' && event.delta) {
+            _thinkChars += event.delta.length;
+          }
+          onHeartbeat?.(_thinkChars ? Math.ceil(_thinkChars / 4) : 0);
+
+          // Text delta: { type: 'response.output_text.delta', delta: '...' }
+          if (event.type === 'response.output_text.delta') {
+            const delta = event.delta || '';
+            if (delta) {
+              buffer += delta;
+              outChars += delta.length;
+              onChunk?.(delta, Math.ceil(outChars / 4));
+              // Early parse: once buffer is valid JSON we have the complete response
+              if (buffer.trimEnd().endsWith('}')) {
+                try { JSON.parse(buffer.trim()); break; } catch {}
+              }
             }
           }
-        }
 
-        // Final event with usage: { type: 'response.completed', response: { usage: { ... } } }
-        if (event.type === 'response.completed' && event.response?.usage) {
-          usage = {
-            input:  event.response.usage.input_tokens  || 0,
-            output: event.response.usage.output_tokens || 0
-          };
+          // Final event with usage: { type: 'response.completed', response: { usage: { ... } } }
+          if (event.type === 'response.completed' && event.response?.usage) {
+            usage = {
+              input:  event.response.usage.input_tokens  || 0,
+              output: event.response.usage.output_tokens || 0
+            };
+          }
         }
+      };
+
+      if (_abortRace) {
+        await Promise.race([_iterate(), _abortRace]);
+      } else {
+        await _iterate();
       }
     } catch (httpError) {
       cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
@@ -1441,7 +1747,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
    * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
    * Returns early once a complete JSON object is detected in the buffer.
    */
-  async _callAnthropicReactive(messages, agent, abortSignal = null, onChunk = null) {
+  async _callAnthropicReactive(messages, agent, abortSignal = null, onChunk = null, onHeartbeat = null) {
     if (!process.env.ANTHROPIC_API_KEY) {
       throw new Error('ANTHROPIC_API_KEY not set in environment');
     }
@@ -1472,6 +1778,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
 
     cliLogger.log('llm', `HTTP request starting (streaming)...`);
 
+    const _anthropicCaps = getModelCaps(this.model);
     const createParams = {
       model: this.model,
       max_tokens: 8192,
@@ -1480,6 +1787,12 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       messages: messagesWithReminder,
       stream: true
     };
+    if (_anthropicCaps.thinking && this._useThinking) {
+      // Extended thinking: remove temperature (unsupported with thinking) and add thinking config
+      delete createParams.temperature;
+      createParams.thinking = { type: 'enabled', budget_tokens: 5000 };
+      createParams.max_tokens = 16000; // thinking tokens count toward max_tokens
+    }
 
     let buffer = '';
     let usage = { input: 0, output: 0 };
@@ -1489,25 +1802,47 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.anthropic.messages.create(createParams, options);
 
-      for await (const event of stream) {
-        if (abortSignal?.aborted) break;
+      // Race stream iteration against abort signal
+      const _abortRace = abortSignal
+        ? new Promise((_, reject) => {
+            if (abortSignal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+            abortSignal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          })
+        : null;
 
-        if (event.type === 'message_start') {
-          usage.input = event.message?.usage?.input_tokens || 0;
-        } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-          const delta = event.delta.text || '';
-          if (delta) {
-            buffer += delta;
-            outChars += delta.length;
-            onChunk?.(delta, Math.ceil(outChars / 4));
-            // Early parse: once buffer is valid JSON we have the complete response
-            if (buffer.trimEnd().endsWith('}')) {
-              try { JSON.parse(buffer.trim()); break; } catch {}
-            }
+      let _thinkChars = 0;
+      const _iterate = async () => {
+        for await (const event of stream) {
+          if (abortSignal?.aborted) break;
+          // Track thinking tokens (Anthropic streams thinking as content_block_delta with thinking_delta)
+          if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
+            _thinkChars += (event.delta.thinking || '').length;
           }
-        } else if (event.type === 'message_delta') {
-          usage.output = event.usage?.output_tokens || 0;
+          onHeartbeat?.(_thinkChars ? Math.ceil(_thinkChars / 4) : 0);
+
+          if (event.type === 'message_start') {
+            usage.input = event.message?.usage?.input_tokens || 0;
+          } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            const delta = event.delta.text || '';
+            if (delta) {
+              buffer += delta;
+              outChars += delta.length;
+              onChunk?.(delta, Math.ceil(outChars / 4));
+              // Early parse: once buffer is valid JSON we have the complete response
+              if (buffer.trimEnd().endsWith('}')) {
+                try { JSON.parse(buffer.trim()); break; } catch {}
+              }
+            }
+          } else if (event.type === 'message_delta') {
+            usage.output = event.usage?.output_tokens || 0;
+          }
         }
+      };
+
+      if (_abortRace) {
+        await Promise.race([_iterate(), _abortRace]);
+      } else {
+        await _iterate();
       }
     } catch (httpError) {
       cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
@@ -1532,7 +1867,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
    * Streams token-by-token; calls onChunk(delta, estOutputTokens) in real time.
    * Returns early once a complete JSON object is detected in the buffer.
    */
-  async _callGeminiReactive(messages, agent, abortSignal = null, onChunk = null) {
+  async _callGeminiReactive(messages, agent, abortSignal = null, onChunk = null, onHeartbeat = null) {
     const agentInfo = agent ? `Agent: ${agent.name}` : '';
     const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
     this.logRequest(this.model, systemPrompt, messages.filter(m => m.role === 'user').pop()?.content || '', `GeminiReactive ${agentInfo}`);
@@ -1547,6 +1882,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       response_format: { type: 'json_object' },
       stream: true
     });
+
+    // Disable extended thinking unless this call was explicitly selected in thinking mode.
+    // Thinking generates internal reasoning tokens before the first response token arrives,
+    // causing 10-60s of streaming silence that can drop the TCP connection.
+    const _caps = getModelCaps(this.model);
+    if (_caps.thinking && !this._useThinking) {
+      geminiParams.extra_body = { thinking_config: { thinking_budget: 0 } };
+    }
+
     const geminiOptions = abortSignal ? { signal: abortSignal } : {};
 
     let buffer = '';
@@ -1556,24 +1900,51 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     try {
       const stream = await this.openai.chat.completions.create(geminiParams, geminiOptions);
 
-      for await (const chunk of stream) {
-        if (abortSignal?.aborted) break;
-        const delta = chunk.choices?.[0]?.delta?.content || '';
-        if (delta) {
-          buffer += delta;
-          outChars += delta.length;
-          onChunk?.(delta, Math.ceil(outChars / 4));
-          // Early parse: once buffer is valid JSON we have the complete response
-          if (buffer.trimEnd().endsWith('}')) {
-            try { JSON.parse(buffer.trim()); break; } catch {}
+      // Race the stream iteration against the abort signal.
+      // The for-await loop can block indefinitely when Gemini is in thinking mode
+      // (no content chunks arrive during the reasoning phase). The abort signal's
+      // check on line `if (abortSignal?.aborted) break` only runs when a chunk
+      // arrives — if no chunks come, the 90s timeout never propagates.
+      const abortRace = abortSignal
+        ? new Promise((_, reject) => {
+            if (abortSignal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+            abortSignal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          })
+        : null;
+
+      let _thinkChars = 0;
+      const iterateStream = async () => {
+        for await (const chunk of stream) {
+          if (abortSignal?.aborted) break;
+          // Gemini thinking tokens: count empty-content chunks as ~10 tokens each (rough estimate).
+          // Gemini's OpenAI-compatible API doesn't expose thinking content directly.
+          const _gDelta = chunk.choices?.[0]?.delta?.content || '';
+          if (!_gDelta && _thinkChars === 0) _thinkChars = 1; // Mark as thinking phase
+          if (!_gDelta && _thinkChars > 0) _thinkChars += 40; // ~10 tokens worth of chars per empty chunk
+          onHeartbeat?.(_thinkChars && !_gDelta ? Math.ceil(_thinkChars / 4) : 0);
+          const delta = _gDelta;
+          if (delta) {
+            buffer += delta;
+            outChars += delta.length;
+            onChunk?.(delta, Math.ceil(outChars / 4));
+            // Early parse: once buffer is valid JSON we have the complete response
+            if (buffer.trimEnd().endsWith('}')) {
+              try { JSON.parse(buffer.trim()); break; } catch {}
+            }
+          }
+          if (chunk.usage) {
+            usage = {
+              input: chunk.usage.prompt_tokens || 0,
+              output: chunk.usage.completion_tokens || 0
+            };
           }
         }
-        if (chunk.usage) {
-          usage = {
-            input: chunk.usage.prompt_tokens || 0,
-            output: chunk.usage.completion_tokens || 0
-          };
-        }
+      };
+
+      if (abortRace) {
+        await Promise.race([iterateStream(), abortRace]);
+      } else {
+        await iterateStream();
       }
     } catch (httpError) {
       cliLogger.log('llm', `HTTP request FAILED: ${httpError.message}`);
@@ -2201,14 +2572,15 @@ Return a JSON execution plan — an ordered array of steps. Each step is one of:
 - { "fragment": "name" } — include this fragment's text
 - { "call": "action_name", "data": {}, "field": "fieldName", "prefix": "optional text before the result" } — call an action at runtime, extract \`result[field]\` (usually "summary"), and include it as text. "prefix" is optional static text prepended before the action result.
 - { "text": "static text to include" } — include literal text
-- { "image_call": "frame_server_state", "textField": "elements", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "optional text" } — call an action that returns both text and an image. The text is included in the prompt, and the image is injected into the LLM call. Only works with 'frame_server_state'.
+- { "image_call": "action_name", "textField": "fieldName", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "optional text" } — call an action that returns both text and an image. The text (result[textField]) is included in the prompt, and the screenshot image (result[imageField]) is injected visually into the LLM call. Supported actions: "frame_server_state" (mobile screen, textField="elements"), "browser_observe" (browser screenshot, textField="elementsSummary").
 
 Example:
 [
   { "fragment": "planning" },
   { "fragment": "template" },
   { "call": "action_history", "data": { "count": 15 }, "field": "summary", "prefix": "## Action History\\n\\nReview the actions below. If you see the same action repeated 3+ times, you are stuck in a loop — change strategy immediately.\\n\\n" },
-  { "image_call": "frame_server_state", "textField": "elements", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "## Current Mobile Screen\\n\\n" }
+  { "image_call": "frame_server_state", "textField": "elements", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "## Current Mobile Screen\\n\\n" },
+  { "image_call": "browser_observe", "textField": "elementsSummary", "imageField": "screenshot", "mimeTypeField": "mimeType", "prefix": "## Current Browser Page\\n\\n" }
 ]
 
 Output ONLY the JSON array, no explanation.`;
@@ -2335,39 +2707,67 @@ Output ONLY the JSON array, no explanation.`;
   }
 
   /**
-   * Generate embeddings for semantic search
-   * Uses OpenAI's text-embedding-3-small for fast, cheap embeddings
+   * Returns the embedding vector dimension for the active embedding provider.
+   * OpenAI text-embedding-3-small = 1536, Gemini text-embedding-004 = 768.
+   * Used by ContextMemory to initialize LanceDB with the correct schema.
+   */
+  getEmbeddingDim() {
+    if (process.env.OPENAI_API_KEY) return 1536;
+    if (process.env.GEMINI_API_KEY)  return 768;
+    return 1536; // fallback default
+  }
+
+  /**
+   * Generate embeddings for semantic search.
+   * Priority: OpenAI (text-embedding-3-small, 1536-dim)
+   *         → Gemini (text-embedding-004, 768-dim via OpenAI-compat endpoint)
+   * Anthropic has no embedding API — throws if only Anthropic key is available.
    */
   async getEmbedding(text) {
-    // Validate input
     if (!text || typeof text !== 'string' || text.trim() === '') {
       throw new Error('getEmbedding requires non-empty text input');
     }
 
-    if (this.provider === 'openai' || this.provider === 'anthropic' || this.provider === 'gemini' || this.provider === 'auto') {
-      // Always use OpenAI for embeddings (Anthropic/Gemini don't have compatible embeddings API)
-      if (!process.env.OPENAI_API_KEY) {
-        throw new Error('OPENAI_API_KEY required for embeddings');
-      }
+    const ac = new AbortController();
+    const _timer = setTimeout(() => ac.abort(new Error('embedding timeout')), 8000);
 
-      // Use a dedicated OpenAI client for embeddings (Gemini's openai client points elsewhere)
-      if (!this._embeddingClient) {
-        this._embeddingClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      }
-
-      try {
-        const response = await this._embeddingClient.embeddings.create({
-          model: 'text-embedding-3-small',
-          input: text.trim()
-        });
-
+    try {
+      // ── OpenAI (preferred: cheapest, 1536-dim) ──────────────────────────
+      if (process.env.OPENAI_API_KEY) {
+        if (!this._embeddingClient) {
+          this._embeddingClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
+        }
+        const response = await this._embeddingClient.embeddings.create(
+          { model: 'text-embedding-3-small', input: text.trim() },
+          { signal: ac.signal }
+        );
+        clearTimeout(_timer);
         return response.data[0].embedding;
-      } catch (error) {
-        console.error(`[LLM] Error generating embedding:`, error.message);
-        throw error;
       }
-    }
 
-    throw new Error(`Embeddings not supported for provider: ${this.provider}`);
+      // ── Gemini (fallback: OpenAI-compatible endpoint, 768-dim) ──────────
+      if (process.env.GEMINI_API_KEY) {
+        if (!this._geminiEmbeddingClient) {
+          this._geminiEmbeddingClient = new OpenAI({
+            apiKey: process.env.GEMINI_API_KEY,
+            baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+            maxRetries: 0
+          });
+        }
+        const response = await this._geminiEmbeddingClient.embeddings.create(
+          { model: 'text-embedding-004', input: text.trim() },
+          { signal: ac.signal }
+        );
+        clearTimeout(_timer);
+        return response.data[0].embedding;
+      }
+
+      throw new Error('No embedding provider available (need OPENAI_API_KEY or GEMINI_API_KEY)');
+    } catch (error) {
+      clearTimeout(_timer);
+      const msg = ac.signal.aborted ? 'embedding timeout' : error.message;
+      cliLogger.log('memory', `Embedding failed: ${msg}`);
+      throw new Error(msg);
+    }
   }
 }

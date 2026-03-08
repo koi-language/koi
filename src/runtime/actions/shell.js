@@ -22,9 +22,33 @@
  */
 
 import { spawn } from 'child_process';
+import path from 'path';
 import { cliLogger } from '../cli-logger.js';
 import { cliSelect } from '../cli-select.js';
 import { getFilePermissions } from '../file-permissions.js';
+
+// Use the user's preferred shell so that PATH and shell functions loaded via
+// .zshrc/.bashrc (e.g. nvm, rbenv, pyenv, conda, fnm) are available.
+// Falls back to /bin/zsh on macOS and /bin/sh elsewhere.
+const USER_SHELL = process.env.SHELL ||
+  (process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh');
+
+// Source the user's interactive rc file before running the command so that shell
+// functions (nvm, rbenv, pyenv, …) are available. We do NOT use the -i flag because
+// interactive shells call tcsetpgrp() to take over the controlling terminal, which
+// puts the parent process (koi-cli/Ink) in the background and triggers SIGTTIN.
+// Instead, we source the rc file explicitly and suppress its output so it doesn't
+// pollute the command's stdout/stderr.
+function _shellArgs(cmd) {
+  const shellName = path.basename(USER_SHELL);
+  let rcSource = '';
+  if (shellName === 'zsh') {
+    rcSource = '[ -f ~/.zshrc ] && source ~/.zshrc >/dev/null 2>&1; ';
+  } else if (shellName === 'bash') {
+    rcSource = '[ -f ~/.bashrc ] && source ~/.bashrc >/dev/null 2>&1; ';
+  }
+  return ['-c', rcSource + cmd];
+}
 
 
 let _pty = null;
@@ -369,7 +393,7 @@ export default {
 
     // Background launch: spawn detached, don't wait for completion.
     if (background) {
-      const bgChild = spawn('sh', ['-c', command], {
+      const bgChild = spawn(USER_SHELL, _shellArgs(command), {
         cwd: cwd || process.cwd(),
         env: { ...process.env },
         stdio: ['ignore', 'ignore', 'pipe'],  // pipe stderr to catch startup errors
@@ -470,6 +494,24 @@ export default {
     let _passwordPending = false;
     let _inputNeededInfo = null; // Set by _scheduleDetect; consumed by the generator loop.
 
+    // Fast-path password detection: matches sudo/ssh/git prompts like:
+    //   "[sudo] password for user:"  "Password:"  "Enter passphrase for key '...':"
+    // Fires _passwordPromptCallback immediately — no 10s wait, no LLM round-trip.
+    const PASSWORD_PROMPT_RE = /(?:(?:\[sudo\]\s+)?password(?:\s+for\s+\S+)?|passphrase(?:\s+for\s+key\s+'\S+')?)\s*:\s*$/im;
+
+    function _checkPasswordPrompt(text) {
+      if (_passwordPending || !_passwordPromptCallback) return false;
+      const m = text.match(PASSWORD_PROMPT_RE);
+      if (!m) return false;
+      _passwordPending = true;
+      clearTimeout(_detectTimer); _detectTimer = null;
+      _passwordPromptCallback(m[0].trim()).then(pwd => {
+        _passwordPending = false;
+        if (pwd != null && !isClosed) proc.writeStdin(pwd + '\n');
+      }).catch(() => { _passwordPending = false; });
+      return true;
+    }
+
     // proc is assigned below in the PTY/spawn branches. Declared here so
     // the finally block and the timeout can reference it after assignment.
     let proc;
@@ -532,7 +574,7 @@ export default {
     };
     if (usePty) {
       // ── PTY path: node-pty (all platforms) ────────────────────────────────
-      const ptyProc = _pty.spawn('sh', ['-c', command], {
+      const ptyProc = _pty.spawn(USER_SHELL, _shellArgs(command), {
         name: 'xterm-256color',
         cols: 220,
         rows: 50,
@@ -548,8 +590,10 @@ export default {
       ptyProc.onData((data) => {
         outputChunks.push(Buffer.from(data));
         _shellOutputCallback?.(data);
-        _scheduleDataWakeup();
-        _scheduleDetect();
+        if (!_checkPasswordPrompt(Buffer.from(data).toString())) {
+          _scheduleDataWakeup();
+          _scheduleDetect();
+        }
       });
 
       ptyProc.onExit(({ exitCode }) => {
@@ -561,7 +605,7 @@ export default {
       // ── Plain spawn fallback ───────────────────────────────────────────────
       // node-pty unavailable or semaphore limit reached.
       // Output may be buffered for programs that check isatty().
-      const child = spawn('sh', ['-c', command], {
+      const child = spawn(USER_SHELL, _shellArgs(command), {
         cwd: cwd || process.cwd(),
         env: { ...process.env },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -576,8 +620,10 @@ export default {
         outputChunks.push(data);
         const str = data.toString();
         _shellOutputCallback?.(str);
-        _scheduleDataWakeup();
-        _scheduleDetect();
+        if (!_checkPasswordPrompt(str)) {
+          _scheduleDataWakeup();
+          _scheduleDetect();
+        }
       });
 
       child.stderr.on('data', (data) => {
@@ -585,8 +631,10 @@ export default {
         stderrChunks.push(data);
         const str = data.toString();
         _shellOutputCallback?.(str);
-        _scheduleDataWakeup();
-        _scheduleDetect();
+        if (!_checkPasswordPrompt(str)) {
+          _scheduleDataWakeup();
+          _scheduleDetect();
+        }
       });
 
       child.on('close', _onClose);

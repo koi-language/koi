@@ -12,6 +12,8 @@
  *   Latent memories can be hydrated back into context when relevant.
  */
 
+import path from 'node:path';
+import fs from 'node:fs';
 import { cliLogger } from './cli-logger.js';
 import { taskManager } from './task-manager.js';
 
@@ -28,6 +30,145 @@ function cosineSimilarity(a, b) {
   magA = Math.sqrt(magA);
   magB = Math.sqrt(magB);
   return (magA && magB) ? dot / (magA * magB) : 0;
+}
+
+// ─── LatentStore (LanceDB-backed persistent latent memory) ────────────────
+
+class LatentStore {
+  constructor(dbPath, embeddingDim = 1536) {
+    this._dbPath = dbPath;
+    this._embeddingDim = embeddingDim;
+    this._db = null;
+    this._dbPromise = null;
+    this._table = null;
+  }
+
+  async _ensureDb() {
+    if (this._db) return;
+    if (this._dbPromise) return this._dbPromise;
+    this._dbPromise = (async () => {
+      let lancedb;
+      try {
+        lancedb = await import('@lancedb/lancedb');
+      } catch (err) {
+        cliLogger.log('memory', `@lancedb/lancedb failed to load: ${err.message}`);
+        throw err;
+      }
+      fs.mkdirSync(this._dbPath, { recursive: true });
+      this._db = await lancedb.connect(this._dbPath);
+    })();
+    await this._dbPromise;
+  }
+
+  async _ensureTable() {
+    if (this._table) return this._table;
+    await this._ensureDb();
+    const names = await this._db.tableNames();
+    if (names.includes('latent')) {
+      this._table = await this._db.openTable('latent');
+    } else {
+      // Create with a dummy row then delete it
+      const dummy = {
+        id: '__init__',
+        text: '',
+        summary: '',
+        role: 'user',
+        ts: 0,
+        vector: new Array(this._embeddingDim).fill(0),
+      };
+      this._table = await this._db.createTable('latent', [dummy]);
+      await this._table.delete('id = "__init__"');
+    }
+    return this._table;
+  }
+
+  async add({ text, summary, embedding, role, ts }) {
+    try {
+      const table = await this._ensureTable();
+      const id = `lat-${ts}-${Math.random().toString(36).slice(2, 8)}`;
+      await table.add([{
+        id,
+        text,
+        summary,
+        role,
+        ts,
+        vector: embedding,
+      }]);
+      cliLogger.log('memory', `→ latent (LanceDB): "${summary.substring(0, 60)}"`);
+    } catch (err) {
+      cliLogger.log('memory', `LatentStore.add failed: ${err.message}`);
+    }
+  }
+
+  async search(queryEmbedding, limit = 3, threshold = 0.35) {
+    try {
+      const table = await this._ensureTable();
+      const rows = await table.query().toArray();
+      if (rows.length === 0) return [];
+
+      const results = rows.map(row => {
+        const vec = row.vector
+          ? (typeof row.vector.toArray === 'function' ? Array.from(row.vector.toArray()) : Array.from(row.vector))
+          : null;
+        return {
+          text: row.text,
+          summary: row.summary,
+          score: vec ? cosineSimilarity(queryEmbedding, vec) : 0,
+        };
+      })
+        .filter(r => r.score >= threshold)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+
+      return results;
+    } catch (err) {
+      cliLogger.log('memory', `LatentStore.search failed: ${err.message}`);
+      return [];
+    }
+  }
+
+  async count() {
+    try {
+      const table = await this._ensureTable();
+      const rows = await table.query().toArray();
+      return rows.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async migrateFromArray(latentPool) {
+    if (!latentPool || latentPool.length === 0) return;
+    cliLogger.log('memory', `Migrating ${latentPool.length} latent entries to LanceDB...`);
+    for (const entry of latentPool) {
+      if (!entry.embedding) continue;
+      await this.add({
+        text: entry.summary,
+        summary: entry.summary,
+        embedding: entry.embedding,
+        role: entry.role || 'user',
+        ts: entry.ts || Date.now(),
+      });
+    }
+    cliLogger.log('memory', 'Latent migration complete.');
+  }
+}
+
+// ─── Per-action TTL configuration ─────────────────────────────────────────
+
+const ACTION_TTL = {
+  read_file:       { shortDuration: 6,  mediumDuration: 20 },
+  shell:           { shortDuration: 6,  mediumDuration: 20 },
+  prompt_user:     { shortDuration: 25, mediumDuration: 20 },
+  print:           { shortDuration: 25, mediumDuration: 20 },
+  delegate:        { shortDuration: 25, mediumDuration: 20 },
+  browser_observe: { shortDuration: 3,  mediumDuration: 0 },
+  mobile_observe:  { shortDuration: 3,  mediumDuration: 0 },
+  _default:        { shortDuration: 6,  mediumDuration: 20 },
+};
+
+function getTTL(intent) {
+  return ACTION_TTL[intent] || ACTION_TTL._default;
 }
 
 // ─── Classification ───────────────────────────────────────────────────────
@@ -48,6 +189,7 @@ export function classifyFeedback(action, result, error) {
       shortTerm: 'Parallel group done.',
       permanent: null,
       imageBlocks: result._parallelImageBlocks ?? null,
+      ...getTTL(intent),
     };
   }
 
@@ -55,7 +197,7 @@ export function classifyFeedback(action, result, error) {
   if (error) {
     const errMsg = error.message || String(error);
     const immediate = `❌${id} ${intent} failed: ${errMsg}`;
-    return { immediate, shortTerm: immediate, permanent: null };
+    return { immediate, shortTerm: immediate, permanent: null, ...getTTL(intent) };
   }
 
   // Build full-detail immediate string — no truncation here.
@@ -69,7 +211,7 @@ export function classifyFeedback(action, result, error) {
     const feedback = result.feedback ? ` Feedback: ${result.feedback}` : '';
     const immediate = `🚫${id} ${intent} DENIED by user.${feedback} Do NOT retry this action or ask again — the user said No. Move on.`;
     const shortTerm = `🚫 ${intent}: denied by user`;
-    return { immediate, shortTerm, permanent: null };
+    return { immediate, shortTerm, permanent: null, ...getTTL(intent) };
   }
 
   // Handle error-like results (success: false)
@@ -78,7 +220,7 @@ export function classifyFeedback(action, result, error) {
     // their useful output to stdout even when exiting with a non-zero code.
     const stdoutPart = result.stdout ? `\nOutput:\n${result.stdout.substring(0, 3000)}` : '';
     const immediate = `❌${id} ${intent}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
-    return { immediate, shortTerm: `❌ ${intent}: ${result.error}`, permanent: null };
+    return { immediate, shortTerm: `❌ ${intent}: ${result.error}`, permanent: null, ...getTTL(intent) };
   }
 
   // Extract image blocks generically from any action that returns MCP-style content
@@ -96,7 +238,7 @@ export function classifyFeedback(action, result, error) {
       const perm = `User: "${answer}"`;
       // Explicit signal: new user input arrived — focus on THIS, not previous results
       const newImmediate = `✅${id} prompt_user: User says: "${answer}"\n\nAnswer only this new question, but you MUST still follow all tool-usage rules (splitting concepts, parallelization, required fields). Do not re-print results from previous commands.`;
-      return { immediate: newImmediate, shortTerm: perm, permanent: perm };
+      return { immediate: newImmediate, shortTerm: perm, permanent: perm, ...getTTL('prompt_user') };
     }
 
     case 'read_file': {
@@ -109,24 +251,19 @@ export function classifyFeedback(action, result, error) {
         ? content.substring(0, MAX_READ_CHARS) + `\n...[truncated at char ${MAX_READ_CHARS} — showing lines ${from}–${to} of ${totalLines} total. Use offset/limit to read more.]`
         : content;
       const truncImmediate = `✅${id} read_file ${action.path} (lines ${from}–${to} of ${totalLines}):\n${truncContent}`;
-      // Medium-term: include a useful content preview (first ~800 chars) so the agent
-      // does not lose the file's substance when the entry ages out of short-term.
-      // Without this, the agent only sees "✅ read schema.ts" and re-reads it.
-      const contentPreview = content.substring(0, 800) + (content.length > 800 ? '\n...[see full read in history]' : '');
-      const shortTermRead = `✅ read ${action.path} (lines ${from}–${to} of ${totalLines}):\n${contentPreview}`;
-      return { immediate: truncImmediate, shortTerm: shortTermRead, permanent: null };
+      return { immediate: truncImmediate, shortTerm: null, needsSummary: true, permanent: null, ...getTTL('read_file') };
     }
 
     case 'edit_file':
-      return { immediate, shortTerm: `✅ edit ${action.path}`, permanent: null };
+      return { immediate, shortTerm: `✅ edit ${action.path}`, permanent: null, ...getTTL(intent) };
 
     case 'write_file':
-      return { immediate, shortTerm: `✅ write ${action.path}`, permanent: null };
+      return { immediate, shortTerm: `✅ write ${action.path}`, permanent: null, ...getTTL(intent) };
 
     case 'search': {
       const query = action.query || action.pattern || action.path || '';
       const hits = result?.matches?.length || result?.results?.length || 0;
-      return { immediate, shortTerm: `✅ search "${query.substring(0, 40)}" (${hits} hits)`, permanent: null };
+      return { immediate, shortTerm: `✅ search "${query.substring(0, 40)}" (${hits} hits)`, permanent: null, ...getTTL(intent) };
     }
 
     case 'shell': {
@@ -135,26 +272,26 @@ export function classifyFeedback(action, result, error) {
       const shellMsg = truncOut
         ? `✅${id} shell output:\n${truncOut}`
         : `✅${id} shell: ${action.description || 'command'} (no output)`;
-      return { immediate: shellMsg, shortTerm: `✅ shell: ${action.description || 'command'}`, permanent: null };
+      return { immediate: shellMsg, shortTerm: null, needsSummary: true, permanent: null, ...getTTL('shell') };
     }
 
     case 'print':
-      return { immediate, shortTerm: `✅ print`, permanent: null };
+      return { immediate, shortTerm: `✅ print`, needsSummary: true, permanent: null, ...getTTL('print') };
 
     case 'call_llm':
-      return { immediate, shortTerm: `✅ call_llm`, permanent: null };
+      return { immediate, shortTerm: `✅ call_llm`, permanent: null, ...getTTL(intent) };
 
     case 'registry_set':
-      return { immediate, shortTerm: `✅ registry_set "${action.key}"`, permanent: null };
+      return { immediate, shortTerm: `✅ registry_set "${action.key}"`, permanent: null, ...getTTL(intent) };
 
     case 'registry_get':
-      return { immediate, shortTerm: `✅ registry_get "${action.key}"`, permanent: null };
+      return { immediate, shortTerm: `✅ registry_get "${action.key}"`, permanent: null, ...getTTL(intent) };
 
     case 'registry_delete':
-      return { immediate, shortTerm: `✅ registry_delete "${action.key}"`, permanent: null };
+      return { immediate, shortTerm: `✅ registry_delete "${action.key}"`, permanent: null, ...getTTL(intent) };
 
     case 'registry_search':
-      return { immediate, shortTerm: `✅ registry_search`, permanent: null };
+      return { immediate, shortTerm: `✅ registry_search`, permanent: null, ...getTTL(intent) };
 
     case 'call_mcp': {
       const mcpText = _imageBlocks
@@ -165,6 +302,7 @@ export function classifyFeedback(action, result, error) {
         shortTerm: `✅ call_mcp ${action.tool || ''}`,
         permanent: null,
         imageBlocks: _imageBlocks,
+        ...getTTL(intent),
       };
     }
 
@@ -179,6 +317,7 @@ export function classifyFeedback(action, result, error) {
         shortTerm: `📷 ${imgId}: ${desc || src}`,
         permanent: null,
         imageBlocks: _imageBlocks,
+        ...getTTL(intent),
       };
     }
 
@@ -191,6 +330,22 @@ export function classifyFeedback(action, result, error) {
         shortTerm: `🔍 recalled ${imgId}`,
         permanent: null,
         imageBlocks: _imageBlocks,
+        ...getTTL(intent),
+      };
+    }
+
+    case 'browser_observe': {
+      const bElCount = result?.elementCount || '?';
+      const bUrl = result?.url || '?';
+      const _bTxt = result?.elementsSummary || result?.content?.find(c => c.type === 'text')?.text || '';
+      return {
+        immediate: _imageBlocks
+          ? `🌐${id} browser_observe (${bUrl}) — ${bElCount} elements [screenshot attached]\n${_bTxt}`
+          : immediate,
+        shortTerm: `🌐 observe: ${bElCount} elements (${bUrl})`,
+        permanent: null,
+        imageBlocks: _imageBlocks,
+        ...getTTL('browser_observe'),
       };
     }
 
@@ -206,6 +361,7 @@ export function classifyFeedback(action, result, error) {
         shortTerm: `📱 observe: ${elCount} elements (${mobSrc})`,
         permanent: null,
         imageBlocks: _imageBlocks,
+        ...getTTL('mobile_observe'),
       };
     }
 
@@ -218,6 +374,7 @@ export function classifyFeedback(action, result, error) {
         immediate: `📱${id} mobile_elements (${elSrc}) — ${elCnt} elements\n${_elTxt}`,
         shortTerm: `📱 elements: ${elCnt} (${elSrc})`,
         permanent: null,
+        ...getTTL(intent),
       };
     }
 
@@ -230,7 +387,7 @@ export function classifyFeedback(action, result, error) {
       else if (intent === 'mobile_type') _mobShort = `📱 type: "${(action.text || '').substring(0, 30)}"`;
       else if (intent === 'mobile_swipe') _mobShort = `📱 swipe: ${action.direction || 'custom'}`;
       else _mobShort = `📱 key: ${action.key}`;
-      return { immediate, shortTerm: _mobShort, permanent: null };
+      return { immediate, shortTerm: _mobShort, permanent: null, ...getTTL(intent) };
     }
 
     case 'task_list': {
@@ -239,7 +396,11 @@ export function classifyFeedback(action, result, error) {
       const allTasks = result?.tasks || [];
       const pending = allTasks.filter(t => t.status !== 'completed');
       if (pending.length === 0) {
-        return { immediate, shortTerm: '✅ task_list (all done)', permanent: null };
+        return {
+          immediate, shortTerm: '✅ task_list (all done)', permanent: null,
+          replaceTag: 'task_list_pending', clearTag: true,
+          ...getTTL(intent),
+        };
       }
       const taskLines = pending.map(t => {
         const icon = t.status === 'in_progress' ? '●' : '☐';
@@ -247,10 +408,43 @@ export function classifyFeedback(action, result, error) {
         return `  [${t.id}] ${icon} ${t.subject}${desc}`;
       }).join('\n');
       const shortTerm = `Pending tasks:\n${taskLines}`;
-      // Do NOT use permanent here: making this long-term freezes stale task state
-      // forever, causing the agent to loop re-reading files because it always sees
-      // "all tasks pending" even after task_update marks them complete.
-      return { immediate, shortTerm, permanent: null };
+      // directLongTerm: task list goes straight to long-term, replaceTag ensures only latest snapshot
+      return {
+        immediate, shortTerm, permanent: shortTerm,
+        directLongTerm: true, replaceTag: 'task_list_pending',
+        ...getTTL(intent),
+      };
+    }
+
+    case 'my_task': {
+      // Assigned task goes to long-term; replace previous my_task for same id
+      const taskId = result?.task?.id || action.taskId || '?';
+      const task = result?.task || result;
+      const desc = task?.description ? ` — ${task.description}` : '';
+      const shortTerm = `My task [${taskId}] (${task?.status || '?'}): ${task?.subject || '?'}${desc}`;
+      if (task?.status === 'completed') {
+        return {
+          immediate, shortTerm, permanent: null,
+          replaceTag: `my_task_${taskId}`, clearTag: true,
+          ...getTTL(intent),
+        };
+      }
+      return {
+        immediate, shortTerm, permanent: shortTerm,
+        directLongTerm: true, replaceTag: `my_task_${taskId}`,
+        ...getTTL(intent),
+      };
+    }
+
+    case 'learn_fact': {
+      const key = action.key || result?.key || '';
+      const value = action.value || result?.value || '';
+      const perm = `Fact: ${key} = ${value}`;
+      return {
+        immediate, shortTerm: perm, permanent: perm,
+        directLongTerm: true,
+        ...getTTL(intent),
+      };
     }
 
     case 'task_get': {
@@ -259,17 +453,17 @@ export function classifyFeedback(action, result, error) {
       if (task?.subject) {
         const desc = task.description ? ` — ${task.description}` : '';
         const shortTerm = `Task [${task.id}] (${task.status}): ${task.subject}${desc}`;
-        return { immediate, shortTerm, permanent: null };
+        return { immediate, shortTerm, permanent: null, ...getTTL(intent) };
       }
-      return { immediate, shortTerm: `✅ task_get`, permanent: null };
+      return { immediate, shortTerm: `✅ task_get`, permanent: null, ...getTTL(intent) };
     }
 
     case 'task_update':
-      return { immediate, shortTerm: `✅ task_update [${action.taskId}] → ${action.status || 'updated'}`, permanent: null };
+      return { immediate, shortTerm: `✅ task_update [${action.taskId}] → ${action.status || 'updated'}`, permanent: null, ...getTTL(intent) };
 
     case 'task_create': {
       const subject = result?.subject || action.subject || '';
-      return { immediate, shortTerm: `✅ task_create: ${subject}`, permanent: null };
+      return { immediate, shortTerm: `✅ task_create: ${subject}`, permanent: null, ...getTTL(intent) };
     }
 
     default: {
@@ -301,9 +495,13 @@ export function classifyFeedback(action, result, error) {
         } catch { /* non-fatal */ }
 
         const msg = `✅${id} delegate ${intent} returned:\n${delegateStr}${taskReminder}`;
-        return { immediate: msg, shortTerm: `✅ delegate ${intent} → answer ready`, permanent: null };
+        return {
+          immediate: msg, shortTerm: `✅ delegate ${intent} → answer ready`,
+          needsSummary: true, needsPermanentSummary: true, permanent: null,
+          ...getTTL('delegate'),
+        };
       }
-      return { immediate, shortTerm: `✅ ${intent}`, permanent: null };
+      return { immediate, shortTerm: `✅ ${intent}`, permanent: null, ...getTTL(intent) };
     }
   }
 }
@@ -320,23 +518,31 @@ export function classifyResponse(responseText, action) {
   // Handle batched actions
   if (Array.isArray(action)) {
     const intents = action.map(a => a.intent || a.type || '?').join(', ');
-    return { immediate: responseText, shortTerm: `→ [${intents}]`, permanent: null };
+    return { immediate: responseText, shortTerm: `→ [${intents}]`, permanent: null, ...getTTL('_default') };
   }
 
   const intent = action.intent || action.type || 'unknown';
   let permanent = null;
   let shortTerm = `→ ${intent}`;
 
+  let needsSummary = false;
+  let needsPermanentSummary = false;
+  let ttl = getTTL(intent);
+
   switch (intent) {
     case 'print': {
       const msg = action.message || '';
-      permanent = `Told user: "${msg.substring(0, 120)}"`;
+      // Remove truncation — use LLM summarization instead
+      needsSummary = true;
+      needsPermanentSummary = true;
       shortTerm = `→ print "${msg.substring(0, 60)}"`;
+      ttl = getTTL('print');
       break;
     }
     case 'prompt_user': {
       const q = action.question || action.prompt || '';
       shortTerm = `→ prompt "${q.substring(0, 60)}"`;
+      ttl = getTTL('prompt_user');
       break;
     }
     case 'edit_file':
@@ -366,33 +572,46 @@ export function classifyResponse(responseText, action) {
     default:
       if (action.actionType === 'delegate') {
         shortTerm = `→ delegate ${intent}`;
+        needsSummary = true;
+        needsPermanentSummary = true;
+        ttl = getTTL('delegate');
       }
   }
 
-  return { immediate: responseText, shortTerm, permanent };
+  return { immediate: responseText, shortTerm, permanent, needsSummary, needsPermanentSummary, ...ttl };
 }
 
 // ─── ContextMemory ─────────────────────────────────────────────────────────
 
 export class ContextMemory {
-  constructor({ agentName, llmProvider, shortTermTTL, mediumTermTTL } = {}) {
+  constructor({ agentName, llmProvider, shortTermTTL, mediumTermTTL, latentDbPath } = {}) {
     this.agentName = agentName || 'unknown';
     this.llmProvider = llmProvider;
     this.entries = [];
-    this.latentPool = [];
     this.turnCounter = 0;
     this.systemPrompt = null;
 
-    // TTLs (in turns — a turn is one user+assistant exchange)
-    // Delegates do focused multi-step tasks (read files, then implement).
-    // Use longer TTLs for delegates so file contents don't evaporate mid-task.
+    // TTLs (in turns) — fallbacks for entries without per-entry TTL
     this.shortTermTTL = shortTermTTL ?? 6;
     this.mediumTermTTL = mediumTermTTL ?? 20;
 
+    // LanceDB-backed latent store — dimension matches the embedding provider:
+    // OpenAI text-embedding-3-small = 1536, Gemini text-embedding-004 = 768.
+    const _embeddingDim = llmProvider?.getEmbeddingDim?.() ?? 1536;
+    this._latentStore = latentDbPath ? new LatentStore(latentDbPath, _embeddingDim) : null;
+    // Fallback in-memory pool when no LanceDB path (e.g. tests)
+    this._fallbackLatentPool = [];
+    this._fallbackMaxLatent = 100;
+
     // Hydration config
     this.latentThreshold = 0.35;
-    this.maxLatent = 100;
     this.maxHydrate = 3;
+
+    // Count of entries moved to latent (for token estimation)
+    this._latentCount = 0;
+
+    // Queue for entries that need to move to latent (from tag replacement)
+    this._latentQueue = [];
   }
 
   /**
@@ -400,7 +619,9 @@ export class ContextMemory {
    */
   clear() {
     this.entries = [];
-    this.latentPool = [];
+    this._fallbackLatentPool = [];
+    this._latentQueue = [];
+    this._latentCount = 0;
     this.turnCounter = 0;
   }
 
@@ -417,49 +638,138 @@ export class ContextMemory {
    * @param {string} immediate  - Full detail (short-term representation)
    * @param {string|null} shortTerm  - Condensed (medium-term representation)
    * @param {string|null} permanent  - Irreplaceable (long-term representation, null = forgettable)
+   * @param {object} opts - Classification options (shortDuration, mediumDuration, needsSummary, etc.)
    */
   add(role, immediate, shortTerm = null, permanent = null, opts = {}) {
+    // Handle replaceTag: expire old entries with the same tag
+    if (opts.replaceTag) {
+      if (opts.clearTag) {
+        // Move old tagged entry to latent, then don't create a new long-term entry
+        this._markTagForLatent(opts.replaceTag);
+      } else {
+        this._replaceTagged(opts.replaceTag);
+      }
+    }
+
     const entry = {
       role,
       immediate,
       shortTerm: shortTerm || immediate,
       permanent,
+      ts: Date.now(),
       turnAdded: this.turnCounter,
-      tier: 'short-term'
+      tier: opts.directLongTerm ? 'long-term' : 'short-term',
+      // Per-entry TTL overrides
+      shortDuration: opts.shortDuration,
+      mediumDuration: opts.mediumDuration,
+      // Deferred summarization flags
+      needsSummary: opts.needsSummary || false,
+      needsPermanentSummary: opts.needsPermanentSummary || false,
+      // Tag for replacement tracking
+      replaceTag: opts.replaceTag || null,
     };
     if (opts.ephemeral) entry.ephemeral = true;
+
+    if (opts.directLongTerm) {
+      cliLogger.log('memory', `↑ direct long-term: "${(permanent || shortTerm || immediate).substring(0, 60)}"`);
+    }
+
     this.entries.push(entry);
   }
 
   /**
    * Advance the clock by one turn.
    * Ages entries: short→medium→long-term or latent.
+   * Uses per-entry TTLs when available, falls back to global TTLs.
    * Call once per reactive loop iteration.
    */
   async tick() {
     this.turnCounter++;
+    // Entries that need LLM summarization before they can leave short-term.
+    // Keyed by entry, value is the medDur so we can complete the transition after summarization.
+    const toSummarize = [];
     const toLatent = [];
 
     for (const entry of this.entries) {
-      if (entry.tier === 'long-term') continue;
+      if (entry.tier === 'long-term' || entry.tier === 'expired') continue;
 
       const age = this.turnCounter - entry.turnAdded;
+      const shortDur = entry.shortDuration ?? this.shortTermTTL;
+      const medDur = entry.mediumDuration ?? this.mediumTermTTL;
 
-      if (entry.tier === 'medium-term' && age > this.mediumTermTTL) {
-        // Consolidation rule (C): promote or fade
-        if (entry.permanent) {
-          entry.tier = 'long-term';
-          cliLogger.log('memory', `↑ long-term: "${entry.permanent.substring(0, 60)}"`);
+      // Short-term expiry check
+      if (entry.tier === 'short-term' && age > shortDur) {
+        if (medDur === 0) {
+          // Skip medium tier — go directly to long-term or latent. No summary needed.
+          if (entry.permanent) {
+            entry.tier = 'long-term';
+            cliLogger.log('memory', `↑ long-term (skip medium): "${entry.permanent.substring(0, 60)}"`);
+          } else {
+            toLatent.push(entry);
+            entry.tier = 'expired';
+          }
+        } else if (entry.immediate && entry.immediate.length > 80) {
+          // Must LLM-summarize BEFORE transitioning — entry stays in short-term until summary succeeds.
+          // Store medDur on the entry so the post-summarization step can complete the transition.
+          entry._pendingMedDur = medDur;
+          toSummarize.push(entry);
         } else {
-          toLatent.push(entry);
-          entry.tier = 'expired';
+          // Trivial entry (short immediate) — transition directly, no summary needed.
+          entry.tier = 'medium-term';
+          entry.tierEnteredAt = this.turnCounter;
         }
-      } else if (entry.tier === 'short-term' && age > this.shortTermTTL) {
-        entry.tier = 'medium-term';
+      }
+
+      // Medium-term expiry check (separate block — not else-if — allows same-tick transitions)
+      if (entry.tier === 'medium-term') {
+        const medAge = this.turnCounter - (entry.tierEnteredAt ?? entry.turnAdded);
+        if (medAge > medDur) {
+          if (entry.permanent) {
+            entry.tier = 'long-term';
+            cliLogger.log('memory', `↑ long-term: "${entry.permanent.substring(0, 60)}"`);
+          } else {
+            toLatent.push(entry);
+            entry.tier = 'expired';
+          }
+        }
       }
     }
 
-    // Move expired entries to latent pool (async: needs embeddings)
+    // Process queued latent moves from tag replacement
+    for (const entry of this._latentQueue) {
+      toLatent.push(entry);
+      entry.tier = 'expired';
+    }
+    this._latentQueue = [];
+
+    // Run LLM summarization in parallel. Only transition to medium-term on success.
+    // On failure the entry stays in short-term and will retry next tick.
+    if (toSummarize.length > 0 && this.llmProvider) {
+      const results = await Promise.allSettled(
+        toSummarize.map(entry => this._summarizeEntry(entry))
+      );
+      for (let i = 0; i < toSummarize.length; i++) {
+        const entry = toSummarize[i];
+        const ok = results[i].status === 'fulfilled' && results[i].value === true;
+        if (ok) {
+          entry.tier = 'medium-term';
+          entry.tierEnteredAt = this.turnCounter;
+        } else {
+          // Summarization failed — keep in short-term, retry next tick.
+          cliLogger.log('memory', `Keeping "${entry.immediate?.substring(0, 40)}" in short-term (summary failed)`);
+        }
+        delete entry._pendingMedDur;
+      }
+    } else if (toSummarize.length > 0) {
+      // No LLM provider — transition anyway but log the miss.
+      for (const entry of toSummarize) {
+        entry.tier = 'medium-term';
+        entry.tierEnteredAt = this.turnCounter;
+        delete entry._pendingMedDur;
+      }
+    }
+
+    // Move expired entries to latent store (async: needs embeddings)
     for (const entry of toLatent) {
       await this._moveToLatent(entry);
     }
@@ -469,31 +779,39 @@ export class ContextMemory {
   }
 
   /**
-   * Search latent pool by semantic similarity and inject relevant memories.
+   * Search latent store by semantic similarity and inject relevant memories.
    * Call after prompt_user or when past context might help.
    * @param {string} query - Text to match against (e.g. user's answer)
    */
   async hydrate(query) {
-    if (this.latentPool.length === 0 || !this.llmProvider) return;
+    if (!this.llmProvider) return;
 
     try {
       const queryEmbedding = await this.llmProvider.getEmbedding(query);
       if (!queryEmbedding) return;
 
-      const matches = this.latentPool
-        .map(m => ({ ...m, score: cosineSimilarity(queryEmbedding, m.embedding) }))
-        .filter(m => m.score >= this.latentThreshold)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, this.maxHydrate);
+      let matches = [];
+
+      if (this._latentStore) {
+        matches = await this._latentStore.search(queryEmbedding, this.maxHydrate, this.latentThreshold);
+      } else if (this._fallbackLatentPool.length > 0) {
+        // Fallback in-memory search (tests, no latentDbPath)
+        matches = this._fallbackLatentPool
+          .map(m => ({ ...m, score: cosineSimilarity(queryEmbedding, m.embedding) }))
+          .filter(m => m.score >= this.latentThreshold)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, this.maxHydrate);
+      }
 
       if (matches.length === 0) return;
 
       cliLogger.log('memory', `Hydrated ${matches.length} latent memories`);
       for (const m of matches) {
-        cliLogger.log('memory', `  score=${m.score.toFixed(3)} "${m.summary.substring(0, 60)}"`);
+        cliLogger.log('memory', `  score=${m.score.toFixed(3)} "${(m.text || m.summary).substring(0, 60)}"`);
       }
 
-      const recallText = matches.map(m => `- ${m.summary}`).join('\n');
+      // Inject full text from matched entries (not just summary)
+      const recallText = matches.map(m => `- ${m.text || m.summary}`).join('\n');
       // Inject as volatile short-term entry (will age and fade normally)
       this.add('user', `RECALLED:\n${recallText}`, null, null);
     } catch (err) {
@@ -555,55 +873,61 @@ export class ContextMemory {
 
   /**
    * Serialize full state for persistence (session tracker).
+   * Version 2: includes per-entry TTL fields, no latentPool (stored in LanceDB).
    */
   serialize() {
     return {
-      version: 1,
+      version: 2,
       systemPrompt: this.systemPrompt,
       entries: this.entries.filter(e => !e.ephemeral).map(e => ({
         role: e.role,
         immediate: e.immediate,
         shortTerm: e.shortTerm,
         permanent: e.permanent,
+        ts: e.ts,
         turnAdded: e.turnAdded,
-        tier: e.tier
+        tier: e.tier,
+        shortDuration: e.shortDuration,
+        mediumDuration: e.mediumDuration,
+        tierEnteredAt: e.tierEnteredAt,
+        needsSummary: e.needsSummary || undefined,
+        needsPermanentSummary: e.needsPermanentSummary || undefined,
+        replaceTag: e.replaceTag || undefined,
       })),
-      latentPool: this.latentPool,
+      latentCount: this._latentCount,
       turnCounter: this.turnCounter
     };
   }
 
   /**
    * Restore from serialized state.
-   * Handles both new format (version 1) and legacy format (raw message array).
+   * Handles v2 (exact restore), v1 (migrate latentPool to LanceDB), and legacy array format.
    */
   restore(data) {
     if (!data) return;
 
-    // New format
-    if (data.version === 1) {
-      // Restore system prompt so token/memory display works immediately
+    // Version 2: exact restore with per-entry TTL fields
+    if (data.version === 2) {
       if (data.systemPrompt) {
         this.systemPrompt = data.systemPrompt;
       }
-
-      this.latentPool = data.latentPool || [];
       this.turnCounter = data.turnCounter || 0;
+      this._latentCount = data.latentCount || 0;
+      this.entries = (data.entries || []).map(e => ({ ...e }));
+      return;
+    }
 
-      // Restore all entries as-is, demoting short-term to medium-term
-      this.entries = [];
-      for (const e of (data.entries || [])) {
-        if (e.tier === 'short-term') {
-          // Demote: no longer "just happened"
-          this.entries.push({ ...e, tier: 'medium-term' });
-        } else {
-          this.entries.push({ ...e });
-        }
+    // Version 1: restore entries + migrate latentPool to LanceDB
+    if (data.version === 1) {
+      if (data.systemPrompt) {
+        this.systemPrompt = data.systemPrompt;
       }
+      this.turnCounter = data.turnCounter || 0;
+      this.entries = (data.entries || []).map(e => ({ ...e }));
 
-      // Trim latent pool
-      if (this.latentPool.length > this.maxLatent) {
-        this.latentPool = this.latentPool.slice(-this.maxLatent);
+      // Migrate old latentPool to LanceDB (async, fire-and-forget)
+      if (data.latentPool && data.latentPool.length > 0) {
+        this._migrateLatentPool(data.latentPool);
       }
       return;
     }
@@ -619,33 +943,151 @@ export class ContextMemory {
     }
   }
 
+  /**
+   * Get the actual count of entries in the latent store (LanceDB or fallback).
+   */
+  async getLatentCount() {
+    if (this._latentStore) {
+      return await this._latentStore.count();
+    }
+    return this._fallbackLatentPool.length;
+  }
+
   // ─── Private ─────────────────────────────────────────────────────────
 
   /**
-   * Move an expired entry to the latent pool with embedding.
+   * LLM-based summarization for an entry transitioning out of short-term.
+   * Uses the cheapest+fastest available model (speed taskType, difficulty=1).
+   * Cost is recorded in costCenter so it appears in /cost reports.
+   * Returns true on success, false on failure — no truncation fallback.
    */
-  async _moveToLatent(entry) {
-    const text = entry.shortTerm || entry.immediate?.substring(0, 200);
-    if (!text || !this.llmProvider) return;
+  async _summarizeEntry(entry) {
+    if (!this.llmProvider) return false;
+
+    const textToSummarize = entry.immediate || '';
+    if (!textToSummarize) return false;
 
     try {
-      const embedding = await this.llmProvider.getEmbedding(text);
+      const system = 'Return ONLY valid JSON. No markdown, no explanations.';
+      const user   = `Summarize in 1-3 sentences. Preserve file paths, names, numbers, and errors. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`;
+      // callSummary uses the cheapest/fastest model and records cost in costCenter.
+      const raw = await this.llmProvider.callSummary(system, user);
+      let cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      let parsed;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch {
+        // LLM may return unescaped control chars inside JSON strings — fix common cases
+        cleaned = cleaned.replace(/[\x00-\x1f]/g, ch => {
+          if (ch === '\n') return '\\n';
+          if (ch === '\r') return '\\r';
+          if (ch === '\t') return '\\t';
+          return '';
+        });
+        try { parsed = JSON.parse(cleaned); } catch {
+          // Last resort: extract summary from raw text
+          const m = raw.match(/["']summary["']\s*:\s*["'](.+?)["']\s*[,}]/s);
+          parsed = m ? { summary: m[1] } : null;
+        }
+      }
+      const summary = parsed?.summary;
+      if (summary && typeof summary === 'string') {
+        entry.shortTerm = summary;
+        if (entry.needsPermanentSummary) {
+          entry.permanent = summary;
+        }
+        cliLogger.log('memory', `LLM summary: "${summary.substring(0, 80)}"`);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      cliLogger.log('memory', `Summarization failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Move an expired entry to the latent store with embedding.
+   * Stores full immediate text (not just summary) for richer recall.
+   */
+  async _moveToLatent(entry) {
+    // Use full immediate text for embedding (truncated for API limits)
+    const fullText = entry.immediate || '';
+    const summary = entry.shortTerm || fullText.substring(0, 200);
+    const textForEmbedding = fullText.substring(0, 2000);
+    if (!textForEmbedding || !this.llmProvider) return;
+
+    try {
+      const embedding = await this.llmProvider.getEmbedding(textForEmbedding);
       if (!embedding) return;
 
-      this.latentPool.push({
-        summary: text,
-        embedding,
-        ts: Date.now(),
-        role: entry.role
-      });
-
-      // Trim pool if too large
-      if (this.latentPool.length > this.maxLatent) {
-        this.latentPool = this.latentPool.slice(-this.maxLatent);
+      if (this._latentStore) {
+        await this._latentStore.add({
+          text: fullText.substring(0, 4000), // Cap for storage
+          summary,
+          embedding,
+          role: entry.role,
+          ts: Date.now(),
+        });
+      } else {
+        // Fallback in-memory pool (tests, no latentDbPath)
+        this._fallbackLatentPool.push({
+          text: fullText.substring(0, 4000),
+          summary,
+          embedding,
+          ts: Date.now(),
+          role: entry.role,
+        });
+        if (this._fallbackLatentPool.length > this._fallbackMaxLatent) {
+          this._fallbackLatentPool = this._fallbackLatentPool.slice(-this._fallbackMaxLatent);
+        }
+        cliLogger.log('memory', `→ latent (in-memory): "${summary.substring(0, 60)}"`);
       }
+      this._latentCount++;
+    } catch (err) {
+      cliLogger.log('memory', `_moveToLatent failed: ${err.message}`);
+    }
+  }
 
-      cliLogger.log('memory', `→ latent: "${text.substring(0, 60)}"`);
-    } catch { /* non-fatal */ }
+  /**
+   * Replace old entries with the same tag (expire them).
+   */
+  _replaceTagged(tag) {
+    for (const entry of this.entries) {
+      if (entry.replaceTag === tag && entry.tier !== 'expired') {
+        entry.tier = 'expired';
+        cliLogger.log('memory', `Tag replace: expired "${tag}" entry`);
+      }
+    }
+  }
+
+  /**
+   * Mark old tagged entries for latent move (used when clearTag is true).
+   */
+  _markTagForLatent(tag) {
+    for (const entry of this.entries) {
+      if (entry.replaceTag === tag && entry.tier !== 'expired') {
+        this._latentQueue.push(entry);
+        cliLogger.log('memory', `Tag clear: queuing "${tag}" for latent`);
+      }
+    }
+  }
+
+  /**
+   * Migrate v1 latentPool to LanceDB (async, fire-and-forget).
+   */
+  _migrateLatentPool(latentPool) {
+    if (!this._latentStore) {
+      // No LanceDB path — keep in fallback pool
+      this._fallbackLatentPool = latentPool.slice(-this._fallbackMaxLatent);
+      return;
+    }
+    // Fire-and-forget migration
+    this._latentStore.migrateFromArray(latentPool).catch(err => {
+      cliLogger.log('memory', `Latent migration failed: ${err.message}`);
+      // Fall back to in-memory
+      this._fallbackLatentPool = latentPool.slice(-this._fallbackMaxLatent);
+    });
   }
 
   /**

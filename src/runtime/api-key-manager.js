@@ -6,6 +6,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+
+const GLOBAL_ENV_PATH = path.join(os.homedir(), '.koi', '.env');
 
 export const PROVIDER_KEYS = {
   openai:    'OPENAI_API_KEY',
@@ -23,10 +26,12 @@ const PROVIDER_NAMES = {
 const REQUIRED_PROVIDERS = ['openai', 'anthropic', 'gemini'];
 
 /**
- * Persist a key to .env, replacing any existing definition.
+ * Persist a key to the global ~/.koi/.env, replacing any existing definition.
  */
 function _saveKeyToEnv(keyName, key) {
-  const dotenvPath = path.join(process.cwd(), '.env');
+  const dotenvPath = GLOBAL_ENV_PATH;
+  const dir = path.dirname(dotenvPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   try {
     let existing = '';
     if (fs.existsSync(dotenvPath)) {
@@ -78,7 +83,7 @@ export async function promptMissingApiKeys() {
 
     const saved = _saveKeyToEnv(keyName, key);
     if (!saved) {
-      cliLogger.print(`Could not write to .env — ${keyName} will be active for this session only`);
+      cliLogger.print(`Could not write to ~/.koi/.env — ${keyName} will be active for this session only`);
     }
     process.env[keyName] = key;
   }
@@ -120,9 +125,9 @@ export async function ensureApiKey(provider) {
 
   const saved = _saveKeyToEnv(keyName, key);
   if (saved) {
-    cliLogger.print(`Saved ${keyName} to .env`);
+    cliLogger.print(`Saved ${keyName} to ~/.koi/.env`);
   } else {
-    cliLogger.print(`Could not write to .env — key will be active for this session only`);
+    cliLogger.print(`Could not write to ~/.koi/.env — key will be active for this session only`);
   }
 
   process.env[keyName] = key;

@@ -45,6 +45,7 @@ export function getModelCaps(model) {
     noTemperature: info?.noTemperature ?? false,
     noMaxTokens:   info?.noMaxTokens   ?? false,
     api:           info?.api           ?? 'chat',
+    thinking:      info?.thinking      ?? false,
   };
 }
 
@@ -85,18 +86,20 @@ class CostCenter {
    * @param {string} model      - Exact model ID (e.g. 'gpt-4o-mini')
    * @param {string} provider   - 'openai' | 'anthropic' | 'gemini'
    * @param {number} inputTokens
-   * @param {number} outputTokens
+   * @param {number} outputTokens  - Content output tokens (NOT including thinking)
    * @param {number} apiMs      - Duration of the HTTP call in ms
+   * @param {number} thinkingTokens - Reasoning/thinking tokens (billed as output)
    */
-  recordUsage(model, provider, inputTokens, outputTokens, apiMs = 0) {
+  recordUsage(model, provider, inputTokens, outputTokens, apiMs = 0, thinkingTokens = 0) {
     if (!this._models.has(model)) {
-      this._models.set(model, { provider, calls: 0, inputTokens: 0, outputTokens: 0, apiMs: 0 });
+      this._models.set(model, { provider, calls: 0, inputTokens: 0, outputTokens: 0, thinkingTokens: 0, apiMs: 0 });
     }
     const entry = this._models.get(model);
-    entry.calls        += 1;
-    entry.inputTokens  += inputTokens  || 0;
-    entry.outputTokens += outputTokens || 0;
-    entry.apiMs        += apiMs        || 0;
+    entry.calls          += 1;
+    entry.inputTokens    += inputTokens    || 0;
+    entry.outputTokens   += outputTokens   || 0;
+    entry.thinkingTokens += thinkingTokens || 0;
+    entry.apiMs          += apiMs          || 0;
 
     this.totalApiMs += apiMs || 0;
   }
@@ -192,17 +195,20 @@ class CostCenter {
 
     // ── Per-model breakdown ───────────────────────────────────────────────
     let grandTotal = 0;
-    let grandInput = 0, grandOutput = 0, grandCalls = 0;
+    let grandInput = 0, grandOutput = 0, grandThinking = 0, grandCalls = 0;
 
     for (const [model, entry] of models) {
       const info = lookupModel(model);
-      const inputCost  = info ? (entry.inputTokens  / 1_000_000) * info.inputPer1M  : null;
-      const outputCost = info ? (entry.outputTokens / 1_000_000) * info.outputPer1M : null;
-      const totalCost  = (inputCost ?? 0) + (outputCost ?? 0);
-      grandTotal  += totalCost;
-      grandInput  += entry.inputTokens;
-      grandOutput += entry.outputTokens;
-      grandCalls  += entry.calls;
+      const inputCost    = info ? (entry.inputTokens    / 1_000_000) * info.inputPer1M  : null;
+      // Thinking tokens are billed at output rate
+      const outputCost   = info ? (entry.outputTokens   / 1_000_000) * info.outputPer1M : null;
+      const thinkingCost = info ? (entry.thinkingTokens / 1_000_000) * info.outputPer1M : null;
+      const totalCost    = (inputCost ?? 0) + (outputCost ?? 0) + (thinkingCost ?? 0);
+      grandTotal    += totalCost;
+      grandInput    += entry.inputTokens;
+      grandOutput   += entry.outputTokens;
+      grandThinking += entry.thinkingTokens;
+      grandCalls    += entry.calls;
 
       const ctxK   = info?.contextK ?? null;
       const ctxStr = ctxK
@@ -231,6 +237,9 @@ class CostCenter {
 
       out.push(row('Input:',  fmtTokens(entry.inputTokens),  inputCost  !== null ? fmtUsd(inputCost)  : '?', pctStr, true));
       out.push(row('Output:', fmtTokens(entry.outputTokens), outputCost !== null ? fmtUsd(outputCost) : '?', '',     true));
+      if (entry.thinkingTokens > 0) {
+        out.push(row('Thinking:', fmtTokens(entry.thinkingTokens), thinkingCost !== null ? fmtUsd(thinkingCost) : '?', 'billed as output', true));
+      }
 
       // Subtotal — bold, padding done on plain string before ANSI
       const subtotalVal = totalCost > 0 ? fmtUsd(totalCost) : '?';
@@ -242,7 +251,10 @@ class CostCenter {
     out.push('');
     out.push(BAR);
 
-    const tokenSummary = `${fmtTokens(grandInput + grandOutput)}  (${fmtTokens(grandInput)} in · ${fmtTokens(grandOutput)} out)`;
+    const totalAllTokens = grandInput + grandOutput + grandThinking;
+    const tokenParts = [`${fmtTokens(grandInput)} in`, `${fmtTokens(grandOutput)} out`];
+    if (grandThinking > 0) tokenParts.push(`${fmtTokens(grandThinking)} thinking`);
+    const tokenSummary = `${fmtTokens(totalAllTokens)}  (${tokenParts.join(' · ')})`;
     out.push(`  \x1b[2m${'Total calls:'.padEnd(16)}\x1b[0m${grandCalls}`);
     out.push(`  \x1b[2m${'Total tokens:'.padEnd(16)}\x1b[0m${tokenSummary}`);
 

@@ -32,34 +32,58 @@ function applyHunks(content, hunks) {
   for (const hunk of sorted) {
     const startIdx = hunk.oldStart - 1; // 0-based
 
-    // Collect old lines (context + remove) and new lines (context + add)
+    // Collect old lines (context + remove) for matching
     const oldLines = [];
-    const newLines = [];
     for (const line of hunk.lines) {
-      if (line.type === 'context') {
+      if (line.type === 'context' || line.type === 'remove') {
         oldLines.push(line.text);
-        newLines.push(line.text);
-      } else if (line.type === 'remove') {
-        oldLines.push(line.text);
-      } else if (line.type === 'add') {
-        newLines.push(line.text);
       }
     }
 
-    // Verify context matches (multi-pass fuzzy search across entire file)
-    let matchIdx = findHunkPosition(lines, oldLines, startIdx, hunk.fuzzy, hunk.lines);
-    if (matchIdx === -1) {
+    // Multi-pass fuzzy search across entire file
+    const match = findHunkPosition(lines, oldLines, startIdx, hunk.fuzzy, hunk.lines);
+    if (match.idx === -1) {
       const err = new Error(`Hunk at line ${hunk.oldStart} does not match file content. Context lines don't match.`);
       err.failingLine = hunk.oldStart;
       throw err;
     }
 
-    // Update hunk's oldStart with actual matched position (for correct line numbers in rendering)
-    hunk.oldStart = matchIdx + 1; // 1-based
-    hunk.newStart = matchIdx + 1;
+    if (match.removeOnly) {
+      // Pass 5 matched: only the remove lines were verified, context is untrusted.
+      // Only splice the remove lines and insert add lines in their place.
+      // match.idx is where the remove lines start in the file.
+      const removeLines = hunk.lines.filter(l => l.type === 'remove');
+      const addLines = hunk.lines.filter(l => l.type === 'add').map(l => l.text);
 
-    // Replace old lines with new lines
-    lines.splice(matchIdx, oldLines.length, ...newLines);
+      // Update hunk positions for rendering
+      hunk.oldStart = match.idx + 1;
+      hunk.newStart = match.idx + 1;
+
+      lines.splice(match.idx, removeLines.length, ...addLines);
+    } else {
+      const matchIdx = match.idx;
+
+      // Update hunk's oldStart with actual matched position (for correct line numbers in rendering)
+      hunk.oldStart = matchIdx + 1; // 1-based
+      hunk.newStart = matchIdx + 1;
+
+      // Rebuild newLines using actual file content for context lines.
+      // This prevents hallucinated context lines from corrupting the file.
+      const rebuiltNewLines = [];
+      let fileIdx = matchIdx;
+      for (const line of hunk.lines) {
+        if (line.type === 'context') {
+          rebuiltNewLines.push(lines[fileIdx]);
+          fileIdx++;
+        } else if (line.type === 'remove') {
+          fileIdx++;
+        } else if (line.type === 'add') {
+          rebuiltNewLines.push(line.text);
+        }
+      }
+
+      lines.splice(matchIdx, oldLines.length, ...rebuiltNewLines);
+    }
   }
 
   return lines.join('\n');
@@ -77,16 +101,16 @@ function applyHunks(content, hunks) {
 function findHunkPosition(fileLines, oldLines, expectedIdx, fuzzy = false, hunkLines = null) {
   // Pass 1: exact position
   if (linesMatch(fileLines, oldLines, expectedIdx, false)) {
-    return expectedIdx;
+    return { idx: expectedIdx, removeOnly: false };
   }
 
   // Pass 2: nearby (±50 lines), strict
   for (let offset = 1; offset <= 50; offset++) {
     if (expectedIdx - offset >= 0 && linesMatch(fileLines, oldLines, expectedIdx - offset, false)) {
-      return expectedIdx - offset;
+      return { idx: expectedIdx - offset, removeOnly: false };
     }
     if (expectedIdx + offset < fileLines.length && linesMatch(fileLines, oldLines, expectedIdx + offset, false)) {
-      return expectedIdx + offset;
+      return { idx: expectedIdx + offset, removeOnly: false };
     }
   }
 
@@ -94,41 +118,33 @@ function findHunkPosition(fileLines, oldLines, expectedIdx, fuzzy = false, hunkL
   for (let idx = 0; idx < fileLines.length; idx++) {
     if (Math.abs(idx - expectedIdx) <= 50) continue; // already checked
     if (linesMatch(fileLines, oldLines, idx, false)) {
-      return idx;
+      return { idx, removeOnly: false };
     }
   }
 
   // Pass 4: entire file, whitespace-normalized (trim both leading & trailing)
   for (let idx = 0; idx < fileLines.length; idx++) {
     if (linesMatch(fileLines, oldLines, idx, true)) {
-      return idx;
+      return { idx, removeOnly: false };
     }
   }
 
   // Pass 5: match using only the remove lines (the actual lines being changed).
   // LLMs frequently hallucinate context lines but get the changed lines right.
+  // Returns the index where the REMOVE lines start (not the hunk start),
+  // and removeOnly=true so the caller knows context is untrusted.
   if (hunkLines) {
     const removeLines = hunkLines.filter(l => l.type === 'remove').map(l => l.text);
     if (removeLines.length > 0) {
-      // Find sequences of remove lines in the file
       for (let idx = 0; idx < fileLines.length; idx++) {
         if (linesMatch(fileLines, removeLines, idx, true)) {
-          // Found the remove lines — figure out where the hunk actually starts
-          // by counting how many context lines precede the first remove
-          let contextBefore = 0;
-          for (const hl of hunkLines) {
-            if (hl.type === 'remove') break;
-            if (hl.type === 'context') contextBefore++;
-          }
-          const hunkStart = idx - contextBefore;
-          if (hunkStart >= 0) return hunkStart;
-          return idx;
+          return { idx, removeOnly: true };
         }
       }
     }
   }
 
-  return -1;
+  return { idx: -1, removeOnly: false };
 }
 
 /**
@@ -193,6 +209,25 @@ export default {
 
     // Parse the diff
     const hunks = parseUnifiedDiff(diffStr);
+
+    // Early detection: reject diffs where every hunk has identical remove/add lines
+    if (hunks.length > 0) {
+      const allNoOp = hunks.every(hunk => {
+        const removes = hunk.lines.filter(l => l.type === 'remove').map(l => l.text.trimEnd());
+        const adds = hunk.lines.filter(l => l.type === 'add').map(l => l.text.trimEnd());
+        return removes.length === adds.length && removes.every((r, i) => r === adds[i]);
+      });
+      if (allNoOp) {
+        return {
+          success: false,
+          error: 'No-op diff: every - line is identical to its corresponding + line (ignoring trailing whitespace).',
+          fix: 'Your diff does not make any real changes. The - and + lines are the same. '
+            + 'Re-read the file to find the exact line you need to change, then write a diff where '
+            + 'the - line contains the CURRENT text and the + line contains the NEW text you want.'
+        };
+      }
+    }
+
     if (hunks.length === 0) {
       return {
         success: false,
@@ -233,6 +268,17 @@ export default {
           + `{ "path": "${filePath}", "offset": ${Math.max(1, failingLine - 5)}, "limit": 30 }. `
           + 'Then rewrite the diff with context lines that EXACTLY match the file. '
           + 'Do NOT use shell/sed. Retry edit_file.'
+      };
+    }
+
+    // Detect no-op diffs (remove and add lines are identical — LLM generated garbage)
+    if (newContent === content) {
+      return {
+        success: false,
+        error: 'No-op diff: the remove and add lines are identical. The file would not change.',
+        fix: 'Your diff does not make any actual changes. The - and + lines are the same. '
+          + 'Re-read the file to find the exact line you need to change, then write a diff where '
+          + 'the - line contains the CURRENT text and the + line contains the NEW text you want.'
       };
     }
 

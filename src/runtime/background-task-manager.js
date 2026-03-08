@@ -47,6 +47,7 @@ class BackgroundTaskManager {
         entry.status = 'error';
         entry.error = err.message;
         this._updateFooter();
+        cliLogger.log('background', `Task "${name}" FAILED: ${err.message}\n${err.stack || ''}`);
         // Auto-cleanup after 5s
         setTimeout(() => {
           if (this._tasks.get(name) === entry) {
@@ -94,18 +95,26 @@ class BackgroundTaskManager {
    * @param {import('./llm-provider.js').LLMProvider} llmProvider
    */
   startSemanticIndexing(projectDir, llmProvider) {
+    cliLogger.log('background', `startSemanticIndexing called — projectDir: ${projectDir}`);
     return this.run('semantic-index', async (report) => {
+      cliLogger.log('background', 'Loading semantic-index module...');
       const { getSemanticIndex } = await import('./semantic-index.js');
+      cliLogger.log('background', 'semantic-index module loaded OK');
+
       const cacheDir = path.join(projectDir, '.koi', 'cache', 'semantic-index');
       const index = getSemanticIndex(cacheDir, llmProvider);
 
-      if (await index.isUpToDate(projectDir)) {
-        cliLogger.log('background', 'Semantic index up-to-date');
-        // Pre-load cache so searches never need to touch LanceDB
+      cliLogger.log('background', 'Checking if index is up-to-date...');
+      const upToDate = await index.isUpToDate(projectDir);
+      cliLogger.log('background', `isUpToDate: ${upToDate}`);
+
+      if (upToDate) {
+        cliLogger.log('background', 'Semantic index up-to-date — pre-loading cache');
         await index.ensureCacheLoaded();
         return;
       }
 
+      cliLogger.log('background', 'Starting index.build()...');
       await index.build(projectDir, (done, total) => {
         const pct = Math.round((done / total) * 100);
         report(`indexing ${pct}%`);

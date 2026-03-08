@@ -236,6 +236,30 @@ class CLILogger {
   }
 
   /**
+   * Print partial text without a trailing newline (for streaming output).
+   * Delegates to provider.printStreaming if available, else raw stdout.write.
+   */
+  printStreaming(text) {
+    if (_provider?.printStreaming) {
+      _provider.printStreaming(text);
+    } else {
+      this.clearProgress();
+      process.stdout.write(text);
+    }
+  }
+
+  /**
+   * Finalize a streaming print: emit trailing newline + spacing.
+   */
+  printStreamingEnd() {
+    if (_provider?.printStreamingEnd) {
+      _provider.printStreamingEnd();
+    } else {
+      process.stdout.write('\n');
+    }
+  }
+
+  /**
    * Print a line without the blank spacer that normally follows print().
    * Use for lines that belong visually to the next output (e.g. shell description before → cmd).
    */
@@ -379,8 +403,8 @@ class CLILogger {
    */
   stopAnimation() {
     const slotId = _slotStorage.getStore();
-    if (slotId !== undefined && _provider?.clearSlot) {
-      _provider.clearSlot(slotId);
+    if (slotId !== undefined) {
+      // In a slot context (delegate agent), do NOT clear the slot spinner.
       return;
     }
     if (_provider?.stopThinking) {
@@ -455,8 +479,10 @@ class CLILogger {
    */
   clearProgress() {
     const slotId = _slotStorage.getStore();
-    if (slotId !== undefined && _provider?.clearSlot) {
-      _provider.clearSlot(slotId);
+    if (slotId !== undefined) {
+      // In a slot context (delegate agent), do NOT clear the slot spinner.
+      // The spinner should stay visible between actions (print, permissions, etc.)
+      // and only be updated by planning() or removed when the delegate finishes.
       return;
     }
     if (_provider?.clear) {
@@ -525,8 +551,9 @@ class CLILogger {
    */
   clear() {
     const slotId = _slotStorage.getStore();
-    if (slotId !== undefined && _provider?.clearSlot) {
-      _provider.clearSlot(slotId);
+    if (slotId !== undefined) {
+      // In a slot context (delegate agent), do NOT clear the slot spinner.
+      // Same rationale as clearProgress() above.
       return;
     }
     if (_provider?.clear) {

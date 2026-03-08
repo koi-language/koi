@@ -64,24 +64,33 @@ export class AgentRouter {
     if (!agent.handlers) return result;
 
     for (const [eventName, handler] of Object.entries(agent.handlers)) {
-      const playbook = agent.playbooks?.[eventName];
-
       let description;
       let confidence;
 
-      if (playbook) {
-        description = this.inferIntentFromPlaybook(playbook, eventName);
-        confidence = 0.9;
+      // Priority 1: build-time LLM-generated description (from --precalculate)
+      if (handler.__description__) {
+        description = handler.__description__;
+        confidence = 0.95;
       } else {
-        description = `Handle ${eventName} event`;
-        confidence = 0.5;
+        // Priority 2: infer from handler's own playbook text (handler.__playbook__)
+        // agent.playbooks[eventName] is only set for top-level PlaybookDecl, not for
+        // PlaybookStatement inside event handlers — so we read from the handler directly.
+        const playbookText = agent.playbooks?.[eventName] || handler.__playbook__;
+
+        if (playbookText) {
+          description = this.inferIntentFromPlaybook(playbookText, eventName);
+          confidence = 0.9;
+        } else {
+          description = `Handle ${eventName} event`;
+          confidence = 0.5;
+        }
       }
 
       result.push({
         event: eventName,
         description,
         confidence,
-        metadata: { hasPlaybook: !!playbook, role: agent.role?.name }
+        metadata: { hasPlaybook: !!(agent.playbooks?.[eventName] || handler.__playbook__), role: agent.role?.name }
       });
     }
 
