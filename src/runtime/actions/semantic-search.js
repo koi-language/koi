@@ -57,8 +57,11 @@ export default {
       return { success: false, error: 'semantic_code_search requires a "query" field' };
     }
 
-    const projectDir = path.resolve(action.path || (process.env.KOI_PROJECT_ROOT || process.cwd()));
-    const pathPrefix = action.path || undefined;
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    const projectDir = path.resolve(action.path || projectRoot);
+    // Only apply pathPrefix for subdirectory scoping within the main project
+    const pathPrefix = (action.path && !action.path.includes('node_modules') && !action.path.startsWith('dep:'))
+      ? action.path : undefined;
 
     // Permission check
     const permissions = getFilePermissions(agent);
@@ -74,29 +77,14 @@ export default {
     }
 
     try {
-      const { getSemanticIndex, findProjectCacheDir } = await import('../semantic-index.js');
+      const _t0 = Date.now();
+      const { getSemanticIndex } = await import('../semantic-index.js');
+      cliLogger.log('semantic-search', `[${query.slice(0, 40)}] import: ${Date.now() - _t0}ms`);
 
-      // Determine which project's index to use.
-      // If action.path points outside KOI_PROJECT_ROOT, look for a .koi index there.
-      const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
-      const searchPath = action.path ? path.resolve(projectRoot, action.path) : projectRoot;
-      const isExternal = !searchPath.startsWith(projectRoot + path.sep) && searchPath !== projectRoot;
-
-      let cacheDir;
-      let indexProjectRoot = projectRoot;
-      if (isExternal) {
-        const externalCache = findProjectCacheDir(searchPath);
-        if (externalCache) {
-          cacheDir = externalCache;
-          // The project root is 3 levels up from .koi/cache/semantic-index
-          indexProjectRoot = path.resolve(externalCache, '..', '..', '..');
-        }
-      }
-      if (!cacheDir) {
-        cacheDir = path.join(projectRoot, '.koi', 'cache', 'semantic-index');
-      }
-
+      // Single unified index — includes main project + dependency files
+      const cacheDir = path.join(projectRoot, '.koi', 'cache', 'semantic-index');
       const index = getSemanticIndex(cacheDir, agent.llmProvider);
+      cliLogger.log('semantic-search', `[${query.slice(0, 40)}] getIndex: ${Date.now() - _t0}ms, building=${index.isBuilding()}`);
 
       if (index.isBuilding()) {
         return {
@@ -111,6 +99,7 @@ export default {
           error: 'Semantic index not built yet. Use index_code first, or wait for background indexing to complete.',
         };
       }
+      cliLogger.log('semantic-search', `[${query.slice(0, 40)}] isReady: ${Date.now() - _t0}ms`);
 
       cliLogger.progress('Searching semantic index...');
 
@@ -119,37 +108,35 @@ export default {
       const queryEmbedding = await agent.llmProvider.getEmbedding(query);
       cliLogger.log('semantic-search', `[${query.slice(0, 40)}] Embedding received, searching cache...`);
 
+      // Search the unified index (includes main project + dependency files)
       const results = await index.search(queryEmbedding, {
         type,
         limit: maxResults,
         pathPrefix,
       });
+
       cliLogger.log('semantic-search', `[${query.slice(0, 40)}] Search done, ${results.length} results`);
 
       cliLogger.clear();
 
-      // Two-tier scoring: high confidence (>= 0.35) and low confidence (0.2-0.35).
-      // Below 0.2 is pure noise and gets discarded.
-      const HIGH_SCORE = 0.35;
+      // Filter pure noise (< 0.2) but keep everything else — let the agent
+      // decide which results are relevant based on their descriptions and context.
       const MIN_SCORE = 0.2;
       const MAX_RESULTS = 10;
 
-      const aboveMin = results.filter(r => r.score >= MIN_SCORE).slice(0, MAX_RESULTS);
+      const filtered = results.filter(r => r.score >= MIN_SCORE).slice(0, MAX_RESULTS);
 
-      if (aboveMin.length === 0) {
+      if (filtered.length === 0) {
         return {
           success: true,
           query,
           count: 0,
           results: [],
-          ...(isExternal && { projectRoot: indexProjectRoot }),
-          hint: 'ZERO RESULTS. DO NOT answer the user — you have no information yet. You MUST search using other tools NOW: grep(pattern:"..."), search(mode:symbols,query:"..."), search(mode:glob,pattern:"*keyword*"). Do NOT print a response until you have found and READ the actual source code.',
+                    hint: 'ZERO RESULTS. You MUST search using other tools NOW: grep(pattern:"..."), search(mode:symbols,query:"..."), search(mode:glob,pattern:"*keyword*"). Do NOT answer until you have found and READ the actual source code.',
         };
       }
 
-      const hasHighConfidence = aboveMin.some(r => r.score >= HIGH_SCORE);
-
-      const mapped = aboveMin.map((r) => ({
+      const mapped = filtered.map((r) => ({
         type: r.type,
         name: r.name,
         filePath: r.filePath,
@@ -166,10 +153,7 @@ export default {
         query,
         count: mapped.length,
         results: mapped,
-        ...(isExternal && { projectRoot: indexProjectRoot }),
-        ...(!hasHighConfidence && {
-          hint: 'WARNING: All results have LOW confidence (< 0.35) — they are likely WRONG. DO NOT answer the user based on these descriptions. You MUST verify by using grep, search(mode:symbols), or search(mode:glob) to find the actual files, then read_file to confirm before answering.',
-        }),
+                hint: 'DECIDE AND ZOOM IN: Review each result\'s description against what you are looking for. For any result whose description matches your search intent, call read_file IMMEDIATELY using its filePath and lineFrom/lineTo. Do NOT skip to grep/glob — the descriptions tell you which files are worth reading. Only fall back to text-based search if NONE of the descriptions match your needs.',
       };
     } catch (err) {
       cliLogger.clear();

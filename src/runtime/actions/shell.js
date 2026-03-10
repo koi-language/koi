@@ -59,8 +59,48 @@ async function _loadPty() {
   try {
     _pty = (await import('node-pty')).default;
     cliLogger.log('shell', 'node-pty loaded ✓');
+    // Inside a pkg snapshot, spawn-helper is readable but not executable.
+    // Extract it to a real temp path so posix_spawnp can exec it.
+    _extractSpawnHelperIfNeeded();
   } catch (e) {
     cliLogger.log('shell', `node-pty unavailable, using spawn fallback: ${e.message}`);
+  }
+}
+
+/** Extract node-pty's spawn-helper from pkg snapshot to a real filesystem path. */
+function _extractSpawnHelperIfNeeded() {
+  try {
+    const fs = require('fs');
+    const os = require('os');
+    const nodePtyDir = require.resolve('node-pty');
+    // Only needed inside a pkg snapshot
+    if (!nodePtyDir.startsWith('/snapshot') && !nodePtyDir.startsWith('C:\\snapshot')) return;
+    const ptyLibDir = require('path').dirname(nodePtyDir);
+    const prebuildDir = require('path').join(ptyLibDir, '..', 'prebuilds', `${process.platform}-${process.arch}`);
+    const snapshotHelper = require('path').join(prebuildDir, 'spawn-helper');
+    if (!fs.existsSync(snapshotHelper)) return;
+    const tempHelper = require('path').join(os.tmpdir(), 'koi-pty-spawn-helper');
+    if (!fs.existsSync(tempHelper)) {
+      fs.copyFileSync(snapshotHelper, tempHelper);
+      fs.chmodSync(tempHelper, 0o755);
+      cliLogger.log('shell', `spawn-helper extracted to ${tempHelper}`);
+    }
+    // Patch node-pty's unixTerminal module to use the extracted helper
+    const unixTerminalPath = require.resolve('node-pty/lib/unixTerminal');
+    const unixTerminal = require(unixTerminalPath);
+    // The helperPath is a module-level var used in the UnixTerminal constructor.
+    // We can't change it directly, but we can monkey-patch the constructor
+    // to override the env before fork.  Alternatively, node-pty checks
+    // the helperPath at pty.fork() — let's replace the pty.fork binding.
+    const nativeUtils = require('node-pty/lib/utils');
+    const native = nativeUtils.loadNativeModule('pty');
+    const origFork = native.module.fork;
+    native.module.fork = function(file, args, env, cwd, cols, rows, uid, gid, utf8, _helperPath, onexit) {
+      return origFork.call(this, file, args, env, cwd, cols, rows, uid, gid, utf8, tempHelper, onexit);
+    };
+    cliLogger.log('shell', `spawn-helper patched → ${tempHelper}`);
+  } catch (e) {
+    cliLogger.log('shell', `spawn-helper extraction skipped: ${e.message}`);
   }
 }
 
@@ -512,10 +552,48 @@ export default {
       return true;
     }
 
+    // Interactive prompt pattern detection: fires _inputNeeded immediately
+    // when the output matches common interactive prompt patterns, without
+    // waiting for the 10-second silence timeout. This catches tools like
+    // drizzle-kit, inquirer, prompts, etc. that may keep emitting spinner
+    // frames or cursor codes while waiting for user input.
+    //
+    // Patterns detected:
+    //   ? Question text (y/N)       — inquirer/prompts yes/no
+    //   ? Question text › ...       — prompts select
+    //   ❯ Option                    — inquirer list/select (arrow menu)
+    //   > Option / ● Option         — alternative menu indicators
+    //   (Y/n) / (y/N) at end        — generic yes/no confirmation
+    //   ~ Rename X / + Create X     — drizzle-kit enum prompts
+    //   Is X renamed from Y? (yes/no) — drizzle-kit specific
+    const INTERACTIVE_PROMPT_RE = /(?:^\s*\?\s+.+\s*(?:\(y\/n\)|›|\(yes\/no\))|(?:^\s*[❯>●]\s+)|(?:\(Y\/n\)|\(y\/N\)|\(yes\/no\))\s*$|^\s*[~+]\s+\w+.*(?:rename|create))/im;
+    let _interactivePromptDebounce = null;
+
+    function _checkInteractivePrompt(text) {
+      if (_passwordPending || _inputNeededInfo || isClosed) return;
+      // Only check the last few lines of the new chunk
+      const lastLines = text.split('\n').slice(-5).join('\n');
+      if (!INTERACTIVE_PROMPT_RE.test(lastLines)) return;
+      // Debounce: wait 1s after detecting the pattern to let the tool finish
+      // rendering its prompt before we snapshot the output for the agent.
+      if (_interactivePromptDebounce) clearTimeout(_interactivePromptDebounce);
+      _interactivePromptDebounce = setTimeout(() => {
+        _interactivePromptDebounce = null;
+        if (isClosed || _passwordPending || _inputNeededInfo) return;
+        const allOutput = Buffer.concat(outputChunks).toString();
+        const promptLines = allOutput.split('\n').slice(-30).join('\n');
+        _inputNeededInfo = { promptContext: promptLines };
+        clearTimeout(_detectTimer); _detectTimer = null;
+        _notify(); // Wake the generator immediately
+      }, 1000);
+    }
+
     // proc is assigned below in the PTY/spawn branches. Declared here so
     // the finally block and the timeout can reference it after assignment.
     let proc;
     let timeout;
+    let ptyProc = null;
+    let child = null;
 
     // Use node-pty if available and a semaphore slot is free; otherwise fall
     // back to plain spawn() (output may be buffered by non-TTY-aware programs).
@@ -553,7 +631,9 @@ export default {
     // Helper: wire up the 'close' and 'error' events shared by both spawn paths.
     const _onClose = (code) => {
       clearTimeout(timeout);
+      clearTimeout(_dataWakeupTimer); _dataWakeupTimer = null;
       clearTimeout(_detectTimer); _detectTimer = null;
+      if (_interactivePromptDebounce) { clearTimeout(_interactivePromptDebounce); _interactivePromptDebounce = null; }
       if (timerInterval) clearInterval(timerInterval);
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       if (!isSilent) cliLogger.clearProgress();
@@ -563,7 +643,9 @@ export default {
     };
     const _onError = (err) => {
       clearTimeout(timeout);
+      clearTimeout(_dataWakeupTimer); _dataWakeupTimer = null;
       clearTimeout(_detectTimer); _detectTimer = null;
+      if (_interactivePromptDebounce) { clearTimeout(_interactivePromptDebounce); _interactivePromptDebounce = null; }
       if (timerInterval) clearInterval(timerInterval);
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       if (!isSilent) cliLogger.clearProgress();
@@ -574,7 +656,7 @@ export default {
     };
     if (usePty) {
       // ── PTY path: node-pty (all platforms) ────────────────────────────────
-      const ptyProc = _pty.spawn(USER_SHELL, _shellArgs(command), {
+      ptyProc = _pty.spawn(USER_SHELL, _shellArgs(command), {
         name: 'xterm-256color',
         cols: 220,
         rows: 50,
@@ -590,7 +672,9 @@ export default {
       ptyProc.onData((data) => {
         outputChunks.push(Buffer.from(data));
         _shellOutputCallback?.(data);
-        if (!_checkPasswordPrompt(Buffer.from(data).toString())) {
+        const dataStr = Buffer.from(data).toString();
+        if (!_checkPasswordPrompt(dataStr)) {
+          _checkInteractivePrompt(dataStr);
           _scheduleDataWakeup();
           _scheduleDetect();
         }
@@ -605,7 +689,7 @@ export default {
       // ── Plain spawn fallback ───────────────────────────────────────────────
       // node-pty unavailable or semaphore limit reached.
       // Output may be buffered for programs that check isatty().
-      const child = spawn(USER_SHELL, _shellArgs(command), {
+      child = spawn(USER_SHELL, _shellArgs(command), {
         cwd: cwd || process.cwd(),
         env: { ...process.env },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -621,6 +705,7 @@ export default {
         const str = data.toString();
         _shellOutputCallback?.(str);
         if (!_checkPasswordPrompt(str)) {
+          _checkInteractivePrompt(str);
           _scheduleDataWakeup();
           _scheduleDetect();
         }
@@ -632,6 +717,7 @@ export default {
         const str = data.toString();
         _shellOutputCallback?.(str);
         if (!_checkPasswordPrompt(str)) {
+          _checkInteractivePrompt(str);
           _scheduleDataWakeup();
           _scheduleDetect();
         }
@@ -682,7 +768,24 @@ export default {
             _passwordPending = false;
             if (agentAnswer != null && !isClosed) {
               cliLogger.log('shell', `[agent-input] writing answer to stdin`);
-              proc.writeStdin(agentAnswer + '\n');
+              // If answer is just "\n" (Enter for menu selection), don't add extra newline
+              const _stdinData = agentAnswer.endsWith('\n') ? agentAnswer : agentAnswer + '\n';
+              proc.writeStdin(_stdinData);
+
+              // After writing auto-input, check if the process responds.
+              // If it stays silent for 8s, the input likely didn't work (e.g. interactive
+              // menu that requires a real TTY). Kill the process and report the failure.
+              const _outputLenBefore = Buffer.concat(outputChunks).length;
+              await new Promise(r => setTimeout(r, 8000));
+              if (!isClosed) {
+                const _outputLenAfter = Buffer.concat(outputChunks).length;
+                if (_outputLenAfter === _outputLenBefore) {
+                  cliLogger.log('shell', `[agent-input] process did not respond after auto-input — killing (likely needs interactive TTY)`);
+                  proc.kill();
+                  // Wait for close event
+                  await new Promise(r => setTimeout(r, 500));
+                }
+              }
             }
           } else {
             yield {
@@ -751,10 +854,20 @@ export default {
         clearTimeout(timeout);
         clearTimeout(_dataWakeupTimer);
         clearTimeout(_detectTimer);
+        if (_interactivePromptDebounce) clearTimeout(_interactivePromptDebounce);
         if (timerInterval) clearInterval(timerInterval);
         if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
         if (!isSilent) cliLogger.clearProgress();
         proc.kill();
+        if (ptyProc?.removeAllListeners) ptyProc.removeAllListeners();
+        if (child) {
+          child.stdout?.removeAllListeners();
+          child.stderr?.removeAllListeners();
+          child.removeAllListeners();
+          child.stdin?.destroy();
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
         _shellOutputCallback?.(false);
         reportDone?.();
       }

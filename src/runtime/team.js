@@ -131,8 +131,9 @@ class TeamEventQuery {
       // Handle both regular agents and MCP resources
       let result;
       if (selected.agent.handle) {
-        // Don't mark as delegation - let the agent decide based on its own context
-        result = await selected.agent.handle(this.eventName, args, false);
+        // Mark as delegation so the delegate agent gets proper task spec injection,
+        // fresh memory, and delegate-specific TTLs.
+        result = await selected.agent.handle(this.eventName, args, true);
       } else if (selected.agent.send) {
         result = await selected.agent.send(this.eventName, args);
       } else {
@@ -147,8 +148,8 @@ class TeamEventQuery {
         cliLogger.progress(`    → [${agentName}] ${this.eventName}...`);
 
         if (agent.handle) {
-          // Don't mark as delegation - let the agent decide based on its own context
-          results.push(await agent.handle(this.eventName, args, false));
+          // Mark as delegation for proper task spec injection and delegate TTLs.
+          results.push(await agent.handle(this.eventName, args, true));
         } else if (agent.send) {
           results.push(await agent.send(this.eventName, args));
         }

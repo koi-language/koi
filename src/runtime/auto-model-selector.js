@@ -64,7 +64,7 @@ export function getAvailableProviders() {
 // Thinking trades speed for quality: better reasoning/planning/code, slower.
 const THINKING_DELTA = { code: 1, planning: 2, reasoning: 2, speed: -2 };
 
-function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown) {
+function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0) {
   const candidates = [];
   for (const provider of providers) {
     if (!skipCooldown && _isOnCooldown(provider)) continue;
@@ -74,6 +74,8 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
     for (const [modelName, caps] of Object.entries(providerModels)) {
       if (caps.outputType !== 'text') continue;
       if (requiresImage && !caps.inputImage) continue;
+      // Skip models whose context window is too small for the input
+      if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
 
       // Non-thinking variant (always added if score qualifies)
@@ -112,17 +114,17 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
  * @param {string[]} availableProviders - providers with API keys
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
-export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false } = {}) {
+export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, minContextK = 0 } = {}) {
   // Code tasks require a minimum difficulty of 6 to ensure capable models are selected.
   // Cheap/fast models can't reliably generate structured output like unified diffs.
   if (taskType === 'code') difficulty = Math.max(difficulty, 6);
 
-  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false);
+  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK);
 
   // If all providers are on cooldown, ignore cooldowns and pick the best available
   // so we never block LLM calls entirely.
   if (candidates.length === 0) {
-    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true);
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK);
   }
 
   if (candidates.length === 0) return null;

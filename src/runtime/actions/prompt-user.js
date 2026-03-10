@@ -9,6 +9,7 @@
 import { cliLogger } from '../cli-logger.js';
 import { cliSelect } from '../cli-select.js';
 import { cliInput } from '../cli-input.js';
+import { renderMarkdown } from '../cli-markdown.js';
 
 export default {
   type: 'prompt_user',
@@ -80,7 +81,7 @@ export default {
     }
 
     // QUESTION mode: print question to scrollback (above separator), then wait for input
-    cliLogger.print(question);
+    cliLogger.print(renderMarkdown(question));
     const raw = await cliInput(promptText);
     const answerText = String(typeof raw === 'string' ? raw : (raw?.text ?? ''));
     const answerAtts = Array.isArray(raw?.attachments) ? raw.attachments : [];

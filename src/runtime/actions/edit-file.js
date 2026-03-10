@@ -96,7 +96,8 @@ function applyHunks(content, hunks) {
  *   Pass 2: Exact match nearby (±50 lines)
  *   Pass 3: Exact match across the entire file
  *   Pass 4: Whitespace-normalized match across entire file
- *   Pass 5: Match using only remove lines (ignore context lines) across entire file
+ *   Pass 5: Partial context match (≥70% lines match, whitespace-normalized)
+ *   Pass 6: Match using only remove lines (ignore context lines) across entire file
  */
 function findHunkPosition(fileLines, oldLines, expectedIdx, fuzzy = false, hunkLines = null) {
   // Pass 1: exact position
@@ -129,7 +130,25 @@ function findHunkPosition(fileLines, oldLines, expectedIdx, fuzzy = false, hunkL
     }
   }
 
-  // Pass 5: match using only the remove lines (the actual lines being changed).
+  // Pass 5: partial context match — tolerate up to 30% mismatched context lines.
+  // LLMs frequently hallucinate some context lines but get the overall position right.
+  // Only triggers when there are enough lines (≥4) to avoid false positives.
+  if (oldLines.length >= 4) {
+    for (let idx = 0; idx < fileLines.length; idx++) {
+      if (idx + oldLines.length > fileLines.length) break;
+      let matches = 0;
+      for (let i = 0; i < oldLines.length; i++) {
+        const a = fileLines[idx + i];
+        const b = oldLines[i];
+        if (a === b || a.trimEnd() === b.trimEnd() || a.trim() === b.trim()) matches++;
+      }
+      if (matches >= Math.ceil(oldLines.length * 0.7)) {
+        return { idx, removeOnly: false };
+      }
+    }
+  }
+
+  // Pass 6: match using only the remove lines (the actual lines being changed).
   // LLMs frequently hallucinate context lines but get the changed lines right.
   // Returns the index where the REMOVE lines start (not the hunk start),
   // and removeOnly=true so the caller knows context is untrusted.

@@ -20,12 +20,13 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { parseFile, getSupportedExtensions } from './code-parser.js';
-import { IGNORE_DIRS } from './file-discovery.js';
+import { IGNORE_DIRS, SOURCE_EXTS } from './file-discovery.js';
 import { cliLogger } from './cli-logger.js';
 
 const EMBEDDING_DIM = 1536; // text-embedding-3-small dimension
 const FUNC_BATCH_SIZE = 10;
 const MAX_SOURCE_CHARS = 1500;
+const FILE_PARALLEL_BATCH = 5; // Index this many files concurrently
 
 // ─── SemanticIndex ──────────────────────────────────────────────────────
 
@@ -55,7 +56,13 @@ export class SemanticIndex {
   /**
    * Build or update the semantic index for a project directory.
    */
-  async build(projectDir, onProgress) {
+  /**
+   * Build or update the semantic index for a project directory.
+   * @param {string} projectDir - Project root directory
+   * @param {Function} [onProgress] - (done, total) callback
+   * @param {{ depDirs?: string[] }} [opts] - Options. depDirs: dependency directories to include in the same index.
+   */
+  async build(projectDir, onProgress, opts = {}) {
     this._building = true;
     this._cache = null; // invalidate cache — will reload after build
     this._cachePromise = null;
@@ -66,43 +73,97 @@ export class SemanticIndex {
       await this._ensureDb();
       this._loadManifest();
 
-      const supportedExts = getSupportedExtensions();
-      cliLogger.log('semantic-index', `Supported extensions: ${[...supportedExts].join(', ')}`);
-      const files = this._discoverFiles(projectDir, supportedExts);
-      const total = files.length;
-      cliLogger.log('semantic-index', `Discovered ${total} files to consider`);
+      // Use SOURCE_EXTS (broad set: .java, .go, .rs, etc.) for file discovery,
+      // not just extensions with tree-sitter plugins. Files without a parser
+      // still get file-level indexing (description + embedding from content).
+      const discoverExts = SOURCE_EXTS;
+      const parserExts = getSupportedExtensions();
+      cliLogger.log('semantic-index', `Discovery extensions: ${[...discoverExts].join(', ')} (parser: ${[...parserExts].join(', ')})`);
 
-      await this._cleanupDeleted(files, projectDir);
+      // Discover files from main project + dependency directories (all in one index)
+      // manifestKey = key for incremental hash check (dep:name/... for deps, relPath for main)
+      // indexPath = path stored in LanceDB file_path column — ALWAYS absolute so agents can read_file directly
+      const fileEntries = []; // { absPath, manifestKey, indexPath }
+      const mainFiles = this._discoverFiles(projectDir, discoverExts);
+      for (const f of mainFiles) {
+        const rel = path.relative(projectDir, f);
+        fileEntries.push({ absPath: f, manifestKey: rel, indexPath: f });
+      }
+
+      // Include dependency files — stored with absolute paths so read_file works directly
+      const depDirs = opts.depDirs || [];
+      for (const depDir of depDirs) {
+        const depName = path.basename(depDir);
+        const depFiles = this._discoverFiles(depDir, discoverExts);
+        cliLogger.log('semantic-index', `Dependency ${depName}: ${depFiles.length} files`);
+        for (const f of depFiles) {
+          fileEntries.push({
+            absPath: f,
+            manifestKey: `dep:${depName}/${path.relative(depDir, f)}`,
+            indexPath: f, // absolute path — agent can read_file directly
+          });
+        }
+      }
+
+      const total = fileEntries.length;
+      cliLogger.log('semantic-index', `Discovered ${total} files to consider (${mainFiles.length} main + ${total - mainFiles.length} deps)`);
+
+      await this._cleanupDeletedByKeys(new Set(fileEntries.map(e => e.manifestKey)));
 
       let indexed = 0;
       let skipped = 0;
+      let processed = 0;
 
-      for (let i = 0; i < files.length; i++) {
-        const filePath = files[i];
-        const relPath = path.relative(projectDir, filePath);
-
+      // Filter out already-up-to-date files first (fast, no I/O beyond fs.read)
+      const toIndex = [];
+      for (const entry of fileEntries) {
         let content;
-        try { content = fs.readFileSync(filePath, 'utf8'); } catch { skipped++; continue; }
-
+        try { content = fs.readFileSync(entry.absPath, 'utf8'); } catch { skipped++; processed++; continue; }
         const hash = sha256(content);
-        if (this._manifest[relPath] === hash) {
+        if (this._manifest[entry.manifestKey] === hash) {
           skipped++;
-          if (onProgress) onProgress(i + 1, total);
+          processed++;
           continue;
         }
-
-        try {
-          await this._indexFile(filePath, relPath, content, hash);
-          indexed++;
-        } catch (err) {
-          cliLogger.log('semantic-index', `Error indexing ${relPath}: ${err.message}`);
-          skipped++;
-        }
-
-        if (onProgress) onProgress(i + 1, total);
+        toIndex.push({ ...entry, content, hash });
       }
 
-      this._saveManifest();
+      if (onProgress) onProgress(processed, total);
+      cliLogger.log('semantic-index', `${toIndex.length} files need indexing, ${skipped} up-to-date`);
+
+      // Pre-create LanceDB tables to avoid race conditions in parallel indexing
+      if (toIndex.length > 0) {
+        await this._ensureFilesTable();
+        await this._ensureFunctionsTable();
+        await this._ensureClassesTable();
+      }
+
+      // Process files in parallel batches
+      for (let i = 0; i < toIndex.length; i += FILE_PARALLEL_BATCH) {
+        const batch = toIndex.slice(i, i + FILE_PARALLEL_BATCH);
+
+        const results = await Promise.allSettled(
+          batch.map(entry => this._indexFile(entry.absPath, entry.indexPath, entry.content, entry.hash, entry.manifestKey))
+        );
+
+        for (let j = 0; j < results.length; j++) {
+          processed++;
+          if (results[j].status === 'fulfilled') {
+            this._manifest[batch[j].manifestKey] = batch[j].hash;
+            indexed++;
+          } else {
+            cliLogger.log('semantic-index', `Error indexing ${batch[j].indexPath}: ${results[j].reason?.message || results[j].reason}`);
+            skipped++;
+          }
+        }
+
+        // Save manifest after each batch so progress survives interruptions
+        this._saveManifest();
+
+        if (onProgress) onProgress(processed, total);
+      }
+
+      this._saveManifest(); // final save
       this._ready = true;
       cliLogger.log('semantic-index', `build() done — indexed: ${indexed}, skipped: ${skipped}, total: ${total}`);
 
@@ -125,12 +186,18 @@ export class SemanticIndex {
    * Fully parallel-safe — no LanceDB access during search.
    */
   async search(queryEmbedding, opts = {}) {
-    if (this._building) return [];
+    if (this._building) {
+      cliLogger.log('semantic-index', 'Search skipped: building in progress');
+      return [];
+    }
 
     // Ensure cache is loaded (one-time from LanceDB, then pure memory)
     if (!this._cache) {
       await this._ensureCacheLoaded();
-      if (!this._cache) return []; // no index data
+      if (!this._cache) {
+        cliLogger.log('semantic-index', 'Search aborted: cache is null after load attempt');
+        return [];
+      }
     }
 
     const { type, limit = 20, pathPrefix } = opts;
@@ -139,15 +206,41 @@ export class SemanticIndex {
       ? [type === 'file' ? 'files' : type === 'class' ? 'classes' : 'functions']
       : ['files', 'classes', 'functions'];
 
+    // Validate cache health — if all vectors are empty, force reload from LanceDB
+    const _totalRows = (this._cache.files?.length || 0) + (this._cache.classes?.length || 0) + (this._cache.functions?.length || 0);
+    if (_totalRows > 0 && !this._cacheValidated) {
+      let _hasVectors = false;
+      for (const tableName of ['files', 'classes', 'functions']) {
+        for (const row of (this._cache[tableName] || [])) {
+          if (row.vector && row.vector.length > 0) { _hasVectors = true; break; }
+        }
+        if (_hasVectors) break;
+      }
+      this._cacheValidated = true;
+      if (!_hasVectors) {
+        cliLogger.log('semantic-index', `Cache has ${_totalRows} rows but ZERO vectors — forcing reload from LanceDB`);
+        this._cache = null;
+        this._ready = false;
+        await this._ensureCacheLoaded();
+        if (!this._cache) {
+          cliLogger.log('semantic-index', 'Search aborted: cache still null after forced reload');
+          return [];
+        }
+      }
+    }
+
+    cliLogger.log('semantic-index', `Search: tables=[${tables.join(',')}], cache sizes: files=${this._cache.files?.length || 0}, classes=${this._cache.classes?.length || 0}, functions=${this._cache.functions?.length || 0}, queryDim=${queryEmbedding?.length || 0}`);
+
     const allResults = [];
+    let _skipNoVector = 0, _skipPathPrefix = 0;
 
     for (const tableName of tables) {
       const rows = this._cache[tableName];
       if (!rows || rows.length === 0) continue;
 
       for (const row of rows) {
-        if (pathPrefix && !row.file_path?.startsWith(pathPrefix)) continue;
-        if (!row.vector || row.vector.length === 0) continue;
+        if (pathPrefix && !row.file_path?.startsWith(pathPrefix)) { _skipPathPrefix++; continue; }
+        if (!row.vector || row.vector.length === 0) { _skipNoVector++; continue; }
 
         const score = cosineSimilarity(queryEmbedding, row.vector);
         const resultType = tableName === 'files' ? 'file' : tableName === 'classes' ? 'class' : 'function';
@@ -167,7 +260,13 @@ export class SemanticIndex {
     }
 
     allResults.sort((a, b) => b.score - a.score);
-    return allResults.slice(0, limit);
+    const top = allResults.slice(0, limit);
+    if (allResults.length > 0) {
+      cliLogger.log('semantic-index', `Search: ${allResults.length} candidates, top score=${allResults[0].score.toFixed(4)}, bottom score=${allResults[allResults.length - 1].score.toFixed(4)}`);
+    } else {
+      cliLogger.log('semantic-index', `Search: 0 candidates (skipped: ${_skipNoVector} no-vector, ${_skipPathPrefix} path-prefix-mismatch, total rows=${_totalRows})`);
+    }
+    return top;
   }
 
   /**
@@ -182,13 +281,17 @@ export class SemanticIndex {
     return this._manifest && Object.keys(this._manifest).length > 0;
   }
 
-  async isUpToDate(projectDir) {
+  /**
+   * Check if the index is up-to-date for the project (and optionally dependencies).
+   * @param {string} projectDir
+   * @param {{ depDirs?: string[] }} [opts]
+   */
+  async isUpToDate(projectDir, opts = {}) {
     this._loadManifest();
     if (!this._manifest || Object.keys(this._manifest).length === 0) return false;
 
-    const supportedExts = getSupportedExtensions();
-    const files = this._discoverFiles(projectDir, supportedExts);
-
+    // Check main project files
+    const files = this._discoverFiles(projectDir, SOURCE_EXTS);
     for (const filePath of files) {
       const relPath = path.relative(projectDir, filePath);
       let content;
@@ -196,6 +299,20 @@ export class SemanticIndex {
       const hash = sha256(content);
       if (this._manifest[relPath] !== hash) return false;
     }
+
+    // Check dependency files
+    for (const depDir of (opts.depDirs || [])) {
+      const depName = path.basename(depDir);
+      const depFiles = this._discoverFiles(depDir, SOURCE_EXTS);
+      for (const filePath of depFiles) {
+        const relPath = `dep:${depName}/${path.relative(depDir, filePath)}`;
+        let content;
+        try { content = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
+        const hash = sha256(content);
+        if (this._manifest[relPath] !== hash) return false;
+      }
+    }
+
     return true;
   }
 
@@ -240,44 +357,76 @@ export class SemanticIndex {
    * or on first search. After this, LanceDB is not touched for reads.
    */
   async _loadCacheFromDb(force = false) {
-    if (!force && this._building) return; // don't read LanceDB while build is writing
+    if (!force && this._building) {
+      cliLogger.log('semantic-index', 'Cache load skipped: building in progress');
+      return;
+    }
     try {
       await this._ensureDb();
       const names = await this._db.tableNames();
+      cliLogger.log('semantic-index', `LanceDB tables found: [${names.join(', ')}]`);
       const cache = { files: [], classes: [], functions: [] };
 
       for (const tableName of ['files', 'classes', 'functions']) {
-        if (!names.includes(tableName)) continue;
+        if (!names.includes(tableName)) {
+          cliLogger.log('semantic-index', `Table "${tableName}" not found in LanceDB, skipping`);
+          continue;
+        }
         try {
           const table = await this._db.openTable(tableName);
           const rows = await table.query().toArray();
-          // Convert Arrow rows to plain JS objects with regular arrays for vectors
+          cliLogger.log('semantic-index', `Table "${tableName}": ${rows.length} rows loaded from LanceDB`);
+          // Convert Arrow rows to plain JS objects with regular arrays for vectors.
+          // Multiple conversion strategies to handle Arrow Vector objects in both
+          // native Node.js and pkg binary environments where native bindings may differ.
+          let vectorOk = 0, vectorFail = 0;
           cache[tableName] = rows.map(row => {
             const obj = {};
             for (const key of Object.keys(row)) {
               const val = row[key];
               if (key === 'vector' && val) {
-                // Arrow Vector → TypedArray → plain Array
-                if (typeof val.toArray === 'function') {
-                  obj[key] = Array.from(val.toArray());
-                } else {
-                  obj[key] = Array.from(val);
-                }
+                let vec = null;
+                try {
+                  // Strategy 1: Arrow Vector.toArray() → Float32Array → Array
+                  if (!vec && typeof val.toArray === 'function') {
+                    const typed = val.toArray();
+                    vec = Array.from(typed);
+                  }
+                  // Strategy 2: Iterable (Symbol.iterator)
+                  if ((!vec || vec.length === 0) && val[Symbol.iterator]) {
+                    vec = [...val];
+                  }
+                  // Strategy 3: JSON round-trip (catches exotic Arrow wrappers)
+                  if ((!vec || vec.length === 0) && typeof val === 'object') {
+                    const parsed = JSON.parse(JSON.stringify(val));
+                    if (Array.isArray(parsed)) vec = parsed;
+                  }
+                  // Strategy 4: Index-based access (fallback for ArrayLike without iterator)
+                  if ((!vec || vec.length === 0) && typeof val.length === 'number' && val.length > 0) {
+                    vec = [];
+                    for (let i = 0; i < val.length; i++) vec.push(val[i]);
+                  }
+                } catch { /* all strategies exhausted */ }
+
+                obj[key] = (vec && vec.length > 0) ? vec : [];
+                if (obj[key].length > 0) vectorOk++; else vectorFail++;
               } else {
                 obj[key] = val;
               }
             }
             return obj;
           });
+          cliLogger.log('semantic-index', `Table "${tableName}": ${vectorOk} vectors OK, ${vectorFail} vectors empty/failed`);
         } catch (err) {
-          cliLogger.log('semantic-index', `Cache load ${tableName}: ${err.message}`);
+          cliLogger.log('semantic-index', `Cache load ${tableName} FAILED: ${err.message}`);
         }
       }
 
       this._cache = cache;
       this._ready = true;
+      cliLogger.log('semantic-index', `Cache ready: files=${cache.files.length}, classes=${cache.classes.length}, functions=${cache.functions.length}`);
     } catch (err) {
-      cliLogger.log('semantic-index', `Cache load failed: ${err.message}`);
+      cliLogger.log('semantic-index', `Cache load FAILED: ${err.message}\n${err.stack}`);
     }
   }
 
@@ -367,10 +516,23 @@ export class SemanticIndex {
 
   // ─── Private: Manifest ──────────────────────────────────────────────
 
+  // Manifest version — bump this when the storage format changes (e.g. relative → absolute paths).
+  // A version mismatch triggers a full re-index on the next build.
+  static MANIFEST_VERSION = 3; // v3: discover all SOURCE_EXTS, file-level indexing for non-parsed languages
+
   _loadManifest() {
     if (this._manifest) return;
     try {
-      this._manifest = JSON.parse(fs.readFileSync(this._manifestPath, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(this._manifestPath, 'utf8'));
+      // Check manifest version — if outdated, invalidate to force full re-index
+      if (raw._version !== SemanticIndex.MANIFEST_VERSION) {
+        cliLogger.log('semantic-index', `Manifest version mismatch (${raw._version || 1} → ${SemanticIndex.MANIFEST_VERSION}) — clearing index for re-build`);
+        this._manifest = {};
+        // Also drop LanceDB tables so stale relative paths are removed
+        this._dropAllTables().catch(() => {});
+      } else {
+        this._manifest = raw;
+      }
     } catch {
       this._manifest = {};
     }
@@ -378,19 +540,40 @@ export class SemanticIndex {
 
   _saveManifest() {
     fs.mkdirSync(path.dirname(this._manifestPath), { recursive: true });
+    this._manifest._version = SemanticIndex.MANIFEST_VERSION;
     fs.writeFileSync(this._manifestPath, JSON.stringify(this._manifest, null, 2));
+  }
+
+  async _dropAllTables() {
+    try {
+      const db = await this._ensureDb();
+      const tables = await db.tableNames();
+      for (const t of tables) {
+        await db.dropTable(t);
+      }
+      cliLogger.log('semantic-index', `Dropped ${tables.length} LanceDB tables for re-index`);
+    } catch (e) {
+      cliLogger.log('semantic-index', `Failed to drop tables: ${e.message}`);
+    }
   }
 
   // ─── Private: Index a Single File ───────────────────────────────────
 
-  async _indexFile(filePath, relPath, content, hash) {
+  async _indexFile(filePath, relPath, content, hash, manifestKey) {
     const parsed = parseFile(filePath, content);
-    if (!parsed) return;
+
+    // Languages without a tree-sitter plugin (Java, Go, Rust, etc.) get
+    // file-level-only indexing: an LLM description + embedding of the content.
+    // This still makes the file discoverable via semantic search.
+    if (!parsed) {
+      return this._indexFileOnly(filePath, relPath, content, hash, manifestKey);
+    }
 
     const { classes, functions } = parsed;
     const lang = path.extname(filePath).replace('.', '');
     const lines = content.split('\n');
-    const fileId = sha256(relPath).slice(0, 16);
+    // Use manifestKey for fileId to ensure consistency between build and cleanup
+    const fileId = sha256(manifestKey || relPath).slice(0, 16);
 
     await this._deleteFileData(fileId);
 
@@ -408,69 +591,144 @@ export class SemanticIndex {
 
     const fileDescription = await this._describeFile(relPath, lines.length, classes, functions, classDescriptions, funcDescriptions);
 
-    // Store functions
-    const funcTable = await this._ensureFunctionsTable();
+    // ── Collect all embedding texts, then embed in parallel ──
+    const embedJobs = []; // { key, text }
+
+    // Function embeddings
     for (const func of allFunctions) {
       const desc = funcDescriptions[func.name] || `${func.name}: ${func.signature}`;
       const embedText = `${desc} | ${func.signature} | ${truncate(func.sourceCode, 200)}`;
-      let vector;
-      try { vector = await this.llmProvider.getEmbedding(embedText); } catch { vector = zeroVector(); }
-      await funcTable.add([{
+      embedJobs.push({ key: `fn:${func.name}:${func.lineFrom}`, text: embedText });
+    }
+
+    // Class embeddings
+    for (const cls of classes) {
+      const desc = classDescriptions[cls.name] || cls.name;
+      const methodSummary = cls.methods.map(m => `${m.name}: ${funcDescriptions[m.name] || m.signature}`).join('; ');
+      embedJobs.push({ key: `cls:${cls.name}`, text: `${desc} | ${methodSummary}`.slice(0, 1000) });
+    }
+
+    // File embedding
+    const contentSummary = truncate(content, 500);
+    embedJobs.push({ key: 'file', text: `${fileDescription} | ${contentSummary}` });
+
+    // Embed all in parallel
+    const embedResults = await Promise.allSettled(
+      embedJobs.map(job => this.llmProvider.getEmbedding(job.text))
+    );
+    const vectors = {};
+    for (let i = 0; i < embedJobs.length; i++) {
+      vectors[embedJobs[i].key] = embedResults[i].status === 'fulfilled'
+        ? embedResults[i].value : zeroVector();
+    }
+
+    // Store functions (batch insert)
+    const funcTable = await this._ensureFunctionsTable();
+    const funcRows = allFunctions.map(func => {
+      const desc = funcDescriptions[func.name] || `${func.name}: ${func.signature}`;
+      return {
         id: `${fileId}-fn-${sha256(func.name + func.lineFrom).slice(0, 8)}`,
         file_id: fileId,
         class_id: func.className ? `${fileId}-cls-${sha256(func.className).slice(0, 8)}` : '',
         file_path: relPath,
         name: func.name,
         description: desc,
-        vector,
+        vector: vectors[`fn:${func.name}:${func.lineFrom}`],
         line_from: func.lineFrom,
         line_to: func.lineTo,
         signature: func.signature,
         source_code: truncate(func.sourceCode, MAX_SOURCE_CHARS),
         is_method: func.isMethod ? 1 : 0,
         class_name: func.className || '',
-      }]);
-    }
+      };
+    });
+    if (funcRows.length > 0) await funcTable.add(funcRows);
 
-    // Store classes
+    // Store classes (batch insert)
     const clsTable = await this._ensureClassesTable();
-    for (const cls of classes) {
+    const clsRows = classes.map(cls => {
       const desc = classDescriptions[cls.name] || cls.name;
-      const methodSummary = cls.methods.map(m => `${m.name}: ${funcDescriptions[m.name] || m.signature}`).join('; ');
-      const embedText = `${desc} | ${methodSummary}`.slice(0, 1000);
-      let vector;
-      try { vector = await this.llmProvider.getEmbedding(embedText); } catch { vector = zeroVector(); }
-      await clsTable.add([{
+      return {
         id: `${fileId}-cls-${sha256(cls.name).slice(0, 8)}`,
         file_id: fileId,
         file_path: relPath,
         name: cls.name,
         description: desc,
-        vector,
+        vector: vectors[`cls:${cls.name}`],
         line_from: cls.lineFrom,
         line_to: cls.lineTo,
         source_code: truncate(cls.sourceCode, MAX_SOURCE_CHARS),
-      }]);
-    }
+      };
+    });
+    if (clsRows.length > 0) await clsTable.add(clsRows);
 
     // Store file
     const fileTable = await this._ensureFilesTable();
-    const contentSummary = truncate(content, 500);
-    const fileEmbedText = `${fileDescription} | ${contentSummary}`;
-    let fileVector;
-    try { fileVector = await this.llmProvider.getEmbedding(fileEmbedText); } catch { fileVector = zeroVector(); }
     await fileTable.add([{
       id: fileId,
       file_path: relPath,
       language: lang,
       description: fileDescription,
-      vector: fileVector,
+      vector: vectors['file'],
       line_count: lines.length,
       content_hash: hash,
       indexed_at: new Date().toISOString(),
     }]);
 
-    this._manifest[relPath] = hash;
+    // Note: manifest is updated by build() using manifestKey, not here.
+  }
+
+  /**
+   * File-level-only indexing for languages without a tree-sitter plugin.
+   * Stores a file entry with an LLM description + embedding so the file
+   * is still discoverable via semantic search, even without structural parsing.
+   */
+  async _indexFileOnly(filePath, relPath, content, hash, manifestKey) {
+    const lang = path.extname(filePath).replace('.', '');
+    const lines = content.split('\n');
+    const fileId = sha256(manifestKey || relPath).slice(0, 16);
+
+    await this._deleteFileData(fileId);
+
+    // Build a description from the content preview (no structural info available)
+    const contentPreview = truncate(content, 2000);
+    const prompt = `Given a source file's contents, write a concise 1-2 sentence description focusing on purpose, key classes, and key methods.
+
+File: ${relPath} (${lines.length} lines, language: ${lang})
+\`\`\`${lang}
+${contentPreview}
+\`\`\`
+
+Return: { "description": "..." }`;
+
+    let fileDescription;
+    try {
+      const result = await this.llmProvider.callJSON(prompt, null, { silent: true });
+      fileDescription = result?.description || relPath;
+    } catch {
+      fileDescription = relPath;
+    }
+
+    // Embed and store file entry
+    const embedText = `${fileDescription} | ${truncate(content, 500)}`;
+    let vector;
+    try {
+      vector = await this.llmProvider.getEmbedding(embedText);
+    } catch {
+      vector = zeroVector();
+    }
+
+    const fileTable = await this._ensureFilesTable();
+    await fileTable.add([{
+      id: fileId,
+      file_path: relPath,
+      language: lang,
+      description: fileDescription,
+      vector,
+      line_count: lines.length,
+      content_hash: hash,
+      indexed_at: new Date().toISOString(),
+    }]);
   }
 
   async _deleteFileData(fileId) {
@@ -515,18 +773,22 @@ export class SemanticIndex {
 
   async _cleanupDeleted(currentFiles, projectDir) {
     const currentRelPaths = new Set(currentFiles.map(f => path.relative(projectDir, f)));
+    await this._cleanupDeletedByKeys(currentRelPaths);
+  }
+
+  async _cleanupDeletedByKeys(currentKeys) {
     const toDelete = [];
 
-    for (const relPath of Object.keys(this._manifest)) {
-      if (!currentRelPaths.has(relPath)) {
-        toDelete.push(relPath);
+    for (const key of Object.keys(this._manifest)) {
+      if (!currentKeys.has(key)) {
+        toDelete.push(key);
       }
     }
 
-    for (const relPath of toDelete) {
-      const fileId = sha256(relPath).slice(0, 16);
+    for (const key of toDelete) {
+      const fileId = sha256(key).slice(0, 16);
       await this._deleteFileData(fileId);
-      delete this._manifest[relPath];
+      delete this._manifest[key];
     }
   }
 

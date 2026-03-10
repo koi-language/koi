@@ -115,11 +115,37 @@ export function visibleLength(str) {
 }
 
 /**
- * Pad a line with spaces to fill the terminal width, preserving background color.
+ * Truncate a string with ANSI escapes to a maximum visible width.
+ * Preserves escape codes but cuts visible characters at maxWidth.
+ */
+export function truncateAnsi(str, maxWidth) {
+  let visible = 0;
+  let i = 0;
+  let result = '';
+  while (i < str.length && visible < maxWidth) {
+    if (str[i] === '\x1b' && str[i + 1] === '[') {
+      // Consume entire escape sequence
+      let j = i + 2;
+      while (j < str.length && str[j] !== 'm') j++;
+      result += str.slice(i, j + 1);
+      i = j + 1;
+    } else {
+      result += str[i];
+      visible++;
+      i++;
+    }
+  }
+  return result;
+}
+
+/**
+ * Pad (or truncate) a line to exactly fill the terminal width,
+ * preserving background color across the full line.
  */
 export function padToWidth(str, totalWidth) {
   const visible = visibleLength(str);
-  if (visible >= totalWidth) return str;
+  if (visible > totalWidth) return truncateAnsi(str, totalWidth);
+  if (visible === totalWidth) return str;
   return str + ' '.repeat(totalWidth - visible);
 }
 

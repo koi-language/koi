@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import fs from 'node:fs';
 import path from 'node:path';
 import { LLMProvider } from './llm-provider.js';
 import { cliLogger, withSlot, registerSlotMeta, unregisterSlotMeta, getCurrentSlotId, clearSlotById } from './cli-logger.js';
@@ -892,7 +893,8 @@ export class Agent {
               // Do NOT call session.recordAction here — the _parallel_done synthetic
               // record below already contains all results. Recording individually would
               // cause the LLM to see each result twice (once per action + once in the summary).
-              cliLogger.log('result', `${this.name} [parallel/${paIntent}]: ${JSON.stringify(result).substring(0, 150)}`);
+              const _pResult = JSON.stringify(result);
+              cliLogger.log('result', `${this.name} [parallel/${paIntent}]: ${_pResult.length > 300 ? _pResult.substring(0, 300) + '…' : _pResult}`);
               return { action: pa, result };
             } catch (error) {
               const failedIntent = pa?.intent || pa?.type || 'unknown';
@@ -930,6 +932,7 @@ export class Agent {
             { intent: '_parallel_done', actionType: 'direct', _parallelGroup: true },
             {
               _parallelResults: parallelSummary,
+              _parallelSubActions: parallelResults.map(r => r.action),
               _parallelImageBlocks: parallelImageBlocks.length > 0 ? parallelImageBlocks : null
             }
           );
@@ -938,6 +941,14 @@ export class Agent {
             const summary = parallelResults.map(r => `${r.action.intent || r.action.type}: ${r.error ? '❌' : '✅'}`).join(', ');
             console.error(`[Agent:${this.name}] ⚡ Parallel done: ${summary}`);
           }
+
+          // Update thinkingHint from the last successful parallel action
+          // (without this, the hint stays stale from before the parallel batch)
+          const lastOk = [...parallelResults].reverse().find(r => !r.error);
+          if (lastOk) {
+            thinkingHint = this._describeNextStep(lastOk.action, lastOk.result) || 'Thinking';
+          }
+          cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint}\x1b[0m`);
           continue;
         }
         // ────────────────────────────────────────────────────────────────────
@@ -957,6 +968,36 @@ export class Agent {
         // CHECK TERMINAL ACTION
         if ((action.intent || action.type) === 'return') {
           let returnData = action.data || {};
+
+          // ── SHELL FAILURE GUARD ──────────────────────────────────────────
+          // If the agent claims success but recent shell actions failed,
+          // bounce the agent back to reconsider instead of silently propagating
+          // a false-positive result to the caller.
+          if (returnData.success === true && isDelegate) {
+            const recentShellFailures = session.actionHistory
+              .filter(e => {
+                const eIntent = e.action?.intent || e.action?.type;
+                return eIntent === 'shell' && e.result && (e.result.success === false || (e.result.exitCode != null && e.result.exitCode !== 0));
+              });
+            if (recentShellFailures.length > 0) {
+              const lastFail = recentShellFailures[recentShellFailures.length - 1];
+              const exitCode = lastFail.result?.exitCode || '?';
+              // Only bounce once to avoid infinite loops
+              if (!session._shellFailureGuardTriggered) {
+                session._shellFailureGuardTriggered = true;
+                cliLogger.log('agent', `${this.name}: Shell failure guard — agent returned success:true but shell exited with code ${exitCode}. Bouncing back.`);
+                session.recordAction(action, returnData);
+                contextMemory.add(
+                  'user',
+                  `⚠️ RETURN REJECTED: You returned { "success": true } but a shell command in this session failed with exit code ${exitCode}. A failed shell command (especially a test run) means the task did NOT succeed. Review the shell output above and return { "success": false } with the actual error, or fix the issue and re-run the command before claiming success.`,
+                  `Return rejected: shell failed (exit code ${exitCode}) but agent claimed success`,
+                  null
+                );
+                thinkingHint = 'Reconsidering — shell command failed';
+                continue;
+              }
+            }
+          }
 
           // Apply state updates if present
           if (returnData && typeof returnData === 'object' && (returnData.state_updates || returnData.stateUpdates)) {
@@ -1171,6 +1212,36 @@ export class Agent {
 
           session.recordAction(action, result);
 
+          // ── Auto-register external project dependencies ──────────────────
+          // When any action touches a file outside the project root (read_file,
+          // edit_file, write_file, search, shell with file paths, etc.), detect
+          // the external project root and register it as a dependency.
+          // This ensures .koi/dependencies.json stays in sync with what the
+          // agent actually uses, regardless of whether config files declare it.
+          try {
+            const _actionPath = action.path || action.file || action.filePath;
+            if (_actionPath) {
+              const _projectDir = process.env.KOI_PROJECT_ROOT || process.cwd();
+              const _resolvedActionPath = path.resolve(_actionPath);
+              if (!_resolvedActionPath.startsWith(_projectDir + path.sep) && _resolvedActionPath !== _projectDir) {
+                const { addManualDependency: _addDep } = await import('./local-dependency-detector.js');
+                const _markers = ['package.json', 'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'settings.gradle'];
+                let _extRoot = fs.existsSync(_resolvedActionPath) && fs.statSync(_resolvedActionPath).isDirectory()
+                  ? _resolvedActionPath
+                  : path.dirname(_resolvedActionPath);
+                for (let _i = 0; _i < 5; _i++) {
+                  if (_markers.some(_m => fs.existsSync(path.join(_extRoot, _m)))) break;
+                  const _parent = path.dirname(_extRoot);
+                  if (_parent === _extRoot) break;
+                  _extRoot = _parent;
+                }
+                if (_markers.some(_m => fs.existsSync(path.join(_extRoot, _m)))) {
+                  _addDep(_projectDir, _extRoot, path.basename(_extRoot), 'auto-detected: agent accessed files in this project');
+                }
+              }
+            }
+          } catch { /* non-critical — never break the agent loop for this */ }
+
           // Inject streaming progress snapshots collected during generator actions (e.g. shell).
           // The LLM will see these checkpoints in its next context window, allowing it to reason
           // about intermediate output that occurred during long-running commands.
@@ -1193,6 +1264,32 @@ export class Agent {
           // ask_parent: pause, get answer from parent, inject into memory, continue loop.
           // Works like prompt_user — no re-entry, no new session, memory stays intact.
           if (result && result.__askParent__ === true && isDelegate) {
+            // ── ARGS GUARD: intercept delegates asking for their own task spec ──
+            // Some LLMs ignore the injected 📋 YOUR TASK SPEC and ask the parent
+            // "what is my task?" / "provide args". Short-circuit this by re-injecting
+            // the args directly instead of wasting a parent LLM call.
+            const _question = (result.question || '').toLowerCase();
+            const _isAskingForArgs = /\b(provide|what|give|send|share|full)\b.*\b(args|task|description|instruction|fields|spec)\b/i.test(_question)
+              || /\b(what should i do|what is my task|no task|missing task)\b/i.test(_question);
+            if (_isAskingForArgs && session.iteration <= 3) {
+              const _taskArgs = session.actionContext?.args;
+              if (_taskArgs && Object.keys(_taskArgs).length > 0) {
+                const _argsStr = Object.entries(_taskArgs)
+                  .filter(([, v]) => v != null && v !== '')
+                  .map(([k, v]) => `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+                  .join('\n');
+                cliLogger.log('agent', `${this.name}: Intercepted ask_parent for task spec — re-injecting args directly`);
+                contextMemory.add(
+                  'user',
+                  `⚠️ Your task spec was ALREADY provided. Here it is again:\n\n📋 YOUR TASK SPEC:\n${_argsStr}\n\nDo NOT ask again. Read the fields above and start implementing immediately. If args.description is present, that is your task. If args.instruction is present, that is your task. Use whatever fields are available.`,
+                  `Task spec re-injected`,
+                  null
+                );
+                thinkingHint = 'Reading task spec';
+                continue;
+              }
+            }
+
             if (_parentAnswerFn) {
               const _answer = await _parentAnswerFn(result.question);
               const _answerMsg = `✅ ask_parent answered: "${_answer}"\n\nContinue your task using this answer. If you have no more questions, implement the task now.`;
@@ -1210,11 +1307,10 @@ export class Agent {
           this._printTokenSummary(session, contextMemory);
 
           const full = result ? JSON.stringify(result) : 'null';
-          const preview = full.length > 150 ? full.substring(0, 150) + '...' : full;
-          cliLogger.log('result', `${this.name}: ${preview}`);
+          cliLogger.log('result', `${this.name}: ${full.length > 300 ? full.substring(0, 300) + '…' : full}`);
 
           if (process.env.KOI_DEBUG_LLM) {
-            console.error(`[Agent:${this.name}] ✅ Result: ${preview}`);
+            console.error(`[Agent:${this.name}] ✅ Result: ${full.length > 500 ? full.substring(0, 500) + '…' : full}`);
           }
 
           // Update thinking hint based on what just happened
@@ -1557,32 +1653,33 @@ export class Agent {
     const trimmed = input.trim();
     const [cmd, ...args] = trimmed.substring(1).split(/\s+/);
 
-    const registryPath = process.env.KOI_CLI_COMMAND_REGISTRY_PATH;
-    if (!registryPath) {
-      return { handled: false };
-    }
-    const { getCommand, getCommands } = await import(registryPath);
-    const command = await getCommand(cmd);
+    try {
+      const registryPath = process.env.KOI_CLI_COMMAND_REGISTRY_PATH;
+      if (!registryPath) {
+        cliLogger.log('warn', `Slash command /${cmd}: KOI_CLI_COMMAND_REGISTRY_PATH not set`);
+        return { handled: false };
+      }
+      const { getCommand, getCommands } = await import(registryPath);
+      const command = await getCommand(cmd);
 
-    if (!command) {
-      // No command or unknown command — show interactive menu of available commands
-      cliLogger.clearProgress();
-      const { cliSelect } = await import('./cli-select.js');
-      const cmds = await getCommands();
-      const options = [...cmds.values()]
-        .map(c => ({ title: `/${c.name}`, value: c.name, description: c.description }));
+      if (!command) {
+        // No command or unknown command — show interactive menu of available commands
+        cliLogger.clearProgress();
+        const { cliSelect } = await import('./cli-select.js');
+        const cmds = await getCommands();
+        const options = [...cmds.values()]
+          .map(c => ({ title: `/${c.name}`, value: c.name, description: c.description }));
 
-      const promptText = originalAction.question || originalAction.prompt || '';
-      const selected = await cliSelect('Commands:', options, 0, { filterable: true, inlinePrefix: promptText, initialFilter: '/' });
-      if (!selected) {
-        return { handled: true };
+        const promptText = originalAction.question || originalAction.prompt || '';
+        const selected = await cliSelect('Commands:', options, 0, { filterable: true, inlinePrefix: promptText, initialFilter: '/' });
+        if (!selected) {
+          return { handled: true };
+        }
+
+        // Execute the selected command
+        return this._handleSlashCommand(`/${selected}`, originalAction, session);
       }
 
-      // Execute the selected command
-      return this._handleSlashCommand(`/${selected}`, originalAction, session);
-    }
-
-    try {
       cliLogger.progress('\x1b[2mplease wait...\x1b[0m');
       // Slash commands always run against the root (System) agent, not the delegate
       const targetAgent = Agent._rootAgent || this;
@@ -1594,8 +1691,11 @@ export class Agent {
       return { handled: true, result };
     } catch (err) {
       cliLogger.clearProgress();
-      cliLogger.log('error', `Slash command /${cmd} failed: ${err.message}`);
-      return { handled: false };
+      cliLogger.log('error', `Slash command /${cmd} failed: ${err.message}\n${err.stack}`);
+      // Show the error to the user so they know what happened
+      cliLogger.print(`\x1b[31m/${cmd} failed:\x1b[0m ${err.message}`);
+      // Return handled: true so the input doesn't get sent to the LLM
+      return { handled: true };
     }
   }
 
@@ -1776,6 +1876,18 @@ export class Agent {
 
     if (toCheck.size === 0) return; // everything already permitted
 
+    // Auto-approve read access within the project root — the agent is expected to
+    // read project files without asking. This eliminates the most common preflight delay.
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    for (const [key, { dir, level }] of toCheck.entries()) {
+      if (level === 'read' && (dir === projectRoot || dir.startsWith(projectRoot + path.sep))) {
+        permissions.allow(dir, 'read');
+        cliLogger.log('permissions', `Auto-granted read for project dir: ${dir}`);
+        toCheck.delete(key);
+      }
+    }
+    if (toCheck.size === 0) return;
+
     // Ask once per unique (dir, level) — sequentially to avoid concurrent prompts
     for (const { dir, level } of toCheck.values()) {
       cliLogger.clearProgress();
@@ -1926,7 +2038,7 @@ export class Agent {
                 // We set _shellKilledByClassifier so we can provide a synthetic error result.
                 const outputSoFar = update.output_so_far || '';
                 const cmd = update.command || resolvedAction.command || '';
-                if (outputSoFar.length > 50 && intent === 'shell' && !this._shellClassifyInFlight) {
+                if (outputSoFar.length > 50 && (action.intent || action.type) === 'shell' && !this._shellClassifyInFlight) {
                   this._shellClassifyInFlight = true;
                   this._classifyShellOutput(outputSoFar, cmd).then(verdict => {
                     this._shellClassifyInFlight = false;
@@ -2002,7 +2114,7 @@ Respond with ONE of:
 - {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash). It should be killed so the agent can fix the problem.
 - {"action":"ask","question":"what to ask the user"} — process is interactively asking for input (a question, a prompt, a confirmation). The question field should contain what the process is asking.
 
-IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warnings, deprecation notices, and info messages are NOT fatal — return "wait".`;
+IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements).`;
 
       const raw = await this.llmProvider.callSummary(system, user);
       const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim());
@@ -2061,9 +2173,18 @@ IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warni
         `Recent task context:\n${recentContext || '(no history yet)'}\n\n` +
         `Running command: ${command}\n` +
         `Recent terminal output (last 20 lines):\n\`\`\`\n${promptContext.slice(-600)}\n\`\`\`\n\n` +
-        `The process is waiting for user input. Based on your task context, what value should you enter?\n` +
-        `- If you can infer the correct answer (DB name, env, region, path, "yes"/"no", etc.) → set autoAnswer to that value.\n` +
-        `- If the value is a password, API key, secret, or truly unknown → set autoAnswer to null.\n` +
+        `The process is waiting for user input. Based on your task context, what value should you enter?\n\n` +
+        `IMPORTANT — Detect the type of prompt:\n\n` +
+        `1. **Arrow-key menu / selector** (lines with ❯, >, ●, ○, or indented options like "~ X rename" / "+ X create"):\n` +
+        `   - Analyze ALL the options listed in the menu.\n` +
+        `   - Decide which option is the CORRECT one based on the task context (e.g. "create enum" vs "rename enum" — pick the one that matches the intent).\n` +
+        `   - Count which position that option is at (0-indexed from the highlighted/first item).\n` +
+        `   - Set autoAnswer to "__MENU_SELECT__:N" where N is the 0-based index of the option to select.\n` +
+        `   - Example: if the correct option is the 3rd item → autoAnswer: "__MENU_SELECT__:2"\n` +
+        `   - Example: if the correct option is already highlighted (first item) → autoAnswer: "__MENU_SELECT__:0"\n\n` +
+        `2. **Yes/No confirmation** (e.g. "Are you sure? [Y/n]", "Continue? (y/N)"): Set autoAnswer to "y" or "n" as appropriate.\n\n` +
+        `3. **Text input** (DB name, env, region, path, etc.): Set autoAnswer to the inferred value.\n\n` +
+        `4. **Password, API key, secret, or truly unknown value**: Set autoAnswer to null.\n\n` +
         `- isSecret: true only for passwords, API keys, tokens, secrets.\n` +
         `Reply ONLY with JSON: {"autoAnswer":"value or null","isSecret":bool,"label":"one-sentence question for the user (only when autoAnswer is null)"}`;
 
@@ -2081,8 +2202,23 @@ IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warni
 
       // Auto-answer: write directly to stdin, no user interaction needed
       if (parsed.autoAnswer != null) {
+        let answer = String(parsed.autoAnswer);
+
+        // Menu selection: send N arrow-down keys + Enter
+        const menuMatch = answer.match(/^__MENU_SELECT__:(\d+)$/);
+        if (menuMatch) {
+          const index = parseInt(menuMatch[1], 10);
+          // Arrow down = \x1b[B, Enter = \n
+          const arrowDown = '\x1b[B';
+          answer = arrowDown.repeat(index) + '\n';
+          cliLogger.log('shell', `[${this.name}] auto-input → menu select option ${index} (${index} arrows + Enter)`);
+          return answer;
+        }
+
+        // Convert literal escape sequences from JSON (e.g. "\\n" → actual newline)
+        answer = answer.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
         cliLogger.log('shell', `[${this.name}] auto-input → "${parsed.autoAnswer}"`);
-        return String(parsed.autoAnswer);
+        return answer;
       }
 
       // Need user input — use cliInput directly for secret support (asterisks)
@@ -2123,7 +2259,14 @@ IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warni
     if (composeDef.resolve) {
       const resolvedFragments = {};
       for (const [key, value] of Object.entries(composeDef.fragments || {})) {
-        resolvedFragments[key] = typeof value === 'function' ? value() : (value || '');
+        if (typeof value === 'function') {
+          resolvedFragments[key] = value();
+        } else if (value && value.__isCompose__) {
+          // Recursively resolve nested compose prompts
+          resolvedFragments[key] = await this._executeComposePrompt(value, _composeArgs);
+        } else {
+          resolvedFragments[key] = value || '';
+        }
       }
       const callAction = async (intent, data = {}) => {
         return await this.callAction(intent, data);
@@ -2167,6 +2310,11 @@ IMPORTANT: Only "kill" for FATAL errors where the process cannot continue. Warni
     }
     // Plain string — clear any previous pending images
     this._composePendingImages = null;
+    if (typeof result === 'string') return result;
+    if (typeof result === 'object' && result !== null) {
+      // Safety net: never return raw objects — would become [object Object]
+      return result.text || JSON.stringify(result);
+    }
     return result || '';
   }
 
@@ -2766,17 +2914,16 @@ Execute this task and return the result as JSON.
       if (formatted) knowledgeStr = `\n\nShared session knowledge (facts discovered so far):\n${formatted}`;
     } catch { /* non-fatal */ }
 
-    // Include System's own memory context (long-term + medium-term entries)
+    // Include System's own memory context (ALL tiers — long, medium, short)
     let memoryStr = '';
     try {
       const ctxMem = this._activeContextMemory;
       if (ctxMem?.entries) {
         const relevant = ctxMem.entries
-          .filter(e => e.tier === 'long-term' || e.tier === 'medium-term')
           .map(e => e.permanent || e.shortTerm)
           .filter(Boolean)
-          .slice(-20); // Last 20 entries max
-        if (relevant.length > 0) memoryStr = `\n\nYour conversation memory (recent):\n${relevant.join('\n')}`;
+          .slice(-40); // Last 40 entries max
+        if (relevant.length > 0) memoryStr = `\n\nYour conversation memory (all tiers):\n${relevant.join('\n')}`;
       }
     } catch { /* non-fatal */ }
 
@@ -2799,18 +2946,30 @@ INSTRUCTIONS:
 3. If you DON'T know but the answer could be found by exploring the filesystem (e.g. checking sibling directories, reading config files), respond: { "answer": "Try looking at [specific suggestion based on project structure]" }
 4. ONLY if the answer requires information that truly only the user knows (credentials, business decisions, external service details), respond: { "askUser": true, "question": "clear, specific question for the user" }
 
+CRITICAL — NEVER escalate to the user for these (the delegate MUST handle them itself):
+- Command errors (exit code != 0, connection refused, timeouts, missing packages, etc.) → Tell the delegate to diagnose and fix the error itself
+- Technical problems that the delegate has the tools to solve → Tell the delegate to investigate and fix
+- Missing files or dependencies → Tell the delegate to install/create them
+- Questions about how to implement something → Tell the delegate to explore the codebase and figure it out
+
+The user should ONLY be asked for things that are impossible to discover programmatically: passwords, API keys, business decisions, personal preferences, account credentials.
+
 Be specific and concise. Never ask the user for things you or the delegate can discover by exploring.`;
 
     const response = await this.llmProvider.callJSON(prompt, this);
 
-    // If the parent says "ask the user", prompt directly
+    // If the parent says "ask the user", use prompt_user style (not chat bubble)
     if (response?.askUser === true) {
       const userQuestion = response.question || question;
-      cliLogger.print(`💬 ${this.name} → user: \x1b[2m${userQuestion}\x1b[0m`);
+      cliLogger.clearProgress();
+      // Show context: which agent is asking and what task it's working on
+      const taskDesc = delegateData?.description || delegateData?.userRequest || delegateData?.goal || '';
+      const taskHint = taskDesc ? ` \x1b[2m(working on: ${taskDesc.substring(0, 120)}${taskDesc.length > 120 ? '…' : ''})\x1b[0m` : '';
+      cliLogger.print(`\x1b[1m${delegateName}\x1b[0m needs your input${taskHint}:`);
+      cliLogger.print(userQuestion);
       const { cliInput } = await import('./cli-input.js');
-      const userAnswer = await cliInput(userQuestion);
-      cliLogger.print(`💬 User: \x1b[2m${userAnswer}\x1b[0m`);
-      return userAnswer;
+      const userAnswer = await cliInput('❯ ');
+      return typeof userAnswer === 'string' ? userAnswer : (userAnswer?.text ?? String(userAnswer ?? ''));
     }
 
     const rawAnswer = response?.answer ?? response;

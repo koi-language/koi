@@ -25,7 +25,7 @@ for (const [provider, models] of Object.entries(_modelsJson)) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-function lookupModel(model) {
+export function lookupModel(model) {
   if (MODEL_DB[model]) return MODEL_DB[model];
   // Partial match (e.g. "gpt-4o-mini-2024-07-18" → "gpt-4o-mini")
   for (const key of Object.keys(MODEL_DB)) {

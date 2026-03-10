@@ -69,8 +69,10 @@ export class PlaybookSession {
 
     this.actionHistory.push(entry);
 
-    // Count both thrown errors AND result.success === false as consecutive errors
-    const isResultError = !error && result && result.success === false && result.error;
+    // Count both thrown errors AND result.success === false as consecutive errors.
+    // User-denied actions with feedback are NOT errors — the user gave instructions.
+    const isDeniedWithFeedback = !error && result && result.denied && result.feedback;
+    const isResultError = !error && !isDeniedWithFeedback && result && result.success === false && result.error;
     const errorKey = this._errorKey(action);
 
     if (error || isResultError) {
@@ -178,6 +180,16 @@ export class PlaybookSession {
     // Step counter
     parts.push(`STEP: ${this.iteration + 1}${this.maxIterations ? ` of ${this.maxIterations}` : ''}`);
 
+    // Task reminder — always present so the agent never loses sight of its mission.
+    const args = this.actionContext?.args;
+    if (args && typeof args === 'object' && Object.keys(args).length > 0) {
+      const taskLines = Object.entries(args)
+        .filter(([, v]) => v != null && v !== '')
+        .map(([k, v]) => `  ${k}: ${typeof v === 'string' ? v.substring(0, 500) : JSON.stringify(v).substring(0, 500)}`)
+        .join('\n');
+      parts.push(`📋 YOUR TASK:\n${taskLines}`);
+    }
+
     // Loop detection warnings
     const warnings = this._detectLoops();
     for (const warning of warnings) {
@@ -196,8 +208,13 @@ export class PlaybookSession {
       //   - web_fetch: needs the complete JSON/HTML to extract data
       // No truncation — results are passed to the LLM in full.
 
+      // Detect when user denied an action with feedback (e.g. edit_file "No, but..." option).
+      // User feedback is SACRED — it represents explicit user constraints for the next attempt.
+      if (lastEntry.result && lastEntry.result.denied && lastEntry.result.feedback) {
+        parts.push(`\u26d4${id} ${intent} was REJECTED by the user with feedback:\n"${lastEntry.result.feedback}"\n\nYou MUST incorporate this feedback into your next attempt. Do NOT repeat the same approach. The user's feedback overrides any previous plan or instruction.`);
+      }
       // Detect when result payload indicates failure (e.g. MCP returns {success: false, error: "..."})
-      if (lastEntry.result && lastEntry.result.success === false && lastEntry.result.error) {
+      else if (lastEntry.result && lastEntry.result.success === false && lastEntry.result.error) {
         const errorMsg = lastEntry.result.error;
         parts.push(`\u274c${id} ${intent} returned an error: ${errorMsg}`);
 
@@ -348,6 +365,23 @@ export class PlaybookSession {
         }
       } else {
         this._oscillateCount = 0;
+      }
+    }
+
+    // Circular exploration: re-reading the same files repeatedly
+    const lastAction = history[history.length - 1].action;
+    const lastIntent = lastAction.intent || lastAction.type;
+    if (lastIntent === 'read_file' || lastIntent === 'grep' || lastIntent === 'search') {
+      const target = lastAction.path || lastAction.file || '';
+      if (target) {
+        if (!this._fileReadCounts) this._fileReadCounts = {};
+        this._fileReadCounts[target] = (this._fileReadCounts[target] || 0) + 1;
+        if (this._fileReadCounts[target] >= 6) {
+          this.consecutiveErrors = this.maxConsecutiveErrors;
+          warnings.push(`FORCED STOP: You have read/searched "${target}" ${this._fileReadCounts[target]} times. You are stuck re-exploring the same files.`);
+        } else if (this._fileReadCounts[target] >= 4) {
+          warnings.push(`WARNING: You have read/searched "${target}" ${this._fileReadCounts[target]} times. If you need this file, read it ENTIRELY in one shot: read_file(path:"${target}") with NO offset/limit. Then synthesize and move on — do NOT read it again.`);
+        }
       }
     }
 

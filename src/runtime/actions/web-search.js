@@ -1,10 +1,11 @@
 /**
  * Web Search Action - Search the internet for up-to-date information.
  *
- * Supported providers (checked in order):
- *   - Brave Search  (BRAVE_SEARCH_API_KEY)
- *   - Tavily        (TAVILY_API_KEY)
+ * Delegates to the provider factory which auto-selects the best available
+ * search provider: Brave Search → Tavily → OpenAI search model.
  */
+
+import { resolve as resolveModel } from '../providers/factory.js';
 
 export default {
   type: 'web_search',
@@ -33,64 +34,15 @@ export default {
 
     if (!query) throw new Error('web_search: "query" is required');
 
-    if (process.env.BRAVE_SEARCH_API_KEY) {
-      return searchBrave(query, count);
-    }
-    if (process.env.TAVILY_API_KEY) {
-      return searchTavily(query, count);
+    const resolved = resolveModel({ type: 'search', clients: {} });
+    if (!resolved) {
+      return {
+        success: false,
+        error: 'No search API key configured. Set BRAVE_SEARCH_API_KEY or TAVILY_API_KEY in your environment.'
+      };
     }
 
-    return {
-      success: false,
-      error: 'No search API key configured. Set BRAVE_SEARCH_API_KEY or TAVILY_API_KEY in your environment.'
-    };
+    const result = await resolved.instance.search(query, { count });
+    return { success: true, source: resolved.instance.providerName, query, results: result.results };
   }
 };
-
-async function searchBrave(query, count) {
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
-  const res = await fetch(url, {
-    headers: {
-      'Accept': 'application/json',
-      'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY
-    }
-  });
-
-  if (!res.ok) {
-    throw new Error(`Brave Search error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
-  const results = (data.web?.results || []).map(r => ({
-    title: r.title,
-    url: r.url,
-    snippet: r.description
-  }));
-
-  return { success: true, source: 'brave', query, results };
-}
-
-async function searchTavily(query, count) {
-  const res = await fetch('https://api.tavily.com/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      api_key: process.env.TAVILY_API_KEY,
-      query,
-      max_results: count
-    })
-  });
-
-  if (!res.ok) {
-    throw new Error(`Tavily error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
-  const results = (data.results || []).map(r => ({
-    title: r.title,
-    url: r.url,
-    snippet: r.content
-  }));
-
-  return { success: true, source: 'tavily', query, results };
-}

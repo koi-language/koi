@@ -58,6 +58,14 @@ export default {
 
     try {
       const { getSemanticIndex } = await import('../semantic-index.js');
+      const { detectAllLocalDependencies } = await import('../local-dependency-detector.js');
+
+      // Detect local dependencies — indexed into the SAME DB as the main project
+      const depDirs = detectAllLocalDependencies(projectDir);
+      if (depDirs.length > 0) {
+        cliLogger.log('index-code', `Local dependencies: ${depDirs.map(d => path.basename(d)).join(', ')}`);
+      }
+
       const cacheDir = path.join(projectDir, '.koi', 'cache', 'semantic-index');
       const index = getSemanticIndex(cacheDir, agent.llmProvider);
 
@@ -69,17 +77,24 @@ export default {
 
       const stats = await index.build(projectDir, (done, total) => {
         const pct = Math.round((done / total) * 100);
-        cliLogger.progress(`Indexing ${pct}%...`);
-      });
+        const filled = Math.round((done / total) * 10);
+        const bar = '▰'.repeat(filled) + '▱'.repeat(10 - filled);
+        cliLogger.progress(`indexing ${bar} ${pct}%`);
+      }, { depDirs });
 
       cliLogger.clear();
-      cliLogger.print(`Semantic index complete: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.total} total files`);
+
+      const depSummary = depDirs.length > 0
+        ? ` (includes ${depDirs.length} dependencies: ${depDirs.map(d => path.basename(d)).join(', ')})`
+        : '';
+      cliLogger.print(`Semantic index complete: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.total} total files${depSummary}`);
 
       return {
         success: true,
         indexed: stats.indexed,
         skipped: stats.skipped,
         total: stats.total,
+        dependencies: depDirs.map(d => path.basename(d)),
       };
     } catch (err) {
       cliLogger.clear();

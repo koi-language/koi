@@ -8,6 +8,13 @@
 import path from 'path';
 import { cliLogger } from './cli-logger.js';
 
+function progressBar(done, total, width = 10) {
+  const pct = Math.round((done / total) * 100);
+  const filled = Math.round((done / total) * width);
+  const bar = '▰'.repeat(filled) + '▱'.repeat(width - filled);
+  return `indexing ${bar} ${pct}%`;
+}
+
 class BackgroundTaskManager {
   constructor() {
     /** @type {Map<string, { status: 'running'|'done'|'error', progress?: string, error?: string, promise: Promise }>} */
@@ -101,11 +108,26 @@ class BackgroundTaskManager {
       const { getSemanticIndex } = await import('./semantic-index.js');
       cliLogger.log('background', 'semantic-index module loaded OK');
 
+      // Detect local dependencies — their files will be indexed into the SAME DB.
+      // On first run, persist discovered deps to .koi/dependencies.json so they're
+      // always available (even if the auto-detection source changes later).
+      let depDirs = [];
+      try {
+        const { detectAllLocalDependencies, seedDependenciesFile } = await import('./local-dependency-detector.js');
+        seedDependenciesFile(projectDir);
+        depDirs = detectAllLocalDependencies(projectDir);
+        if (depDirs.length > 0) {
+          cliLogger.log('background', `Local dependencies found: ${depDirs.map(d => path.basename(d)).join(', ')}`);
+        }
+      } catch (depErr) {
+        cliLogger.log('background', `Dependency detection failed: ${depErr.message}`);
+      }
+
       const cacheDir = path.join(projectDir, '.koi', 'cache', 'semantic-index');
       const index = getSemanticIndex(cacheDir, llmProvider);
 
       cliLogger.log('background', 'Checking if index is up-to-date...');
-      const upToDate = await index.isUpToDate(projectDir);
+      const upToDate = await index.isUpToDate(projectDir, { depDirs });
       cliLogger.log('background', `isUpToDate: ${upToDate}`);
 
       if (upToDate) {
@@ -116,9 +138,8 @@ class BackgroundTaskManager {
 
       cliLogger.log('background', 'Starting index.build()...');
       await index.build(projectDir, (done, total) => {
-        const pct = Math.round((done / total) * 100);
-        report(`indexing ${pct}%`);
-      });
+        report(progressBar(done, total));
+      }, { depDirs });
 
       cliLogger.log('background', 'Semantic indexing complete');
     });

@@ -157,7 +157,7 @@ class LatentStore {
 // ─── Per-action TTL configuration ─────────────────────────────────────────
 
 const ACTION_TTL = {
-  read_file:       { shortDuration: 6,  mediumDuration: 20 },
+  read_file:       { shortDuration: 12, mediumDuration: 30 },
   shell:           { shortDuration: 6,  mediumDuration: 20 },
   prompt_user:     { shortDuration: 25, mediumDuration: 20 },
   print:           { shortDuration: 25, mediumDuration: 20 },
@@ -184,9 +184,19 @@ export function classifyFeedback(action, result, error) {
   // Parallel group synthetic record — show all results to the LLM at once
   if (intent === '_parallel_done' && result?._parallelResults) {
     const immediate = `Parallel actions completed:\n${result._parallelResults}`;
+    // Build a useful shortTerm from the parallel sub-actions (e.g. "read_file x.js, grep y, search z")
+    const subActions = result._parallelSubActions || [];
+    const shortSummary = subActions.length > 0
+      ? subActions.map(a => {
+          const i = a.intent || a.type || '?';
+          const t = a.path || a.file || a.query || a.pattern || '';
+          return t ? `${i} ${t}` : i;
+        }).join(', ')
+      : 'parallel group';
     return {
       immediate,
-      shortTerm: 'Parallel group done.',
+      shortTerm: `✅ ${shortSummary}`,
+      needsSummary: true,
       permanent: null,
       imageBlocks: result._parallelImageBlocks ?? null,
       ...getTTL(intent),
@@ -205,11 +215,16 @@ export function classifyFeedback(action, result, error) {
   // Actions with inherently large output (shell, search, grep) truncate in their own case blocks.
   let resultStr = result ? JSON.stringify(result) : 'ok';
 
-  // User denied the action (file edit/write rejected, shell denied, etc.)
-  // This is NOT an error — it's a deliberate user decision. Do NOT retry or re-ask.
+  // User denied the action with feedback — they want a DIFFERENT approach, not silence.
+  // The feedback text is SACRED user input: it overrides previous plans/instructions.
+  if (result && result.denied && result.feedback) {
+    const immediate = `⛔${id} ${intent} REJECTED by user with feedback:\n"${result.feedback}"\n\nYou MUST incorporate this feedback into your next attempt. The user is telling you HOW they want this done differently. Do NOT repeat the same approach. Do NOT ignore this feedback.`;
+    const permanent = `⛔ User rejected ${intent} and said: "${result.feedback}"`;
+    return { immediate, shortTerm: permanent, permanent, ...getTTL(intent) };
+  }
+  // User denied the action without feedback — they just said No. Move on.
   if (result && result.denied) {
-    const feedback = result.feedback ? ` Feedback: ${result.feedback}` : '';
-    const immediate = `🚫${id} ${intent} DENIED by user.${feedback} Do NOT retry this action or ask again — the user said No. Move on.`;
+    const immediate = `🚫${id} ${intent} DENIED by user. Do NOT retry this action or ask again — the user said No. Move on.`;
     const shortTerm = `🚫 ${intent}: denied by user`;
     return { immediate, shortTerm, permanent: null, ...getTTL(intent) };
   }
@@ -218,9 +233,10 @@ export function classifyFeedback(action, result, error) {
   if (result && result.success === false && result.error) {
     // Include stdout if present — many CLI tools (flutter analyze, tsc, etc.) write
     // their useful output to stdout even when exiting with a non-zero code.
+    const exitCodeStr = result.exitCode != null ? ` (exit code ${result.exitCode})` : '';
     const stdoutPart = result.stdout ? `\nOutput:\n${result.stdout.substring(0, 3000)}` : '';
-    const immediate = `❌${id} ${intent}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
-    return { immediate, shortTerm: `❌ ${intent}: ${result.error}`, permanent: null, ...getTTL(intent) };
+    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}\n\n⚠️ This command FAILED. You MUST NOT report success for this operation. If this was a test run, the test FAILED.`;
+    return { immediate, shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${result.error.substring(0, 200)}`, permanent: null, ...getTTL(intent) };
   }
 
   // Extract image blocks generically from any action that returns MCP-style content
@@ -246,10 +262,15 @@ export function classifyFeedback(action, result, error) {
       const totalLines = result?.totalLines || content.split?.('\n')?.length || 0;
       const from = result?.from || 1;
       const to = result?.to || totalLines;
-      const MAX_READ_CHARS = 6000;
-      const truncContent = content.length > MAX_READ_CHARS
-        ? content.substring(0, MAX_READ_CHARS) + `\n...[truncated at char ${MAX_READ_CHARS} — showing lines ${from}–${to} of ${totalLines} total. Use offset/limit to read more.]`
-        : content;
+      const MAX_READ_CHARS = 50000;
+      let truncContent;
+      if (content.length > MAX_READ_CHARS) {
+        const truncText = content.substring(0, MAX_READ_CHARS);
+        const linesShown = truncText.split('\n').length;
+        truncContent = truncText + `\n...[truncated — showing ~${linesShown} of ${totalLines} lines. Use smaller offset/limit to read specific sections.]`;
+      } else {
+        truncContent = content;
+      }
       const truncImmediate = `✅${id} read_file ${action.path} (lines ${from}–${to} of ${totalLines}):\n${truncContent}`;
       return { immediate: truncImmediate, shortTerm: null, needsSummary: true, permanent: null, ...getTTL('read_file') };
     }
@@ -269,6 +290,16 @@ export function classifyFeedback(action, result, error) {
     case 'shell': {
       const shellOut = result?.stdout || result?.output || result?.content || '';
       const truncOut = shellOut.length > 3000 ? shellOut.substring(0, 3000) + '...[truncated]' : shellOut;
+      // Belt-and-suspenders: catch shell failures even if they slipped past the generic error check above
+      // (e.g. when result.error is empty but exitCode is non-zero)
+      const shellFailed = result?.success === false || (result?.exitCode != null && result?.exitCode !== 0);
+      if (shellFailed) {
+        const exitCodeStr = result?.exitCode != null ? ` (exit code ${result.exitCode})` : '';
+        const shellMsg = truncOut
+          ? `❌${id} SHELL COMMAND FAILED${exitCodeStr}. Output:\n${truncOut}\n\n⚠️ This command FAILED. You MUST NOT report success for this operation.`
+          : `❌${id} shell: command failed${exitCodeStr} with no output`;
+        return { immediate: shellMsg, shortTerm: `❌ shell FAILED${exitCodeStr}`, needsSummary: true, permanent: null, ...getTTL('shell') };
+      }
       const shellMsg = truncOut
         ? `✅${id} shell output:\n${truncOut}`
         : `✅${id} shell: ${action.description || 'command'} (no output)`;
@@ -708,8 +739,9 @@ export class ContextMemory {
             toLatent.push(entry);
             entry.tier = 'expired';
           }
-        } else if (entry.immediate && entry.immediate.length > 80) {
+        } else if (entry.immediate && entry.immediate.length > 80 && (!entry.shortTerm || entry.needsSummary)) {
           // Must LLM-summarize BEFORE transitioning — entry stays in short-term until summary succeeds.
+          // Skip summarization if a shortTerm is already set (e.g. from classifyResponse) — use it as-is.
           // Store medDur on the entry so the post-summarization step can complete the transition.
           entry._pendingMedDur = medDur;
           toSummarize.push(entry);
@@ -755,8 +787,17 @@ export class ContextMemory {
           entry.tier = 'medium-term';
           entry.tierEnteredAt = this.turnCounter;
         } else {
-          // Summarization failed — keep in short-term, retry next tick.
-          cliLogger.log('memory', `Keeping "${entry.immediate?.substring(0, 40)}" in short-term (summary failed)`);
+          // Summarization failed — track retries and give up after 3 attempts.
+          entry._summaryRetries = (entry._summaryRetries || 0) + 1;
+          if (entry._summaryRetries >= 3) {
+            // Give up: transition to medium-term with a truncated fallback summary.
+            entry.shortTerm = entry.shortTerm || (entry.immediate?.substring(0, 200) + '...');
+            entry.tier = 'medium-term';
+            entry.tierEnteredAt = this.turnCounter;
+            cliLogger.log('memory', `Summary gave up after ${entry._summaryRetries} retries, using truncated fallback`);
+          } else {
+            cliLogger.log('memory', `Keeping "${entry.immediate?.substring(0, 40)}" in short-term (summary failed, retry ${entry._summaryRetries}/3)`);
+          }
         }
         delete entry._pendingMedDur;
       }
@@ -964,14 +1005,27 @@ export class ContextMemory {
   async _summarizeEntry(entry) {
     if (!this.llmProvider) return false;
 
-    const textToSummarize = entry.immediate || '';
-    if (!textToSummarize) return false;
+    // Cap input to ~8000 chars. Even models with large context windows (flash-lite: 1M)
+    // produce unreliable JSON when the input is very long. The first 8K chars contain
+    // enough structure (file headers, function signatures, key results) for a good summary.
+    const rawText = entry.immediate || '';
+    if (!rawText) return false;
+    const textToSummarize = rawText.length > 8000
+      ? rawText.substring(0, 8000) + '\n...[truncated]'
+      : rawText;
 
+    const _t0 = Date.now();
     try {
       const system = 'Return ONLY valid JSON. No markdown, no explanations.';
-      const user   = `Summarize in 1-3 sentences. Preserve file paths, names, numbers, and errors. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`;
+      // Code-aware summarization: read_file entries need structural summaries, not action descriptions
+      const isCodeRead = textToSummarize.includes('read_file ') && (textToSummarize.startsWith('✅') || textToSummarize.includes('lines '));
+      const user = isCodeRead
+        ? `Summarize the CODE CONTENT shown below (NOT the action that produced it). List: key functions/classes/components defined, their names and signatures, important state variables, and notable logic. Preserve all identifiers exactly as written. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`
+        : `Summarize in 1-3 sentences. Preserve file paths, names, numbers, and errors. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`;
       // callSummary uses the cheapest/fastest model and records cost in costCenter.
       const raw = await this.llmProvider.callSummary(system, user);
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('memory', `callSummary returned in ${_elapsed}ms, rawLen=${raw.length}, preview="${raw.substring(0, 100).replace(/\n/g, ' ')}"`);
       let cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       let parsed;
       try {
@@ -990,7 +1044,12 @@ export class ContextMemory {
           parsed = m ? { summary: m[1] } : null;
         }
       }
-      const summary = parsed?.summary;
+      let summary = parsed?.summary;
+      // Flash-lite sometimes returns summary as an object instead of a string — flatten it
+      if (summary && typeof summary === 'object') {
+        summary = JSON.stringify(summary);
+        cliLogger.log('memory', `Summary was object, flattened to string (${summary.length} chars)`);
+      }
       if (summary && typeof summary === 'string') {
         entry.shortTerm = summary;
         if (entry.needsPermanentSummary) {
@@ -999,9 +1058,10 @@ export class ContextMemory {
         cliLogger.log('memory', `LLM summary: "${summary.substring(0, 80)}"`);
         return true;
       }
+      cliLogger.log('memory', `Summary parse failed: no "summary" field in response. raw="${raw.substring(0, 200).replace(/\n/g, ' ')}"`);
       return false;
     } catch (err) {
-      cliLogger.log('memory', `Summarization failed: ${err.message}`);
+      cliLogger.log('memory', `Summarization exception: ${err.message} (${Date.now() - _t0}ms)`);
       return false;
     }
   }
@@ -1016,6 +1076,15 @@ export class ContextMemory {
     const summary = entry.shortTerm || fullText.substring(0, 200);
     const textForEmbedding = fullText.substring(0, 2000);
     if (!textForEmbedding || !this.llmProvider) return;
+
+    // Skip trivial entries that provide no useful recall value.
+    // These are action stubs with no meaningful content (e.g. "→ unknown", "→ task_list").
+    const _trivialIntents = new Set(['unknown', 'task_list', 'task_get', 'task_update', 'recall_facts', 'learn_fact', '?']);
+    const _stMatch = summary.match(/^→\s*(\S+)/);
+    if (_stMatch && _trivialIntents.has(_stMatch[1]) && fullText.length < 300) {
+      cliLogger.log('memory', `Skip trivial latent: "${summary.substring(0, 60)}"`);
+      return;
+    }
 
     try {
       const embedding = await this.llmProvider.getEmbedding(textForEmbedding);
