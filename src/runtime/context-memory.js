@@ -219,8 +219,8 @@ export function classifyFeedback(action, result, error) {
   // The feedback text is SACRED user input: it overrides previous plans/instructions.
   if (result && result.denied && result.feedback) {
     const immediate = `⛔${id} ${intent} REJECTED by user with feedback:\n"${result.feedback}"\n\nYou MUST incorporate this feedback into your next attempt. The user is telling you HOW they want this done differently. Do NOT repeat the same approach. Do NOT ignore this feedback.`;
-    const permanent = `⛔ User rejected ${intent} and said: "${result.feedback}"`;
-    return { immediate, shortTerm: permanent, permanent, ...getTTL(intent) };
+    const shortTerm = `⛔ User rejected ${intent} and said: "${result.feedback}"`;
+    return { immediate, shortTerm, permanent: null, ...getTTL('prompt_user') };
   }
   // User denied the action without feedback — they just said No. Move on.
   if (result && result.denied) {
@@ -254,7 +254,10 @@ export function classifyFeedback(action, result, error) {
       const perm = `User: "${answer}"`;
       // Explicit signal: new user input arrived — focus on THIS, not previous results
       const newImmediate = `✅${id} prompt_user: User says: "${answer}"\n\nAnswer only this new question, but you MUST still follow all tool-usage rules (splitting concepts, parallelization, required fields). Do not re-print results from previous commands.`;
-      return { immediate: newImmediate, shortTerm: perm, permanent: perm, ...getTTL('prompt_user') };
+      // User input stays in short-term (25 turns) + medium-term (20 turns) = 45 turns
+      // of visibility, then moves to latent (recoverable by similarity). No need for
+      // permanent — 45 turns is more than enough context, and latent covers the rest.
+      return { immediate: newImmediate, shortTerm: perm, permanent: null, ...getTTL('prompt_user') };
     }
 
     case 'read_file': {
@@ -471,9 +474,12 @@ export function classifyFeedback(action, result, error) {
       const key = action.key || result?.key || '';
       const value = action.value || result?.value || '';
       const perm = `Fact: ${key} = ${value}`;
+      // Facts are already stored in session-knowledge (the shared, persistent store).
+      // Duplicating them in context-memory long-term is redundant and the main source
+      // of memory bloat (441+ permanent entries). Keep in short/medium for immediate
+      // visibility, then let them age to latent like everything else.
       return {
-        immediate, shortTerm: perm, permanent: perm,
-        directLongTerm: true,
+        immediate, shortTerm: perm, permanent: null,
         ...getTTL(intent),
       };
     }
@@ -528,7 +534,7 @@ export function classifyFeedback(action, result, error) {
         const msg = `✅${id} delegate ${intent} returned:\n${delegateStr}${taskReminder}`;
         return {
           immediate: msg, shortTerm: `✅ delegate ${intent} → answer ready`,
-          needsSummary: true, needsPermanentSummary: true, permanent: null,
+          needsSummary: true, needsPermanentSummary: false, permanent: null,
           ...getTTL('delegate'),
         };
       }
@@ -565,7 +571,7 @@ export function classifyResponse(responseText, action) {
       const msg = action.message || '';
       // Remove truncation — use LLM summarization instead
       needsSummary = true;
-      needsPermanentSummary = true;
+      needsPermanentSummary = false; // Print output is episodic, not a permanent fact
       shortTerm = `→ print "${msg.substring(0, 60)}"`;
       ttl = getTTL('print');
       break;
@@ -604,7 +610,7 @@ export function classifyResponse(responseText, action) {
       if (action.actionType === 'delegate') {
         shortTerm = `→ delegate ${intent}`;
         needsSummary = true;
-        needsPermanentSummary = true;
+        needsPermanentSummary = false; // Delegate results are episodic, not permanent facts
         ttl = getTTL('delegate');
       }
   }

@@ -52,13 +52,12 @@ export class AnthropicLLM extends BaseLLM {
     let buffer = '';
     let usage = { input: 0, output: 0 };
     let outChars = 0;
+    let _thinkChars = 0;
 
     try {
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.messages.create(createParams, options);
       const race = this._abortRace(abortSignal);
-
-      let _thinkChars = 0;
       const _iterate = async () => {
         for await (const event of stream) {
           if (abortSignal?.aborted) break;
@@ -94,10 +93,27 @@ export class AnthropicLLM extends BaseLLM {
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+    // Estimate input tokens when streaming break cut off the usage event
+    if (usage.input === 0 && messages.length > 0) {
+      const inputChars = messages.reduce((sum, m) => {
+        const c = m.content;
+        if (typeof c === 'string') return sum + c.length;
+        if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || JSON.stringify(p)).length, 0);
+        return sum;
+      }, 0);
+      usage.input = Math.ceil(inputChars / 4);
+    }
+    // Anthropic includes thinking tokens in output_tokens; estimate from chars if thinking was used
+    if (_thinkChars > 0 && !usage.thinking) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
 
     const text = buffer.trim();
     if (!text) throw new Error('Anthropic returned no content');
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try { JSON.parse(text); } catch {
+        throw new Error(`Anthropic returned truncated response (${text.length} chars): ${text.substring(0, 80)}...`);
+      }
+    }
     return { text, usage };
   }
 
@@ -121,8 +137,15 @@ export class AnthropicLLM extends BaseLLM {
     const text = (message.content.find(b => b.type === 'text')?.text ?? '').trim();
     const usage = {
       input: message.usage?.input_tokens || 0,
-      output: message.usage?.output_tokens || 0
+      output: message.usage?.output_tokens || 0,
+      thinking: 0,
     };
+    // Estimate thinking tokens from thinking content blocks if present
+    const thinkingBlocks = message.content.filter(b => b.type === 'thinking');
+    if (thinkingBlocks.length > 0) {
+      const thinkChars = thinkingBlocks.reduce((sum, b) => sum + (b.thinking || '').length, 0);
+      if (thinkChars > 0) usage.thinking = Math.ceil(thinkChars / 4);
+    }
     return { text, usage };
   }
 }

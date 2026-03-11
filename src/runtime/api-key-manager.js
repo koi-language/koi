@@ -55,6 +55,10 @@ function _saveKeyToEnv(keyName, key) {
  * Called once after the CLI is bootstrapped.
  */
 export async function promptMissingApiKeys() {
+  // When authenticated via koi-cli.ai account, API keys are not needed —
+  // the gateway proxies LLM calls using the auth token.
+  if (process.env.KOI_AUTH_TOKEN) return;
+
   const missing = REQUIRED_PROVIDERS.filter(p => !process.env[PROVIDER_KEYS[p]]);
   if (missing.length === 0) return;
 
@@ -109,6 +113,9 @@ export async function ensureApiKey(provider) {
   if (!keyName) throw new Error(`Unknown provider: ${provider}`);
 
   if (process.env[keyName]) return process.env[keyName];
+
+  // When authenticated via koi-cli.ai account, the gateway handles provider access.
+  if (process.env.KOI_AUTH_TOKEN) return '__KOI_ACCOUNT__';
 
   const { cliLogger } = await import('./cli-logger.js');
   const { cliInput }  = await import('./cli-input.js');

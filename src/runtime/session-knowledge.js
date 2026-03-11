@@ -22,9 +22,8 @@ const VALID_CATEGORIES = new Set([
   'path',         // file/directory locations
   'config',       // config values, ports, feature flags
   'credential',   // env var names (never values) for secrets
-  'status',       // what has been done, deployed, migrated
+  'status',       // service URLs, cluster names, deployment outputs
   'dependency',   // inter-service dependencies, required env vars
-  'other',
 ]);
 
 const MAX_VALUE_LEN = 300;
@@ -42,12 +41,14 @@ class SessionKnowledge extends EventEmitter {
    * @param {string} value - Concise fact (max 300 chars, no code/file contents)
    * @param {{ category?: string, agentName?: string }} opts
    */
-  learn(key, value, { category = 'other', agentName = 'unknown' } = {}) {
+  learn(key, value, { category = 'config', agentName = 'unknown' } = {}) {
     if (!key || value === undefined || value === null) return;
+    // Reject facts without a valid category — no catch-all "other" bucket
+    if (!VALID_CATEGORIES.has(category)) return;
     const entry = {
       key: String(key),
       value: String(value).slice(0, MAX_VALUE_LEN),
-      category: VALID_CATEGORIES.has(category) ? category : 'other',
+      category,
       agentName: String(agentName),
       ts: Date.now(),
     };
@@ -95,11 +96,12 @@ class SessionKnowledge extends EventEmitter {
     return [...this._facts.values()];
   }
 
-  /** Restore facts from a serialized array (e.g. on session resume). */
+  /** Restore facts from a serialized array (e.g. on session resume).
+   *  Filters out facts with invalid categories (legacy "other" entries). */
   restore(data) {
     if (!Array.isArray(data)) return;
     for (const entry of data) {
-      if (entry && entry.key && entry.value !== undefined) {
+      if (entry && entry.key && entry.value !== undefined && VALID_CATEGORIES.has(entry.category)) {
         this._facts.set(entry.key, entry);
       }
     }

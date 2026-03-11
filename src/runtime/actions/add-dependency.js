@@ -11,6 +11,7 @@
 import path from 'path';
 import { cliLogger } from '../cli-logger.js';
 import { addManualDependency, removeManualDependency, listManualDependencies } from '../local-dependency-detector.js';
+import { backgroundTaskManager } from '../background-task-manager.js';
 
 export default {
   type: 'add_dependency',
@@ -79,7 +80,8 @@ export default {
     // Default: add
     const result = addManualDependency(projectDir, action.path, action.name, action.reason);
     if (result.added) {
-      cliLogger.print(`Dependency registered: ${result.path} — will be included in next semantic indexing run`);
+      cliLogger.print(`Dependency registered: ${result.path} — indexing now...`);
+      backgroundTaskManager.restartSemanticIndexing();
     }
     return { success: result.added, ...result };
   },

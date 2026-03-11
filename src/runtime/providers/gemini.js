@@ -36,13 +36,13 @@ export class GeminiLLM extends BaseLLM {
     let buffer = '';
     let usage = { input: 0, output: 0 };
     let outChars = 0;
+    let _thinkChars = 0;
 
     try {
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.chat.completions.create(geminiParams, options);
 
       const race = this._abortRace(abortSignal);
-      let _thinkChars = 0;
 
       const _iterate = async () => {
         for await (const chunk of stream) {
@@ -64,7 +64,8 @@ export class GeminiLLM extends BaseLLM {
           if (chunk.usage) {
             usage = {
               input: chunk.usage.prompt_tokens || 0,
-              output: chunk.usage.completion_tokens || 0
+              output: chunk.usage.completion_tokens || 0,
+              thinking: chunk.usage.completion_tokens_details?.reasoning_tokens || 0,
             };
           }
         }
@@ -78,10 +79,26 @@ export class GeminiLLM extends BaseLLM {
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+    // Estimate input tokens when streaming break cut off the usage chunk
+    if (usage.input === 0 && messages.length > 0) {
+      const inputChars = messages.reduce((sum, m) => {
+        const c = m.content;
+        if (typeof c === 'string') return sum + c.length;
+        if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || JSON.stringify(p)).length, 0);
+        return sum;
+      }, 0);
+      usage.input = Math.ceil(inputChars / 4);
+    }
+    if (!usage.thinking && _thinkChars > 0) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
 
     const text = buffer.trim();
     if (!text) throw new Error('Gemini returned no content');
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try { JSON.parse(text); } catch {
+        throw new Error(`Gemini returned truncated response (${text.length} chars): ${text.substring(0, 80)}...`);
+      }
+    }
     return { text, usage };
   }
 
@@ -107,7 +124,8 @@ export class GeminiLLM extends BaseLLM {
       const text = completion.choices[0].message.content?.trim() || '';
       const usage = {
         input: completion.usage?.prompt_tokens || 0,
-        output: completion.usage?.completion_tokens || 0
+        output: completion.usage?.completion_tokens || 0,
+        thinking: completion.usage?.completion_tokens_details?.reasoning_tokens || 0,
       };
       return { text, usage };
     } finally {

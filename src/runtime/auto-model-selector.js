@@ -3,11 +3,59 @@
  *
  * Task profile (type + difficulty) is determined by a fast LLM call in LLMProvider._inferTaskProfile().
  * This module only handles provider discovery and model selection logic.
+ *
+ * Models are loaded from the backend API (GET /gateway/models) at startup in gateway mode,
+ * falling back to the local models.json if the API is unreachable.
  */
 
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
-const modelsData = _require('./models.json');
+const localModelsData = _require('./models.json');
+
+/** Active models data — starts with local fallback, replaced by backend data when available. */
+let modelsData = localModelsData;
+
+/** Whether remote models have been loaded successfully. */
+let _remoteLoaded = false;
+/** Timestamp of last failed attempt — allows retry after cooldown. */
+let _remoteLastAttempt = 0;
+const _REMOTE_RETRY_MS = 30_000; // retry every 30s if failed
+
+/**
+ * Fetch active models from the backend API.
+ * Called at startup and periodically in gateway mode.
+ * Falls back to local models.json on error but retries after cooldown.
+ */
+export async function loadRemoteModels() {
+  if (_remoteLoaded) return;
+  // Don't hammer the backend on repeated failures — wait before retrying
+  const now = Date.now();
+  if (_remoteLastAttempt && now - _remoteLastAttempt < _REMOTE_RETRY_MS) return;
+  _remoteLastAttempt = now;
+
+  const base = (process.env.KOI_API_URL || 'http://localhost:3000');
+  try {
+    const res = await fetch(`${base}/gateway/models`, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+        modelsData = data;
+        _remoteLoaded = true;
+        if (process.env.KOI_LOG_FILE) {
+          const count = Object.values(data).reduce((n, p) => n + Object.keys(p).length, 0);
+          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Loaded ${count} models from backend\n`); } catch {}
+        }
+      }
+    }
+  } catch {
+    if (process.env.KOI_LOG_FILE) {
+      try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Failed to load remote models, using local models.json fallback\n`); } catch {}
+    }
+  }
+}
 
 /** Default profile used as fallback when LLM classification is unavailable. */
 export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 5 };
@@ -26,8 +74,10 @@ export function markProviderTimeout(provider) {
   entry.until = Date.now() + COOLDOWN_STEPS_MS[step];
   _providerCooldowns.set(provider, entry);
   const secs = COOLDOWN_STEPS_MS[step] / 1000;
-  // Use console.error to avoid import cycle with cliLogger
-  console.error(`[circuit-breaker] ${provider} on cooldown for ${secs}s (timeout #${entry.failures})`);
+  // Log to file only — not visible to the user
+  if (process.env.KOI_LOG_FILE) {
+    try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[circuit-breaker] ${provider} on cooldown for ${secs}s (timeout #${entry.failures})\n`); } catch {}
+  }
 }
 
 /** Reset cooldown for a provider after a successful call. */
@@ -53,6 +103,11 @@ function _looksLikeApiKey(val) {
 }
 
 export function getAvailableProviders() {
+  // Gateway mode: return providers that have models in the loaded data
+  if (process.env.KOI_AUTH_TOKEN) {
+    return Object.keys(modelsData);
+  }
+
   const providers = [];
   if (_looksLikeApiKey(process.env.OPENAI_API_KEY))    providers.push('openai');
   if (_looksLikeApiKey(process.env.ANTHROPIC_API_KEY)) providers.push('anthropic');

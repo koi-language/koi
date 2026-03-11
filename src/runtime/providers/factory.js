@@ -18,11 +18,12 @@ import { AnthropicLLM } from './anthropic.js';
 import { GeminiLLM, GeminiEmbedding } from './gemini.js';
 import { BraveSearch } from './brave.js';
 import { TavilySearch } from './tavily.js';
+import { GatewayEmbedding, GatewaySearch } from './gateway.js';
 import { cliLogger } from '../cli-logger.js';
 
 // ── Re-export from auto-model-selector (circuit breaker, provider discovery) ─
 // These are consumed by llm-provider.js for error handling.
-export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, DEFAULT_TASK_PROFILE } from '../auto-model-selector.js';
+export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE } from '../auto-model-selector.js';
 import { selectAutoModel } from '../auto-model-selector.js';
 
 // Default models per provider (used as fallbacks)
@@ -103,14 +104,20 @@ function _resolveLLM(req) {
   cliLogger.setInfo('model', model);
 
   // ── Create instance ────────────────────────────────────────────────────
-  const client = clients[provider];
+  // In gateway mode, all providers route through the OpenAI-compatible gateway.
+  // Force effectiveProvider to 'openai' so createLLM uses the OpenAI SDK wrapper,
+  // but keep the original provider name for tracking/exclusion purposes.
+  const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : provider;
+  const client = process.env.KOI_AUTH_TOKEN ? clients.openai : clients[provider];
   if (!client) throw new Error(`No SDK client for provider: ${provider}`);
 
-  const instance = createLLM(provider, client, model, {
+  const instance = createLLM(effectiveProvider, client, model, {
     temperature, maxTokens, useThinking
   });
 
-  return { instance, provider, model, useThinking, effectiveDifficulty };
+  // provider = original (for tracking, exclusion, cost)
+  // effectiveProvider = 'openai' in gateway mode (for SDK wrapper selection)
+  return { instance, provider, effectiveProvider, model, useThinking, effectiveDifficulty };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +126,12 @@ function _resolveLLM(req) {
 
 function _resolveEmbedding(req) {
   const { clients } = req;
+
+  // Gateway mode: route through koi-cli.ai backend
+  if (process.env.KOI_AUTH_TOKEN) {
+    const instance = new GatewayEmbedding();
+    return { instance, provider: 'koi-gateway', model: 'text-embedding-3-small', useThinking: false };
+  }
 
   // Priority: OpenAI (cheapest, 1536-dim) → Gemini (768-dim)
   if (clients?.openai_embedding || process.env.OPENAI_API_KEY) {
@@ -140,6 +153,12 @@ function _resolveEmbedding(req) {
 
 function _resolveSearch(req) {
   const { clients } = req;
+
+  // Gateway mode: route through koi-cli.ai backend
+  if (process.env.KOI_AUTH_TOKEN) {
+    const instance = new GatewaySearch();
+    return { instance, provider: 'koi-gateway', model: 'gateway-search', useThinking: false };
+  }
 
   // Priority: Brave → Tavily → OpenAI search model
   if (process.env.BRAVE_SEARCH_API_KEY) {

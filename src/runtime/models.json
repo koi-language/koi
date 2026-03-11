@@ -67,5 +67,19 @@
     "gemini-3-flash-preview": { "inputPer1M": 0.50,  "outputPer1M":  3.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 5,  "planning": 6,  "reasoning": 6,  "thinking": true },
     "gemini-2.5-flash-image": { "inputPer1M": 0.20,  "outputPer1M":  0.80, "contextK":  256, "outputType": "image", "inputImage": true  },
     "gemini-3-pro-image":     { "inputPer1M": 1.00,  "outputPer1M":  8.00, "contextK":  256, "outputType": "image", "inputImage": true  }
+  },
+
+  "kimi": {
+    "kimi-k2.5":         { "inputPer1M": 0.45, "outputPer1M": 2.20, "contextK": 262, "outputType": "text", "inputImage": true,  "speed": 7, "code": 7, "planning": 7, "reasoning": 8, "thinking": true },
+    "kimi-k2-thinking":  { "inputPer1M": 0.47, "outputPer1M": 2.00, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 6, "code": 6, "planning": 7, "reasoning": 8, "thinking": true },
+    "kimi-k2":           { "inputPer1M": 0.60, "outputPer1M": 2.40, "contextK": 128, "outputType": "text", "inputImage": false, "speed": 7, "code": 6, "planning": 6, "reasoning": 7, "thinking": true },
+    "kimi-k2-instruct":  { "inputPer1M": 0.60, "outputPer1M": 2.40, "contextK": 128, "outputType": "text", "inputImage": false, "speed": 8, "code": 5, "planning": 5, "reasoning": 6 },
+    "kimi-k1.5-long":    { "inputPer1M": 0.40, "outputPer1M": 1.60, "contextK": 128, "outputType": "text", "inputImage": true,  "speed": 7, "code": 5, "planning": 5, "reasoning": 6, "thinking": true },
+    "kimi-k1.5":         { "inputPer1M": 0.40, "outputPer1M": 1.60, "contextK": 128, "outputType": "text", "inputImage": true,  "speed": 8, "code": 4, "planning": 5, "reasoning": 5 }
+  },
+
+  "qwen": {
+    "qwen3.5-397b-a17b": { "inputPer1M": 0.39, "outputPer1M": 2.34, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 7, "code": 7, "planning": 7, "reasoning": 8, "thinking": true },
+    "qwen3.5-32b":       { "inputPer1M": 0.10, "outputPer1M": 0.40, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 8, "code": 5, "planning": 5, "reasoning": 6, "thinking": true }
   }
 }

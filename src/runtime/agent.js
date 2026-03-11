@@ -807,6 +807,11 @@ export class Agent {
           console.error(`[Agent:${this.name}] ❌ LLM call failed (${modelId}): ${error.message}`);
         }
         session.recordAction({ intent: '_llm_error', actionType: 'direct' }, null, error);
+        // Exponential backoff on consecutive LLM failures to avoid tight retry loops.
+        // 1st fail: 1s, 2nd: 2s, 3rd: 4s, cap at 15s.
+        const _backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveErrors - 1), 15000);
+        cliLogger.log('agent', `${this.name}: Backoff ${_backoffMs}ms before retry`);
+        await new Promise(r => setTimeout(r, _backoffMs));
         continue;
       }
 
@@ -1173,6 +1178,10 @@ export class Agent {
             cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             // Track user message for compose template {{userMessage}} variable
             this._lastUserMessage = result?.answer || null;
+            // Share with session tracker so delegate commits can also use the user's request
+            if (sessionTracker && this._lastUserMessage) {
+              sessionTracker._lastUserRequest = this._lastUserMessage;
+            }
 
             // Clear stale tasks from previous requests.
             // A new user message = fresh task context. Old pending tasks should
@@ -1743,24 +1752,37 @@ export class Agent {
 
     try {
       const files = [...sessionTracker.pendingFiles];
-      let summary = `Changed: ${files.join(', ')}`;
 
-      // Get the actual diff of staged changes to feed the summary LLM
-      let diffText = '';
-      try {
-        diffText = sessionTracker._git('diff --cached');
-      } catch { /* fallback to no diff */ }
+      // Use the user's original request as commit message for better history readability.
+      // Falls back to LLM-generated diff summary, then to plain file list.
+      let summary = '';
+      const userRequest = this._lastUserMessage || sessionTracker?._lastUserRequest;
+      if (userRequest) {
+        // Truncate long user messages to a reasonable commit message length
+        const msg = userRequest.trim().split('\n')[0]; // first line only
+        summary = msg.length > 120 ? msg.substring(0, 117) + '...' : msg;
+      }
 
-      // Generate natural language summary via LLM (fast, non-critical)
-      if (this.llmProvider && diffText) {
+      if (!summary) {
+        summary = `Changed: ${files.join(', ')}`;
+
+        // Get the actual diff of staged changes to feed the summary LLM
+        let diffText = '';
         try {
-          summary = await this.llmProvider.callUtility(
-            'Summarize the code diff in one short sentence (max 80 chars). Be specific about WHAT changed, not the files. No markdown, no quotes. Examples: "Added execute command as alias for run", "Removed unused import and helper function"',
-            diffText.substring(0, 2000),
-            100
-          );
-        } catch {
-          // Fallback to file list if LLM fails
+          diffText = sessionTracker._git('diff --cached');
+        } catch { /* fallback to no diff */ }
+
+        // Generate natural language summary via LLM (fast, non-critical)
+        if (this.llmProvider && diffText) {
+          try {
+            summary = await this.llmProvider.callUtility(
+              'Summarize the code diff in one short sentence (max 80 chars). Be specific about WHAT changed, not the files. No markdown, no quotes. Examples: "Added execute command as alias for run", "Removed unused import and helper function"',
+              diffText.substring(0, 2000),
+              100
+            );
+          } catch {
+            // Fallback to file list if LLM fails
+          }
         }
       }
 

@@ -21,6 +21,7 @@ export class OpenAIChatLLM extends BaseLLM {
     let buffer = '';
     let usage = { input: 0, output: 0 };
     let outChars = 0;
+    let _thinkChars = 0;
 
     try {
       const params = this._cleanParams({
@@ -35,7 +36,6 @@ export class OpenAIChatLLM extends BaseLLM {
       const stream = await this.client.chat.completions.create(params, options);
 
       const race = this._abortRace(abortSignal);
-      let _thinkChars = 0;
 
       const _iterate = async () => {
         for await (const chunk of stream) {
@@ -58,7 +58,10 @@ export class OpenAIChatLLM extends BaseLLM {
           if (chunk.usage) {
             usage = {
               input: chunk.usage.prompt_tokens || 0,
-              output: chunk.usage.completion_tokens || 0
+              output: chunk.usage.completion_tokens || 0,
+              thinking: chunk.usage.reasoning_tokens
+                || chunk.usage.completion_tokens_details?.reasoning_tokens
+                || 0,
             };
           }
         }
@@ -72,10 +75,32 @@ export class OpenAIChatLLM extends BaseLLM {
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+    // Estimate input tokens from message content when streaming break cut off the usage chunk.
+    // This happens when we break early after receiving a complete JSON object — the usage
+    // chunk comes after content but we stop reading to save time.
+    if (usage.input === 0 && messages.length > 0) {
+      const inputChars = messages.reduce((sum, m) => {
+        const c = m.content;
+        if (typeof c === 'string') return sum + c.length;
+        if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || JSON.stringify(p)).length, 0);
+        return sum;
+      }, 0);
+      usage.input = Math.ceil(inputChars / 4);
+    }
+    // Fall back to character-based estimate for thinking tokens if provider didn't report them
+    if (!usage.thinking && _thinkChars > 0) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
 
     const text = buffer.trim();
     if (!text) throw new Error('OpenAI returned no content');
+    // Validate that the response is complete JSON — if the stream was cut short
+    // (connection drop, timeout), the buffer will be truncated and unparseable.
+    // Throwing here lets the agent retry the LLM call instead of failing at parse.
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try { JSON.parse(text); } catch {
+        throw new Error(`OpenAI returned truncated response (${text.length} chars): ${text.substring(0, 80)}...`);
+      }
+    }
     return { text, usage };
   }
 
@@ -101,7 +126,10 @@ export class OpenAIChatLLM extends BaseLLM {
       const text = completion.choices[0].message.content?.trim() || '';
       const usage = {
         input: completion.usage?.prompt_tokens || 0,
-        output: completion.usage?.completion_tokens || 0
+        output: completion.usage?.completion_tokens || 0,
+        thinking: completion.usage?.reasoning_tokens
+          || completion.usage?.completion_tokens_details?.reasoning_tokens
+          || 0,
       };
       return { text, usage };
     } finally {
@@ -152,6 +180,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
     let buffer = '';
     let usage = { input: 0, output: 0 };
     let outChars = 0;
+    let _thinkChars = 0;
 
     try {
       const params = {
@@ -171,8 +200,6 @@ export class OpenAIResponsesLLM extends BaseLLM {
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.responses.create(params, options);
       const race = this._abortRace(abortSignal);
-
-      let _thinkChars = 0;
       const _iterate = async () => {
         for await (const event of stream) {
           if (abortSignal?.aborted) break;
@@ -198,7 +225,10 @@ export class OpenAIResponsesLLM extends BaseLLM {
           if (event.type === 'response.completed' && event.response?.usage) {
             usage = {
               input: event.response.usage.input_tokens || 0,
-              output: event.response.usage.output_tokens || 0
+              output: event.response.usage.output_tokens || 0,
+              thinking: event.response.usage.reasoning_tokens
+                || event.response.usage.output_tokens_details?.reasoning_tokens
+                || 0,
             };
           }
         }
@@ -212,10 +242,26 @@ export class OpenAIResponsesLLM extends BaseLLM {
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
+    // Estimate input tokens when streaming break cut off the usage event
+    if (usage.input === 0 && messages.length > 0) {
+      const inputChars = messages.reduce((sum, m) => {
+        const c = m.content;
+        if (typeof c === 'string') return sum + c.length;
+        if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || JSON.stringify(p)).length, 0);
+        return sum;
+      }, 0);
+      usage.input = Math.ceil(inputChars / 4);
+    }
+    if (!usage.thinking && _thinkChars > 0) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
 
     const text = buffer.trim();
     if (!text) throw new Error('OpenAI Responses API returned no content');
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try { JSON.parse(text); } catch {
+        throw new Error(`OpenAI Responses API returned truncated response (${text.length} chars): ${text.substring(0, 80)}...`);
+      }
+    }
     return { text, usage };
   }
 

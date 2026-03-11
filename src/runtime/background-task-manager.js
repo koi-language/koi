@@ -97,20 +97,33 @@ class BackgroundTaskManager {
   }
 
   /**
+   * Re-run a named task even if it already completed.
+   * If the task is currently running, waits for it to finish first.
+   * @param {string} name - Task name to restart
+   * @param {Function} asyncFn - Same as run()
+   */
+  async rerun(name, asyncFn) {
+    const existing = this._tasks.get(name);
+    if (existing && existing.status === 'running') {
+      await existing.promise;
+    }
+    this._tasks.delete(name);
+    return this.run(name, asyncFn);
+  }
+
+  /**
    * Helper: start semantic code indexing using SemanticIndex + LanceDB.
    * @param {string} projectDir - Project root directory
    * @param {import('./llm-provider.js').LLMProvider} llmProvider
    */
-  startSemanticIndexing(projectDir, llmProvider) {
-    cliLogger.log('background', `startSemanticIndexing called — projectDir: ${projectDir}`);
-    return this.run('semantic-index', async (report) => {
+  /** @private Shared indexing logic used by start/restart. */
+  _indexingFn(projectDir, llmProvider) {
+    return async (report) => {
       cliLogger.log('background', 'Loading semantic-index module...');
       const { getSemanticIndex } = await import('./semantic-index.js');
       cliLogger.log('background', 'semantic-index module loaded OK');
 
       // Detect local dependencies — their files will be indexed into the SAME DB.
-      // On first run, persist discovered deps to .koi/dependencies.json so they're
-      // always available (even if the auto-detection source changes later).
       let depDirs = [];
       try {
         const { detectAllLocalDependencies, seedDependenciesFile } = await import('./local-dependency-detector.js');
@@ -142,7 +155,25 @@ class BackgroundTaskManager {
       }, { depDirs });
 
       cliLogger.log('background', 'Semantic indexing complete');
-    });
+    };
+  }
+
+  startSemanticIndexing(projectDir, llmProvider) {
+    cliLogger.log('background', `startSemanticIndexing called — projectDir: ${projectDir}`);
+    // Store params so restartSemanticIndexing can reuse them
+    this._lastIndexProjectDir = projectDir;
+    this._lastIndexLlmProvider = llmProvider;
+    return this.run('semantic-index', this._indexingFn(projectDir, llmProvider));
+  }
+
+  /**
+   * Re-trigger semantic indexing (e.g. after a new dependency is added).
+   * Waits for any in-progress indexing to finish, then re-runs.
+   */
+  restartSemanticIndexing() {
+    if (!this._lastIndexProjectDir || !this._lastIndexLlmProvider) return;
+    cliLogger.log('background', 'restartSemanticIndexing — new dependency added, re-indexing');
+    return this.rerun('semantic-index', this._indexingFn(this._lastIndexProjectDir, this._lastIndexLlmProvider));
   }
 }
 

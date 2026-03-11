@@ -138,13 +138,44 @@ export class SemanticIndex {
         await this._ensureClassesTable();
       }
 
-      // Process files in parallel batches
+      // Process files in parallel batches.
+      // Phase 1: Parse + describe files in parallel (LLM calls for descriptions).
+      // Phase 2: Collect all embedding jobs across the batch.
+      // Phase 3: Embed everything in one batch request.
+      // Phase 4: Store results.
       for (let i = 0; i < toIndex.length; i += FILE_PARALLEL_BATCH) {
         const batch = toIndex.slice(i, i + FILE_PARALLEL_BATCH);
 
+        // Phase 1+2: Prepare files in parallel — returns pending embed jobs + store callbacks
         const results = await Promise.allSettled(
-          batch.map(entry => this._indexFile(entry.absPath, entry.indexPath, entry.content, entry.hash, entry.manifestKey))
+          batch.map(entry => this._prepareFile(entry.absPath, entry.indexPath, entry.content, entry.hash, entry.manifestKey))
         );
+
+        // Phase 3: Collect all embed jobs from all files in this batch
+        const allEmbedTexts = [];
+        const preparedFiles = [];
+        for (let j = 0; j < results.length; j++) {
+          if (results[j].status === 'fulfilled' && results[j].value) {
+            const prepared = results[j].value;
+            prepared._batchOffset = allEmbedTexts.length;
+            allEmbedTexts.push(...prepared.embedTexts);
+            preparedFiles.push({ idx: j, prepared });
+          }
+        }
+
+        // Single batch embedding call for all files in this batch
+        let allVectors = [];
+        if (allEmbedTexts.length > 0) {
+          allVectors = await this.llmProvider.getEmbeddingBatch(allEmbedTexts);
+        }
+
+        // Phase 4: Store results — give each file its slice of vectors
+        for (const { idx, prepared } of preparedFiles) {
+          const vectors = allVectors.slice(prepared._batchOffset, prepared._batchOffset + prepared.embedTexts.length);
+          try {
+            await prepared.store(vectors);
+          } catch { /* logged inside store */ }
+        }
 
         for (let j = 0; j < results.length; j++) {
           processed++;
@@ -559,20 +590,21 @@ export class SemanticIndex {
 
   // ─── Private: Index a Single File ───────────────────────────────────
 
-  async _indexFile(filePath, relPath, content, hash, manifestKey) {
+  /**
+   * Prepare a file for indexing: parse, describe, collect embedding texts.
+   * Returns { embedTexts: string[], store: (vectors) => Promise<void> }
+   * The actual embedding is done externally so multiple files can be batched.
+   */
+  async _prepareFile(filePath, relPath, content, hash, manifestKey) {
     const parsed = parseFile(filePath, content);
 
-    // Languages without a tree-sitter plugin (Java, Go, Rust, etc.) get
-    // file-level-only indexing: an LLM description + embedding of the content.
-    // This still makes the file discoverable via semantic search.
     if (!parsed) {
-      return this._indexFileOnly(filePath, relPath, content, hash, manifestKey);
+      return this._prepareFileOnly(filePath, relPath, content, hash, manifestKey);
     }
 
     const { classes, functions } = parsed;
     const lang = path.extname(filePath).replace('.', '');
     const lines = content.split('\n');
-    // Use manifestKey for fileId to ensure consistency between build and cleanup
     const fileId = sha256(manifestKey || relPath).slice(0, 16);
 
     await this._deleteFileData(fileId);
@@ -591,106 +623,101 @@ export class SemanticIndex {
 
     const fileDescription = await this._describeFile(relPath, lines.length, classes, functions, classDescriptions, funcDescriptions);
 
-    // ── Collect all embedding texts, then embed in parallel ──
-    const embedJobs = []; // { key, text }
+    // Collect embedding texts (keys track which vector goes where)
+    const embedKeys = [];
+    const embedTexts = [];
 
-    // Function embeddings
     for (const func of allFunctions) {
       const desc = funcDescriptions[func.name] || `${func.name}: ${func.signature}`;
-      const embedText = `${desc} | ${func.signature} | ${truncate(func.sourceCode, 200)}`;
-      embedJobs.push({ key: `fn:${func.name}:${func.lineFrom}`, text: embedText });
+      embedKeys.push(`fn:${func.name}:${func.lineFrom}`);
+      embedTexts.push(`${desc} | ${func.signature} | ${truncate(func.sourceCode, 200)}`);
     }
 
-    // Class embeddings
     for (const cls of classes) {
       const desc = classDescriptions[cls.name] || cls.name;
       const methodSummary = cls.methods.map(m => `${m.name}: ${funcDescriptions[m.name] || m.signature}`).join('; ');
-      embedJobs.push({ key: `cls:${cls.name}`, text: `${desc} | ${methodSummary}`.slice(0, 1000) });
+      embedKeys.push(`cls:${cls.name}`);
+      embedTexts.push(`${desc} | ${methodSummary}`.slice(0, 1000));
     }
 
-    // File embedding
     const contentSummary = truncate(content, 500);
-    embedJobs.push({ key: 'file', text: `${fileDescription} | ${contentSummary}` });
+    embedKeys.push('file');
+    embedTexts.push(`${fileDescription} | ${contentSummary}`);
 
-    // Embed all in parallel
-    const embedResults = await Promise.allSettled(
-      embedJobs.map(job => this.llmProvider.getEmbedding(job.text))
-    );
-    const vectors = {};
-    for (let i = 0; i < embedJobs.length; i++) {
-      vectors[embedJobs[i].key] = embedResults[i].status === 'fulfilled'
-        ? embedResults[i].value : zeroVector();
-    }
+    // Return texts for batching + a store callback that receives the vectors
+    const self = this;
+    return {
+      embedTexts,
+      async store(vectorsArray) {
+        const vectors = {};
+        for (let i = 0; i < embedKeys.length; i++) {
+          vectors[embedKeys[i]] = vectorsArray[i] || zeroVector();
+        }
 
-    // Store functions (batch insert)
-    const funcTable = await this._ensureFunctionsTable();
-    const funcRows = allFunctions.map(func => {
-      const desc = funcDescriptions[func.name] || `${func.name}: ${func.signature}`;
-      return {
-        id: `${fileId}-fn-${sha256(func.name + func.lineFrom).slice(0, 8)}`,
-        file_id: fileId,
-        class_id: func.className ? `${fileId}-cls-${sha256(func.className).slice(0, 8)}` : '',
-        file_path: relPath,
-        name: func.name,
-        description: desc,
-        vector: vectors[`fn:${func.name}:${func.lineFrom}`],
-        line_from: func.lineFrom,
-        line_to: func.lineTo,
-        signature: func.signature,
-        source_code: truncate(func.sourceCode, MAX_SOURCE_CHARS),
-        is_method: func.isMethod ? 1 : 0,
-        class_name: func.className || '',
-      };
-    });
-    if (funcRows.length > 0) await funcTable.add(funcRows);
+        const funcTable = await self._ensureFunctionsTable();
+        const funcRows = allFunctions.map(func => {
+          const desc = funcDescriptions[func.name] || `${func.name}: ${func.signature}`;
+          return {
+            id: `${fileId}-fn-${sha256(func.name + func.lineFrom).slice(0, 8)}`,
+            file_id: fileId,
+            class_id: func.className ? `${fileId}-cls-${sha256(func.className).slice(0, 8)}` : '',
+            file_path: relPath,
+            name: func.name,
+            description: desc,
+            vector: vectors[`fn:${func.name}:${func.lineFrom}`],
+            line_from: func.lineFrom,
+            line_to: func.lineTo,
+            signature: func.signature,
+            source_code: truncate(func.sourceCode, MAX_SOURCE_CHARS),
+            is_method: func.isMethod ? 1 : 0,
+            class_name: func.className || '',
+          };
+        });
+        if (funcRows.length > 0) await funcTable.add(funcRows);
 
-    // Store classes (batch insert)
-    const clsTable = await this._ensureClassesTable();
-    const clsRows = classes.map(cls => {
-      const desc = classDescriptions[cls.name] || cls.name;
-      return {
-        id: `${fileId}-cls-${sha256(cls.name).slice(0, 8)}`,
-        file_id: fileId,
-        file_path: relPath,
-        name: cls.name,
-        description: desc,
-        vector: vectors[`cls:${cls.name}`],
-        line_from: cls.lineFrom,
-        line_to: cls.lineTo,
-        source_code: truncate(cls.sourceCode, MAX_SOURCE_CHARS),
-      };
-    });
-    if (clsRows.length > 0) await clsTable.add(clsRows);
+        const clsTable = await self._ensureClassesTable();
+        const clsRows = classes.map(cls => {
+          const desc = classDescriptions[cls.name] || cls.name;
+          return {
+            id: `${fileId}-cls-${sha256(cls.name).slice(0, 8)}`,
+            file_id: fileId,
+            file_path: relPath,
+            name: cls.name,
+            description: desc,
+            vector: vectors[`cls:${cls.name}`],
+            line_from: cls.lineFrom,
+            line_to: cls.lineTo,
+            source_code: truncate(cls.sourceCode, MAX_SOURCE_CHARS),
+          };
+        });
+        if (clsRows.length > 0) await clsTable.add(clsRows);
 
-    // Store file
-    const fileTable = await this._ensureFilesTable();
-    await fileTable.add([{
-      id: fileId,
-      file_path: relPath,
-      language: lang,
-      description: fileDescription,
-      vector: vectors['file'],
-      line_count: lines.length,
-      content_hash: hash,
-      indexed_at: new Date().toISOString(),
-    }]);
-
-    // Note: manifest is updated by build() using manifestKey, not here.
+        const fileTable = await self._ensureFilesTable();
+        await fileTable.add([{
+          id: fileId,
+          file_path: relPath,
+          language: lang,
+          description: fileDescription,
+          vector: vectors['file'],
+          line_count: lines.length,
+          content_hash: hash,
+          indexed_at: new Date().toISOString(),
+        }]);
+      },
+    };
   }
 
   /**
-   * File-level-only indexing for languages without a tree-sitter plugin.
-   * Stores a file entry with an LLM description + embedding so the file
-   * is still discoverable via semantic search, even without structural parsing.
+   * Prepare file-level-only indexing (no tree-sitter plugin available).
+   * Returns { embedTexts, store } like _prepareFile.
    */
-  async _indexFileOnly(filePath, relPath, content, hash, manifestKey) {
+  async _prepareFileOnly(filePath, relPath, content, hash, manifestKey) {
     const lang = path.extname(filePath).replace('.', '');
     const lines = content.split('\n');
     const fileId = sha256(manifestKey || relPath).slice(0, 16);
 
     await this._deleteFileData(fileId);
 
-    // Build a description from the content preview (no structural info available)
     const contentPreview = truncate(content, 2000);
     const prompt = `Given a source file's contents, write a concise 1-2 sentence description focusing on purpose, key classes, and key methods.
 
@@ -709,26 +736,26 @@ Return: { "description": "..." }`;
       fileDescription = relPath;
     }
 
-    // Embed and store file entry
-    const embedText = `${fileDescription} | ${truncate(content, 500)}`;
-    let vector;
-    try {
-      vector = await this.llmProvider.getEmbedding(embedText);
-    } catch {
-      vector = zeroVector();
-    }
+    const embedTexts = [`${fileDescription} | ${truncate(content, 500)}`];
 
-    const fileTable = await this._ensureFilesTable();
-    await fileTable.add([{
-      id: fileId,
-      file_path: relPath,
-      language: lang,
-      description: fileDescription,
-      vector,
-      line_count: lines.length,
-      content_hash: hash,
-      indexed_at: new Date().toISOString(),
-    }]);
+    const self = this;
+    return {
+      embedTexts,
+      async store(vectorsArray) {
+        const vector = vectorsArray[0] || zeroVector();
+        const fileTable = await self._ensureFilesTable();
+        await fileTable.add([{
+          id: fileId,
+          file_path: relPath,
+          language: lang,
+          description: fileDescription,
+          vector,
+          line_count: lines.length,
+          content_hash: hash,
+          indexed_at: new Date().toISOString(),
+        }]);
+      },
+    };
   }
 
   async _deleteFileData(fileId) {

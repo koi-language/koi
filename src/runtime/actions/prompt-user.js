@@ -21,6 +21,10 @@ export default {
   schema: {
     type: 'object',
     properties: {
+      message: {
+        type: 'string',
+        description: 'Optional message to print before the question (e.g., a detailed explanation or answer). Displayed as markdown.'
+      },
       question: {
         type: 'string',
         description: 'The question to ask the user'
@@ -38,6 +42,7 @@ export default {
   },
 
   examples: [
+    { intent: 'prompt_user', message: 'Here is the answer to your question:\n\n1. First point\n2. Second point', question: 'Do you need more details?' },
     { intent: 'prompt_user', question: 'What is your name?' },
     { intent: 'prompt_user', question: 'Do you want to proceed?', options: ['Yes', 'No'] },
     { intent: 'prompt_user', prompt: '(~/project) $ ' }
@@ -45,6 +50,7 @@ export default {
 
   // Executor function - receives the action and agent context
   async execute(action, agent) {
+    const message = action.message || action.data?.message || '';
     const question = action.question || action.data?.question || '';
     const options = action.options || action.data?.options || null;
     // Always use the default prompt — the LLM must not change the visual prompt
@@ -52,6 +58,18 @@ export default {
 
     // Clear any progress indicators
     cliLogger.clearProgress();
+
+    // Print message before question/input if provided.
+    // Deduplicate: if the message ends with the same text as the question, strip it.
+    if (message) {
+      let cleanMessage = message;
+      if (question && cleanMessage.trimEnd().endsWith(question.trim())) {
+        cleanMessage = cleanMessage.slice(0, cleanMessage.lastIndexOf(question.trim())).trimEnd();
+      }
+      if (cleanMessage) {
+        cliLogger.print(renderMarkdown(cleanMessage));
+      }
+    }
 
     // If options are provided, show interactive menu
     if (options && Array.isArray(options) && options.length > 0) {

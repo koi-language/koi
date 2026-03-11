@@ -21,7 +21,7 @@ import { actionRegistry } from './action-registry.js';
 import { classifyFeedback, classifyResponse } from './context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
 import { renderLine, renderTable } from './cli-markdown.js';
-import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
+import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -93,6 +93,33 @@ export class LLMProvider {
     this.maxTokens = config.max_tokens || 8000; // Increased to avoid truncation of long responses
     this._useThinking = false; // Set to true by auto-selector when thinking variant wins
 
+    // ── koi-cli.ai account mode: route all LLM calls through the gateway ──────
+    // The gateway is OpenAI-compatible and handles provider selection server-side.
+    // No need to hardcode providers — they come dynamically from GET /gateway/models.
+    // Production: https://api.koi-cli.ai/gateway  Local: http://localhost:3000/gateway
+    if (process.env.KOI_AUTH_TOKEN) {
+      const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
+      const gatewayBase = apiBase + '/gateway';
+      this._koiGatewayApiBase = apiBase;
+      this._koiGateway = new OpenAI({
+        apiKey: process.env.KOI_AUTH_TOKEN,
+        baseURL: gatewayBase,
+        maxRetries: 2, // Retry connection errors (concurrent agents can saturate the pool)
+      });
+      this._autoMode = true;
+      this._gatewayMode = true;
+      this.provider = 'auto';
+      this.model = 'auto';
+      this.openai = null;
+      this.anthropic = null;
+      // Start with common providers as fallback — syncGatewayProviders() will
+      // replace this with the actual list from the backend (fully dynamic).
+      this._availableProviders = ['openai', 'anthropic', 'gemini'];
+      // Fire async sync (non-blocking — updates _availableProviders from backend)
+      this.syncGatewayProviders();
+      return;
+    }
+
     // Auto mode: dynamically pick the best model per task
     if (this._autoMode) {
       this.provider = 'auto';
@@ -145,6 +172,31 @@ export class LLMProvider {
   }
 
   // =========================================================================
+  // Gateway provider sync — fetch which providers the user has configured
+  // =========================================================================
+
+  /**
+   * Fetch available providers from the koi-cli.ai gateway and update
+   * _availableProviders accordingly. Called at startup and on 400 errors
+   * (e.g. "key not configured") to re-sync.
+   */
+  async syncGatewayProviders() {
+    if (!process.env.KOI_AUTH_TOKEN) return;
+
+    // Load models from backend — this populates the auto-model-selector with
+    // the actual active models. getAvailableProviders() then returns providers
+    // dynamically from whatever the backend sent (no hardcoded list needed).
+    await loadRemoteModels();
+    const providers = getAvailableProviders();
+    if (providers.length > 0) {
+      this._availableProviders = providers;
+      cliLogger.log('llm', `[gateway] Available providers: ${providers.join(', ')}`);
+    } else {
+      cliLogger.log('llm', '[gateway] No providers found — using fallback list');
+    }
+  }
+
+  // =========================================================================
   // API KEY MANAGEMENT — lazy client initialization
   // =========================================================================
 
@@ -170,6 +222,8 @@ export class LLMProvider {
    */
   async _ensureAnyProvider() {
     if (this._availableProviders.length > 0) return;
+    // Gateway mode: all providers are available via the koi-cli.ai backend
+    if (this._koiGateway) return;
 
     const { cliLogger } = await import('./cli-logger.js');
     const { cliSelect } = await import('./cli-select.js');
@@ -248,10 +302,22 @@ export class LLMProvider {
    */
   _getClient(provider) {
     const p = provider || this.provider;
+    // Gateway mode: all providers route through the same OpenAI-compatible gateway
+    if (this._gatewayMode) return this._koiGateway;
     if (p === 'openai')    return this._autoMode ? this._oa : this.openai;
     if (p === 'gemini')    return this._autoMode ? this._gc : this.openai;
     if (p === 'anthropic') return this._autoMode ? this._ac : this.anthropic;
     throw new Error(`No client for provider: ${p}`);
+  }
+
+  /**
+   * Build a dynamic clients map for gateway mode.
+   * Every provider uses the same gateway client — no hardcoded provider list needed.
+   * Returns a Proxy so any provider name maps to the gateway client.
+   */
+  _gatewayClients() {
+    const gw = this._koiGateway;
+    return new Proxy({}, { get: () => gw });
   }
 
   /**
@@ -260,7 +326,10 @@ export class LLMProvider {
    * @returns {import('./providers/base.js').BaseLLM}
    */
   _createLLM(opts = {}) {
-    return createLLM(this.provider, this._getClient(), this.model, {
+    // In gateway mode, _effectiveLLMProvider is 'openai' so we always create
+    // OpenAIChatLLM, regardless of the original provider (gemini, anthropic, etc.)
+    const llmProvider = this._effectiveLLMProvider || this.provider;
+    return createLLM(llmProvider, this._getClient(llmProvider), this.model, {
       temperature: this.temperature,
       maxTokens: this.maxTokens,
       useThinking: this._useThinking,
@@ -408,8 +477,9 @@ export class LLMProvider {
     try {
       // Force best model per provider for planning
       const planModels = { openai: 'gpt-5.2', anthropic: 'claude-3-haiku-20240307', gemini: 'gemini-2.0-flash' };
+      const _planProvider = this._effectiveLLMProvider || this.provider;
       const planModel = planModels[this.provider] || this.model;
-      const llm = createLLM(this.provider, this._getClient(), planModel, { temperature: 0, maxTokens: 800 });
+      const llm = createLLM(_planProvider, this._getClient(_planProvider), planModel, { temperature: 0, maxTokens: 800 });
 
       const { text } = await llm.complete([
         { role: 'system', content: 'Planning assistant. JSON only.' },
@@ -595,7 +665,7 @@ ${taskDescription}`;
     const { instance: llm, provider, model } = resolveModel({
       type: 'llm', taskType: 'speed', difficulty: 1,
       availableProviders: this._availableProviders,
-      clients: { openai: this._oa, anthropic: this._ac, gemini: this._gc },
+      clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
       minContextK,
     });
 
@@ -619,7 +689,7 @@ ${taskDescription}`;
     const { instance: llm, provider, model } = resolveModel({
       type: 'llm', taskType: 'reasoning', difficulty: 1,
       availableProviders: this._availableProviders,
-      clients: { openai: this._oa, anthropic: this._ac, gemini: this._gc },
+      clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
       maxTokens,
     });
 
@@ -852,6 +922,9 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     // two delegates share the same LLMProvider in parallel: the first to finish would
     // restore this.provider='auto', corrupting the state for the second mid-stream.
     if (this._autoMode) {
+      // Ensure remote models are loaded in gateway mode (retries if initial load failed)
+      if (this._koiGateway) await loadRemoteModels();
+
       const _lastAction = session.actionHistory.at(-1);
       const _isDelegateReturn = _lastAction?.action?.actionType === 'delegate';
       const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn;
@@ -883,7 +956,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         session,
         agentName,
         availableProviders: this._availableProviders,
-        clients: { openai: this._oa, anthropic: this._ac, gemini: this._gc },
+        clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
       });
 
       // Store for cost tracking after the finally block restores this.model → 'auto'
@@ -891,12 +964,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       session._autoModel    = resolved.model;
 
       // Set provider/model/client for this call (auto-resolved)
-      this.provider     = resolved.provider;
+      // In gateway mode, effectiveProvider='openai' (for SDK wrapper) but
+      // provider keeps the original name (for tracking/exclusion).
+      this._effectiveLLMProvider = resolved.effectiveProvider || resolved.provider;
+      this.provider     = resolved.provider;  // original provider for tracking
       this.model        = resolved.model;
       this._useThinking = resolved.useThinking;
-      if (resolved.provider === 'openai')        this.openai    = this._oa;
-      else if (resolved.provider === 'gemini')    this.openai    = this._gc;
-      else if (resolved.provider === 'anthropic') this.anthropic = this._ac;
+      if (this._effectiveLLMProvider === 'openai')        this.openai    = this._oa;
+      else if (this._effectiveLLMProvider === 'gemini')    this.openai    = this._gc;
+      else if (this._effectiveLLMProvider === 'anthropic') this.anthropic = this._ac;
     }
 
     // Build messages from tiered memory
@@ -1242,20 +1318,31 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         if (this._autoMode) markProviderTimeout(this.provider);
         throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_MS / 1000}s (no chunks received)`);
       }
-      // Circuit breaker: any timeout error (including provider-side) puts provider on cooldown
+      // Circuit breaker: timeout or connection errors put provider on cooldown
       const _isTimeout = /timed?\s*out|timeout/i.test(_callErr.message || '');
-      if (_isTimeout && this._autoMode) markProviderTimeout(this.provider);
+      const _isConnError = /connection error|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed/i.test(_callErr.message || '');
+      if ((_isTimeout || _isConnError) && this._autoMode) markProviderTimeout(this.provider);
       // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
       // model is unavailable. Remove that provider from candidates so we don't hammer it
       // on every retry iteration — the agent would otherwise loop forever with the same error.
       if (this._autoMode) {
         const _status = _callErr.status ?? _callErr.statusCode;
-        if (typeof _status === 'number' && _status >= 400 && _status < 500) {
+        // 429 = rate limit — put provider on cooldown so auto-selector picks another model.
+        if (_status === 429) {
+          markProviderTimeout(this.provider);
+        }
+        // Other 4xx (401, 403, 404) = invalid key or model — exclude provider entirely.
+        if (typeof _status === 'number' && _status >= 400 && _status < 500 && _status !== 429) {
           const _badProvider = this.provider;
           const _idx = this._availableProviders.indexOf(_badProvider);
           if (_idx !== -1) {
             this._availableProviders.splice(_idx, 1);
             cliLogger.log('llm', `[auto] Provider "${_badProvider}" excluded — HTTP ${_status} (key may be invalid or model unavailable)`);
+          }
+          // Gateway mode: re-sync available providers from backend when a key
+          // is missing or invalid, so subsequent calls pick the right provider.
+          if (this._koiGateway) {
+            this.syncGatewayProviders(); // fire-and-forget
           }
         }
       }
@@ -1420,12 +1507,17 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
 
     // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
     // Find the first { or [ and discard everything before it.
+    // Capture preamble text — if the action is prompt_user, inject it as "message".
+    let preambleText = '';
     const braceIdx = cleaned.indexOf('{');
     const bracketIdx = cleaned.indexOf('[');
     const jsonStart = braceIdx >= 0 && bracketIdx >= 0
       ? Math.min(braceIdx, bracketIdx)
       : braceIdx >= 0 ? braceIdx : bracketIdx;
-    if (jsonStart > 0) cleaned = cleaned.substring(jsonStart);
+    if (jsonStart > 0) {
+      preambleText = cleaned.substring(0, jsonStart).trim();
+      cleaned = cleaned.substring(jsonStart);
+    }
 
     // Strip trailing text after JSON: some models (Gemini) append explanations
     // after the JSON object. Find the matching closing brace/bracket by counting.
@@ -1454,12 +1546,20 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     try {
       parsed = JSON.parse(cleaned);
     } catch (firstErr) {
-      // Fallback 0: Fix unescaped newlines/tabs inside JSON string values.
-      // Some models (Gemini) emit literal newlines within strings instead of \n.
+      // Fallback 0: Fix malformed escape sequences and literal newlines/tabs inside JSON string values.
+      // Some models (Gemini) emit literal newlines within strings instead of \n,
+      // or produce invalid escape sequences like \a, \p, \s etc. in diff content.
       try {
-        const fixed = cleaned.replace(/"(?:[^"\\]|\\.)*"/gs, match =>
-          match.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')
-        );
+        const fixed = cleaned.replace(/"(?:[^"\\]|\\.)*"/gs, match => {
+          let s = match;
+          // Fix literal control characters
+          s = s.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+          // Fix invalid escape sequences: \X where X is not a valid JSON escape char.
+          // Valid: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+          // Replace invalid \X with \\X (escaped backslash + literal char)
+          s = s.replace(/\\([^"\\/bfnrtu])/g, '\\\\$1');
+          return s;
+        });
         parsed = JSON.parse(fixed);
       } catch { /* fall through */ }
 
@@ -1491,11 +1591,26 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       }
     }
 
+    // Helper: inject preamble text into the last prompt_user in an action list
+    const _injectPreamble = (actions) => {
+      if (!preambleText) return actions;
+      // Find the last prompt_user action and inject preamble as message
+      for (let i = actions.length - 1; i >= 0; i--) {
+        const a = actions[i];
+        if (a && a.intent === 'prompt_user' && !a.message) {
+          a.message = preambleText;
+          break;
+        }
+      }
+      return actions;
+    };
+
     // Handle batched actions: { "batch": [action1, action2, ...] }
     // Items may be regular actions OR { "parallel": [...] } groups.
     if (parsed.batch && Array.isArray(parsed.batch) && parsed.batch.length > 0) {
       this.logDebug(`Reactive response batched ${parsed.batch.length} actions`);
       const actions = parsed.batch.map(a => this._normalizeBatchItem(a));
+      _injectPreamble(actions);
       return actions.length === 1 ? actions[0] : actions;
     }
 
@@ -1505,6 +1620,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         throw new Error('Reactive response was an empty array');
       }
       const actions = parsed.map(a => this._normalizeReactiveAction(a));
+      _injectPreamble(actions);
       return actions.length === 1 ? actions[0] : actions;
     }
 
@@ -1512,6 +1628,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     if (parsed.actions && Array.isArray(parsed.actions) && parsed.actions.length > 0) {
       this.logDebug('Reactive response used legacy {actions:[...]} format, extracting as batch');
       const actions = parsed.actions.map(a => this._normalizeReactiveAction(a));
+      _injectPreamble(actions);
       return actions.length === 1 ? actions[0] : actions;
     }
 
@@ -1525,7 +1642,18 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       return { parallel: parsed.parallel.map(a => this._normalizeReactiveAction(a)) };
     }
 
-    return this._normalizeReactiveAction(parsed);
+    const result = this._normalizeReactiveAction(parsed);
+
+    // If the LLM wrote explanation text before the JSON and the action is prompt_user,
+    // inject the preamble as the "message" field so it's displayed to the user.
+    if (preambleText && result && !Array.isArray(result)) {
+      const action = result;
+      if (action.intent === 'prompt_user' && !action.message) {
+        action.message = preambleText;
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -1700,12 +1828,12 @@ RULES:
 4. If an action fails, choose a different valid action — EXCEPT for "command not found" / exit code 127, which must be handled by rule 11, not skipped.
 5. If the user denies permission (🚫), do not retry the same action.
 6. If instructions say to repeat N times, execute ALL N iterations.
-7. Do not duplicate content (e.g., do not print before prompt_user).
+7. Do not duplicate content (e.g., do not print before prompt_user). When responding to the user with information AND a follow-up question, put the information in prompt_user's "message" field — never as free text before the JSON.
 8. PARALLELISM IS MANDATORY: within a batch, whenever 2 or more actions do not depend on each other's output, they MUST go inside a "parallel" block. It is WRONG to list independent actions sequentially in a batch — always parallelize them. EXCEPTION: prompt_user is always sequential and must never be in a parallel block.
 9. NEVER return before ALL steps are done. Delegating/reading/exploring is NOT completing a task — you must also execute every follow-up action (edits, writes, prints, etc.) that the task requires. Only emit { "intent": "return" } when every required change has been applied and verified.
 10. ONE QUESTION PER prompt_user: Never list multiple questions in a single prompt_user. If you need N pieces of information, use N sequential prompt_user actions, one question each. After the last answer, continue with the next step — do NOT add a "submit" or summary prompt.
 11. ⚠️ MISSING TOOLS (overrides rule 4): If any shell command returns "command not found" or exit code 127, the required tool is not installed. You MUST immediately stop the current task and use prompt_user (with options ["Yes", "No"]) to ask the user for permission to install it. Example: { "intent": "prompt_user", "prompt": "Flutter is not installed. Install it now? (brew install flutter) → ", "options": ["Yes", "No"] }. If Yes, install it first, then continue the original task. If No, tell the user what to install and stop. Never skip this step and continue with the task.
-12. QUESTIONS: When gathering information from the user, always use prompt_user with a "question" field. The question is displayed above the input area. Never use a preceding print to show a question. Example: { "intent": "prompt_user", "question": "What is the app's main purpose?" }
+12. QUESTIONS: When gathering information from the user, always use prompt_user with a "question" field. The question is displayed above the input area. Never use a preceding print to show a question. When you need to show an explanation/answer AND ask a follow-up, use the "message" field for the explanation and "question" for the follow-up. Example: { "intent": "prompt_user", "message": "Here is what I found:\\n\\n1. Point A\\n2. Point B", "question": "Do you need more details?" }
 14. BACKGROUND PROCESSES: Commands that launch apps, emulators, or dev servers (e.g. "flutter run", "open -a Simulator", "npm start", "python server.py") MUST use "background": true in the shell action. These processes run indefinitely — do not wait for them to finish.
 13. NEVER ask the user something you can verify yourself with a shell command or file read. Run the check first, then act on the result. Examples: do NOT ask "Is Flutter installed?" — run "which flutter" or "flutter --version". Do NOT ask "Does this file exist?" — read it. Only ask the user for things that are genuinely unknowable without their input (e.g. project name, desired behavior, credentials).
 
@@ -2177,6 +2305,7 @@ Output ONLY the JSON array, no explanation.`;
    * Used by ContextMemory to initialize LanceDB with the correct schema.
    */
   getEmbeddingDim() {
+    if (process.env.KOI_AUTH_TOKEN) return 1536; // gateway uses text-embedding-3-small
     if (process.env.OPENAI_API_KEY) return getEmbeddingDimension('openai');
     if (process.env.GEMINI_API_KEY) return getEmbeddingDimension('gemini');
     return getEmbeddingDimension('openai'); // fallback default
@@ -2195,7 +2324,7 @@ Output ONLY the JSON array, no explanation.`;
 
     const MAX_RETRIES = 2;
     const TIMEOUT_MS = 15000;
-    const _provider = process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
+    const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
     let lastError;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -2211,6 +2340,18 @@ Output ONLY the JSON array, no explanation.`;
       cliLogger.log('memory', `Embedding request: provider=${_provider}, textLen=${text.length}, attempt=${attempt}, preview="${text.substring(0, 80).replace(/\n/g, ' ')}..."`);
 
       try {
+        // Gateway mode: use koi-cli.ai backend for embeddings
+        if (process.env.KOI_AUTH_TOKEN) {
+          if (!this._gatewayEmbeddingInstance) {
+            const { GatewayEmbedding } = await import('./providers/gateway.js');
+            this._gatewayEmbeddingInstance = new GatewayEmbedding();
+          }
+          const result = await this._gatewayEmbeddingInstance.embed(text, { abortSignal: ac.signal });
+          clearTimeout(_timer);
+          cliLogger.log('memory', `Embedding OK: ${Date.now() - _t0}ms, dim=${result.length}${attempt > 0 ? `, retry=${attempt}` : ''}`);
+          return result;
+        }
+
         if (process.env.OPENAI_API_KEY) {
           if (!this._embeddingClient) {
             this._embeddingClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
@@ -2255,5 +2396,65 @@ Output ONLY the JSON array, no explanation.`;
       }
     }
     throw lastError;
+  }
+
+  /**
+   * Batch embed multiple texts in a single API call (gateway mode only).
+   * Falls back to individual getEmbedding() calls for non-gateway providers.
+   * Returns an array of embedding vectors (same order as input texts).
+   * Failed embeddings return null.
+   *
+   * Batches are serialized: only one batch request runs at a time, even if
+   * multiple files are being indexed in parallel. This prevents flooding the
+   * gateway/provider with concurrent batch requests.
+   */
+  async getEmbeddingBatch(texts) {
+    if (!texts.length) return [];
+
+    // Serialize batch requests — wait for any in-flight batch to finish first
+    if (this._embeddingBatchLock) {
+      await this._embeddingBatchLock;
+    }
+
+    let _unlock;
+    this._embeddingBatchLock = new Promise(r => { _unlock = r; });
+
+    try {
+      return await this._doEmbeddingBatch(texts);
+    } finally {
+      this._embeddingBatchLock = null;
+      _unlock();
+    }
+  }
+
+  async _doEmbeddingBatch(texts) {
+    // Gateway mode: use batch API (single HTTP request)
+    if (process.env.KOI_AUTH_TOKEN) {
+      if (!this._gatewayEmbeddingInstance) {
+        const { GatewayEmbedding } = await import('./providers/gateway.js');
+        this._gatewayEmbeddingInstance = new GatewayEmbedding();
+      }
+      const _t0 = Date.now();
+      cliLogger.log('memory', `Embedding batch: ${texts.length} texts via gateway`);
+      try {
+        const results = await this._gatewayEmbeddingInstance.embedBatch(texts);
+        cliLogger.log('memory', `Embedding batch OK: ${Date.now() - _t0}ms, count=${results.length}`);
+        return results;
+      } catch (err) {
+        cliLogger.log('memory', `Embedding batch FAILED: ${err.message}, falling back to individual`);
+        // Fall through to individual calls
+      }
+    }
+
+    // Fallback: sequential individual calls
+    const results = [];
+    for (const text of texts) {
+      try {
+        results.push(await this.getEmbedding(text));
+      } catch {
+        results.push(null);
+      }
+    }
+    return results;
   }
 }
