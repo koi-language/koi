@@ -1,35 +1,102 @@
-<div align="center">
-  <img src="koi.png" alt="KOI Language Logo" width="400"/>
-</div>
+<p align="center">
+  <img src="./koi.png" alt="Koi logo" width="220" />
+</p>
 
-# Koi - Agent-first language. Calm orchestration. 🌊
+# Koi - Next-generation native language for AI agents
+Build multi-agent systems with roles, teams, skills, playbooks, and MCP integration.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GitHub](https://img.shields.io/badge/GitHub-koi--language%2FKoi-6495ED?logo=github)](https://github.com/koi-language/Koi)
-[![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?logo=visualstudiocode)](vscode-koi-extension/)
-[![Syntax Highlighting](https://img.shields.io/badge/GitHub-Syntax_Highlighting-6495ED?logo=github)](LINGUIST.md)
+## Why Koi?
 
-Koi is a multi-agent orchestration language with role-based routing.
+Most AI agent systems today are built by stitching together prompts, tools, routing logic, and framework glue.  
+It works — but it quickly becomes messy.
 
-## Quick Install
+**Koi is the first language designed specifically for agentic systems.**
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/koi-language/Koi/main/install.sh | bash
+It provides native primitives for building agents:
+
+- **Agents** — autonomous workers with behavior  
+- **Roles** — define what an agent is allowed to do (e.g. delegate tasks, use tools, access external resources)  
+- **Teams** — structured collaboration between agents  
+- **Skills** — reusable capabilities  
+- **Playbooks** — natural-language behavior embedded in code  
+- **MCP** — consume or expose agents as MCP tools  
+
+**Less framework glue. More native agent architecture.**
+
+---
+
+## What makes Koi different?
+
+### 1. Program AI agents with natural-language playbooks
+
+```python
+role Researcher { can execute, can web_access }
+
+agent WebResearcher : Researcher {
+  on analyzeUrl(args: Json) {
+
+    playbook """
+
+Analyze the webpage at {{args.url}} and display the following information to the user on the screen:
+
+1. A one-sentence summary
+2. The 3 most important insights
+3. A conclusion
+
+Do not return the data as structured output. Instead, present the information directly to the user.
+
+Use Markdown format and structure the response with clear sections and titles.
+
+    """
+  }
+}
+
+run WebResearcher.analyzeUrl({
+  url: "https://es.wikipedia.org/wiki/Amalia_Navarro"
+})
+
 ```
 
-> **🚀 New to Koi?** Check out the [Quick Start Guide](QUICKSTART.md) for a 2-minute setup!
->
-> **📚 Complete Documentation**: See the [doc/](doc/) directory for comprehensive guides
+### 2. Multi-agent orchestration
 
-## Architecture
+```python
 
-### Key Concepts
+role Lead { can execute, can delegate }
 
-- **Agent**: Autonomous worker with a role, executes playbooks
-- **Playbook**: Natural language instructions that define agent behavior
-- **Role**: Abstract capabilities (can delegate, can execute, can read, ...)
-- **Team**: Agent composition that enables collaboration
-- **Skills**: Reusable capability with internal logic and agents
+...
+
+team Development {
+  analyzer: Analyzer,
+  reviewer: Reviewer
+}
+
+agent Orchestrator : Lead {
+
+  uses team Development
+
+  on start(args: Json) {
+    playbook """
+    Task: {{args.task}}
+
+    Work with the team to complete the task.
+    Route work to the right collaborators based on their capabilities.
+
+    """
+  }
+}
+```
+
+### 3. Natural language for behavior, code for execution
+
+A core Koi idea is:
+- **Playbooks** define behavior
+- **Code** handles technical operations
+
+```python
+
+  xxx
+
+```
 
 ## Installation
 

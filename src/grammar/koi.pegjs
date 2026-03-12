@@ -291,8 +291,8 @@ StateDecl
     }
 
 StateFields
-  = head:StateField tail:(_ StateField)* {
-      return [head, ...tail.map(t => t[1])];
+  = head:StateField tail:(_ ","? _ StateField)* _ ","? {
+      return [head, ...tail.map(t => t[3])];
     }
 
 StateField

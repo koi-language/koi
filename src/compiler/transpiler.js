@@ -292,6 +292,7 @@ export class KoiTranspiler {
       // Clean exit
       code += this.emit(`${this.getIndent()}await mcpRegistry.disconnectAll();\n`);
       code += this.emit(`${this.getIndent()}if (globalThis.lspManager) await globalThis.lspManager.disconnectAll();\n`);
+      code += this.emit(`${this.getIndent()}process.stdout.write('\\r\\x1b[K\\x1b[?25h');\n`);
       code += this.emit(`${this.getIndent()}process.exit(0);\n`);
 
       this.indent--;

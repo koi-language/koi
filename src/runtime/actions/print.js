@@ -36,12 +36,17 @@ export default {
     const message = action.message || action.text || action.data || '';
 
     if (action._alreadyStreamed) {
-      // Clear the streaming area first, then commit the formatted version.
-      // This swaps the raw streamed text for the markdown-formatted version
-      // in one visual step, avoiding the "shown twice" effect.
       cliLogger.printStreamingEnd();
+      // When a UI provider owns streaming, the dynamic area was cleared above
+      // so we must re-print the final markdown version to the permanent scroll.
+      // Without a provider, streaming went straight to stdout and is already
+      // permanent — printing again would duplicate the output.
+      if (cliLogger.hasStreamingProvider()) {
+        cliLogger.print(`\x1b[0m${renderMarkdown(message)}`);
+      }
+    } else {
+      cliLogger.print(`\x1b[0m${renderMarkdown(message)}`);
     }
-    cliLogger.print(`\x1b[0m${renderMarkdown(message)}`);
 
     return { printed: true, message };
   }

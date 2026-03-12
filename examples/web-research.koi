@@ -1,0 +1,35 @@
+role Researcher { can execute, can web_access }
+
+agent WebResearcher : Researcher {
+
+  on analyzeUrl(args: Json) {
+
+    playbook """
+
+Analyze the webpage at {{args.url}}.
+
+You must:
+1. Read the webpage content first
+2. Wait for the real result
+3. Then display the analysis directly to the user using a user-visible action
+
+The user-visible output must include:
+- a one-sentence summary
+- the 3 most important insights
+- a conclusion
+
+Format the user-visible output in Markdown with clear sections and titles.
+
+Do NOT return the analysis as structured data.
+Do NOT put the final analysis only inside "return".
+Displaying the formatted analysis to the user is a required final step.
+After displaying it, use "return" only to signal completion if needed by the runtime.
+
+    """
+  }
+
+}
+
+run WebResearcher.analyzeUrl({
+  url: "https://es.wikipedia.org/wiki/Amalia_Navarro"
+})

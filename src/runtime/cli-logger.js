@@ -249,6 +249,15 @@ class CLILogger {
   }
 
   /**
+   * Returns true when a UI provider handles streaming in a dynamic area
+   * that gets cleared on printStreamingEnd (i.e. content is NOT permanent).
+   * When false, streamed text went straight to stdout and is already permanent.
+   */
+  hasStreamingProvider() {
+    return !!_provider?.printStreamingEnd;
+  }
+
+  /**
    * Finalize a streaming print: emit trailing newline + spacing.
    */
   printStreamingEnd() {

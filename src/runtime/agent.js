@@ -133,7 +133,7 @@ export class Agent {
     this.skills = config.skills || [];
     this.usesTeams = config.usesTeams || []; // Teams this agent uses as a client
     this.usesMCPNames = config.usesMCP || []; // MCP server names this agent uses
-    this.llm = config.llm || { provider: 'openai', model: 'gpt-4', temperature: 0.2 };
+    this.llm = config.llm || { provider: 'auto', model: 'auto', temperature: 0.2 };
     this.state = config.state || {};
     this.playbooks = config.playbooks || {};
     this.resilience = config.resilience || null;

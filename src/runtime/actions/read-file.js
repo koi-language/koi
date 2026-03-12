@@ -15,7 +15,7 @@ import { getFilePermissions } from '../file-permissions.js';
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Returns the text with line numbers. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000). Lines longer than 2000 chars are truncated. If path is a directory, lists its contents. Returns: { success, content, totalLines, path }',
+  description: 'Read a file\'s contents. Supports text files and PDF files. Returns the text with line numbers. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs, e.g. "1-5", "3", "10-20"). Lines longer than 2000 chars are truncated. If path is a directory, lists its contents. Returns: { success, content, totalLines, path }',
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,
@@ -25,14 +25,16 @@ export default {
     properties: {
       path: { type: 'string', description: 'File path to read' },
       offset: { type: 'number', description: 'Start reading from this line number (1-based, optional)' },
-      limit: { type: 'number', description: 'Maximum number of lines to read (optional)' }
+      limit: { type: 'number', description: 'Maximum number of lines to read (optional)' },
+      pages: { type: 'string', description: 'Page range for PDF files (e.g. "1-5", "3", "10-20"). Only for .pdf files. Max 20 pages per request.' }
     },
     required: ['path']
   },
 
   examples: [
     { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js' },
-    { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js', offset: 10, limit: 50 }
+    { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js', offset: 10, limit: 50 },
+    { actionType: 'direct', intent: 'read_file', path: 'docs/manual.pdf', pages: '1-5' }
   ],
 
   async execute(action, agent) {
@@ -81,6 +83,140 @@ export default {
         }
       });
       return { success: true, path: filePath, type: 'directory', entries: listing };
+    }
+
+    // --- PDF support ---
+    if (resolvedPath.toLowerCase().endsWith('.pdf')) {
+      try {
+        // Try direct import first (works in pkg binary and when pdfjs-dist is a
+        // direct dependency). Fall back to createRequire from cwd (works when this
+        // module is symlinked via npm link and pdfjs-dist lives in the host project).
+        let pdfjsLib;
+        try {
+          pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        } catch {
+          const { createRequire } = await import('module');
+          const _require = createRequire(path.join(process.cwd(), '__placeholder.js'));
+          const pdfjsPath = _require.resolve('pdfjs-dist/legacy/build/pdf.mjs');
+          pdfjsLib = await import(pdfjsPath);
+        }
+        // Suppress benign "standardFontDataUrl" warnings from pdfjs
+        pdfjsLib.VerbosityLevel && pdfjsLib.setVerbosityLevel?.(0);
+        const dataBuffer = fs.readFileSync(resolvedPath);
+        const uint8Array = new Uint8Array(dataBuffer);
+        const MAX_PDF_PAGES = 20;
+
+        const doc = await pdfjsLib.getDocument({ data: uint8Array, verbosity: 0 }).promise;
+        const totalPages = doc.numPages;
+
+        // Parse page range if provided
+        let pagesToRead = [];
+        if (action.pages) {
+          const ranges = String(action.pages).split(',').map(r => r.trim());
+          const pageSet = new Set();
+          for (const r of ranges) {
+            if (r.includes('-')) {
+              const [startStr, endStr] = r.split('-');
+              const start = parseInt(startStr, 10);
+              const end = parseInt(endStr, 10);
+              if (!isNaN(start) && !isNaN(end)) {
+                for (let p = start; p <= Math.min(end, totalPages); p++) pageSet.add(p);
+              }
+            } else {
+              const p = parseInt(r, 10);
+              if (!isNaN(p) && p >= 1 && p <= totalPages) pageSet.add(p);
+            }
+          }
+          if (pageSet.size > MAX_PDF_PAGES) {
+            return { success: false, error: `Too many pages requested (max ${MAX_PDF_PAGES}). Use a smaller range.` };
+          }
+          pagesToRead = [...pageSet].sort((a, b) => a - b);
+        } else {
+          // No pages specified — read all (up to MAX_PDF_PAGES)
+          const maxPage = Math.min(totalPages, MAX_PDF_PAGES);
+          for (let i = 1; i <= maxPage; i++) pagesToRead.push(i);
+        }
+
+        // Extract text from selected pages, preserving line breaks.
+        // pdfjs items have a transform matrix where [5] is the Y coordinate.
+        // When Y changes between items, it means a new line in the PDF layout.
+        const pageTexts = [];
+        for (const pageNum of pagesToRead) {
+          const page = await doc.getPage(pageNum);
+          const textContent = await page.getTextContent();
+          const items = textContent.items.filter(i => i.str !== undefined);
+          if (!items.length) continue;
+
+          let lines = [];
+          let currentLine = '';
+          let lastY = null;
+
+          for (const item of items) {
+            const y = item.transform ? item.transform[5] : null;
+            if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) {
+              // Y position changed — new line
+              lines.push(currentLine);
+              currentLine = item.str;
+            } else {
+              // Same line — append with space if needed
+              if (currentLine && item.str && !currentLine.endsWith(' ') && !item.str.startsWith(' ')) {
+                currentLine += ' ' + item.str;
+              } else {
+                currentLine += item.str;
+              }
+            }
+            if (y !== null) lastY = y;
+          }
+          if (currentLine) lines.push(currentLine);
+
+          const pageText = lines.join('\n').trim();
+          if (pageText) {
+            pageTexts.push(`--- Page ${pageNum} ---\n${pageText}`);
+          }
+        }
+
+        const text = pageTexts.join('\n\n').trim();
+
+        if (!text) {
+          return { success: true, path: filePath, type: 'pdf', totalPages, content: '(No extractable text found in PDF — it may contain only images/scans.)', hint: 'This PDF has no text layer. Consider using OCR or screenshot to read it.' };
+        }
+
+        // Apply line numbering and truncation like regular files
+        const allLines = text.split('\n');
+        const MAX_LINES = 2000;
+        const MAX_LINE_LENGTH = 2000;
+        const offset = Math.max(1, action.offset || 1);
+        const limit = action.limit || MAX_LINES;
+        const startIdx = offset - 1;
+        const endIdx = Math.min(startIdx + limit, allLines.length);
+        const selectedLines = allLines.slice(startIdx, endIdx);
+
+        const numbered = selectedLines.map((line, i) => {
+          const lineNum = String(startIdx + i + 1).padStart(5);
+          const truncated = line.length > MAX_LINE_LENGTH
+            ? line.substring(0, MAX_LINE_LENGTH) + '...'
+            : line;
+          return `${lineNum} ${truncated}`;
+        }).join('\n');
+
+        const wasTruncated = endIdx < allLines.length && !action.limit;
+
+        return {
+          success: true,
+          path: filePath,
+          type: 'pdf',
+          totalPages,
+          pagesRead: pagesToRead.join(', '),
+          content: numbered,
+          totalLines: allLines.length,
+          from: offset,
+          to: endIdx,
+          ...(wasTruncated && { truncated: true, hint: `PDF text has ${allLines.length} lines. Use offset/limit to read more.` }),
+          ...(!action.pages && totalPages > MAX_PDF_PAGES && { hint: `PDF has ${totalPages} pages but only first ${MAX_PDF_PAGES} were read. Use "pages" field (e.g. "1-5") to read specific pages.` })
+        };
+      } catch (err) {
+        return { success: false, error: `Failed to read PDF: ${err.message}` };
+      }
     }
 
     const content = fs.readFileSync(resolvedPath, 'utf8');
