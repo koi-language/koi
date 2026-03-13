@@ -1,6 +1,6 @@
 import { SourceMapGenerator } from 'source-map';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 export class KoiSemanticError extends Error {
   constructor(message, location = null) {
@@ -111,8 +111,8 @@ export class KoiTranspiler {
       const runtimeIndexPath = path.join(koiRuntimePath, 'index.js');
       const routerPath = path.join(koiRuntimePath, 'router.js');
 
-      runtimeImportPath = 'file://' + path.resolve(runtimeIndexPath);
-      routerImportPath = 'file://' + path.resolve(routerPath);
+      runtimeImportPath = pathToFileURL(path.resolve(runtimeIndexPath)).href;
+      routerImportPath = pathToFileURL(path.resolve(routerPath)).href;
 
       code += this.emit(`// Using local runtime from KOI_RUNTIME_PATH: ${koiRuntimePath}\n`);
     } else {
