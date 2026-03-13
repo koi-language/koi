@@ -50,11 +50,55 @@ function _saveKeyToEnv(keyName, key) {
 }
 
 /**
+ * Internal helper to prompt for an API key using the runtime's prompt_user action.
+ * This ensures the UI (Ink) handles the input correctly.
+ */
+async function _promptForApiKey(executor, { provider, keyName, providerName, allowSkip }) {
+  const question = allowSkip
+    ? `No ${keyName} found. Enter your ${providerName} API key (Enter to skip):`
+    : `No ${keyName} found. Enter your ${providerName} API key:`;
+  const label = `API Key for ${providerName}`;
+  const hint = allowSkip ? 'Press Enter to skip.' : undefined;
+
+  // If no executor (agent) is provided, we can't use the action system.
+  // This shouldn't happen in CLI mode after bootstrap.
+  if (!executor || typeof executor.executeActions !== 'function') {
+    const { cliLogger } = await import('./cli-logger.js');
+    const { cliInput } = await import('./cli-input.js');
+    cliLogger.print(question);
+    const raw = await cliInput(`${providerName}: `);
+    return (typeof raw === 'string' ? raw : (raw?.text ?? '')).trim();
+  }
+
+  const result = await executor.executeActions([
+    {
+      actionType: 'direct',
+      intent: 'prompt_form',
+      title: question,
+      fields: [
+        {
+          label,
+          question: `Enter your ${providerName} API key:`,
+          ...(hint ? { hint } : {})
+        }
+      ]
+    }
+  ]);
+
+  if (result?.cancelled) return '';
+  const key = (result?.answers?.[label] || '').trim();
+  if (key === '/exit' || key === 'exit') process.exit(0);
+  return key;
+}
+
+/**
  * At startup: check all required providers and prompt for any missing keys.
  * If the user skips a provider, a warning is shown at the end.
  * Called once after the CLI is bootstrapped.
+ * 
+ * @param {Agent} agent - The agent instance to use for executing the prompt action
  */
-export async function promptMissingApiKeys() {
+export async function promptMissingApiKeys(agent) {
   // When authenticated via koi-cli.ai account, API keys are not needed —
   // the gateway proxies LLM calls using the auth token.
   if (process.env.KOI_AUTH_TOKEN) return;
@@ -63,7 +107,6 @@ export async function promptMissingApiKeys() {
   if (missing.length === 0) return;
 
   const { cliLogger } = await import('./cli-logger.js');
-  const { cliInput }  = await import('./cli-input.js');
 
   const skipped = [];
 
@@ -71,14 +114,7 @@ export async function promptMissingApiKeys() {
     const keyName = PROVIDER_KEYS[provider];
     const providerName = PROVIDER_NAMES[provider];
 
-    cliLogger.print(`No ${keyName} found. Enter your ${providerName} API key (Enter to skip):`);
-    const raw = await cliInput(`${providerName}: `);
-    const key = (typeof raw === 'string' ? raw : (raw?.text ?? '')).trim();
-
-    // Handle /exit typed during API key prompts
-    if (key === '/exit' || key === 'exit') {
-      process.exit(0);
-    }
+    const key = await _promptForApiKey(agent, { provider, keyName, providerName, allowSkip: true });
 
     if (!key) {
       skipped.push(providerName);
@@ -105,10 +141,11 @@ export async function promptMissingApiKeys() {
  * If missing, prompts the user (no skip option — used when a specific provider is required).
  *
  * @param {string} provider - 'openai' | 'anthropic' | 'gemini'
+ * @param {Agent} [agent] - Optional agent instance for prompting
  * @returns {Promise<string>} the API key
  * @throws if the user provides an empty key
  */
-export async function ensureApiKey(provider) {
+export async function ensureApiKey(provider, agent) {
   const keyName = PROVIDER_KEYS[provider];
   if (!keyName) throw new Error(`Unknown provider: ${provider}`);
 
@@ -117,19 +154,14 @@ export async function ensureApiKey(provider) {
   // When authenticated via koi-cli.ai account, the gateway handles provider access.
   if (process.env.KOI_AUTH_TOKEN) return '__KOI_ACCOUNT__';
 
-  const { cliLogger } = await import('./cli-logger.js');
-  const { cliInput }  = await import('./cli-input.js');
-
   const providerName = PROVIDER_NAMES[provider] || provider;
-  cliLogger.print(`No ${keyName} found. Enter your ${providerName} API key:`);
-
-  const raw = await cliInput('API key: ');
-  const key = (typeof raw === 'string' ? raw : (raw?.text ?? '')).trim();
+  const key = await _promptForApiKey(agent, { provider, keyName, providerName, allowSkip: false });
 
   if (!key) {
     throw new Error(`${keyName} is required — no key provided`);
   }
 
+  const { cliLogger } = await import('./cli-logger.js');
   const saved = _saveKeyToEnv(keyName, key);
   if (saved) {
     cliLogger.print(`Saved ${keyName} to ~/.koi/.env`);

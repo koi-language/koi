@@ -289,7 +289,7 @@ export class Agent {
       }
       // Prompt for any missing API keys (OpenAI, Anthropic, Gemini)
       const { promptMissingApiKeys } = await import('./api-key-manager.js');
-      await promptMissingApiKeys();
+      await promptMissingApiKeys(this);
     }
 
     // Fire-and-forget: start project indexing in background (once per process)

@@ -204,15 +204,15 @@ export class LLMProvider {
    * Ensure all required clients are ready before making any LLM call.
    * Prompts the user for missing API keys, saves them to .env, and creates clients.
    */
-  async _ensureClients() {
+  async _ensureClients(agent) {
     if (this._autoMode) {
       if (this._lockedProvider) {
-        await this._ensureLockedProviderClient();
+        await this._ensureLockedProviderClient(agent);
       } else {
-        await this._ensureAnyProvider();
+        await this._ensureAnyProvider(agent);
       }
     } else {
-      await this._ensureExplicitClient();
+      await this._ensureExplicitClient(agent);
     }
   }
 
@@ -220,7 +220,7 @@ export class LLMProvider {
    * For auto mode with no locked provider: ensure at least one provider client exists.
    * If none are configured, let the user pick a provider and enter the key.
    */
-  async _ensureAnyProvider() {
+  async _ensureAnyProvider(agent) {
     if (this._availableProviders.length > 0) return;
     // Gateway mode: all providers are available via the koi-cli.ai backend
     if (this._koiGateway) return;
@@ -238,7 +238,7 @@ export class LLMProvider {
 
     if (!provider) throw new Error('No provider selected — cannot continue without an API key');
 
-    const apiKey = await ensureApiKey(provider);
+    const apiKey = await ensureApiKey(provider, agent);
 
     if (provider === 'openai') {
       this._oa = new OpenAI({ apiKey, maxRetries: 0 });
@@ -254,7 +254,7 @@ export class LLMProvider {
   /**
    * For auto mode with a locked provider: ensure the client for that provider exists.
    */
-  async _ensureLockedProviderClient() {
+  async _ensureLockedProviderClient(agent) {
     const p = this._lockedProvider;
     const hasClient = (p === 'openai' && this._oa) ||
                       (p === 'anthropic' && this._ac) ||
@@ -262,7 +262,7 @@ export class LLMProvider {
     if (hasClient) return;
 
     const { ensureApiKey } = await import('./api-key-manager.js');
-    const apiKey = await ensureApiKey(p);
+    const apiKey = await ensureApiKey(p, agent);
 
     if (p === 'openai') {
       this._oa = new OpenAI({ apiKey, maxRetries: 0 });
@@ -276,11 +276,11 @@ export class LLMProvider {
   /**
    * For explicit (non-auto) provider: ensure the client exists.
    */
-  async _ensureExplicitClient() {
+  async _ensureExplicitClient(agent) {
     if (this.openai || this.anthropic) return;
 
     const { ensureApiKey } = await import('./api-key-manager.js');
-    const apiKey = await ensureApiKey(this.provider);
+    const apiKey = await ensureApiKey(this.provider, agent);
 
     if (this.provider === 'openai') {
       this.openai = new OpenAI({ apiKey, maxRetries: 0 });
@@ -722,7 +722,7 @@ ${taskDescription}`;
    */
   async executePlaybookReactive({ playbook, playbookResolver = null, context, agentName, session, agent, contextMemory, isFirstCall = false, thinkingHint = 'Thinking', isDelegate = false, abortSignal = null }) {
     // Ensure API keys / clients are ready (prompts user if missing)
-    await this._ensureClients();
+    await this._ensureClients(agent);
 
     const planningPrefix = agentName ? `🤖 \x1b[1m\x1b[38;2;173;218;228m${agentName}\x1b[0m` : '';
 
