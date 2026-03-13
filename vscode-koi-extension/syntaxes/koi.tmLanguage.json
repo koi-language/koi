@@ -169,8 +169,8 @@
           "contentName": "string.quoted.triple.prompt.koi",
           "patterns": [
             { "include": "#prompt-directives" },
-            { "include": "#prompt-interpolation" },
             { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
             { "include": "#template-variable" }
           ]
         },
@@ -190,8 +190,8 @@
           "contentName": "string.quoted.triple.prompt.koi",
           "patterns": [
             { "include": "#prompt-directives" },
-            { "include": "#prompt-interpolation" },
             { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
             { "include": "#template-variable" }
           ]
         }
@@ -433,11 +433,11 @@
       ]
     },
     "prompt-fragment-reference": {
-      "match": "(`)([A-Za-z_][A-Za-z0-9_]*)(`)",
+      "match": "(\\{\\{)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(\\}\\})",
       "captures": {
-        "1": { "name": "punctuation.definition.string.begin.koi" },
+        "1": { "name": "punctuation.section.embedded.begin.koi" },
         "2": { "name": "entity.name.function.fragment.koi" },
-        "3": { "name": "punctuation.definition.string.end.koi" }
+        "3": { "name": "punctuation.section.embedded.end.koi" }
       }
     },
     "template-variable": {
@@ -491,8 +491,8 @@
           "end": "\"\"\"",
           "patterns": [
             { "include": "#prompt-directives" },
-            { "include": "#prompt-interpolation" },
             { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
             { "include": "#template-variable" }
           ]
         },

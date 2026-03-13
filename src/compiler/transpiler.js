@@ -596,7 +596,7 @@ export class KoiTranspiler {
 
   /**
    * Compile compose template directives into a JavaScript resolver body.
-   * Handles: `fragmentName`, @let, @if, {{expr}}, plain text.
+   * Handles: {{fragmentName}}, @let, @if, {{expr}}, plain text.
    */
   _compileComposeTemplate(template, fragmentNames) {
     const lines = template.split('\n');
@@ -675,16 +675,8 @@ export class KoiTranspiler {
         continue;
       }
 
-      // Line is ONLY a fragment reference: `fragmentName`
-      const fragOnlyMatch = trimmed.match(/^`([a-zA-Z_]\w*)`$/);
-      if (fragOnlyMatch && fragmentNames.includes(fragOnlyMatch[1])) {
-        flushText();
-        jsLines.push(`__parts.push(fragments.${fragOnlyMatch[1]});`);
-        continue;
-      }
-
-      // Line contains {{expr}} interpolation(s) or inline `fragment`
-      if (/\{\{.+?\}\}/.test(trimmed) || /`[a-zA-Z_]\w*`/.test(trimmed)) {
+      // Line contains {{expr}} interpolation(s) (including fragment references)
+      if (/\{\{.+?\}\}/.test(trimmed)) {
         flushText();
         this._compileInterpolatedLine(rawLine, fragmentNames, jsLines);
         continue;
@@ -703,29 +695,17 @@ export class KoiTranspiler {
   }
 
   /**
-   * Compile a line containing {{expr}} interpolations and/or `fragment` references
-   * into __parts.push() calls.
+   * Compile a line containing {{expr}} interpolations (including fragment references)
+   * into __parts.push() calls. If {{expr}} matches a known fragment name, it emits
+   * a fragment inclusion; otherwise it emits an interpolated expression.
    */
   _compileInterpolatedLine(line, fragmentNames, jsLines) {
     let remaining = line;
 
     while (remaining.length > 0) {
       const interpIdx = remaining.indexOf('{{');
-      const fragMatch = /`([a-zA-Z_]\w*)`/.exec(remaining);
-      const fragIdx = fragMatch ? fragMatch.index : -1;
 
-      let nextIdx = -1;
-      let type = null;
-
-      if (interpIdx >= 0 && (fragIdx < 0 || interpIdx < fragIdx)) {
-        nextIdx = interpIdx;
-        type = 'interp';
-      } else if (fragIdx >= 0) {
-        nextIdx = fragIdx;
-        type = 'frag';
-      }
-
-      if (nextIdx < 0) {
+      if (interpIdx < 0) {
         if (remaining.trim()) {
           jsLines.push(`__parts.push(${JSON.stringify(remaining)});`);
         }
@@ -733,32 +713,26 @@ export class KoiTranspiler {
       }
 
       // Text before the pattern
-      const before = remaining.substring(0, nextIdx);
+      const before = remaining.substring(0, interpIdx);
       if (before.trim()) {
         jsLines.push(`__parts.push(${JSON.stringify(before)});`);
       }
 
-      if (type === 'interp') {
-        const endIdx = remaining.indexOf('}}', nextIdx + 2);
-        if (endIdx >= 0) {
-          const expr = remaining.substring(nextIdx + 2, endIdx).trim();
+      const endIdx = remaining.indexOf('}}', interpIdx + 2);
+      if (endIdx >= 0) {
+        const expr = remaining.substring(interpIdx + 2, endIdx).trim();
+        // Check if this is a known fragment name
+        if (fragmentNames.includes(expr)) {
+          jsLines.push(`__parts.push(fragments.${expr});`);
+        } else {
           const safeExpr = this._safePropertyAccess(expr);
           jsLines.push(`__parts.push(String(${safeExpr} ?? ''));`);
-          remaining = remaining.substring(endIdx + 2);
-        } else {
-          // Unclosed {{ — treat rest as text
-          jsLines.push(`__parts.push(${JSON.stringify(remaining)});`);
-          break;
         }
+        remaining = remaining.substring(endIdx + 2);
       } else {
-        const fragName = fragMatch[1];
-        if (fragmentNames.includes(fragName)) {
-          jsLines.push(`__parts.push(fragments.${fragName});`);
-        } else {
-          // Not a known fragment — preserve as literal text
-          jsLines.push(`__parts.push(${JSON.stringify(fragMatch[0])});`);
-        }
-        remaining = remaining.substring(fragIdx + fragMatch[0].length);
+        // Unclosed {{ — treat rest as text
+        jsLines.push(`__parts.push(${JSON.stringify(remaining)});`);
+        break;
       }
     }
   }
