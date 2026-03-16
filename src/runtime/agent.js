@@ -297,7 +297,9 @@ export class Agent {
     if (process.env.KOI_CLI_MODE === '1' && !Agent._indexingStarted) {
       Agent._indexingStarted = true;
       cliLogger.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);
-      // xxx this._startBackgroundIndexing();
+      this._startBackgroundIndexing().catch(err => {
+        cliLogger.log('background', `Background indexing failed: ${err?.message || err}`);
+      });
     }
 
     if (!_fromDelegation) {
