@@ -22,8 +22,11 @@ const PROVIDER_NAMES = {
   gemini:    'Google Gemini',
 };
 
-// All providers that should be configured for full functionality
-const REQUIRED_PROVIDERS = ['openai', 'anthropic', 'gemini'];
+// Providers required for basic local functionality
+const REQUIRED_PROVIDERS = ['openai'];
+
+// Optional providers to recommend during initial setup
+const RECOMMENDED_PROVIDERS = ['anthropic', 'gemini'];
 
 /**
  * Persist a key to the global ~/.koi/.env, replacing any existing definition.
@@ -103,7 +106,19 @@ export async function promptMissingApiKeys(agent) {
   // the gateway proxies LLM calls using the auth token.
   if (process.env.KOI_AUTH_TOKEN) return;
 
-  const missing = REQUIRED_PROVIDERS.filter(p => !process.env[PROVIDER_KEYS[p]]);
+  const configuredProvider = process.env.KOI_DEFAULT_PROVIDER;
+  const includeRecommended = !configuredProvider
+    || configuredProvider === 'auto'
+    || !Object.prototype.hasOwnProperty.call(PROVIDER_KEYS, configuredProvider)
+    || REQUIRED_PROVIDERS.includes(configuredProvider)
+    || RECOMMENDED_PROVIDERS.includes(configuredProvider);
+
+  const providerPool = includeRecommended
+    ? REQUIRED_PROVIDERS.concat(RECOMMENDED_PROVIDERS)
+    : REQUIRED_PROVIDERS;
+
+  // If a default provider is explicitly set (e.g., openai), skip recommending other providers.
+  const missing = providerPool.filter(p => !process.env[PROVIDER_KEYS[p]]);
   if (missing.length === 0) return;
 
   const { cliLogger } = await import('./cli-logger.js');
@@ -130,8 +145,9 @@ export async function promptMissingApiKeys(agent) {
 
   if (skipped.length > 0) {
     cliLogger.print(
-      `Warning: no API key configured for ${skipped.join(', ')}. ` +
-      `Provider availability and quality will be limited.`
+      `Hint: optional API keys not configured for ${skipped.join(', ')}. ` +
+      `You can add them anytime in ~/.koi/.env or via /config. ` +
+      `Optional providers expand availability and model quality.`
     );
   }
 }

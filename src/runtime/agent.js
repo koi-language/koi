@@ -116,6 +116,7 @@ export class Agent {
    */
   static _cliHooks = null;
   static _cliBootstrapped = false;
+  static _cliBootstrapPromise = null;
   static _indexingStarted = false;
   static _lastActiveAgent = null;
   /** The root (System) agent — set once, used by slash commands like /memory. */
@@ -296,7 +297,7 @@ export class Agent {
     if (process.env.KOI_CLI_MODE === '1' && !Agent._indexingStarted) {
       Agent._indexingStarted = true;
       cliLogger.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);
-      this._startBackgroundIndexing();
+      // xxx this._startBackgroundIndexing();
     }
 
     if (!_fromDelegation) {
@@ -2451,14 +2452,15 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
           let result;
 
           // Unique slot ID so each parallel delegation shows its own spinner row.
-          const _delegateSlot = `${teamMember.agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          const displayName = teamMember.alias || teamMember.agent.name;
+          const _delegateSlot = `${displayName}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           // getCurrentSlotId() returns undefined when the parent runs outside any
           // withSlot context (e.g. the top-level System agent). The main spinner
           // slot uses null as its key, so map undefined → null so clearSlotById
           // actually clears it and the parent spinner doesn't show alongside the delegate.
           const _parentSlotId = getCurrentSlotId() ?? null;
           registerSlotMeta(_delegateSlot, {
-            agentName: teamMember.agent.name,
+            agentName: displayName,
             subject: currentData?.subject || null,
           });
 
@@ -2466,15 +2468,20 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
           // no re-entry, no new session. Works like prompt_user but the answer
           // comes from this (parent) agent's LLM instead of the terminal.
           const _parentAnswerFn = (question) =>
-            this._answerDelegateQuestion(question, currentData, teamMember.agent.name);
+            this._answerDelegateQuestion(question, currentData, displayName);
 
           // Hide the parent's spinner — it's waiting for the delegate to finish.
           // The parent will re-show naturally when it resumes after this await.
           clearSlotById(_parentSlotId);
+          const originalDisplayName = teamMember.agent.displayName;
           try {
+            if (teamMember.alias) {
+              teamMember.agent.displayName = teamMember.alias;
+            }
             result = await withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
           } finally {
             clearSlotById(_delegateSlot);
+            teamMember.agent.displayName = originalDisplayName;
             unregisterSlotMeta(_delegateSlot);
           }
           return result;
@@ -2568,7 +2575,7 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
               if (process.env.KOI_DEBUG_LLM) {
                 console.error(`[Agent:${this.name}] ✅ Qualified match: ${memberName}::${matchingEvent} for intent "${intent}"`);
               }
-              return { agent: member, event: matchingEvent };
+            return { agent: member, event: matchingEvent, alias: memberName };
             }
           }
         }
@@ -2586,7 +2593,7 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
           if (process.env.KOI_DEBUG_LLM) {
             console.error(`[Agent:${this.name}] ✅ Direct match: ${member.name}.${matchingEvent} for intent "${intent}"`);
           }
-          return { agent: member, event: matchingEvent };
+              return { agent: member, event: matchingEvent, alias: memberName };
         }
       }
     }

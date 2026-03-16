@@ -123,7 +123,7 @@ class TeamEventQuery {
     // Execute based on selection mode
     if (this.selectionMode === 'any') {
       const selected = candidates[0];
-      const agentName = selected.agent.name || selected.name;
+      const agentName = selected.name || selected.agent.name;
 
       // Show delegation
       cliLogger.progress(`    → [${agentName}] ${this.eventName}...`);
@@ -144,7 +144,7 @@ class TeamEventQuery {
     } else if (this.selectionMode === 'all') {
       const results = [];
       for (const { name, agent } of candidates) {
-        const agentName = agent.name || name;
+        const agentName = name || agent.name;
         cliLogger.progress(`    → [${agentName}] ${this.eventName}...`);
 
         if (agent.handle) {

@@ -1246,7 +1246,8 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     // Inactivity timeout: abort if no chunks (content OR thinking) arrive for 30s.
     // Resets on every chunk — as long as data flows, the stream lives.
     // No total timeout needed: inactivity is the only watchdog.
-    const STREAM_INACTIVITY_MS = 30_000;
+    const STREAM_INACTIVITY_MS = this._useThinking ? 300_000 : 30_000;
+    const STREAM_INACTIVITY_LABEL = this._useThinking ? '5m' : `${STREAM_INACTIVITY_MS / 1000}s`;
     const _inactivityCtrl = new AbortController();
     let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
     let _firstContentReceived = false;
@@ -1314,9 +1315,9 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
       if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {
-        cliLogger.log('llm', `Stream inactivity timeout — no chunks for ${STREAM_INACTIVITY_MS / 1000}s`);
+        cliLogger.log('llm', `Stream inactivity timeout — no chunks for ${STREAM_INACTIVITY_LABEL}`);
         if (this._autoMode) markProviderTimeout(this.provider);
-        throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_MS / 1000}s (no chunks received)`);
+        throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_LABEL} (no chunks received)`);
       }
       // Circuit breaker: timeout or connection errors put provider on cooldown
       const _isTimeout = /timed?\s*out|timeout/i.test(_callErr.message || '');

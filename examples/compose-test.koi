@@ -13,8 +13,8 @@ export prompt CoordinatorBehavior = compose {
   }
   template: """
   Call task_list first.
-  - If there are pending tasks → include only `core`
-  - If no tasks → include `core` then `planning`
+  - If there are pending tasks → include only {{core}}
+  - If no tasks → include {{core}} then {{planning}}
   """
 }
 

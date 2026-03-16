@@ -8,9 +8,79 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import sharp from 'sharp';
+import Tesseract from 'tesseract.js';
 import { cliLogger } from '../cli-logger.js';
 import { cliSelect } from '../cli-select.js';
 import { getFilePermissions } from '../file-permissions.js';
+
+async function extractPdfPageImages(page, pdfjsLib) {
+  const opList = await page.getOperatorList();
+  const images = [];
+  const ImageKind = pdfjsLib.ImageKind || {
+    GRAYSCALE_1BPP: 1,
+    RGB_24BPP: 2,
+    RGBA_32BPP: 3
+  };
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    if (fn !== pdfjsLib.OPS.paintImageXObject && fn !== pdfjsLib.OPS.paintInlineImageXObject) continue;
+
+    const args = opList.argsArray[i] || [];
+    const imageId = args[0];
+    let img = null;
+
+    if (imageId) {
+      try {
+        img = page.objs.get(imageId);
+      } catch {
+        img = null;
+      }
+    }
+
+    if (!img && fn === pdfjsLib.OPS.paintInlineImageXObject) {
+      img = args[0];
+    }
+
+    if (!img || !img.data || !img.width || !img.height) continue;
+
+    let rgba;
+    if (img.kind === ImageKind.RGBA_32BPP) {
+      rgba = img.data instanceof Uint8ClampedArray ? img.data : new Uint8ClampedArray(img.data);
+    } else if (img.kind === ImageKind.RGB_24BPP) {
+      rgba = new Uint8ClampedArray(img.width * img.height * 4);
+      for (let src = 0, dest = 0; src < img.data.length; src += 3, dest += 4) {
+        rgba[dest] = img.data[src];
+        rgba[dest + 1] = img.data[src + 1];
+        rgba[dest + 2] = img.data[src + 2];
+        rgba[dest + 3] = 255;
+      }
+    } else if (img.kind === ImageKind.GRAYSCALE_1BPP) {
+      rgba = new Uint8ClampedArray(img.width * img.height * 4);
+      const rowBytes = Math.ceil(img.width / 8);
+      for (let y = 0; y < img.height; y++) {
+        for (let x = 0; x < img.width; x++) {
+          const byte = img.data[y * rowBytes + (x >> 3)];
+          const bit = (byte >> (7 - (x & 7))) & 1;
+          const value = bit ? 0 : 255;
+          const idx = (y * img.width + x) * 4;
+          rgba[idx] = value;
+          rgba[idx + 1] = value;
+          rgba[idx + 2] = value;
+          rgba[idx + 3] = 255;
+        }
+      }
+    } else {
+      rgba = img.data instanceof Uint8ClampedArray ? img.data : new Uint8ClampedArray(img.data);
+    }
+
+    images.push({ data: rgba, width: img.width, height: img.height });
+  }
+
+  return images;
+}
 
 export default {
   type: 'read_file',
@@ -145,7 +215,24 @@ export default {
           const page = await doc.getPage(pageNum);
           const textContent = await page.getTextContent();
           const items = textContent.items.filter(i => i.str !== undefined);
-          if (!items.length) continue;
+          if (!items.length) {
+            const images = await extractPdfPageImages(page, pdfjsLib);
+            if (images.length) {
+              const cachePath = path.join(os.homedir(), '.koi', 'tesseract-data');
+              if (!fs.existsSync(cachePath)) {
+                fs.mkdirSync(cachePath, { recursive: true });
+              }
+              for (const image of images) {
+                const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } }).png().withMetadata({ density: 300 }).toBuffer();
+                const { data } = await Tesseract.recognize(pngBuffer, 'eng', { cachePath, user_defined_dpi: '300' });
+                const ocrText = data?.text ? data.text.trim() : '';
+                if (ocrText) {
+                  pageTexts.push(`--- Page ${pageNum} (OCR) ---\n${ocrText}`);
+                }
+              }
+            }
+            continue;
+          }
 
           let lines = [];
           let currentLine = '';
@@ -178,7 +265,7 @@ export default {
         const text = pageTexts.join('\n\n').trim();
 
         if (!text) {
-          return { success: true, path: filePath, type: 'pdf', totalPages, content: '(No extractable text found in PDF — it may contain only images/scans.)', hint: 'This PDF has no text layer. Consider using OCR or screenshot to read it.' };
+          return { success: true, path: filePath, type: 'pdf', totalPages, content: '(No extractable text found in PDF — OCR was attempted but no text was recognized.)', hint: 'This PDF has no text layer. OCR was attempted but returned no text.' };
         }
 
         // Apply line numbering and truncation like regular files
