@@ -2,7 +2,7 @@
   <img src="./koi.png" alt="Koi logo" width="220" />
 </p>
 
-# Koi - Next-generation Agentic-first Programming Language
+# Koi - Next-generation AI Agents Programming Language
 Build multi-agent systems with roles, teams, skills, playbooks, and MCP integration.
 
 ## Why Koi?
