@@ -47,7 +47,7 @@ async function inferActionMetadata(playbook) {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: this.llmProvider?.model || 'auto',
         temperature: 0,
         messages: [
           {

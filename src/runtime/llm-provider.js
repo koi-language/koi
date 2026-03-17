@@ -47,13 +47,6 @@ function _truncB64Debug(str) {
   return str.replace(/[A-Za-z0-9+/]{60,}={0,2}/g, m => `${m.slice(0, 20)}\u2026${m.slice(-10)}`);
 }
 
-// Default models per provider
-const DEFAULT_MODELS = {
-  openai:    'gpt-4o-mini',
-  anthropic: 'claude-sonnet-4-6',
-  gemini:    'gemini-2.0-flash',
-};
-
 // Short aliases for Anthropic models
 const ANTHROPIC_ALIASES = {
   'sonnet':       'claude-sonnet-4-6',
@@ -157,7 +150,7 @@ export class LLMProvider {
     if (this.provider === 'anthropic' && model && ANTHROPIC_ALIASES[model]) {
       model = ANTHROPIC_ALIASES[model];
     }
-    this.model = model || DEFAULT_MODELS[this.provider];
+    this.model = model || 'auto';
 
     // Initialize clients — deferred if key is missing (user will be prompted on first use).
     if (this.provider === 'openai') {
@@ -233,7 +226,7 @@ export class LLMProvider {
     const provider = await cliSelect('Select provider', [
       { title: 'OpenAI (GPT-4o, GPT-4o-mini…)', value: 'openai' },
       { title: 'Anthropic (Claude Sonnet, Haiku…)', value: 'anthropic' },
-      { title: 'Google Gemini (gemini-2.0-flash…)', value: 'gemini' },
+      { title: 'Google Gemini (Gemini Flash, Pro…)', value: 'gemini' },
     ]);
 
     if (!provider) throw new Error('No provider selected — cannot continue without an API key');
@@ -300,6 +293,26 @@ export class LLMProvider {
    * @param {string} [provider] - Override provider (defaults to this.provider)
    * @returns {Object} SDK client
    */
+  /**
+   * Resolve the best model for a given task via the factory.
+   * @param {string} taskType - 'code' | 'planning' | 'reasoning' | 'speed'
+   * @param {number} [difficulty=5] - 1-10
+   * @returns {{ instance, provider, model, useThinking }}
+   */
+  _resolveModel(taskType, difficulty = 5, opts = {}) {
+    const clients = this._gatewayMode
+      ? this._gatewayClients()
+      : { openai: this._oa, anthropic: this._ac, gemini: this._gc };
+    return resolveModel({
+      type: 'llm',
+      taskType,
+      difficulty,
+      availableProviders: this._availableProviders || getAvailableProviders(),
+      clients,
+      ...opts,
+    });
+  }
+
   _getClient(provider) {
     const p = provider || this.provider;
     // Gateway mode: all providers route through the same OpenAI-compatible gateway
@@ -475,11 +488,9 @@ export class LLMProvider {
 
   async executePlanning(prompt) {
     try {
-      // Force best model per provider for planning
-      const planModels = { openai: 'gpt-5.2', anthropic: 'claude-3-haiku-20240307', gemini: 'gemini-2.0-flash' };
-      const _planProvider = this._effectiveLLMProvider || this.provider;
-      const planModel = planModels[this.provider] || this.model;
-      const llm = createLLM(_planProvider, this._getClient(_planProvider), planModel, { temperature: 0, maxTokens: 800 });
+      // Use factory to pick the best planning model
+      const _plan = this._resolveModel('planning', 7, { temperature: 0, maxTokens: 800 });
+      const llm = _plan.instance;
 
       const { text } = await llm.complete([
         { role: 'system', content: 'Planning assistant. JSON only.' },
@@ -558,14 +569,14 @@ ${taskDescription}`;
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
 
-    // Ordered fallback candidates for classification (cheapest/fastest first)
-    const _candidates = [
-      ...(this._gc ? [
-        { client: this._gc, model: 'gemini-2.0-flash', provider: 'gemini' },
-      ] : []),
-      ...(this._oa ? [{ client: this._oa, model: 'gpt-4o-mini', provider: 'openai' }] : []),
-      ...(this._ac ? [{ client: null, model: 'claude-haiku-4-5-20251001', provider: 'anthropic' }] : []),
-    ];
+    // Use factory to pick the cheapest/fastest model for classification
+    let _resolved;
+    try {
+      _resolved = this._resolveModel('speed', 1);
+    } catch { _resolved = null; }
+    const _candidates = _resolved
+      ? [{ client: this._getClient(_resolved.provider), model: _resolved.model, provider: _resolved.provider }]
+      : [];
 
     if (_candidates.length === 0) {
       if (_debug) console.error(`[Auto] No client for classification — using default profile`);
@@ -617,13 +628,10 @@ ${taskDescription}`;
 
     this.logRequest(this.model, 'Return ONLY valid JSON.', prompt, agentName ? `callJSON | Agent: ${agentName}` : 'callJSON');
 
-    const _cjProvider = this._autoMode ? this._availableProviders[0] : this.provider;
-    const _cjModel    = this._autoMode ? (DEFAULT_MODELS[_cjProvider] || this._availableProviders[0]) : this.model;
-    const _cjClient   = this._getClient(_cjProvider);
-
     let response;
     try {
-      const llm = createLLM(_cjProvider, _cjClient, _cjModel, { temperature: 0, maxTokens: this.maxTokens });
+      const _resolved = this._resolveModel('speed', 3);
+      const llm = _resolved.instance;
       const { text } = await llm.complete([
         { role: 'system', content: 'Return ONLY valid JSON. No markdown, no explanations.' },
         { role: 'user', content: prompt }
@@ -1243,11 +1251,14 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       }
     };
 
-    // Inactivity timeout: abort if no chunks (content OR thinking) arrive for 30s.
+    // Inactivity timeout: abort if no chunks (content OR thinking) arrive.
     // Resets on every chunk — as long as data flows, the stream lives.
-    // No total timeout needed: inactivity is the only watchdog.
-    const STREAM_INACTIVITY_MS = this._useThinking ? 300_000 : 30_000;
-    const STREAM_INACTIVITY_LABEL = this._useThinking ? '5m' : `${STREAM_INACTIVITY_MS / 1000}s`;
+    // Thinking-capable models (even without explicit thinking mode) may buffer
+    // internally before sending the first chunk, so use a longer timeout.
+    const _modelCaps = getModelCaps(this.model);
+    const _isThinkingCapable = this._useThinking || _modelCaps?.thinking;
+    const STREAM_INACTIVITY_MS = _isThinkingCapable ? 300_000 : 60_000;
+    const STREAM_INACTIVITY_LABEL = _isThinkingCapable ? '5m' : '60s';
     const _inactivityCtrl = new AbortController();
     let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
     let _firstContentReceived = false;

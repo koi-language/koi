@@ -713,7 +713,7 @@ role Worker { can execute }
 
 // Agent with LLM playbook - generates creative greetings
 Agent Greeter : Worker {
-  llm default = { provider: "openai", model: "gpt-4o-mini" }
+  llm default = { provider: "auto", model: "auto" }
 
   on greet(args: Json) {
     playbook """

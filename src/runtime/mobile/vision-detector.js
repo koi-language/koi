@@ -42,9 +42,8 @@ export async function detectElementsViaVision(imageBuffer, llmProvider, screenWi
 
   const base64 = imageBuffer.toString('base64');
 
-  // Determine model: check provider field or which client is available
-  const isGemini = llmProvider.provider === 'gemini' || !!llmProvider._gc;
-  const model = isGemini ? 'gemini-2.0-flash' : 'gpt-4o-mini';
+  // Use the provider's configured model
+  const model = llmProvider.model || 'auto';
 
   try {
     const completion = await client.chat.completions.create({

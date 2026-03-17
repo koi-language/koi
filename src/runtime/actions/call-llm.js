@@ -83,7 +83,7 @@ Output (result only):`;
       // Call OpenAI with centralized logging
       const completion = await agent.llmProvider.callOpenAI(
         {
-          model: 'gpt-4o-mini',
+          model: agent.llmProvider?.model || 'auto',
           temperature: 0.3,
           max_tokens: 2000,
           messages: [

@@ -141,8 +141,8 @@ export class SkillSelector {
   async getEmbedding(text) {
     if (!this.embeddingProvider) {
       this.embeddingProvider = new LLMProvider({
-        provider: 'openai',
-        model: 'text-embedding-3-small'
+        provider: 'auto',
+        model: 'auto',
       });
     }
 

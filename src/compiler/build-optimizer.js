@@ -460,15 +460,13 @@ ${handlerKeys}
    * Intentionally independent of agent runtime configs.
    */
   _pickOptimizerProvider() {
-    if (process.env.OPENAI_API_KEY)    return this.getOrCreateChatProvider({ provider: 'openai',    model: 'gpt-4o-mini' });
-    if (process.env.ANTHROPIC_API_KEY) return this.getOrCreateChatProvider({ provider: 'anthropic', model: 'haiku' });
-    if (process.env.GEMINI_API_KEY)    return this.getOrCreateChatProvider({ provider: 'gemini',    model: 'gemini-2.0-flash' });
-    return this.getOrCreateChatProvider(null); // fallback, will error if no key at all
+    // Let auto mode pick the cheapest/fastest available model
+    return this.getOrCreateChatProvider({ provider: 'auto' });
   }
 
   getOrCreateChatProvider(agentLLM = null) {
-    const provider = agentLLM?.provider || 'openai';
-    const model = agentLLM?.model || 'gpt-4o-mini';
+    const provider = agentLLM?.provider || 'auto';
+    const model = agentLLM?.model || 'auto';
     const key = `${provider}:${model}`;
 
     if (!this._chatProviders) this._chatProviders = new Map();

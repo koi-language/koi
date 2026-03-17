@@ -25,6 +25,17 @@ for (const [provider, models] of Object.entries(_modelsJson)) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
+/**
+ * Get the first model ID for a given provider from models.json.
+ * @param {string} provider - e.g. 'openai', 'anthropic', 'gemini'
+ * @returns {string|null}
+ */
+export function getFirstModelForProvider(provider) {
+  const models = _modelsJson[provider];
+  if (!models) return null;
+  return Object.keys(models)[0] || null;
+}
+
 export function lookupModel(model) {
   if (MODEL_DB[model]) return MODEL_DB[model];
   // Partial match (e.g. "gpt-4o-mini-2024-07-18" → "gpt-4o-mini")

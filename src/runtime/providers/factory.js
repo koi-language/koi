@@ -12,7 +12,7 @@
  * know exactly which provider/model to use.
  */
 
-import { getModelCaps } from '../cost-center.js';
+import { getModelCaps, getFirstModelForProvider } from '../cost-center.js';
 import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch } from './openai.js';
 import { AnthropicLLM } from './anthropic.js';
 import { GeminiLLM, GeminiEmbedding } from './gemini.js';
@@ -25,13 +25,6 @@ import { cliLogger } from '../cli-logger.js';
 // These are consumed by llm-provider.js for error handling.
 export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE } from '../auto-model-selector.js';
 import { selectAutoModel } from '../auto-model-selector.js';
-
-// Default models per provider (used as fallbacks)
-const DEFAULT_MODELS = {
-  openai:    'gpt-4o-mini',
-  anthropic: 'claude-sonnet-4-6',
-  gemini:    'gemini-2.0-flash',
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // resolve() — the main entry point
@@ -89,7 +82,7 @@ function _resolveLLM(req) {
   // ── Select best model ──────────────────────────────────────────────────
   const selected = selectAutoModel(taskType, effectiveDifficulty, availableProviders, { requiresImage, minContextK });
   const provider = selected?.provider || availableProviders[0];
-  const model    = selected?.model    || DEFAULT_MODELS[provider];
+  const model    = selected?.model    || getFirstModelForProvider(provider);
   const useThinking = selected?.useThinking ?? false;
 
   // ── Log selection ──────────────────────────────────────────────────────

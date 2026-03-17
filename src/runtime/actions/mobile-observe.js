@@ -78,8 +78,7 @@ Respond in JSON:
 }`;
 
   const base64 = imageBuffer.toString('base64');
-  const isGemini = llmProvider.provider === 'gemini' || !!llmProvider._gc;
-  const model = isGemini ? 'gemini-2.0-flash' : 'gpt-4o-mini';
+  const model = llmProvider.model || 'auto';
 
   try {
     const completion = await client.chat.completions.create({

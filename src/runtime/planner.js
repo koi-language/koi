@@ -11,7 +11,7 @@ import { actionRegistry } from './action-registry.js';
 export class Planner {
   constructor(config) {
     this.name = config.name || 'DefaultPlanner';
-    this.llm = config.llm || { provider: 'openai', model: 'gpt-5.2', temperature: 0 };
+    this.llm = config.llm || { provider: 'auto', model: 'auto', temperature: 0 };
     this.maxSteps = config.maxSteps || 10;
     this.allowReplanning = config.allowReplanning !== false;
     this.llmProvider = null;
