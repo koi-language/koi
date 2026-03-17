@@ -90,7 +90,7 @@ export class LLMProvider {
     // The gateway is OpenAI-compatible and handles provider selection server-side.
     // No need to hardcode providers — they come dynamically from GET /gateway/models.
     // Production: https://api.koi-cli.ai/gateway  Local: http://localhost:3000/gateway
-    if (process.env.KOI_AUTH_TOKEN) {
+    if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
       const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
       const gatewayBase = apiBase + '/gateway';
       this._koiGatewayApiBase = apiBase;

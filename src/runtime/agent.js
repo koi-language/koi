@@ -129,6 +129,8 @@ export class Agent {
 
   constructor(config) {
     this.name = config.name;
+    this.displayName = config.displayName || this.name;
+    this.instanceId = config.instanceId ?? Agent._nextInstanceId++;
     this.description = config.description || null;
     this.role = config.role;
     this.skills = config.skills || [];
@@ -472,7 +474,11 @@ export class Agent {
       agentName: this.name
     });
     session.actionContext.args = args;
-    session.actionContext.state = this.state;
+    // Delegates get a fresh isolated state so parallel delegations to the same agent
+    // instance never contaminate each other or the base agent's persistent state.
+    session.actionContext.state = isDelegate
+      ? (this.state ? JSON.parse(JSON.stringify(this.state)) : {})
+      : this.state;
 
     // If this loop was triggered by feedback (not a real session resume),
     // mark it so llm-provider.js doesn't inject "SESSION RESUMED".
