@@ -28,32 +28,23 @@ let Python = null;
 try {
   Parser = (await import('tree-sitter')).default;
   cliLogger.log('semantic-index', 'tree-sitter runtime loaded OK');
-} catch (err) {
-  cliLogger.log('semantic-index', `tree-sitter runtime FAILED: ${err.message}`);
+} catch {
+  // tree-sitter not available (expected in binary builds)
 }
 
 try {
   JavaScript = (await import('tree-sitter-javascript')).default;
-  cliLogger.log('semantic-index', 'tree-sitter-javascript loaded OK');
-} catch (err) {
-  cliLogger.log('semantic-index', `tree-sitter-javascript FAILED: ${err.message}`);
-}
+} catch { /* not available */ }
 
 try {
   const ts = (await import('tree-sitter-typescript')).default;
   TypeScript = ts?.typescript ?? null;
   TSX = ts?.tsx ?? null;
-  cliLogger.log('semantic-index', 'tree-sitter-typescript loaded OK');
-} catch (err) {
-  cliLogger.log('semantic-index', `tree-sitter-typescript FAILED: ${err.message}`);
-}
+} catch { /* not available */ }
 
 try {
   Python = (await import('tree-sitter-python')).default;
-  cliLogger.log('semantic-index', 'tree-sitter-python loaded OK');
-} catch (err) {
-  cliLogger.log('semantic-index', `tree-sitter-python FAILED: ${err.message}`);
-}
+} catch { /* not available */ }
 
 // ─── Language → tree-sitter grammar mapping ─────────────────────────────
 
@@ -83,11 +74,9 @@ if (Parser) {
   try {
     parser = new Parser();
     cliLogger.log('semantic-index', 'tree-sitter Parser instance created OK');
-  } catch (err) {
-    cliLogger.log('semantic-index', `tree-sitter Parser instantiation FAILED: ${err.message}`);
+  } catch {
+    // Parser instantiation failed — code parsing disabled
   }
-} else {
-  cliLogger.log('semantic-index', 'tree-sitter Parser not available — code parsing disabled');
 }
 
 /**

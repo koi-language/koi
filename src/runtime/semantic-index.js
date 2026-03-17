@@ -22,15 +22,10 @@ import crypto from 'crypto';
 import { parseFile, getSupportedExtensions } from './code-parser.js';
 import { IGNORE_DIRS, SOURCE_EXTS } from './file-discovery.js';
 import { cliLogger } from './cli-logger.js';
-import { createRequire } from 'module';
-
 const EMBEDDING_DIM = 1536; // text-embedding-3-small dimension
 const FUNC_BATCH_SIZE = 10;
 const MAX_SOURCE_CHARS = 1500;
 const FILE_PARALLEL_BATCH = 5; // Index this many files concurrently
-const _require = createRequire(import.meta.url);
-const isBinary = typeof process.pkg !== 'undefined';
-const nativeRequire = isBinary ? _require : null;
 
 // ─── SemanticIndex ──────────────────────────────────────────────────────
 
@@ -497,10 +492,11 @@ export class SemanticIndex {
     this._dbPromise = (async () => {
       cliLogger.log('semantic-index', 'Loading @lancedb/lancedb...');
       let lancedb;
+      const isBinary = typeof process.pkg !== 'undefined';
       try {
         if (isBinary) {
-          const lancedbPath = path.join(process.env.KOI_EXTRACTED_NODE_MODULES, '@lancedb', 'lancedb', 'index.js');
-          console.error('[binary-load] Attempting to load LanceDB from:', lancedbPath);
+          const lancedbPath = path.join(process.env.KOI_EXTRACTED_NODE_MODULES, '@lancedb', 'lancedb', 'dist', 'index.js');
+          cliLogger.log('semantic-index', `Loading LanceDB from disk: ${lancedbPath}`);
           let binaryRequire = globalThis.require;
           if (!binaryRequire) {
             try { binaryRequire = eval('require'); } catch {}
