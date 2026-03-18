@@ -136,7 +136,7 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       // Non-thinking variant (always added if score qualifies)
       const taskScore = caps[taskType] ?? 0;
       if (taskScore >= difficulty) {
-        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 5, useThinking: false });
+        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 5, score: taskScore, useThinking: false });
       }
 
       // Thinking variant: boosted scores, lower speed, higher effective cost.
@@ -150,9 +150,27 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
         if (thinkingScore >= difficulty) {
           const thinkingSpeed = (caps.speed || 5) + THINKING_DELTA.speed;
           const costMultiplier = difficulty <= 7 ? 1.5 : difficulty === 8 ? 2 : difficulty === 9 ? 3 : 4;
-          candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, useThinking: true });
+          candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: thinkingScore, useThinking: true });
         }
       }
+    }
+  }
+  return candidates;
+}
+
+/** Build all text-output models regardless of score, used as last-resort fallback. */
+function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0) {
+  const candidates = [];
+  for (const provider of providers) {
+    const providerModels = modelsData[provider];
+    if (!providerModels) continue;
+    for (const [modelName, caps] of Object.entries(providerModels)) {
+      if (caps.outputType !== 'text') continue;
+      if (requiresImage && !caps.inputImage) continue;
+      if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
+      const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
+      const taskScore = caps[taskType] ?? 0;
+      candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 5, score: taskScore, useThinking: false });
     }
   }
   return candidates;
@@ -182,7 +200,22 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
     candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK);
   }
 
-  if (candidates.length === 0) return null;
+  // No model meets the difficulty threshold — pick the one with the highest score
+  // for this task type rather than failing. This avoids crashes when available
+  // models are weaker than the minimum required score.
+  if (candidates.length === 0) {
+    candidates = _buildAllCandidates(availableProviders, taskType, requiresImage, minContextK);
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
+      const scoreDiff = b.score - a.score;
+      if (scoreDiff !== 0) return scoreDiff;
+      const costDiff = a.totalCost - b.totalCost;
+      if (Math.abs(costDiff) > 0.0001) return costDiff;
+      return b.speed - a.speed;
+    });
+    const winner = candidates[0];
+    return { provider: winner.provider, model: winner.model, useThinking: winner.useThinking };
+  }
 
   candidates.sort((a, b) => {
     const costDiff = a.totalCost - b.totalCost;

@@ -1474,7 +1474,10 @@ export class Agent {
         // Check if the abort was triggered by the FeedbackArbitrator (user sent
         // a correction while the agent was busy). If so, inject the feedback
         // directly into context without prompting the user again.
-        const hasFeedback = Agent._cliHooks?.hasPendingFeedback?.();
+        const _hasFeedbackHook = Agent._cliHooks?.hasPendingFeedback;
+        const hasFeedback = typeof _hasFeedbackHook === 'function'
+          ? _hasFeedbackHook.call(Agent._cliHooks)
+          : !!_hasFeedbackHook;
         if (hasFeedback) {
           const feedbackInput = Agent._cliHooks.consumePendingFeedback();
           const feedbackText = typeof feedbackInput === 'string' ? feedbackInput : (feedbackInput?.text ?? '');

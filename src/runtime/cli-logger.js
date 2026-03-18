@@ -227,6 +227,7 @@ class CLILogger {
    * Print a line of output. Delegates to provider if set.
    */
   print(text) {
+    this.stopAnimation();
     if (_provider?.print) {
       _provider.print(text);
     } else {

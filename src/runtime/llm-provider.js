@@ -1592,12 +1592,20 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
           }
         } catch { /* fall through */ }
         // Fallback 3: truncated response — try to parse just the first complete JSON object
-        const firstObjMatch = cleaned.match(/^\{[\s\S]*?\}(?=\s*[\{$]|\s*$)/);
-        if (firstObjMatch) {
-          try {
-            const firstObj = JSON.parse(firstObjMatch[0]);
-            return this._normalizeReactiveAction(firstObj);
-          } catch { /* fall through */ }
+        const objMatches = [...cleaned.matchAll(/\{[\s\S]*?\}(?=\s*[\{$]|\s*$)/g)];
+        if (objMatches.length > 0) {
+          for (const match of objMatches) {
+            const block = match[0];
+            const hasJsIdentifiers = /:\s*(?!["\d{\[]|true\b|false\b|null\b)[A-Za-z_$][\w$\.]*\b/.test(block);
+            const hasJsKeywords = /\bfunction\b|=>|\bthis\./.test(block);
+            if (hasJsIdentifiers || hasJsKeywords) {
+              continue;
+            }
+            try {
+              const firstObj = JSON.parse(block);
+              return this._normalizeReactiveAction(firstObj);
+            } catch { /* fall through */ }
+          }
         }
         throw new Error(`Failed to parse reactive LLM response as JSON: ${firstErr.message}\nResponse: ${cleaned.substring(0, 200)}`);
       }

@@ -81,9 +81,10 @@ function _resolveLLM(req) {
 
   // ── Select best model ──────────────────────────────────────────────────
   const selected = selectAutoModel(taskType, effectiveDifficulty, availableProviders, { requiresImage, minContextK });
-  const provider = selected?.provider || availableProviders[0];
-  const model    = selected?.model    || getFirstModelForProvider(provider);
-  const useThinking = selected?.useThinking ?? false;
+  if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
+  const provider = selected.provider;
+  const model    = selected.model;
+  const useThinking = selected.useThinking;
 
   // ── Log selection ──────────────────────────────────────────────────────
   const boostNote = boosts.total > 0 ? ` [escalated +${boosts.total}: ${boosts.parts.join(', ')}]` : '';

@@ -101,8 +101,6 @@ export default {
       }
       cliLogger.log('semantic-search', `[${query.slice(0, 40)}] isReady: ${Date.now() - _t0}ms`);
 
-      cliLogger.progress('Searching semantic index...');
-
       // Embed the query
       cliLogger.log('semantic-search', `[${query.slice(0, 40)}] Getting embedding...`);
       const queryEmbedding = await agent.llmProvider.getEmbedding(query);
