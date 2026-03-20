@@ -1,10 +1,13 @@
 /**
  * Provider factory — resolves the best model instance based on requirements.
  *
- * Three model types:
+ * Six model types:
  *   - LLM:       resolve({ type: 'llm', ... })       or createLLM(provider, client, model, opts)
  *   - Embedding:  resolve({ type: 'embedding' })       or createEmbedding(provider, client)
  *   - Search:     resolve({ type: 'search' })           or createSearch(provider, opts)
+ *   - Image:      resolve({ type: 'image', ... })       or createImageGen(provider, client, model)
+ *   - Audio:      resolve({ type: 'audio', ... })       or createAudioGen(provider, client, model)
+ *   - Video:      resolve({ type: 'video', ... })       or createVideoGen(provider, client, model)
  *
  * The resolve() method is the main entry point — it picks the best available
  * provider and model based on task requirements, available API keys, costs,
@@ -13,12 +16,15 @@
  */
 
 import { getModelCaps, getFirstModelForProvider } from '../cost-center.js';
-import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch } from './openai.js';
+import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch, OpenAIImageGen, OpenAIAudioGen, OpenAIVideoGen } from './openai.js';
 import { AnthropicLLM } from './anthropic.js';
-import { GeminiLLM, GeminiEmbedding } from './gemini.js';
+import { GeminiLLM, GeminiEmbedding, GeminiImageGen, GeminiVideoGen } from './gemini.js';
 import { BraveSearch } from './brave.js';
 import { TavilySearch } from './tavily.js';
-import { GatewayEmbedding, GatewaySearch } from './gateway.js';
+import { GatewayEmbedding, GatewaySearch, GatewayImageGen, GatewayAudioGen, GatewayVideoGen } from './gateway.js';
+import { KlingVideoGen } from './kling.js';
+import { SeedanceVideoGen } from './seedance.js';
+import { NanoBanana2ImageGen } from './banana.js';
 import { cliLogger } from '../cli-logger.js';
 
 // ── Re-export from auto-model-selector (circuit breaker, provider discovery) ─
@@ -34,7 +40,7 @@ import { selectAutoModel } from '../auto-model-selector.js';
  * Resolve the best model instance for the given requirements.
  *
  * @param {Object} req
- * @param {'llm'|'embedding'|'search'} req.type
+ * @param {'llm'|'embedding'|'search'|'image'|'audio'|'video'} req.type
  *
  * --- LLM-specific fields ---
  * @param {string}   [req.taskType]         - 'code' | 'planning' | 'reasoning' | 'speed'
@@ -56,6 +62,9 @@ export function resolve(req) {
     case 'llm':       return _resolveLLM(req);
     case 'embedding': return _resolveEmbedding(req);
     case 'search':    return _resolveSearch(req);
+    case 'image':     return _resolveImage(req);
+    case 'audio':     return _resolveAudio(req);
+    case 'video':     return _resolveVideo(req);
     default:          throw new Error(`Unknown model type: ${req.type}`);
   }
 }
@@ -168,6 +177,104 @@ function _resolveSearch(req) {
     return { instance, provider: 'openai', model: 'gpt-5-search-api', useThinking: false };
   }
   return null; // No search provider available
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image generation resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _resolveImage(req) {
+  const { clients, model: requestedModel } = req;
+
+  // Gateway mode
+  if (process.env.KOI_AUTH_TOKEN) {
+    const model = requestedModel || 'auto';
+    const instance = new GatewayImageGen(model);
+    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  }
+
+  // Priority: Google/NanoBanana2 → OpenAI (gpt-image-1) → Gemini (gemini-2.5-flash-image)
+  // Nano Banana 2 is the fastest and supports up to 14 reference images
+  if (process.env.GEMINI_API_KEY && (!requestedModel || requestedModel.includes('3.1-flash-image') || requestedModel.includes('3-pro-image-preview'))) {
+    const model = requestedModel || 'gemini-3.1-flash-image-preview';
+    if (model.includes('3.1-flash-image') || model.includes('3-pro-image-preview')) {
+      const instance = new NanoBanana2ImageGen(null, model);
+      return { instance, provider: 'google', model, useThinking: false };
+    }
+  }
+  if (clients?.openai && process.env.OPENAI_API_KEY) {
+    const model = requestedModel || 'gpt-image-1';
+    const instance = new OpenAIImageGen(clients.openai, model);
+    return { instance, provider: 'openai', model, useThinking: false };
+  }
+  if (process.env.GEMINI_API_KEY) {
+    const model = requestedModel || 'gemini-2.5-flash-image';
+    const instance = new GeminiImageGen(null, model);
+    return { instance, provider: 'gemini', model, useThinking: false };
+  }
+  throw new Error('No image generation provider available (need OPENAI_API_KEY or GEMINI_API_KEY)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio generation resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _resolveAudio(req) {
+  const { clients, model: requestedModel } = req;
+
+  // Gateway mode
+  if (process.env.KOI_AUTH_TOKEN) {
+    const model = requestedModel || 'auto';
+    const instance = new GatewayAudioGen(model);
+    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  }
+
+  // Only OpenAI has TTS/STT via SDK
+  if (clients?.openai && process.env.OPENAI_API_KEY) {
+    const model = requestedModel || 'tts-1';
+    const instance = new OpenAIAudioGen(clients.openai, model);
+    return { instance, provider: 'openai', model, useThinking: false };
+  }
+  throw new Error('No audio generation provider available (need OPENAI_API_KEY)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Video generation resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _resolveVideo(req) {
+  const { clients, model: requestedModel } = req;
+
+  // Gateway mode
+  if (process.env.KOI_AUTH_TOKEN) {
+    const model = requestedModel || 'auto';
+    const instance = new GatewayVideoGen(model);
+    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  }
+
+  // Priority: Kling → Seedance → OpenAI (Sora) → Gemini (Veo) → Google (Nano Banana)
+  if (process.env.KLING_ACCESS_KEY && process.env.KLING_SECRET_KEY) {
+    const model = requestedModel || 'kling-v3-0';
+    const instance = new KlingVideoGen(null, model);
+    return { instance, provider: 'kling', model, useThinking: false };
+  }
+  if (process.env.SEEDANCE_API_KEY) {
+    const model = requestedModel || 'seedance-2-0-lite';
+
+    const instance = new SeedanceVideoGen(null, model);
+    return { instance, provider: 'seedance', model, useThinking: false };
+  }
+  if (clients?.openai && process.env.OPENAI_API_KEY) {
+    const model = requestedModel || 'sora';
+    const instance = new OpenAIVideoGen(clients.openai, model);
+    return { instance, provider: 'openai', model, useThinking: false };
+  }
+  if (clients?.gemini || process.env.GEMINI_API_KEY) {
+    const model = requestedModel || 'veo-3.1-generate-preview';
+    const instance = new GeminiVideoGen(clients?.gemini, model);
+    return { instance, provider: 'gemini', model, useThinking: false };
+  }
+  throw new Error('No video generation provider available (need KLING_ACCESS_KEY+KLING_SECRET_KEY, SEEDANCE_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY)');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +394,41 @@ export function createSearch(provider, opts = {}) {
       return new TavilySearch(opts.apiKey || process.env.TAVILY_API_KEY);
     default:
       throw new Error(`Unknown search provider: ${provider}`);
+  }
+}
+
+/**
+ * Create an ImageGen instance directly.
+ */
+export function createImageGen(provider, client, model) {
+  switch (provider) {
+    case 'openai':  return new OpenAIImageGen(client, model || 'gpt-image-1');
+    case 'gemini':  return new GeminiImageGen(client, model || 'gemini-2.5-flash-image');
+    case 'google':  return new NanoBanana2ImageGen(null, model || 'gemini-3.1-flash-image-preview');
+    default: throw new Error(`No image generation support for provider: ${provider}`);
+  }
+}
+
+/**
+ * Create an AudioGen instance directly.
+ */
+export function createAudioGen(provider, client, model) {
+  switch (provider) {
+    case 'openai':  return new OpenAIAudioGen(client, model || 'tts-1');
+    default: throw new Error(`No audio generation support for provider: ${provider}`);
+  }
+}
+
+/**
+ * Create a VideoGen instance directly.
+ */
+export function createVideoGen(provider, client, model) {
+  switch (provider) {
+    case 'openai':   return new OpenAIVideoGen(client, model || 'sora');
+    case 'gemini':   return new GeminiVideoGen(client, model || 'veo-3.1-generate-preview');
+    case 'kling':    return new KlingVideoGen(null, model || 'kling-v3-0');
+    case 'seedance': return new SeedanceVideoGen(null, model || 'seedance-2-0-lite');
+    default: throw new Error(`No video generation support for provider: ${provider}`);
   }
 }
 

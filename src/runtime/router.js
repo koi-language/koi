@@ -83,6 +83,7 @@ export class AgentRouter {
         } else {
           description = `Handle ${eventName} event`;
           confidence = 0.5;
+          console.warn(`⚠️  [AgentRouter] No affordance for ${agent.name}.${eventName} — description will be generic. Run with precalculate enabled or add an affordance statement.`);
         }
       }
 

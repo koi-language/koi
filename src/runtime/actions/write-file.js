@@ -21,7 +21,8 @@ import { sessionTracker } from '../session-tracker.js';
 export default {
   type: 'write_file',
   intent: 'write_file',
-  description: 'Write or edit a file. Shows a colored diff preview and asks for permission. Fields: "path" (file path), "content" (full new content). Returns: { success, path }',
+  description: 'Write or create a file. Shows a colored diff preview and asks for permission. Fields: "path" (file path), "content" (full new content). Returns: { success, path }',
+  instructions: 'This is the ONLY correct way to create new files or fully rewrite existing files. NEVER use shell commands (cat >, echo >, tee, python scripts, etc.) to write files — always use write_file instead.',
   thinkingHint: 'Writing file',
   permission: 'write',
   hidden: false,

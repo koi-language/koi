@@ -13,7 +13,11 @@ export default {
   type: 'ask_parent',
   intent: 'ask_parent',
   description: 'Ask the calling (parent) agent a question when you cannot proceed without more information. The runtime will pause, ask the parent, and re-call you with args.answer set to the answer. Requires: question (the specific question you need answered)',
-  permission: null,
+  instructions: `If you need information that only the parent can provide, use:
+{ "actionType": "direct", "intent": "ask_parent", "question": "..." }
+
+If args.answer is present, it contains the parent response. Use it and continue.`,
+  permission: 'ask_parent',
 
   schema: {
     type: 'object',

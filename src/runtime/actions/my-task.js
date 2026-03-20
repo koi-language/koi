@@ -10,7 +10,15 @@ export default {
   intent: 'my_task',
   description: 'Get the task assigned to this agent (by owner) → Returns: task object with id, subject, description, status or { message } if none assigned',
   thinkingHint: 'Checking assigned task',
-  // No permission required — every agent can check its own assigned task
+  permission: null,
+  // Only show when agent has an assigned task
+  hidden: (agent) => {
+    if (!agent?.name) return true;
+    try {
+      const task = taskManager.getTaskByOwner(agent.name);
+      return !task;
+    } catch { return true; }
+  },
 
   schema: {
     type: 'object',

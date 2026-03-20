@@ -15,6 +15,23 @@ export default {
   type: 'prompt_user',
   intent: 'prompt_user',
   description: 'Ask the user a question or show an inline prompt. Two modes: (1) QUESTION mode: set "question" to display text, then show input below. (2) INLINE mode: set "prompt" (without "question") to show an inline prompt where the user types on the same line — ideal for shell-like prompts, e.g. { "intent": "prompt_user", "prompt": "(~/dir) $ " }. Can include "options" array for interactive menu — an "Other..." free-text option is always appended automatically so the user can express anything not covered by the choices. Returns: { answer }',
+  instructions: `Use prompt_user only for information that cannot be verified from tools, commands, files, or prior action results.
+
+Never ask the user something you can verify yourself with:
+- shell
+- read_file
+- search
+- grep
+- semantic_code_search
+
+One prompt_user = one question.
+Do not ask multiple questions in a single prompt_user.
+
+When you need to explain something and ask a follow-up:
+- put the explanation in "message"
+- put the single question in "question"
+
+Do not print a question separately before prompt_user.`,
   thinkingHint: 'Processing your answer',
   permission: null,
 

@@ -300,9 +300,7 @@ export class LLMProvider {
    * @returns {{ instance, provider, model, useThinking }}
    */
   _resolveModel(taskType, difficulty = 5, opts = {}) {
-    const clients = this._gatewayMode
-      ? this._gatewayClients()
-      : { openai: this._oa, anthropic: this._ac, gemini: this._gc };
+    const clients = this.getClients();
     return resolveModel({
       type: 'llm',
       taskType,
@@ -311,6 +309,17 @@ export class LLMProvider {
       clients,
       ...opts,
     });
+  }
+
+  /**
+   * Get the SDK clients map for use with the provider factory.
+   * Used by media generation actions (image, video, audio) to resolve providers.
+   * @returns {{ openai?, anthropic?, gemini? }}
+   */
+  getClients() {
+    return this._gatewayMode
+      ? this._gatewayClients()
+      : { openai: this._oa, anthropic: this._ac, gemini: this._gc };
   }
 
   _getClient(provider) {
@@ -429,6 +438,20 @@ export class LLMProvider {
    */
   async simpleChat(prompt, { timeoutMs = 15000 } = {}) {
     await this._ensureClients();
+
+    // In auto mode, _effectiveLLMProvider is only set during chat() flow.
+    // For simpleChat we need to resolve a concrete provider ourselves.
+    if (this._autoMode && !this._effectiveLLMProvider) {
+      const p = this._availableProviders?.[0];
+      if (p) {
+        this._effectiveLLMProvider = p;
+        // Pick a sensible default model for build-time tasks (cheap & fast)
+        if (p === 'openai')         this.model = 'gpt-4o-mini';
+        else if (p === 'anthropic') this.model = 'claude-haiku-4-5-20251001';
+        else if (p === 'gemini')    this.model = 'gemini-2.0-flash';
+      }
+    }
+
     const llm = this._createLLM();
     const { text } = await llm.complete(
       [{ role: 'user', content: prompt }],
@@ -1728,13 +1751,48 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     const intentNesting = hasTeams ? '\nIMPORTANT: Do NOT nest "intent" inside "data". The "intent" field must be at the top level.' : '';
     const koiMd = agent.hasPermission('read_koi_md') ? this._loadKoiMd() : '';
 
+    // ── Runtime Context block (universal for all agents) ──
+    const now = new Date().toISOString().slice(0, 19);
+    const cwd = process.cwd();
+    const agentDisplayName = agent?.name || 'unknown';
+    const statusPhase = agent?.state?.statusPhase || null;
+    const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
+
+    // ── Phase system explanation (only when agent uses phases) ──
+    const phaseSystemBlock = statusPhase ? `
+========================================
+PHASE SYSTEM
+========================================
+
+You operate in phases. Each phase controls which actions, agents, and rules are loaded — keeping your context focused and minimal.
+
+Your current phase is \`${statusPhase}\`. Only the actions and agents relevant to this phase are shown below.
+
+To transition phase, emit update_state either alone or as the LAST action in a batch:
+
+{ "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "implementing" } }
+
+**Phase transitions MUST be the LAST action — NEVER place any action AFTER a phase change.** Phase transitions change which actions are available, but the new actions only appear on the NEXT turn. Any action placed after the transition in the same batch will execute with the OLD phase's permissions and may fail or bypass safety checks.
+
+Always set the phase that matches what you expect to do NEXT turn.
+` : '';
+
+    // prompt_user has null permission so it's always available — check if agent is a coordinator
+    const hasPromptUser = !agent?.amnesia; // delegate agents with amnesia don't use prompt_user
+
     return `
-# ENVIRONMENT
-Working directory: ${process.cwd()}
-All file paths (read_file, edit_file, write_file, shell) are relative to this directory unless absolute.
+# RUNTIME CONTEXT
+
+| Field | Value |
+|---|---|
+| Working directory | \`${cwd}\` |
+| Timestamp | ${now} |
+| Agent | ${agentDisplayName} |${phaseField}
+
+All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
 
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.
-
+${phaseSystemBlock}
 ========================================
 OUTPUT CONTRACT (MUST FOLLOW)
 ========================================
@@ -1780,13 +1838,13 @@ Every action object MUST include:
 - "actionType"
 - "intent"
 
+ONE action = ONE intent = ONE object. Each object contains ONLY the fields defined for that specific intent. NEVER add fields from a different intent into the same object — extra fields are silently ignored and the second action will NOT execute. If you need two actions, use a batch with two separate objects.
+
 Valid action types:
-- "direct"
-- "delegate"
+- "direct"${hasTeams ? '\n- "delegate"' : ''}
 
 Intent rules:
-- For direct actions: "intent" MUST be exactly one of AVAILABLE ACTIONS.
-- For delegate actions: "intent" MUST follow "agentKey::eventName" and refer to a valid available agent/event.
+- For direct actions: "intent" MUST be exactly one of AVAILABLE ACTIONS.${hasTeams ? '\n- For delegate actions: "intent" MUST follow "agentKey::eventName" and refer to a valid available agent/event.' : ''}
 - Never invent new intents.
 - Never put descriptive text inside "intent". Put that text in "query", "pattern", "message", "question", or other parameters.
 
@@ -1797,91 +1855,29 @@ Valid:
 { "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index language parser support" }
 
 ========================================
-REQUIRED FIELDS
+BATCH
 ========================================
 
-Never output a bare action such as:
-{ "actionType": "...", "intent": "..." }
+"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with "actionType", "intent", or any other action field. If you need to do multiple things in one turn (e.g. prompt_user + update_state), use a batch:
 
-Each intent must include its required fields:
-
-- semantic_code_search => query
-- search => mode + (query or pattern depending on mode)
-- grep => pattern
-- read_file => path + offset + limit
-- shell => command + description
-- learn_fact => key + value + category
-- prompt_user => question or message
-- return => data
-
-read_file rules:
-- Always use offset + limit
-- Prefer 50-150 lines per read
-- Never read more than 200 lines at once
-- For large files, never omit offset/limit
-
-Before emitting JSON, verify:
-1) Every action has actionType + intent
-2) intent is valid for its actionType
-3) All required fields are present
-4) JSON is valid
-
-If any check fails, fix the JSON before responding.
-
-========================================
-SEARCH RULES
-========================================
-
-Semantic search queries MUST be compact keyword queries, not natural-language questions.
-
-Guidelines:
-- Remove filler words such as: where, which, how, what, is, the, are, does, find
-- Prefer technical keywords
-- Expand with synonyms when helpful
-
-Bad:
-"where is semantic indexing implemented"
-
-Good:
-"semantic index build embed vector store"
-
-Bad:
-"which languages are supported"
-
-Good:
-"language support parser javascript typescript python"
-
-Split searches only when the request contains independent subquestions or distinct search targets.
-If multiple independent searches do not depend on each other, they MUST be run in a single parallel block.
-
-Do NOT split a query merely because it contains multiple nouns if they refer to the same concept.
-
-========================================
-EVIDENCE RULES
-========================================
-
-Search results are leads, not answers.
-- semantic_code_search, search, and grep tell you where to look, not the final answer
-- You MUST read_file the relevant source before answering questions about code behavior or implementation
-- If search results are low-confidence, incomplete, or ambiguous, use additional tools before answering
-- Never summarize unread content
-- If a result has not been returned yet, you do not know it
-- If the answer cannot be found after reasonable attempts, say so honestly; never fabricate
+{ "batch": [
+  { "actionType": "direct", "intent": "prompt_user", "question": "Hello! How can I help?" },
+  { "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "routing" } }
+]}
 
 ========================================
 EXECUTION FLOW
 ========================================
 
-Return exactly ONE JSON object per step:
-- either a single action
-- or { "batch": [ ... ] }
+Your response MUST be ONE JSON object per step and it MUST be one of two forms — never mix them:
+1. A single action: { "actionType": "direct", "intent": "...", ... }
+2. A batch: { "batch": [ ...actions... ] }
 
 Use sequential steps only when later actions depend on earlier results.
 
 Parallelism is mandatory:
 - If 2+ actions are independent, they MUST go inside a "parallel" block
-- Never place independent actions sequentially in a batch
-- EXCEPTION: prompt_user must NEVER be inside a parallel block
+- Never place independent actions sequentially in a batch${hasPromptUser ? '\n- EXCEPTION: prompt_user must NEVER be inside a parallel block' : ''}
 
 Examples:
 
@@ -1922,82 +1918,6 @@ Do not treat exploration alone as task completion.
 You must complete all required follow-up actions before returning.
 
 ========================================
-PROMPT_USER RULES
-========================================
-
-Use prompt_user only for information that cannot be verified from tools, commands, files, or prior action results.
-
-Never ask the user something you can verify yourself with:
-- shell
-- read_file
-- search
-- grep
-- semantic_code_search
-
-One prompt_user = one question.
-Do not ask multiple questions in a single prompt_user.
-
-When you need to explain something and ask a follow-up:
-- put the explanation in "message"
-- put the single question in "question"
-
-Do not print a question separately before prompt_user.
-
-========================================
-USER-VISIBLE OUTPUT RULES
-========================================
-
-If the task requires showing information to the user (e.g. "display", "print", "present", "show", "tell"), you MUST use an explicit user-facing action for the final content.
-
-Internal reasoning, retrieval actions, and "return" do NOT count as user-visible output.
-
-Do NOT place final user-facing content only inside "return" unless the task explicitly says that "return" is the user-facing channel.
-
-If a user-facing output action exists in AVAILABLE ACTIONS, use it.
-If both user-visible output and workflow completion are required:
-1) emit the user-visible output action
-2) then emit "return" only as completion
-
-========================================
-FAILURE / TOOLING RULES
-========================================
-
-If an action fails, do not guess.
-Choose another valid action only if it is meaningfully different and can resolve the issue.
-
-If a shell command returns:
-- "command not found"
-- exit code 127
-
-then the required tool is missing.
-
-In that case:
-1) stop the current task
-2) ask permission with prompt_user using options ["Yes", "No"]
-3) if Yes, install the tool first
-4) if No, tell the user what is missing and stop
-
-Never skip this rule.
-
-Commands that launch long-running processes MUST use:
-"background": true
-
-Examples:
-- npm start
-- flutter run
-- python server.py
-- open -a Simulator
-
-========================================
-DELEGATION / PARENT COMMUNICATION
-========================================
-
-If you are a delegate agent and need information that only the parent can provide, use:
-{ "actionType": "direct", "intent": "ask_parent", "question": "..." }
-
-If args.answer is present, it contains the parent response. Use it and continue.
-
-========================================
 FINAL NON-NEGOTIABLE RULES
 ========================================
 
@@ -2010,11 +1930,9 @@ FINAL NON-NEGOTIABLE RULES
 7. Never return before the whole task is done
 8. Always prefer evidence over speculation
 
-All available capabilities are defined below. Use them exactly as specified.
-
 ${resourceSection}${intentNesting}
 
-CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions. No markdown. Remember: static headers/labels go in the FIRST response; parallelize independent actions; never return until ALL steps are done.${koiMd}`;
+CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.${koiMd}`;
 
   }
 
@@ -2166,6 +2084,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions
       result.push({
         agentName: teamName ? `${memberKey} (${teamName})` : memberKey,
         agentPureName: memberKey,
+        teamName: teamName || null,
         agentDescription: member.description || null,
         handlers
       });
@@ -2205,7 +2124,14 @@ CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions
     }
 
     // ── AVAILABLE AGENTS ────────────────────────────────────────────────────
-    const delegateResources = resources.filter(r => r.type === 'delegate');
+    let delegateResources = resources.filter(r => r.type === 'delegate');
+
+    // Phase-based filtering: if 'delegate' permission is disabled, hide all agents
+    const disabledPerms = agent?.state?.disabledPermissions;
+    if (Array.isArray(disabledPerms) && disabledPerms.includes('delegate')) {
+      delegateResources = [];
+    }
+
     if (delegateResources.length > 0) {
       doc += '## AVAILABLE AGENTS\n\n';
       for (const resource of delegateResources) {
@@ -2224,7 +2150,10 @@ CRITICAL: Return a single JSON action or { "batch": [...] } for multiple actions
     }
 
     // ── AVAILABLE MCP TOOLS ─────────────────────────────────────────────────
-    const mcpResources = resources.filter(r => r.type === 'mcp');
+    let mcpResources = resources.filter(r => r.type === 'mcp');
+    if (Array.isArray(disabledPerms) && disabledPerms.includes('call_mcp')) {
+      mcpResources = [];
+    }
     if (mcpResources.length > 0) {
       doc += '## AVAILABLE MCP TOOLS\n\n';
       for (const resource of mcpResources) {

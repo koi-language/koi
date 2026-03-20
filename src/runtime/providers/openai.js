@@ -3,7 +3,7 @@
  * Embeddings, and Search.
  */
 
-import { BaseLLM, BaseEmbedding, BaseSearch } from './base.js';
+import { BaseLLM, BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen } from './base.js';
 import { getModelCaps } from '../cost-center.js';
 import { cliLogger } from '../cli-logger.js';
 
@@ -341,5 +341,361 @@ export class OpenAISearch extends BaseSearch {
     // OpenAI search models may include annotations/citations in the response
     const citations = completion.choices[0].message?.annotations || [];
     return { text, citations, usage };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI Image Generation (gpt-image-1, gpt-image-1.5, dall-e-3, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Normalized aspect ratio → OpenAI size mapping
+const _OPENAI_IMG_ASPECT_MAP = {
+  '1:1':  '1024x1024',
+  '16:9': '1792x1024',
+  '9:16': '1024x1792',
+  '4:3':  '1536x1024',  // closest supported
+  '3:4':  '1024x1536',
+  '3:2':  '1792x1024',
+  '2:3':  '1024x1792',
+  '21:9': '1792x1024',
+};
+
+// Normalized resolution → OpenAI size multiplier
+const _OPENAI_IMG_RES_MAP = {
+  'low':    '512x512',
+  'medium': '1024x1024',
+  'high':   '2048x2048',  // dall-e-3: not available, falls back to 1024
+  'ultra':  '4096x4096',
+};
+
+function _openaiImageSize(aspectRatio, resolution) {
+  // If aspect ratio specified, use it (resolution affects quality param instead)
+  if (aspectRatio && _OPENAI_IMG_ASPECT_MAP[aspectRatio]) {
+    return _OPENAI_IMG_ASPECT_MAP[aspectRatio];
+  }
+  // Fallback to resolution-based square
+  return _OPENAI_IMG_RES_MAP[resolution] || '1024x1024';
+}
+
+export class OpenAIImageGen extends BaseImageGen {
+  constructor(client, model = 'gpt-image-1') {
+    super(client, model);
+  }
+
+  get providerName() { return 'openai'; }
+
+  get capabilities() {
+    const isGptImage = this.model.startsWith('gpt-image') || this.model.startsWith('chatgpt-image');
+    return {
+      referenceImages: isGptImage,    // gpt-image-1+ supports image input for style ref
+      maxReferenceImages: isGptImage ? 1 : 0,
+      edit: true,
+      aspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+      resolutions: ['low', 'medium', 'high'],
+      qualities: ['auto', 'low', 'medium', 'high'],
+      maxN: isGptImage ? 4 : 1,      // dall-e-3 only supports n=1
+      outputFormats: ['png', 'webp', 'jpeg', 'b64_json'],
+    };
+  }
+
+  async generate(prompt, opts = {}) {
+    const aspectRatio = opts.aspectRatio || '1:1';
+    const resolution = opts.resolution || 'medium';
+    const size = _openaiImageSize(aspectRatio, resolution);
+    const quality = opts.quality || 'auto';
+    const n = opts.n || 1;
+    const outputFormat = opts.outputFormat || 'b64_json';
+
+    cliLogger.log('image', `OpenAI image generate: model=${this.model}, aspect=${aspectRatio}→size=${size}, quality=${quality}, n=${n}`);
+    const _t0 = Date.now();
+
+    try {
+      const params = {
+        model: this.model,
+        prompt,
+        n,
+        size,
+        quality,
+      };
+
+      // gpt-image-1+ supports output_format; dall-e-3 uses response_format
+      const isGptImage = this.model.startsWith('gpt-image') || this.model.startsWith('chatgpt-image');
+      if (isGptImage) {
+        params.output_format = outputFormat === 'url' ? 'png' : outputFormat;
+      } else {
+        params.response_format = outputFormat === 'b64_json' ? 'b64_json' : 'url';
+      }
+
+      // Reference images: gpt-image-1+ accepts them as additional image inputs
+      if (opts.referenceImages?.length && isGptImage) {
+        const ref = opts.referenceImages[0];
+        params.image = typeof ref.data === 'string' ? ref.data : ref.data;
+      }
+
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.images.generate(params, options);
+
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('image', `OpenAI image generate completed in ${_elapsed}ms`);
+
+      const images = (response.data || []).map(img => ({
+        url: img.url || undefined,
+        b64: img.b64_json || undefined,
+        revisedPrompt: img.revised_prompt || undefined,
+      }));
+
+      return {
+        images,
+        usage: {
+          input: response.usage?.input_tokens || 0,
+          output: response.usage?.output_tokens || 0,
+        },
+      };
+    } catch (err) {
+      cliLogger.log('image', `OpenAI image generate FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+
+  async edit(prompt, image, opts = {}) {
+    const aspectRatio = opts.aspectRatio || '1:1';
+    const resolution = opts.resolution || 'medium';
+    const size = _openaiImageSize(aspectRatio, resolution);
+    const n = opts.n || 1;
+
+    cliLogger.log('image', `OpenAI image edit: model=${this.model}, aspect=${aspectRatio}→size=${size}, n=${n}`);
+    const _t0 = Date.now();
+
+    try {
+      const params = {
+        model: this.model,
+        prompt,
+        image,
+        n,
+        size,
+      };
+      if (opts.mask) params.mask = opts.mask;
+
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.images.edit(params, options);
+
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('image', `OpenAI image edit completed in ${_elapsed}ms`);
+
+      const images = (response.data || []).map(img => ({
+        url: img.url || undefined,
+        b64: img.b64_json || undefined,
+        revisedPrompt: img.revised_prompt || undefined,
+      }));
+
+      return {
+        images,
+        usage: {
+          input: response.usage?.input_tokens || 0,
+          output: response.usage?.output_tokens || 0,
+        },
+      };
+    } catch (err) {
+      cliLogger.log('image', `OpenAI image edit FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI Audio Generation (TTS + STT)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class OpenAIAudioGen extends BaseAudioGen {
+  constructor(client, model = 'tts-1') {
+    super(client, model);
+  }
+
+  get providerName() { return 'openai'; }
+
+  async speech(text, opts = {}) {
+    const voice = opts.voice || 'alloy';
+    const outputFormat = opts.outputFormat || 'mp3';
+    const speed = opts.speed || 1.0;
+
+    cliLogger.log('audio', `OpenAI TTS: model=${this.model}, voice=${voice}, format=${outputFormat}, chars=${text.length}`);
+    const _t0 = Date.now();
+
+    try {
+      const params = {
+        model: this.model,
+        input: text,
+        voice,
+        response_format: outputFormat,
+        speed,
+      };
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.audio.speech.create(params, options);
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('audio', `OpenAI TTS completed in ${_elapsed}ms, ${buffer.length} bytes`);
+
+      return {
+        audio: buffer,
+        format: outputFormat,
+        usage: { characters: text.length },
+      };
+    } catch (err) {
+      cliLogger.log('audio', `OpenAI TTS FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+
+  async transcribe(audio, opts = {}) {
+    const language = opts.language;
+    const format = opts.format || 'json';
+
+    cliLogger.log('audio', `OpenAI STT: model=whisper-1, format=${format}`);
+    const _t0 = Date.now();
+
+    try {
+      const params = {
+        model: 'whisper-1',
+        file: audio,
+        response_format: format,
+      };
+      if (language) params.language = language;
+
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.audio.transcriptions.create(params, options);
+
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('audio', `OpenAI STT completed in ${_elapsed}ms`);
+
+      const text = typeof response === 'string' ? response : response.text;
+      return {
+        text,
+        segments: response.segments || undefined,
+        usage: { duration: response.duration || 0 },
+      };
+    } catch (err) {
+      cliLogger.log('audio', `OpenAI STT FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI Video Generation (Sora)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Normalized aspect ratio → Sora size mapping
+const _SORA_ASPECT_MAP = {
+  '1:1':  '1080x1080',
+  '16:9': '1920x1080',
+  '9:16': '1080x1920',
+  '4:3':  '1440x1080',
+  '3:4':  '1080x1440',
+  '3:2':  '1620x1080',
+  '2:3':  '1080x1620',
+  '21:9': '1920x820',
+};
+
+// Normalized resolution → Sora resolution scaling
+const _SORA_RES_MAP = {
+  '360p':  '640x360',
+  '480p':  '854x480',
+  '720p':  '1280x720',
+  '1080p': '1920x1080',
+  '2k':    '1920x1080',
+  '4k':    '1920x1080', // Sora max is 1080p
+};
+
+function _soraSize(aspectRatio, resolution) {
+  if (aspectRatio && _SORA_ASPECT_MAP[aspectRatio]) {
+    return _SORA_ASPECT_MAP[aspectRatio];
+  }
+  return _SORA_RES_MAP[resolution] || '1920x1080';
+}
+
+export class OpenAIVideoGen extends BaseVideoGen {
+  constructor(client, model = 'sora') {
+    super(client, model);
+  }
+
+  get providerName() { return 'openai'; }
+
+  get capabilities() {
+    return {
+      startFrame: true,
+      endFrame: false,
+      referenceImages: false,
+      maxReferenceImages: 0,
+      withAudio: false,
+      aspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'],
+      resolutions: ['480p', '720p', '1080p'],
+      qualities: ['auto', 'high'],
+      durations: [5, 10, 15, 20],
+      maxDuration: 20,
+    };
+  }
+
+  async generate(prompt, opts = {}) {
+    const aspectRatio = opts.aspectRatio || '16:9';
+    const resolution = opts.resolution || '1080p';
+    const size = _soraSize(aspectRatio, resolution);
+    const duration = opts.duration || 5;
+
+    cliLogger.log('video', `OpenAI video generate: model=${this.model}, aspect=${aspectRatio}→size=${size}, duration=${duration}s`);
+    const _t0 = Date.now();
+
+    try {
+      const input = [{ type: 'text', text: prompt }];
+
+      // Start frame: send as image input
+      if (opts.startFrame?.data) {
+        const imgData = typeof opts.startFrame.data === 'string'
+          ? opts.startFrame.data
+          : opts.startFrame.data.toString('base64');
+        const mime = opts.startFrame.mimeType || 'image/png';
+        input.unshift({ type: 'image_url', image_url: { url: `data:${mime};base64,${imgData}` } });
+      }
+
+      const params = {
+        model: this.model,
+        input,
+        size,
+        duration,
+        n: 1,
+      };
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.responses.create(params, options);
+
+      const _elapsed = Date.now() - _t0;
+      cliLogger.log('video', `OpenAI video generate submitted in ${_elapsed}ms`);
+
+      return {
+        id: response.id,
+        status: response.status || 'pending',
+        url: response.output?.[0]?.url || undefined,
+        usage: { durationSec: duration },
+      };
+    } catch (err) {
+      cliLogger.log('video', `OpenAI video generate FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+
+  async getStatus(jobId, opts = {}) {
+    try {
+      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
+      const response = await this.client.responses.retrieve(jobId, options);
+
+      return {
+        id: response.id,
+        status: response.status || 'pending',
+        url: response.output?.[0]?.url || undefined,
+        error: response.error?.message || undefined,
+      };
+    } catch (err) {
+      cliLogger.log('video', `OpenAI video status FAILED: ${err.message}`);
+      throw err;
+    }
   }
 }

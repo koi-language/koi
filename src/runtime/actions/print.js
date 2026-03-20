@@ -9,6 +9,15 @@ export default {
   type: 'print',          // Mantener temporalmente
   intent: 'print',        // NUEVO: identificador semántico
   description: 'Print directly to console (FAST - use this for all console output!)',
+  instructions: `If the task requires showing information to the user (e.g. "display", "print", "present", "show", "tell"), you MUST use print for the final content.
+
+Internal reasoning, retrieval actions, and "return" do NOT count as user-visible output.
+
+Do NOT place final user-facing content only inside "return" unless the task explicitly says that "return" is the user-facing channel.
+
+If both user-visible output and workflow completion are required:
+1) emit the print action first
+2) then emit "return" only as completion`,
   thinkingHint: 'Continuing',
   permission: null,
 

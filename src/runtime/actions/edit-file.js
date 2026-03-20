@@ -189,6 +189,7 @@ export default {
   type: 'edit_file',
   intent: 'edit_file',
   description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Returns: { success, path }',
+  instructions: 'This is the ONLY correct way to modify existing files. NEVER use shell commands (sed, awk, echo >, python scripts, etc.) to edit files — always use edit_file instead.',
   thinkingHint: (action) => `Editing ${action.path || 'file'}`,
   permission: 'write',
   hidden: false,
@@ -229,23 +230,9 @@ export default {
     // Parse the diff
     const hunks = parseUnifiedDiff(diffStr);
 
-    // Early detection: reject diffs where every hunk has identical remove/add lines
-    if (hunks.length > 0) {
-      const allNoOp = hunks.every(hunk => {
-        const removes = hunk.lines.filter(l => l.type === 'remove').map(l => l.text.trimEnd());
-        const adds = hunk.lines.filter(l => l.type === 'add').map(l => l.text.trimEnd());
-        return removes.length === adds.length && removes.every((r, i) => r === adds[i]);
-      });
-      if (allNoOp) {
-        return {
-          success: false,
-          error: 'No-op diff: every - line is identical to its corresponding + line (ignoring trailing whitespace).',
-          fix: 'Your diff does not make any real changes. The - and + lines are the same. '
-            + 'Re-read the file to find the exact line you need to change, then write a diff where '
-            + 'the - line contains the CURRENT text and the + line contains the NEW text you want.'
-        };
-      }
-    }
+    // No-op detection happens AFTER applying the diff (see below), by comparing
+    // the final content to the original. Positional comparison (removes[i] === adds[i])
+    // was removed because it incorrectly rejects diffs that reorder lines.
 
     if (hunks.length === 0) {
       return {

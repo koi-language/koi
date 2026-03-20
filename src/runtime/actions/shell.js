@@ -337,6 +337,15 @@ export default {
   type: 'shell',
   intent: 'shell',
   description: 'Execute a shell command (requires user permission). Requires: command (the shell command), description (human-friendly explanation of what it does and why). Optional: cwd (working directory), background (boolean — launch without waiting, for apps/servers)',
+  instructions: `If a shell command returns "command not found" or exit code 127, the required tool is missing:
+1) stop the current task
+2) ask permission with prompt_user using options ["Yes", "No"]
+3) if Yes, install the tool first
+4) if No, tell the user what is missing and stop
+
+If an action fails, do not guess. Choose another valid action only if it is meaningfully different and can resolve the issue.
+
+Commands that launch long-running processes MUST use "background": true. Examples: npm start, flutter run, python server.py, open -a Simulator.`,
   thinkingHint: (action) => `Executing ${extractBaseCommand(action.command || '')}`,
   permission: 'execute',
   hidden: false,

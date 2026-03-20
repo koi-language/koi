@@ -86,6 +86,11 @@ export default {
   type: 'read_file',
   intent: 'read_file',
   description: 'Read a file\'s contents. Supports text files and PDF files. Returns the text with line numbers. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs, e.g. "1-5", "3", "10-20"). Lines longer than 2000 chars are truncated. If path is a directory, lists its contents. Returns: { success, content, totalLines, path }',
+  instructions: `read_file rules:
+- Always use offset + limit
+- Prefer 50-150 lines per read
+- Never read more than 200 lines at once
+- For large files, never omit offset/limit`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,

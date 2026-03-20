@@ -20,6 +20,19 @@ const RST  = '\x1b[0m';
 // ── Inline formatting ────────────────────────────────────────────────────────
 
 function renderInline(text) {
+  // Links FIRST — before any ANSI codes are inserted, so URL regexes match cleanly.
+  // Render as blue underline (no OSC 8 — Ink TUI doesn't support it).
+  // Markdown links: [label](url) → blue underlined label
+  text = text.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+    '\x1b[38;5;75m\x1b[4m$1\x1b[24m\x1b[39m'
+  );
+  // Bare URLs: http(s)://... → blue underlined URL
+  text = text.replace(
+    /(^|[\s(])(https?:\/\/[^\s)\]>*]+)/g,
+    '$1\x1b[38;5;75m\x1b[4m$2\x1b[24m\x1b[39m'
+  );
+
   // Inline code: `code` → cyan
   text = text.replace(/`([^`]+)`/g, '\x1b[36m$1\x1b[39m');
 

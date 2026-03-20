@@ -40,11 +40,36 @@
     "gpt-4o-audio-preview":         { "inputPer1M": 2.50, "outputPer1M": 10.00, "contextK":  128, "outputType": "audio", "inputImage": true  },
     "gpt-4o-mini-audio-preview":    { "inputPer1M": 0.15, "outputPer1M":  0.60, "contextK":  128, "outputType": "audio", "inputImage": false },
 
-    "gpt-image-1.5":                { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK":    0, "outputType": "image", "inputImage": true  },
-    "chatgpt-image-latest":         { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK":    0, "outputType": "image", "inputImage": true  },
-    "gpt-image-1":                  { "inputPer1M": 5.00, "outputPer1M":  0.00, "contextK":    0, "outputType": "image", "inputImage": true  },
-    "gpt-image-1-mini":             { "inputPer1M": 2.00, "outputPer1M":  0.00, "contextK":    0, "outputType": "image", "inputImage": true  },
-    "computer-use-preview":         { "inputPer1M": 3.00, "outputPer1M": 12.00, "contextK":    8, "outputType": "text",  "inputImage": true  }
+    "gpt-image-1.5":                { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
+    "chatgpt-image-latest":         { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
+    "gpt-image-1":                  { "inputPer1M": 5.00, "outputPer1M":  0.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
+    "gpt-image-1-mini":             { "inputPer1M": 2.00, "outputPer1M":  0.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": false, "edit": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["low","medium"], "qualities": ["auto"] } },
+    "computer-use-preview":         { "inputPer1M": 3.00, "outputPer1M": 12.00, "contextK":    8, "outputType": "text",  "inputImage": true  },
+
+    "tts-1":                        { "inputPer1M": 15.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "audio", "inputImage": false },
+    "tts-1-hd":                     { "inputPer1M": 30.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "audio", "inputImage": false },
+    "whisper-1":                    { "inputPer1M":  0.006,"outputPer1M": 0.00, "contextK": 0, "outputType": "text",  "inputImage": false },
+
+    "sora":                         { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3","21:9"], "resolutions": ["480p","720p","1080p"], "durations": [5,10,15,20], "maxDuration": 20 } }
+  },
+
+  "kling": {
+    "kling-v3-0":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p","4k"], "durations": [5,10,15], "maxDuration": 15 } },
+    "kling-v2-0":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
+    "kling-v1-6":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
+    "kling-v1-5":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } }
+  },
+
+  "seedance": {
+    "seedance-2-0-pro":  { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": true, "maxRefImages": 3, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
+    "seedance-2-0-lite": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": true, "maxRefImages": 3, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
+    "seedance-1-5-pro":  { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
+    "seedance-1-5-lite": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p"], "durations": [5], "maxDuration": 5 } }
+  },
+
+  "google": {
+    "gemini-3.1-flash-image-preview":  { "inputPer1M": 0.20, "outputPer1M": 0.80, "contextK": 256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 14, "edit": true, "aspectRatios": ["1:1","1:4","1:8","2:3","3:2","3:4","4:1","4:3","4:5","5:4","8:1","9:16","16:9","21:9"], "resolutions": ["low","medium","high","ultra"], "qualities": ["auto","high"] } },
+    "gemini-3-pro-image-preview":      { "inputPer1M": 1.00, "outputPer1M": 8.00, "contextK": 256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": true, "aspectRatios": ["1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9"], "resolutions": ["medium","high"], "qualities": ["auto"] } }
   },
 
   "anthropic": {
@@ -64,8 +89,13 @@
     "gemini-1.5-flash":       { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true },
     "gemini-3-pro":           { "inputPer1M": 2.00,  "outputPer1M": 12.00, "contextK": 1000, "outputType": "text",  "inputImage": true },
     "gemini-3-flash-preview": { "inputPer1M": 0.50,  "outputPer1M":  3.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 5,  "planning": 6,  "reasoning": 6,  "thinking": true },
-    "gemini-2.5-flash-image": { "inputPer1M": 0.20,  "outputPer1M":  0.80, "contextK":  256, "outputType": "image", "inputImage": true  },
-    "gemini-3-pro-image":     { "inputPer1M": 1.00,  "outputPer1M":  8.00, "contextK":  256, "outputType": "image", "inputImage": true  }
+    "gemini-2.5-flash-image": { "inputPer1M": 0.20,  "outputPer1M":  0.80, "contextK":  256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3"], "resolutions": ["medium","high"], "qualities": ["auto"] } },
+    "gemini-3-pro-image":     { "inputPer1M": 1.00,  "outputPer1M":  8.00, "contextK":  256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3"], "resolutions": ["medium","high"], "qualities": ["auto"] } },
+
+    "veo-3.1-generate-preview":      { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": true, "maxRefImages": 3, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p","4k"], "durations": [4,6,8], "maxDuration": 8 } },
+    "veo-3.1-fast-generate-preview": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": true, "maxRefImages": 3, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [4,6,8], "maxDuration": 8 } },
+    "veo-3.0-generate-preview":      { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [4,6,8], "maxDuration": 8 } },
+    "veo-2.0-generate-001":          { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,8], "maxDuration": 8 } }
   },
 
   "kimi": {

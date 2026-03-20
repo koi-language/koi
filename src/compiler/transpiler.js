@@ -591,7 +591,7 @@ export class KoiTranspiler {
    * Check if compose template contains template directives (@let, @if).
    */
   _hasComposeDirectives(template) {
-    return /@let\s|@if\s/.test(template);
+    return /@let\s|@if\s|\{\{/.test(template);
   }
 
   /**
@@ -603,7 +603,8 @@ export class KoiTranspiler {
     const jsLines = [
       'const { args, state, agentName, userMessage } = context || {};',
       'const __parts = [];',
-      'const __images = [];'
+      'const __images = [];',
+      'const __str = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);'
     ];
 
 
@@ -702,37 +703,65 @@ export class KoiTranspiler {
   _compileInterpolatedLine(line, fragmentNames, jsLines) {
     let remaining = line;
 
+    // Collect all segments of this line. If ALL interpolations are inline expressions
+    // (not fragment inclusions), concatenate them into a single __parts.push() to
+    // avoid the join('\n') in the resolver from splitting one template line into
+    // multiple output lines.
+    const segments = [];  // { type: 'text'|'expr'|'fragment', value: string }
+
     while (remaining.length > 0) {
       const interpIdx = remaining.indexOf('{{');
 
       if (interpIdx < 0) {
         if (remaining.trim()) {
-          jsLines.push(`__parts.push(${JSON.stringify(remaining)});`);
+          segments.push({ type: 'text', value: remaining });
         }
         break;
       }
 
       // Text before the pattern
       const before = remaining.substring(0, interpIdx);
-      if (before.trim()) {
-        jsLines.push(`__parts.push(${JSON.stringify(before)});`);
+      if (before) {
+        segments.push({ type: 'text', value: before });
       }
 
       const endIdx = remaining.indexOf('}}', interpIdx + 2);
       if (endIdx >= 0) {
         const expr = remaining.substring(interpIdx + 2, endIdx).trim();
-        // Check if this is a known fragment name
         if (fragmentNames.includes(expr)) {
-          jsLines.push(`__parts.push(fragments.${expr});`);
+          segments.push({ type: 'fragment', value: expr });
         } else {
           const safeExpr = this._safePropertyAccess(expr);
-          jsLines.push(`__parts.push(String(${safeExpr} ?? ''));`);
+          segments.push({ type: 'expr', value: safeExpr });
         }
         remaining = remaining.substring(endIdx + 2);
       } else {
         // Unclosed {{ — treat rest as text
-        jsLines.push(`__parts.push(${JSON.stringify(remaining)});`);
+        segments.push({ type: 'text', value: remaining });
         break;
+      }
+    }
+
+    // If ANY segment is a fragment, emit them separately (fragments are multi-line blocks).
+    const hasFragment = segments.some(s => s.type === 'fragment');
+    if (hasFragment) {
+      for (const seg of segments) {
+        if (seg.type === 'text' && seg.value.trim()) {
+          jsLines.push(`__parts.push(${JSON.stringify(seg.value)});`);
+        } else if (seg.type === 'expr') {
+          jsLines.push(`__parts.push(__str(${seg.value}));`);
+        } else if (seg.type === 'fragment') {
+          jsLines.push(`__parts.push(fragments.${seg.value});`);
+        }
+      }
+    } else {
+      // All inline: concatenate into a single string expression to avoid split lines.
+      const parts = segments.map(s => {
+        if (s.type === 'text') return JSON.stringify(s.value);
+        return `__str(${s.value})`;
+      });
+      if (parts.length > 0) {
+        jsLines.push(`__parts.push(${parts.join(' + ')});`);
       }
     }
   }

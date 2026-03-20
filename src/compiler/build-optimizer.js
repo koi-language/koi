@@ -78,7 +78,7 @@ export class BuildTimeOptimizer {
         const handlers = [];
         for (const handler of eventHandlers) {
           const eventName = handler.event.name;
-          const playbook = this.findPlaybookForHandler(handler);
+          const playbook = this.findPlaybookForHandler(handler, ast.declarations);
           if (playbook) {
             handlers.push({
               name: eventName,
@@ -166,45 +166,11 @@ export class BuildTimeOptimizer {
   }
 
   /**
-   * Find all ComposeDecl prompt declarations and generate JS resolver functions.
-   * Returns a map: { promptName: resolverFunctionBody }
+   * Compose resolvers are now always compiled deterministically by the transpiler.
+   * LLM-based resolver generation is no longer used.
    */
   async _generateComposeResolvers(ast, provider) {
-    const composeJobs = [];
-
-    for (const decl of ast.declarations) {
-      if (decl.type === 'PromptDecl' && decl.content?.type === 'ComposeDecl') {
-        const name = decl.name.name;
-        const { fragments, template } = decl.content;
-        // Skip directive-based compose blocks — compiled deterministically by the transpiler
-        if (/@let\s|@if\s/.test(template)) continue;
-        const fragmentNames = fragments.map(f => f.name);
-        composeJobs.push({ name, fragmentNames, template });
-      }
-    }
-
-    if (composeJobs.length === 0) return {};
-
-    process.stdout.write('\r\x1b[K🔄 Generating compose resolvers...');
-
-    const results = {};
-    for (const job of composeJobs) {
-      try {
-        const code = await this._generateResolverCode(job, provider);
-        if (code) {
-          results[job.name] = code;
-          if (this.verbose) {
-            console.log(`    ✓ Compose resolver for ${job.name} generated (${code.length} chars)`);
-          }
-        }
-      } catch (error) {
-        if (this.verbose) {
-          console.warn(`[BuildOptimizer] Failed to generate resolver for ${job.name}: ${error.message}`);
-        }
-      }
-    }
-
-    return results;
+    return {};
   }
 
   /**
@@ -366,12 +332,29 @@ ${handlerKeys}
 
   // --- Helper methods ---
 
-  findPlaybookForHandler(handler) {
+  findPlaybookForHandler(handler, declarations = []) {
     for (const stmt of handler.body) {
       if (stmt.type === 'PlaybookStatement') {
         if (stmt.parts) {
+          // Try StringPart first (simple string playbooks)
           const firstStringPart = stmt.parts.find(p => p.type === 'StringPart');
-          return firstStringPart ? firstStringPart.content.value : null;
+          if (firstStringPart) return firstStringPart.content.value;
+
+          // Resolve PromptRef / PromptCall to their compose template text
+          for (const part of stmt.parts) {
+            const promptName = part.type === 'PromptRef' ? part.name?.name
+              : part.type === 'PromptCall' ? part.name?.name
+              : null;
+            if (!promptName) continue;
+
+            const promptDecl = declarations.find(
+              d => d.type === 'PromptDecl' && d.name?.name === promptName
+            );
+            if (promptDecl?.content?.type === 'ComposeDecl' && promptDecl.content.template) {
+              return promptDecl.content.template;
+            }
+          }
+          return null;
         }
         return stmt.content ? stmt.content.value : null;
       }

@@ -88,13 +88,22 @@ class ActionRegistry {
     let actions = this.getAll();
 
     if (agent) {
+      const disabledPerms = agent.state?.disabledPermissions;
       actions = actions.filter(action => {
-        if (action.hidden) return false;
+        // hidden can be boolean or function(agent)
+        const isHidden = typeof action.hidden === 'function' ? action.hidden(agent) : action.hidden;
+        if (isHidden) return false;
         if (!action.permission) return true;
-        return agent.hasPermission(action.permission);
+        if (!agent.hasPermission(action.permission)) return false;
+        // Phase-based: if permission is temporarily disabled, hide the action
+        if (Array.isArray(disabledPerms) && disabledPerms.includes(action.permission)) return false;
+        return true;
       });
     } else {
-      actions = actions.filter(action => !action.hidden);
+      actions = actions.filter(action => {
+        const isHidden = typeof action.hidden === 'function' ? action.hidden(null) : action.hidden;
+        return !isHidden;
+      });
     }
 
     if (actions.length === 0) return '';
@@ -140,6 +149,7 @@ class ActionRegistry {
     let out = `### ${intent}\n${desc}\n`;
     if (inText)  out += `In: ${inText}\n`;
     if (outText) out += `Out: ${outText}\n`;
+    if (action.instructions) out += `\n${action.instructions}\n`;
     return out;
   }
 

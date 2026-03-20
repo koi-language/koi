@@ -16,6 +16,36 @@ export default {
   type: 'semantic_code_search',
   intent: 'semantic_code_search',
   description: 'Search the codebase semantically by keywords and concepts. Finds files, classes, and functions by meaning. Write queries as keyword lists (NOT questions): "email validation regex format", "database connection pool setup". Drop filler words (where, which, how). Fields: "query" (keywords), "type" (file|class|function — optional filter), "path" (directory scope), "maxResults" (default 20)',
+  instructions: `Semantic search queries MUST be compact keyword queries, not natural-language questions.
+
+Guidelines:
+- Remove filler words such as: where, which, how, what, is, the, are, does, find
+- Prefer technical keywords
+- Expand with synonyms when helpful
+
+Bad:
+"where is semantic indexing implemented"
+
+Good:
+"semantic index build embed vector store"
+
+Bad:
+"which languages are supported"
+
+Good:
+"language support parser javascript typescript python"
+
+Split searches only when the request contains independent subquestions or distinct search targets.
+If multiple independent searches do not depend on each other, they MUST be run in a single parallel block.
+
+Do NOT split a query merely because it contains multiple nouns if they refer to the same concept.
+
+Search results are leads, not answers:
+- You MUST read_file the relevant source before answering questions about code behavior or implementation
+- If search results are low-confidence, incomplete, or ambiguous, use additional tools before answering
+- Never summarize unread content
+- If a result has not been returned yet, you do not know it
+- If the answer cannot be found after reasonable attempts, say so honestly; never fabricate`,
   thinkingHint: (action) => `Searching: ${action.query ? action.query.slice(0, 40) : 'code'}`,
   permission: 'read',
   hidden: false,
