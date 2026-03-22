@@ -473,6 +473,7 @@ export class Agent {
       playbook: interpolatedPlaybook,
       agentName: this.name
     });
+    this._activeSession = session; // Expose to actions (e.g. read_file image vision)
     session.actionContext.args = args;
     // Delegates get a fresh isolated state so parallel delegations to the same agent
     // instance never contaminate each other or the base agent's persistent state.
@@ -1063,6 +1064,12 @@ export class Agent {
 
             if (!_recoveredToTasks) {
               cliLogger.log('agent', `${this.name}: Task completed, waiting for next input`);
+              // Non-interactive mode: task is done, exit cleanly.
+              if (process.env.KOI_EXIT_ON_COMPLETE === '1' && !this.amnesia) {
+                cliLogger.log('agent', `[exit-mode] Root agent returned — exiting.`);
+                if (returnData?.summary) cliLogger.print(returnData.summary);
+                process.exit(0);
+              }
               // Commit pending changes
               if (sessionTracker && sessionTracker.hasPendingChanges()) {
                 await this._commitSessionChanges(interpolatedPlaybook);
@@ -2061,6 +2068,13 @@ export class Agent {
                 // Process went silent and may be waiting for input.
                 // Ask the running agent (with full context) to decide the answer.
                 const answer = await this._resolveProcessInput(update, resolvedAction);
+                if (answer === null && process.env.KOI_EXIT_ON_COMPLETE === '1') {
+                  // Non-interactive: can't provide input — kill process and return error
+                  this._shellKilledByClassifier = update.output_so_far || '';
+                  this._shellKilledNonInteractive = true;
+                  iter.return();
+                  break;
+                }
                 item = await iter.next(answer);
               } else {
                 if (!this._pendingProgressUpdates) this._pendingProgressUpdates = [];
@@ -2097,10 +2111,14 @@ export class Agent {
           // so the agent knows the command failed and can see the output.
           if (!result && this._shellKilledByClassifier) {
             const killedOutput = this._shellKilledByClassifier;
+            const wasNonInteractive = this._shellKilledNonInteractive;
             this._shellKilledByClassifier = null;
+            this._shellKilledNonInteractive = false;
             const truncOut = killedOutput.length > 3000 ? killedOutput.slice(-3000) : killedOutput;
-            result = { success: false, exitCode: 1, stdout: '', stderr: truncOut,
-              error: 'Process killed — LLM analysis detected a fatal error in the output. Review stderr and fix the issue.' };
+            const errorMsg = wasNonInteractive
+              ? 'Process killed — it required interactive input which is not available in non-interactive mode. Use a different approach that does not require user input (e.g. pass all arguments via command line flags, use config files, or pipe input).'
+              : 'Process killed — LLM analysis detected a fatal error in the output. Review stderr and fix the issue.';
+            result = { success: false, exitCode: 1, stdout: '', stderr: truncOut, error: errorMsg };
           }
         } else {
           result = await maybeGen;
@@ -2262,6 +2280,11 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
         const answer = await _cliInput(label, { secret: true });
         return answer ?? null;
       }
+      // Non-interactive mode: can't ask the user — kill the process
+      if (process.env.KOI_EXIT_ON_COMPLETE === '1') {
+        cliLogger.log('shell', `[${this.name}] _resolveProcessInput: no auto-answer in non-interactive mode — returning null to kill process`);
+        return null;
+      }
       // Non-secret: use prompt_user action for full UI integration
       const promptUserDef = actionRegistry.get('prompt_user');
       if (promptUserDef) {
@@ -2310,7 +2333,8 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
         args: _composeArgs || {},
         state: this.state || {},
         agentName: this.name,
-        userMessage: this._lastUserMessage ?? _composeArgs?.goal ?? null
+        userMessage: this._lastUserMessage ?? _composeArgs?.goal ?? null,
+        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1'
       };
       try {
         const result = await composeDef.resolve(resolvedFragments, callAction, context);

@@ -85,12 +85,13 @@ async function extractPdfPageImages(page, pdfjsLib) {
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Supports text files and PDF files. Returns the text with line numbers. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs, e.g. "1-5", "3", "10-20"). Lines longer than 2000 chars are truncated. If path is a directory, lists its contents. Returns: { success, content, totalLines, path }',
+  description: 'Read a file\'s contents. Supports text files, PDF files, and images (PNG, JPG, GIF, WebP). For images, the file is attached as vision input — you will see the image on your next response and can describe or analyze it visually. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
   instructions: `read_file rules:
-- Always use offset + limit
+- Always use offset + limit for text files
 - Prefer 50-150 lines per read
 - Never read more than 200 lines at once
-- For large files, never omit offset/limit`,
+- For large files, never omit offset/limit
+- For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,
@@ -109,7 +110,8 @@ export default {
   examples: [
     { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js' },
     { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js', offset: 10, limit: 50 },
-    { actionType: 'direct', intent: 'read_file', path: 'docs/manual.pdf', pages: '1-5' }
+    { actionType: 'direct', intent: 'read_file', path: 'docs/manual.pdf', pages: '1-5' },
+    { actionType: 'direct', intent: 'read_file', path: 'assets/screenshot.png' }
   ],
 
   async execute(action, agent) {
@@ -158,6 +160,38 @@ export default {
         }
       });
       return { success: true, path: filePath, type: 'directory', entries: listing };
+    }
+
+    // --- Image support (vision) ---
+    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'];
+    if (IMAGE_EXTS.includes(path.extname(resolvedPath).toLowerCase())) {
+      // Queue the image for the next LLM turn as a vision input.
+      // Uses session._pendingImages which llm-provider.js injects into the
+      // next LLM message as multimodal content (base64 image blocks).
+      const session = agent?._activeSession;
+      if (session) {
+        if (!session._pendingImages) session._pendingImages = [];
+        session._pendingImages.push({ path: resolvedPath });
+        cliLogger.log('read_file', `Image queued for vision: ${filePath}`);
+        return {
+          success: true,
+          path: filePath,
+          type: 'image',
+          message: `Image loaded and attached for visual analysis. You will see the image on your next response — describe what you see or answer questions about it.`
+        };
+      }
+      // Fallback: no agent available, return base64 directly
+      const b64 = fs.readFileSync(resolvedPath).toString('base64');
+      const ext = path.extname(resolvedPath).toLowerCase().slice(1);
+      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+      return {
+        success: true,
+        path: filePath,
+        type: 'image',
+        mimeType: mime,
+        base64: b64,
+        message: 'Image data returned as base64.'
+      };
     }
 
     // --- PDF support ---

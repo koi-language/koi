@@ -49,7 +49,18 @@ class LatentStore {
     this._dbPromise = (async () => {
       let lancedb;
       try {
-        lancedb = await import('@lancedb/lancedb');
+        const isBinary = typeof process.pkg !== 'undefined';
+        if (isBinary && process.env.KOI_EXTRACTED_NODE_MODULES) {
+          const lancedbPath = path.join(process.env.KOI_EXTRACTED_NODE_MODULES, '@lancedb', 'lancedb', 'dist', 'index.js');
+          let binaryRequire = globalThis.require;
+          if (!binaryRequire) {
+            try { binaryRequire = eval('require'); } catch {}
+          }
+          lancedb = binaryRequire(lancedbPath);
+          lancedb = lancedb?.default ?? lancedb;
+        } else {
+          lancedb = await import('@lancedb/lancedb');
+        }
       } catch (err) {
         cliLogger.log('memory', `@lancedb/lancedb failed to load: ${err.message}`);
         throw err;

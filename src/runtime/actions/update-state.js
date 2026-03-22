@@ -27,10 +27,17 @@ export default {
   // Executor function
   async execute(action, agent) {
     const updates = action.updates || action.state || {};
+    const oldPhase = agent.state?.statusPhase;
 
     Object.keys(updates).forEach(key => {
       agent.state[key] = updates[key];
     });
+
+    // Log phase transitions
+    if (updates.statusPhase && updates.statusPhase !== oldPhase) {
+      const { cliLogger } = await import('../cli-logger.js');
+      cliLogger.log('state', `[phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase}`);
+    }
 
     return { state_updated: true, state: agent.state };
   }

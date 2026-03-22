@@ -2,11 +2,13 @@
  * Deactivate Skill Action — Remove a skill from the active set.
  */
 
+import { cliLogger } from '../cli-logger.js';
+
 export default {
   type: 'deactivate_skill',
   intent: 'deactivate_skill',
   description: 'Deactivate an active skill by name. Fields: "name" (required). → Returns: { deactivated, name, activeSkills }',
-  thinkingHint: 'Unloading skill',
+  thinkingHint: (action) => `Deactivating skill: ${action.name || '...'}`,
   permission: null,
   hidden: true,
 
@@ -41,6 +43,8 @@ export default {
 
     // Update agent state via agent.callAction (avoids circular import)
     await agent.callAction('update_state', { updates: { skills: newSkills } });
+
+    cliLogger.print(`\x1b[33m✗\x1b[0m \x1b[2mSkill deactivated: \x1b[1m${skillName}\x1b[0m`);
 
     return {
       deactivated: true,

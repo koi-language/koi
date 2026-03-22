@@ -1,9 +1,9 @@
 /**
- * Anthropic provider implementations: LLM (Messages API).
- * Anthropic does not offer embedding or search-augmented models.
+ * Anthropic provider implementations: LLM (Messages API) + Web Search.
  */
 
-import { BaseLLM } from './base.js';
+import { BaseLLM, BaseSearch } from './base.js';
+import { cliLogger } from '../cli-logger.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Anthropic Messages API LLM
@@ -81,6 +81,9 @@ export class AnthropicLLM extends BaseLLM {
             }
           } else if (event.type === 'message_delta') {
             usage.output = event.usage?.output_tokens || 0;
+            if (event.delta?.stop_reason === 'max_tokens') {
+              cliLogger.log('llm', `[anthropic] Response hit max_tokens limit (${this.maxTokens}), output truncated at ${outChars} chars`);
+            }
           }
         }
       };
@@ -133,6 +136,26 @@ export class AnthropicLLM extends BaseLLM {
     };
     if (systemMsg) params.system = systemMsg.content;
 
+    // Anthropic requires streaming for high max_tokens (10min timeout).
+    // Use streaming transparently to avoid the error.
+    if (maxTokens > 4096) {
+      params.stream = true;
+      let buffer = '';
+      const usage = { input: 0, output: 0, thinking: 0 };
+      const stream = await this.client.messages.create(params);
+      for await (const event of stream) {
+        if (event.type === 'message_start') {
+          usage.input = event.message?.usage?.input_tokens || 0;
+        } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+          buffer += event.delta.text || '';
+        } else if (event.type === 'message_delta') {
+          usage.output = event.usage?.output_tokens || 0;
+        }
+      }
+      if (usage.output === 0 && buffer.length > 0) usage.output = Math.ceil(buffer.length / 4);
+      return { text: buffer.trim(), usage };
+    }
+
     const message = await this.client.messages.create(params);
     const text = (message.content.find(b => b.type === 'text')?.text ?? '').trim();
     const usage = {
@@ -140,12 +163,74 @@ export class AnthropicLLM extends BaseLLM {
       output: message.usage?.output_tokens || 0,
       thinking: 0,
     };
-    // Estimate thinking tokens from thinking content blocks if present
     const thinkingBlocks = message.content.filter(b => b.type === 'thinking');
     if (thinkingBlocks.length > 0) {
       const thinkChars = thinkingBlocks.reduce((sum, b) => sum + (b.thinking || '').length, 0);
       if (thinkChars > 0) usage.thinking = Math.ceil(thinkChars / 4);
     }
     return { text, usage };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anthropic Web Search (server-side tool via Messages API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class AnthropicSearch extends BaseSearch {
+  /**
+   * @param {Object} client - Anthropic SDK client
+   * @param {string} [model] - Model to use for search (default: claude-sonnet-4-20250514)
+   */
+  constructor(client, model = 'claude-sonnet-4-20250514') {
+    super(client, model);
+  }
+
+  get providerName() { return 'anthropic'; }
+
+  async search(query, opts = {}) {
+    const count = Math.min(opts.count || 5, 10);
+
+    const params = {
+      model: this.model,
+      max_tokens: 1024,
+      tools: [{
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: count,
+      }],
+      messages: [{ role: 'user', content: query }],
+    };
+
+    const message = await this.client.messages.create(params);
+
+    // Extract search results from tool_use content blocks
+    const results = [];
+    for (const block of message.content) {
+      if (block.type === 'web_search_tool_result') {
+        for (const sr of (block.content || [])) {
+          if (sr.type === 'web_search_result') {
+            results.push({
+              title: sr.title || '',
+              url: sr.url || '',
+              snippet: sr.encrypted_content ? '(encrypted)' : (sr.page_content || ''),
+            });
+          }
+        }
+      }
+    }
+
+    // Also grab any text summary Claude produced
+    const textBlocks = message.content.filter(b => b.type === 'text');
+    const summary = textBlocks.map(b => b.text).join('\n').trim();
+
+    const text = summary ||
+      results.map(r => `${r.title}\n${r.url}\n${r.snippet}`).join('\n\n');
+
+    const usage = {
+      input: message.usage?.input_tokens || 0,
+      output: message.usage?.output_tokens || 0,
+    };
+
+    return { text, results, usage };
   }
 }

@@ -15,9 +15,11 @@
  * know exactly which provider/model to use.
  */
 
+import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import { getModelCaps, getFirstModelForProvider } from '../cost-center.js';
 import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch, OpenAIImageGen, OpenAIAudioGen, OpenAIVideoGen } from './openai.js';
-import { AnthropicLLM } from './anthropic.js';
+import { AnthropicLLM, AnthropicSearch } from './anthropic.js';
 import { GeminiLLM, GeminiEmbedding, GeminiImageGen, GeminiVideoGen } from './gemini.js';
 import { BraveSearch } from './brave.js';
 import { TavilySearch } from './tavily.js';
@@ -79,6 +81,35 @@ function _resolveLLM(req) {
     session, agentName, availableProviders, clients,
     temperature, maxTokens, minContextK = 0
   } = req;
+
+  // ── Forced model override (--model flag / KOI_DEFAULT_MODEL) ───────────
+  // Check BEFORE availableProviders — forced mode creates its own client
+  // and doesn't need providers from the auto-selector.
+  const envModelOverride = process.env.KOI_DEFAULT_MODEL;
+  const envProviderOverride = process.env.KOI_DEFAULT_PROVIDER;
+  if (envModelOverride && envModelOverride !== 'auto') {
+    const provider = envProviderOverride
+      || (envModelOverride.startsWith('claude-') ? 'anthropic' : envModelOverride.startsWith('gemini-') ? 'gemini' : 'openai');
+    const model = envModelOverride;
+    cliLogger.log('llm', `[forced] ${agentName || 'agent'} → ${provider}/${model} | ${taskType}`);
+    cliLogger.setInfo('model', model);
+    // Create a direct client for the forced provider — bypass gateway.
+    // In gateway mode, clients[provider] returns the gateway proxy, so we
+    // create a fresh direct client using the API key instead.
+    let client;
+    if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
+      client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    } else if (provider === 'openai' && process.env.OPENAI_API_KEY) {
+      client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
+    } else if (provider === 'gemini' && process.env.GEMINI_API_KEY) {
+      client = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', maxRetries: 0 });
+    } else {
+      client = clients[provider];
+    }
+    if (!client) throw new Error(`No SDK client for forced provider: ${provider}. Is the API key set?`);
+    const instance = createLLM(provider, client, model, { temperature, maxTokens, useThinking: false });
+    return { instance, provider, effectiveProvider: provider, model, useThinking: false, effectiveDifficulty: baseDifficulty };
+  }
 
   if (!availableProviders?.length) {
     throw new Error('NO_PROVIDERS: No LLM providers available — all API keys are missing or invalid.');
@@ -157,13 +188,15 @@ function _resolveEmbedding(req) {
 function _resolveSearch(req) {
   const { clients } = req;
 
-  // Gateway mode: route through koi-cli.ai backend
-  if (process.env.KOI_AUTH_TOKEN) {
+  // Gateway mode: route through koi-cli.ai backend (skip if forced model is set —
+  // forced mode means we're bypassing the gateway for direct API access)
+  if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_DEFAULT_MODEL) {
     const instance = new GatewaySearch();
     return { instance, provider: 'koi-gateway', model: 'gateway-search', useThinking: false };
   }
 
-  // Priority: Brave → Tavily → OpenAI search model
+  // Priority: dedicated search APIs first (cheaper, faster), then LLM-based search.
+  // 1. Dedicated search APIs (no LLM cost)
   if (process.env.BRAVE_SEARCH_API_KEY) {
     const instance = new BraveSearch(process.env.BRAVE_SEARCH_API_KEY);
     return { instance, provider: 'brave', model: 'brave-search', useThinking: false };
@@ -172,8 +205,17 @@ function _resolveSearch(req) {
     const instance = new TavilySearch(process.env.TAVILY_API_KEY);
     return { instance, provider: 'tavily', model: 'tavily-search', useThinking: false };
   }
-  if (clients?.openai && process.env.OPENAI_API_KEY) {
-    const instance = new OpenAISearch(clients.openai, 'gpt-5-search-api');
+  // 2. LLM-based search — pick the best available provider.
+  //    Anthropic (web_search tool) is preferred: returns structured results + summary.
+  //    OpenAI (gpt-5-search-api) is fallback.
+  if (process.env.ANTHROPIC_API_KEY) {
+    const client = clients?.anthropic || new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const instance = new AnthropicSearch(client);
+    return { instance, provider: 'anthropic', model: 'claude-sonnet-4-20250514', useThinking: false };
+  }
+  if (process.env.OPENAI_API_KEY) {
+    const client = clients?.openai || new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
+    const instance = new OpenAISearch(client, 'gpt-5-search-api');
     return { instance, provider: 'openai', model: 'gpt-5-search-api', useThinking: false };
   }
   return null; // No search provider available

@@ -66,6 +66,9 @@ export class FilePermissions {
    * @returns {{ permitted: boolean, scope: 'file'|'directory'|null }}
    */
   isAllowed(filePath, level = 'read') {
+    // --yes flag: auto-accept all file permissions
+    if (process.env.KOI_YES === '1') return true;
+
     const resolved = path.resolve(filePath);
     const dir = path.dirname(resolved);
 

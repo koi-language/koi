@@ -38,7 +38,7 @@ export default {
     if (!resolved) {
       return {
         success: false,
-        error: 'No search API key configured. Set BRAVE_SEARCH_API_KEY or TAVILY_API_KEY in your environment.'
+        error: 'No search API key configured. Set BRAVE_SEARCH_API_KEY, TAVILY_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY in your environment.'
       };
     }
 

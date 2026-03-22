@@ -80,25 +80,29 @@ ${instruction}
 Output (result only):`;
 
     try {
-      // Call OpenAI with centralized logging
-      const completion = await agent.llmProvider.callOpenAI(
-        {
-          model: agent.llmProvider?.model || 'auto',
-          temperature: 0.3,
-          max_tokens: 2000,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ]
-        },
-        'call_llm action'
-      );
+      // Use the same provider/model as the agent's main loop (via resolveModel).
+      // No explicit maxTokens — BaseLLM will use 1/4 of the model's max output.
+      const { resolve: resolveModel } = await import('../providers/factory.js');
+      const { costCenter } = await import('../cost-center.js');
 
-      let resultText = completion.choices[0].message.content.trim();
+      await agent.llmProvider._ensureClients();
+      const { instance: llm, provider, model } = resolveModel({
+        type: 'llm', taskType: 'code', difficulty: 3,
+        availableProviders: agent.llmProvider._availableProviders,
+        clients: agent.llmProvider._gatewayMode
+          ? agent.llmProvider._gatewayClients()
+          : { openai: agent.llmProvider._oa, anthropic: agent.llmProvider._ac, gemini: agent.llmProvider._gc },
+      });
 
-      // Clean up any markdown code blocks that might have leaked through
-      resultText = resultText.replace(/^```[\w]*\n/gm, '').replace(/\n```$/gm, '');
-      resultText = resultText.trim();
+      const t0 = Date.now();
+      const result = await llm.complete([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ]);
+      costCenter.recordUsage(model, provider, result.usage?.input || 0, result.usage?.output || 0, Date.now() - t0);
+
+      let resultText = (result.text || '').trim();
+      resultText = resultText.replace(/^```[\w]*\n/gm, '').replace(/\n```$/gm, '').trim();
 
       return { result: resultText };
     } catch (error) {

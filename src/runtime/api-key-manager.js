@@ -106,6 +106,12 @@ export async function promptMissingApiKeys(agent) {
   // the gateway proxies LLM calls using the auth token.
   if (process.env.KOI_AUTH_TOKEN) return;
 
+  // If at least one API key is already configured, don't prompt for the missing ones.
+  // The user can add more anytime via .env or /config.
+  const allKeys = Object.values(PROVIDER_KEYS);
+  const hasAnyKey = allKeys.some(k => process.env[k]);
+  if (hasAnyKey) return;
+
   const configuredProvider = process.env.KOI_DEFAULT_PROVIDER;
   const includeRecommended = !configuredProvider
     || configuredProvider === 'auto'

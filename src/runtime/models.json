@@ -73,10 +73,10 @@
   },
 
   "anthropic": {
-    "claude-opus-4-6":            { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 5,  "code": 8,  "planning": 9,  "reasoning": 9,  "thinking": true },
-    "claude-sonnet-4-6":          { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "outputType": "text", "inputImage": true, "speed": 7,  "code": 7,  "planning": 7,  "reasoning": 7,  "thinking": true },
-    "claude-haiku-4-5-20251001":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "outputType": "text", "inputImage": true },
-    "claude-3-5-sonnet-20241022": { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "outputType": "text", "inputImage": true },
+    "claude-opus-4-6":            { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "maxOutputTokens": 128000, "outputType": "text", "inputImage": true, "speed": 5,  "code": 8,  "planning": 9,  "reasoning": 9,  "thinking": true },
+    "claude-sonnet-4-6":          { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "maxOutputTokens": 64000, "outputType": "text", "inputImage": true, "speed": 7,  "code": 7,  "planning": 7,  "reasoning": 7,  "thinking": true },
+    "claude-haiku-4-5-20251001":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "maxOutputTokens": 8192, "outputType": "text", "inputImage": true },
+    "claude-3-5-sonnet-20241022": { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "maxOutputTokens": 8192, "outputType": "text", "inputImage": true },
     "claude-3-5-haiku-20241022":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "outputType": "text", "inputImage": true },
     "claude-3-opus-20240229":     { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "outputType": "text", "inputImage": true }
   },

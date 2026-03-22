@@ -63,7 +63,7 @@ async function _loadPty() {
     // Extract it to a real temp path so posix_spawnp can exec it.
     _extractSpawnHelperIfNeeded();
   } catch (e) {
-    cliLogger.log('shell', `node-pty unavailable, using spawn fallback: ${e.message}`);
+    cliLogger.log('shell', `node-pty unavailable, using spawn fallback`);
   }
 }
 
@@ -411,7 +411,7 @@ Commands that launch long-running processes MUST use "background": true. Example
       return _globalIndividualPerms.isAllowed(baseCmd, effectiveDir);
     };
 
-    let permitted = isSilent || checkPermitted();
+    let permitted = isSilent || process.env.KOI_YES === '1' || checkPermitted();
     let reportDone;
     let descriptionShown = false;
 

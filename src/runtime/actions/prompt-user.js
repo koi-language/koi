@@ -33,6 +33,9 @@ When you need to explain something and ask a follow-up:
 
 Do not print a question separately before prompt_user.`,
   thinkingHint: 'Processing your answer',
+  // In non-interactive mode, hide when there's nothing queued to consume.
+  // Visible while the initial prompt is still in the queue; hidden after it's consumed.
+  hidden: () => process.env.KOI_EXIT_ON_COMPLETE === '1' && process.env._KOI_INITIAL_PROMPT_CONSUMED === '1',
   permission: null,
 
   schema: {
@@ -72,6 +75,30 @@ Do not print a question separately before prompt_user.`,
     const options = action.options || action.data?.options || null;
     // Always use the default prompt — the LLM must not change the visual prompt
     const promptText = '❯ ';
+
+    // --exit mode: allow consuming the initial prompt from the queue,
+    // but block any subsequent prompt_user calls (no user to answer).
+    if (process.env.KOI_EXIT_ON_COMPLETE === '1') {
+      if (process.env._KOI_INITIAL_PROMPT_CONSUMED === '1') {
+        // Track how many times prompt_user has been blocked
+        const blockedCount = Number(process.env._KOI_PROMPT_BLOCKED_COUNT || '0') + 1;
+        process.env._KOI_PROMPT_BLOCKED_COUNT = String(blockedCount);
+        cliLogger.log('prompt_user', `[exit-mode] Blocked (${blockedCount}/3). agent=${agent?.name || 'unknown'} message=${(message || '').substring(0, 100)} question=${(question || '').substring(0, 100)}`);
+        if (message) cliLogger.print(renderMarkdown(message));
+
+        // After 3 blocked attempts, force exit to prevent infinite loop
+        if (blockedCount >= 3) {
+          cliLogger.log('prompt_user', `[exit-mode] Too many blocked prompt_user attempts — forcing exit.`);
+          process.exit(0);
+        }
+
+        return {
+          error: 'Non-interactive mode — no user available. Do not use prompt_user. Complete the task autonomously and call return when done.',
+        };
+      }
+      // First call — mark as consumed and let it proceed to read from the queue.
+      process.env._KOI_INITIAL_PROMPT_CONSUMED = '1';
+    }
 
     // Clear any progress indicators
     cliLogger.clearProgress();

@@ -28,7 +28,11 @@ export class BaseLLM {
     this.client = client;
     this.model = model;
     this.temperature = opts.temperature ?? 0;
-    this.maxTokens = opts.maxTokens ?? 8192;
+    // Caller's maxTokens wins if explicitly set (e.g. callUtility with 150 tokens).
+    // Otherwise use 1/4 of model's max output (floor 8K, capped at model max).
+    const _modelMax = opts.caps?.maxOutputTokens || 0;
+    const _perModel = _modelMax ? Math.max(Math.min(8000, _modelMax), Math.floor(_modelMax / 4)) : 0;
+    this.maxTokens = opts.maxTokens || _perModel || 8192;
     this.caps = opts.caps || {};
     this.useThinking = opts.useThinking ?? false;
   }

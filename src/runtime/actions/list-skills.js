@@ -98,7 +98,7 @@ export default {
   type: 'list_skills',
   intent: 'list_skills',
   description: 'Discover available Agent Skills by scanning skill directories. → Returns: { skills: [{ name, description, location, resources }], catalog }',
-  thinkingHint: 'Discovering skills',
+  thinkingHint: 'Examining available skills',
   permission: null,
 
   schema: {

@@ -8,7 +8,9 @@ import { renderMarkdown } from '../cli-markdown.js';
 export default {
   type: 'print',          // Mantener temporalmente
   intent: 'print',        // NUEVO: identificador semántico
-  description: 'Print directly to console (FAST - use this for all console output!)',
+  description: 'Print directly to console',
+  // Hide in non-interactive mode — no user reading output
+  hidden: () => process.env.KOI_EXIT_ON_COMPLETE === '1',
   instructions: `If the task requires showing information to the user (e.g. "display", "print", "present", "show", "tell"), you MUST use print for the final content.
 
 Internal reasoning, retrieval actions, and "return" do NOT count as user-visible output.

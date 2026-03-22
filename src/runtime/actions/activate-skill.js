@@ -7,12 +7,13 @@
 
 import fs from 'fs';
 import path from 'path';
+import { cliLogger } from '../cli-logger.js';
 
 export default {
   type: 'activate_skill',
   intent: 'activate_skill',
   description: 'Activate a skill by name. Reads its SKILL.md instructions and adds it to active skills. Fields: "name" (required). → Returns: { activated, name, content, directory, resources }',
-  thinkingHint: 'Loading skill',
+  thinkingHint: (action) => `Activating skill: ${action.name || '...'}`,
   permission: null,
   hidden: true,
 
@@ -82,6 +83,8 @@ export default {
         } catch { /* skip */ }
       }
     }
+
+    cliLogger.print(`\x1b[32m✓\x1b[0m \x1b[2mSkill activated: \x1b[1m${skillName}\x1b[0m`);
 
     return {
       activated: true,

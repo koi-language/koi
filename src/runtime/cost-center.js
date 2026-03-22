@@ -53,10 +53,11 @@ export function lookupModel(model) {
 export function getModelCaps(model) {
   const info = lookupModel(model);
   return {
-    noTemperature: info?.noTemperature ?? false,
-    noMaxTokens:   info?.noMaxTokens   ?? false,
-    api:           info?.api           ?? 'chat',
-    thinking:      info?.thinking      ?? false,
+    noTemperature:   info?.noTemperature   ?? false,
+    noMaxTokens:     info?.noMaxTokens     ?? false,
+    api:             info?.api             ?? 'chat',
+    thinking:        info?.thinking        ?? false,
+    maxOutputTokens: info?.maxOutputTokens ?? 0,
   };
 }
 

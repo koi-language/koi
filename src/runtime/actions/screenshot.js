@@ -160,6 +160,7 @@ export default {
     + '"url" (optional: URL for browser screenshots), '
     + '"description" (optional: text description for later recall). '
     + 'Returns: { imageId, source, content: [image, text] }',
+  instructions: 'screenshot captures the LIVE SCREEN (desktop, simulator, browser). It is NOT for reading image files from disk. To read an image file (.png, .jpg, etc.), use read_file instead.',
   thinkingHint: (action) => `Capturing screenshot${action.source ? ` (${action.source})` : ''}`,
   permission: null,
   hidden: false,

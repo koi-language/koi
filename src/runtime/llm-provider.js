@@ -83,7 +83,7 @@ export class LLMProvider {
     this._lockedProvider = (!_providerIsAuto && _modelIsAuto) ? config.provider : null;
 
     this.temperature = config.temperature ?? 0.1; // Low temperature for deterministic results
-    this.maxTokens = config.max_tokens || 8000; // Increased to avoid truncation of long responses
+    this.maxTokens = config.max_tokens || 16000; // Fallback; per-model limit set in BaseLLM via caps.maxOutputTokens
     this._useThinking = false; // Set to true by auto-selector when thinking variant wins
 
     // ── koi-cli.ai account mode: route all LLM calls through the gateway ──────
@@ -697,6 +697,7 @@ ${taskDescription}`;
       type: 'llm', taskType: 'speed', difficulty: 1,
       availableProviders: this._availableProviders,
       clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
+      maxTokens: 1024, // Summaries are short — keep it fast and cheap
       minContextK,
     });
 
@@ -1780,6 +1781,31 @@ Always set the phase that matches what you expect to do NEXT turn.
     // prompt_user has null permission so it's always available — check if agent is a coordinator
     const hasPromptUser = !agent?.amnesia; // delegate agents with amnesia don't use prompt_user
 
+    // Non-interactive mode: agent must act without asking for confirmation
+    const nonInteractiveBlock = process.env.KOI_EXIT_ON_COMPLETE === '1' ? `
+
+========================================
+NON-INTERACTIVE MODE
+========================================
+
+You are running in non-interactive (headless) mode. There is no human to answer follow-up questions.
+
+**CRITICAL RULES:**
+- Do NOT ask for confirmation — execute actions directly.
+- Do NOT use prompt_user to ask "Do you want me to...?" — just do it.
+- Complete the ENTIRE task autonomously: investigate, implement, verify.
+- Only call prompt_user at the very end to report what you did.
+
+**USE TOOLS, NOT YOUR OWN KNOWLEDGE:**
+- You are an agent with access to tools (shell, web_search, read_file, etc.). Use them.
+- If a task requires domain expertise you lack (chess, math, science, music, etc.), search the web for APIs, libraries, or tools that can help. Install them with shell and use them programmatically.
+- Example: for chess analysis, install stockfish or python-chess. For math proofs, use sympy. For image processing, use python libraries. Never try to solve domain-specific problems from memory alone.
+
+**VERIFY DATA EXTRACTED FROM IMAGES:**
+- When you extract structured data from an image (positions, numbers, text, coordinates), ALWAYS verify it programmatically before using it.
+- If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, include the image file path so the delegate can re-read it if the extracted data is wrong.' : ''}
+` : '';
+
     return `
 # RUNTIME CONTEXT
 
@@ -1790,6 +1816,7 @@ Always set the phase that matches what you expect to do NEXT turn.
 | Agent | ${agentDisplayName} |${phaseField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
+${nonInteractiveBlock}
 
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.
 ${phaseSystemBlock}
