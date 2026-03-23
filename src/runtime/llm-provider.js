@@ -1542,11 +1542,20 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     }
 
     // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
-    // Find the first { or [ and discard everything before it.
+    // Find the first { or [ that starts valid JSON and discard everything before it.
     // Capture preamble text — if the action is prompt_user, inject it as "message".
+    // Prefer { over [ — arrays at the top level are rare and often false positives
+    // (e.g. the LLM writes "[0, range)" as math notation, not a JSON array).
     let preambleText = '';
     const braceIdx = cleaned.indexOf('{');
-    const bracketIdx = cleaned.indexOf('[');
+    let bracketIdx = cleaned.indexOf('[');
+    // Only trust [ if it looks like a JSON array of objects (reactive actions are always objects)
+    if (bracketIdx >= 0) {
+      const afterBracket = cleaned.substring(bracketIdx + 1).trimStart();
+      if (!afterBracket.startsWith('{')) {
+        bracketIdx = -1; // Not an array of action objects — ignore it
+      }
+    }
     const jsonStart = braceIdx >= 0 && bracketIdx >= 0
       ? Math.min(braceIdx, bracketIdx)
       : braceIdx >= 0 ? braceIdx : bracketIdx;
@@ -1753,7 +1762,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     const koiMd = agent.hasPermission('read_koi_md') ? this._loadKoiMd() : '';
 
     // ── Runtime Context block (universal for all agents) ──
-    const now = new Date().toISOString().slice(0, 19);
+    // Use local time with UTC offset so the LLM knows the user's timezone.
+    // e.g. "2026-03-22T21:53:14+01:00" instead of "2026-03-22T20:53:14" (ambiguous UTC)
+    const _now = new Date();
+    const _pad = (n) => String(n).padStart(2, '0');
+    const _offsetMin = _now.getTimezoneOffset(); // negative for east of UTC
+    const _absH = _pad(Math.floor(Math.abs(_offsetMin) / 60));
+    const _absM = _pad(Math.abs(_offsetMin) % 60);
+    const _offsetStr = `${_offsetMin <= 0 ? '+' : '-'}${_absH}:${_absM}`;
+    const now = `${_now.getFullYear()}-${_pad(_now.getMonth() + 1)}-${_pad(_now.getDate())}T${_pad(_now.getHours())}:${_pad(_now.getMinutes())}:${_pad(_now.getSeconds())}${_offsetStr}`;
     const cwd = process.cwd();
     const agentDisplayName = agent?.name || 'unknown';
     const statusPhase = agent?.state?.statusPhase || null;
@@ -2199,7 +2216,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.${koiMd
     // ── INVOCATION SYNTAX ───────────────────────────────────────────────────
     doc += '---\n';
     doc += 'To execute an action (intent MUST be an exact name from AVAILABLE ACTIONS):\n';
-    doc += '{ "actionType": "direct", "intent": "print", "message": "Hello" }\n\n';
+    doc += '{ "actionType": "direct", "intent": "<action_name>", "<param1>": "<value1>", "<param2>": "<value2>" }\n\n';
 
     if (delegateResources.length > 0) {
       const ex = delegateResources[0];

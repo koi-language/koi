@@ -56,11 +56,12 @@ export default {
       return { success: false, error: 'learn_fact: "key" and "value" are required' };
     }
 
-    // Reject non-project facts: intent tracking, context dumps, narrative summaries
-    const _rejectedKeys = new Set(['current_intent', 'initial_user_request', 'context']);
-    if (_rejectedKeys.has(key)) {
-      cliLogger.log('knowledge', `[${agent?.name || '?'}] REJECTED learn_fact: "${key}" is not a project fact`);
-      return { success: false, error: `"${key}" is not a project fact. learn_fact is only for reusable project knowledge (paths, tech stacks, config, etc.), not conversation context or user intent.` };
+    // Silently ignore non-project facts (intent tracking, context dumps, narrative summaries).
+    // Returning success prevents the LLM from wasting iterations retrying.
+    const _ignoredKeys = new Set(['current_intent', 'initial_user_request', 'context', 'user_request', 'task_intent', 'goal', 'objective']);
+    if (_ignoredKeys.has(key)) {
+      cliLogger.log('knowledge', `[${agent?.name || '?'}] Ignored learn_fact: "${key}" (not a project fact)`);
+      return { success: true, stored: false, message: 'Noted.' };
     }
 
     // Reject "other" category — forces the LLM to pick a real category

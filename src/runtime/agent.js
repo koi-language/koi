@@ -891,17 +891,11 @@ export class Agent {
 
           // Per-delegate timeout: if a delegate hangs (no LLM response, stuck permission, etc.)
           // it should not block the entire parallel group forever.
-          const PARALLEL_DELEGATE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
           const parallelResults = await Promise.all(group.map(async (pa) => {
             const paIntent = pa.intent || pa.type || 'unknown';
             cliLogger.log('action', `${this.name}: Starting parallel delegate: ${paIntent}`);
             try {
-              const delegatePromise = this._executeAction(pa, pa, session.actionContext);
-              const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`Parallel delegate "${paIntent}" timed out after ${PARALLEL_DELEGATE_TIMEOUT_MS / 1000}s`)), PARALLEL_DELEGATE_TIMEOUT_MS)
-              );
-              const { result } = await Promise.race([delegatePromise, timeoutPromise]);
+              const { result } = await this._executeAction(pa, pa, session.actionContext);
               if (pa.id) {
                 session.actionContext[pa.id] = { output: result };
               }

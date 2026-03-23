@@ -601,7 +601,7 @@ export class KoiTranspiler {
   _compileComposeTemplate(template, fragmentNames) {
     const lines = template.split('\n');
     const jsLines = [
-      'const { args, state, agentName, userMessage } = context || {};',
+      'const { args, state, agentName, userMessage, nonInteractive } = context || {};',
       'const __parts = [];',
       'const __images = [];',
       'const __str = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);'
@@ -666,6 +666,21 @@ export class KoiTranspiler {
         } else {
           jsLines.push(`} else {`);
         }
+        continue;
+      }
+
+      // } @else { on the same line
+      if (/^\}\s*@else\s*\{$/.test(trimmed)) {
+        flushText();
+        jsLines.push(`} else {`);
+        continue;
+      }
+
+      // } @else if (...) { on the same line
+      const sameLineElseIfMatch = trimmed.match(/^\}\s*@else\s+if\s*\((.+)\)\s*\{$/);
+      if (sameLineElseIfMatch) {
+        flushText();
+        jsLines.push(`} else if (${sameLineElseIfMatch[1]}) {`);
         continue;
       }
 

@@ -61,6 +61,7 @@
     "@mozilla/readability": "^0.6.0",
     "apache-arrow": "^17.0.0",
     "better-sqlite3": "^11.8.1",
+    "croner": "^10.0.1",
     "crypto-js": "^4.2.0",
     "dotenv": "^17.2.3",
     "keyv": "^5.1.1",
