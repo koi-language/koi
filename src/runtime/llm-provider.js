@@ -535,7 +535,7 @@ export class LLMProvider {
     const taskDescription = [
       agentName ? `Agent: ${agentName}` : '',
       playbookText ? `Role: ${playbookText}` : '',
-      args ? 'Task: ' + JSON.stringify(args).substring(0, 400) : '',
+      args ? 'Task: ' + JSON.stringify(args) : '',
     ].filter(Boolean).join('\n');
 
     const prompt = `Reply ONLY with valid JSON (no markdown in the output):
