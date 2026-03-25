@@ -31,7 +31,7 @@ import { cliLogger } from '../cli-logger.js';
 
 // ── Re-export from auto-model-selector (circuit breaker, provider discovery) ─
 // These are consumed by llm-provider.js for error handling.
-export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE } from '../auto-model-selector.js';
+export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE, getAllCandidates } from '../auto-model-selector.js';
 import { selectAutoModel } from '../auto-model-selector.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ import { selectAutoModel } from '../auto-model-selector.js';
  * @param {'llm'|'embedding'|'search'|'image'|'audio'|'video'} req.type
  *
  * --- LLM-specific fields ---
- * @param {string}   [req.taskType]         - 'code' | 'planning' | 'reasoning' | 'speed'
+ * @param {string}   [req.taskType]         - 'code' | 'reasoning' | 'speed'
  * @param {number}   [req.difficulty]       - 1-10
  * @param {boolean}  [req.requiresImage]    - Needs vision-capable model
  * @param {Object}   [req.session]          - Agent session (for difficulty boost calculation)
@@ -77,7 +77,7 @@ export function resolve(req) {
 
 function _resolveLLM(req) {
   const {
-    taskType = 'code', difficulty: baseDifficulty = 5, requiresImage = false,
+    taskType = 'code', difficulty: baseDifficulty = 50, profile = null, requiresImage = false,
     session, agentName, availableProviders, clients,
     temperature, maxTokens, minContextK = 0
   } = req;
@@ -117,10 +117,10 @@ function _resolveLLM(req) {
 
   // ── Calculate effective difficulty with boosts ──────────────────────────
   const boosts = session ? _calculateDifficultyBoosts(session) : { total: 0, parts: [] };
-  const effectiveDifficulty = Math.min(10, baseDifficulty + boosts.total);
+  const effectiveDifficulty = Math.min(100, baseDifficulty + boosts.total);
 
   // ── Select best model ──────────────────────────────────────────────────
-  const selected = selectAutoModel(taskType, effectiveDifficulty, availableProviders, { requiresImage, minContextK });
+  const selected = selectAutoModel(taskType, effectiveDifficulty, availableProviders, { requiresImage, minContextK, profile });
   if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
   const provider = selected.provider;
   const model    = selected.model;
@@ -129,13 +129,16 @@ function _resolveLLM(req) {
   // ── Log selection ──────────────────────────────────────────────────────
   const boostNote = boosts.total > 0 ? ` [escalated +${boosts.total}: ${boosts.parts.join(', ')}]` : '';
   const thinkingNote = useThinking ? ' [thinking]' : '';
-  cliLogger.log('llm', `[auto] ${agentName || 'agent'} → ${provider}/${model}${thinkingNote} | ${taskType}:${effectiveDifficulty}/10${boostNote}`);
+  const scoreNote = profile?.code != null
+    ? `code:${profile.code}/100, reasoning:${profile.reasoning}/100`
+    : `${taskType}:${effectiveDifficulty}/100`;
+  cliLogger.log('llm', `[auto] ${agentName || 'agent'} → ${provider}/${model}${thinkingNote} | ${scoreNote}${boostNote}`);
   if (process.env.KOI_DEBUG_LLM) {
-    console.error(`[Auto] ${agentName || 'agent'} → ${provider}/${model} (${taskType} ${effectiveDifficulty}/10${boostNote})`);
+    console.error(`[Auto] ${agentName || 'agent'} → ${provider}/${model} (${taskType} ${effectiveDifficulty}/100${boostNote})`);
   }
 
-  // ── Show model in footer ───────────────────────────────────────────────
-  cliLogger.setInfo('model', model);
+  // ── Show model in footer (only for named agents, not background tasks) ──
+  if (agentName) cliLogger.setInfo('model', model);
 
   // ── Create instance ────────────────────────────────────────────────────
   // In gateway mode, all providers route through the OpenAI-compatible gateway.
@@ -367,7 +370,8 @@ export function _calculateDifficultyBoosts(session) {
       _sameErrorCount++;
     }
   }
-  const difficultyBoost = _sameErrorCount >= 3 ? Math.min(Math.floor(_sameErrorCount / 3), 3) : 0;
+  // Boost on 1-100 scale: each escalation step adds ~5 points
+  const difficultyBoost = _sameErrorCount >= 3 ? Math.min(Math.floor(_sameErrorCount / 3) * 5, 15) : 0;
   if (difficultyBoost > 0) parts.push(`same error ×${_sameErrorCount}`);
 
   // ── Loop boost (set externally) ────────────────────────────────────────
@@ -380,7 +384,7 @@ export function _calculateDifficultyBoosts(session) {
     e => e.error || (e.result?.success === false && e.result.error)
   ).length;
   const failRateBoost = (_recentWindow.length >= 5 && _recentFailCount >= Math.ceil(_recentWindow.length * 0.6))
-    ? Math.min(Math.floor(_recentFailCount / 3), 2)
+    ? Math.min(Math.floor(_recentFailCount / 3) * 5, 10)
     : 0;
   if (failRateBoost > 0) parts.push(`fail-rate ${_recentFailCount}/${_recentWindow.length}`);
 

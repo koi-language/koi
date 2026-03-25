@@ -374,14 +374,12 @@ Commands that launch long-running processes MUST use "background": true. Example
   ],
 
   async * execute(action, agent) {
-    const { command, description, cwd, background = false, timeout: timeoutMs = 120000, stream_interval = 30000 } = action;
+    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, stream_interval = 30000 } = action;
 
     if (!command) {
       throw new Error('shell: "command" field is required');
     }
-    if (!description) {
-      throw new Error('shell: "description" field is required');
-    }
+    const description = _desc || command;
 
     const _cmdFull = command.split('\n')[0];
     const cmdPreview = _cmdFull.length > 60 ? _cmdFull.substring(0, 60) + '...' : _cmdFull;
@@ -760,7 +758,7 @@ Commands that launch long-running processes MUST use "background": true. Example
           const outputSoFar = Buffer.concat(outputChunks).toString();
           const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-          if (_inputNeededInfo) {
+          if (_inputNeededInfo && !isClosed) {
             const info = _inputNeededInfo;
             _inputNeededInfo = null;
             // Block re-triggering while the agent is deciding.
@@ -775,7 +773,8 @@ Commands that launch long-running processes MUST use "background": true. Example
               command: cmdPreview
             };
             _passwordPending = false;
-            if (agentAnswer != null && !isClosed) {
+            _inputNeededInfo = null;
+            if (agentAnswer != null && !isClosed && proc) {
               cliLogger.log('shell', `[agent-input] writing answer to stdin`);
               // If answer is just "\n" (Enter for menu selection), don't add extra newline
               const _stdinData = agentAnswer.endsWith('\n') ? agentAnswer : agentAnswer + '\n';

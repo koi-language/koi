@@ -115,6 +115,30 @@ Do not print a question separately before prompt_user.`,
       }
     }
 
+    // Quota exceeded prompt — _quota_options have { key, label, action, url }
+    const isQuota = action._quota_exceeded || action.data?._quota_exceeded;
+    const quotaOptions = action._quota_options || action.data?._quota_options;
+    if (isQuota && quotaOptions && Array.isArray(quotaOptions)) {
+      const msg = action.message || action.data?.message || 'Choose an option:';
+      const labels = quotaOptions.map(o => o.label);
+      const selected = await cliSelect(msg, labels.map((l, i) => ({ title: l, value: i })), 0);
+      const chosen = quotaOptions[selected ?? 0];
+
+      if (chosen?.action === 'open_url' && chosen.url) {
+        try {
+          const { exec } = await import('child_process');
+          const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+          exec(`${cmd} "${chosen.url}"`);
+        } catch {}
+      } else if (chosen?.action === 'print') {
+        cliLogger.print(renderMarkdown(chosen.text || ''));
+      } else if (chosen?.action === 'exit') {
+        process.exit(0);
+      }
+      // Return empty answer so agent goes back to prompt_user (waiting for user input)
+      return { answer: '' };
+    }
+
     // If options are provided, show interactive menu
     if (options && Array.isArray(options) && options.length > 0) {
       // Require a visible question when showing a select menu — without it the

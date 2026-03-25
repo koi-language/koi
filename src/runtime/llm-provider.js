@@ -21,7 +21,7 @@ import { actionRegistry } from './action-registry.js';
 import { classifyFeedback, classifyResponse } from './context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
 import { renderLine, renderTable } from './cli-markdown.js';
-import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
+import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -295,11 +295,11 @@ export class LLMProvider {
    */
   /**
    * Resolve the best model for a given task via the factory.
-   * @param {string} taskType - 'code' | 'planning' | 'reasoning' | 'speed'
+   * @param {string} taskType - 'code' | 'reasoning' | 'speed'
    * @param {number} [difficulty=5] - 1-10
    * @returns {{ instance, provider, model, useThinking }}
    */
-  _resolveModel(taskType, difficulty = 5, opts = {}) {
+  _resolveModel(taskType, difficulty = 50, opts = {}) {
     const clients = this.getClients();
     return resolveModel({
       type: 'llm',
@@ -511,8 +511,8 @@ export class LLMProvider {
 
   async executePlanning(prompt) {
     try {
-      // Use factory to pick the best planning model
-      const _plan = this._resolveModel('planning', 7, { temperature: 0, maxTokens: 800 });
+      // Use factory to pick the best reasoning model for planning tasks
+      const _plan = this._resolveModel('reasoning', 65, { temperature: 0, maxTokens: 800 });
       const llm = _plan.instance;
 
       const { text } = await llm.complete([
@@ -528,7 +528,7 @@ export class LLMProvider {
 
   /**
    * Classify a task using the fastest/cheapest available model.
-   * Returns { taskType: 'code'|'planning'|'reasoning', difficulty: 1-10 }.
+   * Returns { taskType: 'code'|'reasoning', difficulty: 1-10 }.
    * Falls back to keyword heuristic if the LLM call fails.
    */
   async _inferTaskProfile(playbookText, args, agentName) {
@@ -538,105 +538,134 @@ export class LLMProvider {
       args ? 'Task: ' + JSON.stringify(args) : '',
     ].filter(Boolean).join('\n');
 
-    const prompt = `Reply ONLY with valid JSON (no markdown in the output):
-{"taskType":"code"|"planning"|"reasoning","difficulty":1-10}
+    const prompt = `Return ONLY valid JSON using this exact shape:
+{"code":0-100,"reasoning":0-100}
 
-## TASK TYPE
+Score how much coding ability and reasoning ability this task requires.
 
-- **"code"**: writing, editing, debugging, refactoring, analysing or generating code, scripts, queries, configs, tests, or file operations. Includes implementation tasks even if design is required. **Also includes exploring, navigating, searching, or reading a codebase** — any task that requires understanding source code to produce results, even if no code is written. An agent named "Explorer" or tasked with "find where X is implemented" is ALWAYS "code".
-- **"planning"**: system design, architecture, task decomposition, requirement analysis, specifications, workflows or strategy definition — when NO code is produced.
-- **"reasoning"**: logic, math, research, classification, summarisation, comparison, or conceptual analysis that does NOT involve reading or understanding source code.
+- code = how much coding / programming / codebase-understanding skill is needed
+- reasoning = how much analysis / planning / diagnosis / judgment is needed
 
-If multiple apply, choose the dominant expected output. Producing code → always "code". Reading/exploring code → always "code".
+Score both independently.
+Both can be high, both can be low, or one can be high and the other low.
 
-## DIFFICULTY
+CALIBRATION — most tasks are 40-60. Only score 70+ for genuinely complex work.
+- 80+ means "very complex" — multi-file refactors, race conditions, architecture redesigns. Most tasks are NOT this hard.
+- A typical "add a feature" or "fix a bug" task is 50-60, not 70-80.
+- Planning/exploration tasks are usually reasoning 40-60, not 70+.
+- Only score 70+ if the task genuinely involves deep complexity, multiple interacting systems, or high risk.
+- Do not average the two scores together. Judge them independently.
+- Prefer multiples of 10. Use other numbers only if truly needed.
 
-Code tasks are inherently complex. Most real programming tasks are 7+.
+Scale guide:
+- 0-10: almost none
+- 20: trivial
+- 30: very simple
+- 40: simple but requires some understanding
+- 50: moderate
+- 60: substantial
+- 70: complex
+- 80: very complex
+- 90: expert
+- 100: top-end expert / frontier difficulty
 
-- **1-2 trivial** — echo a value, list files, read a single config key
-- **3-4 easy** — change a string/label/constant, rename a variable, fix a typo, add a log line
-- **5-6 moderate** — implement a self-contained function or script with no existing codebase to understand; build a simple landing page or basic CRUD app from scratch
-- **7 standard** — ANY task that requires reading and understanding existing code before making changes; add a feature to an existing module; fix a non-obvious bug in an existing system; integrate a new library into an existing project
-- **8 hard** — multi-file refactor; changes that ripple across several modules; implement a non-trivial algorithm; debug a subtle race condition or state issue; design and implement a new subsystem within an existing architecture
-- **9-10 legendary (rare)** — distributed systems, compilers, cryptography, kernel/low-level, novel research, formal proofs
+Examples:
+- "rename a variable" -> {"code":20,"reasoning":10}
+- "fix a typo in a label" -> {"code":20,"reasoning":10}
+- "change a button color" -> {"code":20,"reasoning":10}
+- "write a SQL query to list active users from one table" -> {"code":40,"reasoning":20}
+- "add basic form validation to a signup page" -> {"code":50,"reasoning":30}
+- "create a small Python script to rename files in a folder" -> {"code":50,"reasoning":30}
+- "implement pagination in an existing table" -> {"code":50,"reasoning":40}
+- "tell me the weather" -> {"code":0,"reasoning":10}
+- "summarize this article" -> {"code":0,"reasoning":30}
+- "compare these two pricing plans" -> {"code":0,"reasoning":40}
+- "research the best approach for email verification" -> {"code":10,"reasoning":60}
+- "explore the codebase and find where auth is implemented" -> {"code":60,"reasoning":40}
+- "find where this API endpoint is called and explain the flow" -> {"code":60,"reasoning":50}
+- "fix a bug in an existing React component" -> {"code":60,"reasoning":50}
+- "add a settings page to the backoffice with a new DB table" -> {"code":60,"reasoning":50}
+- "integrate Stripe payments into an existing app" -> {"code":70,"reasoning":60}
+- "debug why login sometimes fails in production" -> {"code":70,"reasoning":70}
+- "fix a race condition in concurrent API requests" -> {"code":80,"reasoning":70}
+- "refactor the entire auth flow across 10 files" -> {"code":80,"reasoning":70}
+- "migrate a large Node.js codebase from JavaScript to TypeScript" -> {"code":80,"reasoning":70}
+- "design a multi-tenant architecture with isolation" -> {"code":60,"reasoning":90}
+- "design a zero-downtime migration strategy for a live payment system" -> {"code":70,"reasoning":90}
+- "implement distributed locking across services" -> {"code":90,"reasoning":80}
+- "build a static analyzer using AST traversal" -> {"code":90,"reasoning":80}
+- "design a CRDT for collaborative editing" -> {"code":90,"reasoning":90}
+- "create a compiler for a new programming language" -> {"code":100,"reasoning":90}
 
-**KEY RULE**: if the agent must first explore or read the codebase to understand context, minimum difficulty is 7. Greenfield code (no existing codebase) may be 5-6.
+Task:
 
-## ADJUSTMENTS
-
-Increase difficulty (+1 to +2) if:
-- High ambiguity or underspecified requirements
-- Security-sensitive logic
-- Strict correctness guarantees or complex edge cases
-- Concurrency, distributed state, or performance-critical constraints
-
-Default to **7** for code tasks when unsure.
-Use **9-10** only for genuinely expert-level tasks.
-
-## PROGRAMMING EXAMPLES
-
-**6** — Add a loading spinner to existing API calls without breaking layout · Fix a mobile CSS overflow issue in a production page · Add client-side form validation to an existing form · Implement pagination in an already working list view · Add sorting to a table component · Extract duplicated frontend logic into a shared utility · Add a confirmation modal before delete actions · Introduce basic unit tests into an untested component · Add debouncing to a search input · Fix a minor state synchronization bug
-
-**7** — Refactor a 500+ LOC React component into smaller components · Introduce TypeScript gradually into a JS frontend · Fix a race condition in concurrent API requests · Add optimistic UI updates with rollback on failure · Implement code splitting to reduce bundle size · Add JWT authentication middleware to an API · Optimize a slow SQL query with proper indexing · Implement rate limiting using Redis · Add background job processing with retry logic · Containerize an existing application with Docker
-
-**8** — Migrate class-based React components to hooks · Remove jQuery from a legacy frontend without regressions · Improve Lighthouse score from 60 to 90+ · Add full accessibility compliance (WCAG AA) · Introduce caching layer without breaking consistency · Implement distributed locking mechanism · Design a plugin system with dynamic module loading · Implement SSR with proper hydration handling · Add observability (logs + metrics + tracing) to a backend · Build a GraphQL gateway aggregating multiple services
-
-**9** — Replace REST calls with GraphQL in a production frontend · Design event-driven architecture with outbox pattern · Implement idempotent webhook processing · Build a real-time dashboard using WebSockets · Implement deep linking with routing + attribution (mobile) · Design zero-downtime database migration strategy · Build a scalable ETL pipeline with incremental loads · Implement collaborative editing backend (presence + patches) · Introduce multi-tenant isolation with per-tenant encryption · Implement vector search with embeddings + reranking
-
-**10** — Implement a CRDT for distributed state synchronization · Build a distributed task scheduler with fault tolerance · Design a multi-tenant architecture with strict isolation guarantees · Implement end-to-end encrypted messaging protocol · Build a horizontally scalable API gateway with dynamic routing · Create a static code analyzer with AST parsing and rule engine · Implement a custom ORM abstraction layer · Design a distributed tracing system from scratch · Build a micro-frontend platform with shared runtime · Implement a fault-tolerant distributed queue with exactly-once semantics
-
----
-
-Classify the following task:
 ${taskDescription}`;
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
 
-    // Use factory to pick the cheapest/fastest model for classification
-    let _resolved;
-    try {
-      _resolved = this._resolveModel('speed', 1);
-    } catch { _resolved = null; }
-    const _candidates = _resolved
-      ? [{ client: this._getClient(_resolved.provider), model: _resolved.model, provider: _resolved.provider }]
-      : [];
+    // Get ALL candidate models sorted by cost (cheapest first), try each until one works
+    // Classification needs a model that can follow instructions and return valid JSON.
+    const _allModels = getAllCandidates('reasoning', 30, this._availableProviders || getAvailableProviders());
+    const _candidates = _allModels.map(c => ({
+      client: this._getClient(c.provider),
+      model: c.model,
+      provider: c.provider,
+    }));
 
     if (_candidates.length === 0) {
-      if (_debug) console.error(`[Auto] No client for classification — using default profile`);
+      cliLogger.log('llm', `[classify] No models available for classification — default profile`);
       return DEFAULT_TASK_PROFILE;
     }
+    cliLogger.log('llm', `[classify] ${_candidates.length} candidate models: ${_candidates.map(c => c.model).join(', ')}`);
 
     const _timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms));
+    cliLogger.log('llm', `[classify] Using ${_candidates[0].model} for classification`);
 
     // Skip classification for startup (empty args) — no task to classify yet
     const _hasTask = args && Object.keys(args).length > 0;
     if (!_hasTask) {
-      if (_debug) console.error(`[Auto] No task args — using default profile`);
+      cliLogger.log('llm', `[classify] No task args — default profile ${DEFAULT_TASK_PROFILE.taskType}:${DEFAULT_TASK_PROFILE.difficulty}`);
       return DEFAULT_TASK_PROFILE;
     }
 
     for (const candidate of _candidates) {
-      if (_debug) console.error(`[Auto] Classifying with ${candidate.model}...`);
+      cliLogger.log('llm', `[classify] Trying ${candidate.model}...`);
       try {
-        const llm = createLLM(candidate.provider, candidate.client || this._ac, candidate.model, { temperature: 0, maxTokens: 50 });
+        // Force Chat Completions API (not Responses) — classification is a simple JSON call
+        const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
+        const { OpenAIChatLLM } = await import('./providers/openai.js');
+        const llm = new OpenAIChatLLM(candidate.client, candidate.model, { temperature: 0, maxTokens: 200, useThinking: false, caps: {} });
         const apiCall = llm.complete([{ role: 'user', content: prompt }]).then(r => r);
-        const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(3000)]);
+        const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(8000)]);
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
         costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
-        if (_debug) console.error(`[Auto] Classification: ${content} (${inputTokens}↑ ${outputTokens}↓)`);
+        cliLogger.log('llm', `[classify] Raw response: ${content.substring(0, 200)}`);
         const _stripped = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
         const json = JSON.parse(_stripped);
-        if (json.taskType && json.difficulty) {
-          const profile = { taskType: json.taskType, difficulty: Math.min(10, Math.max(1, Number(json.difficulty))) };
-          if (_debug) console.error(`[Auto] Profile: ${profile.taskType} difficulty=${profile.difficulty}/10`);
+        // New format: { code: 0-100, reasoning: 0-100 }
+        if (json.code != null && json.reasoning != null) {
+          const codeScore = Math.min(100, Math.max(0, Number(json.code)));
+          const reasoningScore = Math.min(100, Math.max(0, Number(json.reasoning)));
+          // Primary task type = whichever dimension scores higher
+          const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
+          // Difficulty = the higher of the two (the model needs to be at least this capable)
+          const difficulty = Math.max(codeScore, reasoningScore);
+          const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore };
+          cliLogger.log('llm', `[classify] Result: code=${codeScore} reasoning=${reasoningScore} → ${taskType}:${difficulty}/100`);
           return profile;
         }
-        if (_debug) console.error(`[Auto] Invalid shape from ${candidate.model}, trying next...`);
+        // Legacy format: { taskType, difficulty }
+        if (json.taskType && json.difficulty) {
+          const profile = { taskType: json.taskType, difficulty: Math.min(100, Math.max(1, Number(json.difficulty))) };
+          cliLogger.log('llm', `[classify] Result (legacy): ${profile.taskType} difficulty=${profile.difficulty}/100`);
+          return profile;
+        }
+        cliLogger.log('llm', `[classify] Invalid shape from ${candidate.model}: ${JSON.stringify(json)}`);
       } catch (e) {
-        if (_debug) console.error(`[Auto] ${candidate.model} failed: ${e.message} — trying next...`);
+        cliLogger.log('llm', `[classify] ${candidate.model} failed: ${e.message}`);
       }
     }
-    if (_debug) console.error(`[Auto] All candidates failed — using default profile`);
+    cliLogger.log('llm', `[classify] All candidates failed — default profile ${DEFAULT_TASK_PROFILE.taskType}:${DEFAULT_TASK_PROFILE.difficulty}`);
     return DEFAULT_TASK_PROFILE;
   }
 
@@ -653,7 +682,7 @@ ${taskDescription}`;
 
     let response;
     try {
-      const _resolved = this._resolveModel('speed', 3);
+      const _resolved = this._resolveModel('speed', 10);
       const llm = _resolved.instance;
       const { text } = await llm.complete([
         { role: 'system', content: 'Return ONLY valid JSON. No markdown, no explanations.' },
@@ -765,8 +794,8 @@ ${taskDescription}`;
     cliLogger.planning(planningPrefix ? `${planningPrefix} \x1b[38;2;185;185;185m${_hint}\x1b[0m` : _hint);
     cliLogger.log('llm', `Reactive call: ${agentName} (iteration ${session.iteration + 1}, firstCall=${isFirstCall})`);
 
-    // Age memories each iteration
-    await contextMemory.tick();
+    // Age memories each iteration (fire-and-forget — don't block the agent)
+    contextMemory.tick().catch(() => {});
 
     // Rebuild the system prompt when:
     // - First call or no history yet (fresh/resumed session), OR
@@ -954,19 +983,44 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     // two delegates share the same LLMProvider in parallel: the first to finish would
     // restore this.provider='auto', corrupting the state for the second mid-stream.
     if (this._autoMode) {
-      // Ensure remote models are loaded in gateway mode (retries if initial load failed)
-      if (this._koiGateway) await loadRemoteModels();
+      // Ensure remote models are loaded (gateway mode or dev mode with local backend)
+      await loadRemoteModels();
 
       const _lastAction = session.actionHistory.at(-1);
       const _isDelegateReturn = _lastAction?.action?.actionType === 'delegate';
-      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn;
+      const _isDefaultProfile = session._autoProfile?.difficulty === DEFAULT_TASK_PROFILE.difficulty && session._autoProfile?.taskType === DEFAULT_TASK_PROFILE.taskType;
+      const _hasUserInput = session.actionHistory.some(e => e.action?.intent === 'prompt_user' && e.result?.answer);
+      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || (_isDefaultProfile && _hasUserInput);
 
       if (_shouldReclassify) {
-        session._autoProfile = await this._inferTaskProfile(agent?.description, context?.args, agentName);
+        // Build classification context from: args, user message, or pending tasks
+        let _classifyArgs = context?.args && Object.keys(context.args).length > 0 ? context.args : null;
+        // System/coordinator agent always needs a capable model (min code:65, reasoning:60)
+        // — it coordinates, delegates, and interprets results. Weak models loop endlessly.
+        const _isCoordinator = agent?.hasPermission?.('delegate');
+        if (_isCoordinator && !_classifyArgs) {
+          session._autoProfile = { taskType: 'code', difficulty: 65, code: 65, reasoning: 60 };
+          cliLogger.log('llm', `[classify] Coordinator agent — min profile code:65, reasoning:60`);
+        } else {
+        if (!_classifyArgs && agent?._lastUserMessage) {
+          _classifyArgs = { userRequest: agent._lastUserMessage };
+        }
+        if (!_classifyArgs) {
+          // Check for pending tasks — use them as classification context
+          try {
+            const { taskManager: _tm } = await import('./task-manager.js');
+            const _pending = _tm.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
+            if (_pending.length > 0) {
+              _classifyArgs = { pendingTasks: _pending.map(t => t.subject).join('; ') };
+            }
+          } catch {}
+        }
+        session._autoProfile = await this._inferTaskProfile(agent?.description, _classifyArgs, agentName);
         if (process.env.KOI_DEBUG_LLM) {
           const _reason = isFirstCall ? 'first call' : _isDelegateReturn ? 'delegate returned' : 'no cached profile';
           console.error(`[Auto] Reclassifying (${_reason})`);
         }
+        } // close else from coordinator check
       }
       const profile = session._autoProfile;
 
@@ -984,6 +1038,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         type: 'llm',
         taskType: profile.taskType,
         difficulty: profile.difficulty,
+        profile,
         requiresImage: _requiresImage,
         session,
         agentName,
@@ -1363,7 +1418,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       // on every retry iteration — the agent would otherwise loop forever with the same error.
       if (this._autoMode) {
         const _status = _callErr.status ?? _callErr.statusCode;
-        // 429 = rate limit — put provider on cooldown so auto-selector picks another model.
+        // 429 = rate limit — put provider on cooldown
         if (_status === 429) {
           markProviderTimeout(this.provider);
         }
@@ -1775,6 +1830,15 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     const agentDisplayName = agent?.name || 'unknown';
     const statusPhase = agent?.state?.statusPhase || null;
     const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
+    // User language — set by System agent via update_state, propagated via globalThis
+    const stateLanguage = agent?.state?.userLanguage;
+    if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
+    const userLanguage = globalThis.__koiUserLanguage || '';
+    const langField = userLanguage ? `\n| User language | ${userLanguage} |` : '';
+
+    // Timezone (IANA)
+    let timezone = '';
+    try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
 
     // ── Phase system explanation (only when agent uses phases) ──
     const phaseSystemBlock = statusPhase ? `
@@ -1819,7 +1883,7 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 - Example: for chess analysis, install stockfish or python-chess. For math proofs, use sympy. For image processing, use python libraries. Never try to solve domain-specific problems from memory alone.
 
 **VERIFY DATA EXTRACTED FROM IMAGES:**
-- When you extract structured data from an image (positions, numbers, text, coordinates), ALWAYS verify it programmatically before using it.
+- When you extract spacial data from an image (positions, coordinates, ...), ALWAYS verify it programmatically before using it.
 - If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, include the image file path so the delegate can re-read it if the extracted data is wrong.' : ''}
 ` : '';
 
@@ -1830,9 +1894,12 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 |---|---|
 | Working directory | \`${cwd}\` |
 | Timestamp | ${now} |
-| Agent | ${agentDisplayName} |${phaseField}
+| Timezone | ${timezone || 'unknown'} |
+| Agent | ${agentDisplayName} |${langField}${phaseField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
+
+**LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
 ${nonInteractiveBlock}
 
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.

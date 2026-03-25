@@ -692,6 +692,22 @@ export class Agent {
     }
 
     while (!session.isTerminated) {
+      // Detect shell command loop: same shell command repeated and failing = stuck
+      if (session.actionHistory.length >= 2) {
+        const _prev = session.actionHistory.at(-1);
+        const _prev2 = session.actionHistory.at(-2);
+        if (_prev?.action?.intent === 'shell' && _prev2?.action?.intent === 'shell'
+          && _prev.action.command && _prev.action.command === _prev2.action.command
+          && (_prev.error || _prev.result?.success === false || _prev.result?.exitCode > 0)) {
+          cliLogger.log('agent', `${this.name}: Blocked shell retry — same command failed twice: "${_prev.action.command.substring(0, 80)}"`);
+          contextMemory.add('user',
+            `You ran the shell command "${_prev.action.command}" and it FAILED twice in a row with the same result. Running it again will fail again. You MUST: (1) diagnose WHY it failed by reading the error output, (2) fix the underlying cause, or (3) try a completely different approach. If you are stuck, ask the user for help via prompt_user.`,
+            `Blocked shell retry: ${_prev.action.command.substring(0, 60)}`,
+            null
+          );
+        }
+      }
+
       // If stuck on too many consecutive errors, pivot before giving up.
       // Inject a "try completely different approach" message and reset counters.
       // After 3 pivots, break out and let recovery handle it.
@@ -808,6 +824,7 @@ export class Agent {
           cliLogger.log('agent', `${this.name}: No LLM providers — stopping`);
           break;
         }
+
 
         const modelId = this.llmProvider?.model ?? '?';
         const providerId = this.llmProvider?.provider ?? '?';
@@ -1165,6 +1182,14 @@ export class Agent {
 
         // EXECUTE ACTION
         try {
+          // Update hint BEFORE execution so the user sees what's about to happen
+          const actionDef = actionRegistry.get(intent);
+          if (actionDef?.thinkingHint) {
+            thinkingHint = typeof actionDef.thinkingHint === 'function' ? actionDef.thinkingHint(action) : actionDef.thinkingHint;
+          } else if (action.actionType === 'delegate') {
+            const _agentKey = intent.split('::')[0];
+            thinkingHint = `Delegating to ${_agentKey.charAt(0).toUpperCase() + _agentKey.slice(1)}`;
+          }
           cliLogger.planning(buildActionDisplay(this.name, action));
 
           let { result } = await this._executeAction(action, action, session.actionContext);
@@ -1188,19 +1213,21 @@ export class Agent {
             cliLogger.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             // Track user message for compose template {{userMessage}} variable
             this._lastUserMessage = result?.answer || null;
+
             // Share with session tracker so delegate commits can also use the user's request
             if (sessionTracker && this._lastUserMessage) {
               sessionTracker._lastUserRequest = this._lastUserMessage;
             }
 
-            // Clear stale tasks from previous requests.
-            // A new user message = fresh task context. Old pending tasks should
-            // not block or confuse the processing of the new request.
+            // Clear completed tasks on new user input (keeps the slate clean).
+            // Do NOT clear pending/in-progress tasks — the user may be continuing
+            // work from a resumed session or referring to existing tasks.
             try {
               const { taskManager: _tmCleanup } = await import('./task-manager.js');
-              const _staleTasks = _tmCleanup.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
-              if (_staleTasks.length > 0) {
-                cliLogger.log('agent', `${this.name}: Clearing ${_staleTasks.length} stale task(s) on new user input`);
+              const _allTasks = _tmCleanup.list();
+              const _allCompleted = _allTasks.length > 0 && _allTasks.every(t => t.status === 'completed');
+              if (_allCompleted) {
+                cliLogger.log('agent', `${this.name}: Clearing ${_allTasks.length} completed task(s) on new user input`);
                 _tmCleanup.reset();
               }
               // Reset recovery counter for the new request
@@ -3034,6 +3061,16 @@ Be specific and concise. Never ask the user for things you or the delegate can d
     const answer = (rawAnswer !== null && typeof rawAnswer === 'object')
       ? JSON.stringify(rawAnswer)
       : String(rawAnswer ?? '');
+
+    // If the parent's answer is empty/useless, escalate to the user as fallback
+    if (!answer || answer === '""' || answer === 'null' || answer === '{}') {
+      cliLogger.log('agent', `${this.name}: Empty answer for delegate question — escalating to user`);
+      cliLogger.clearProgress();
+      cliLogger.print(`\x1b[1m${delegateName}\x1b[0m asks: ${question}`);
+      const { cliInput } = await import('./cli-input.js');
+      const userAnswer = await cliInput('❯ ');
+      return typeof userAnswer === 'string' ? userAnswer : (userAnswer?.text ?? String(userAnswer ?? ''));
+    }
 
     cliLogger.print(`💬 ${this.name} responds to ${delegateName}: \x1b[2m${answer}\x1b[0m`);
     return answer;

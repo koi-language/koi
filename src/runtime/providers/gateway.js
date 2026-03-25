@@ -151,7 +151,9 @@ export class GatewaySearch extends BaseSearch {
       throw new Error(`Gateway search error (${res.status}): ${body}`);
     }
 
-    return res.json();
+    const data = await res.json();
+    // Backend returns a flat array; wrap in { results } for consistency with other providers
+    return { results: Array.isArray(data) ? data : (data.results || []) };
   }
 }
 

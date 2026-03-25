@@ -10,40 +10,71 @@
 
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
-const localModelsData = _require('./models.json');
+
+/**
+ * models.json is ONLY used as a fallback when running with direct API keys
+ * and no backend is available. In gateway mode, models always come from the backend.
+ */
+let _localModelsData = null;
+function _getLocalFallback() {
+  if (!_localModelsData) {
+    try { _localModelsData = _require('./models.json'); } catch { _localModelsData = {}; }
+  }
+  return _localModelsData;
+}
 
 /** Active models data — starts with local fallback, replaced by backend data when available. */
-let modelsData = localModelsData;
+let modelsData = process.env.KOI_AUTH_TOKEN ? {} : _getLocalFallback();
 
-/** Whether remote models have been loaded successfully. */
+/** ETag from last successful fetch — used for conditional requests. */
+let _remoteEtag = '';
+/** Whether initial load has completed. */
 let _remoteLoaded = false;
-/** Timestamp of last failed attempt — allows retry after cooldown. */
+/** Timestamp of last attempt — rate limits retries on failure. */
 let _remoteLastAttempt = 0;
-const _REMOTE_RETRY_MS = 30_000; // retry every 30s if failed
+const _REMOTE_RETRY_MS = 30_000; // retry every 30s on failure
+const _REMOTE_POLL_MS = 60_000;  // poll for changes every 60s
+let _pollTimer = null;
 
 /**
  * Fetch active models from the backend API.
- * Called at startup and periodically in gateway mode.
- * Falls back to local models.json on error but retries after cooldown.
+ * Uses ETag/If-None-Match to avoid downloading unchanged data.
+ * Starts a background poll timer on first successful load.
  */
 export async function loadRemoteModels() {
-  if (_remoteLoaded) return;
-  // Don't hammer the backend on repeated failures — wait before retrying
   const now = Date.now();
-  if (_remoteLastAttempt && now - _remoteLastAttempt < _REMOTE_RETRY_MS) return;
+  const isEmpty = Object.keys(modelsData).length === 0;
+  // Always retry if modelsData is empty (critical — no models = can't work)
+  if (!isEmpty) {
+    // Rate limit: don't hammer on repeated failures
+    if (!_remoteLoaded && _remoteLastAttempt && now - _remoteLastAttempt < _REMOTE_RETRY_MS) return;
+    // Skip if polled recently and already loaded
+    if (_remoteLoaded && _remoteLastAttempt && now - _remoteLastAttempt < _REMOTE_POLL_MS) return;
+  }
   _remoteLastAttempt = now;
 
   const base = (process.env.KOI_API_URL || 'http://localhost:3000');
+  // Gateway mode (KOI_AUTH_TOKEN): use /gateway/models (active models for this user)
+  // API keys mode: use /gateway/models.json (all models with complete scores)
+  const endpoint = process.env.KOI_AUTH_TOKEN ? '/gateway/models' : '/gateway/models.json';
   try {
-    const res = await fetch(`${base}/gateway/models`, {
-      headers: { 'Accept': 'application/json' },
+    const headers = { 'Accept': 'application/json' };
+    if (_remoteEtag) headers['If-None-Match'] = _remoteEtag;
+
+    const res = await fetch(`${base}${endpoint}`, {
+      headers,
       signal: AbortSignal.timeout(5000),
     });
+
+    // 304 Not Modified — models haven't changed, nothing to do
+    if (res.status === 304) return;
+
     if (res.ok) {
       const data = await res.json();
       if (data && typeof data === 'object' && Object.keys(data).length > 0) {
         modelsData = data;
         _remoteLoaded = true;
+        _remoteEtag = res.headers.get('etag') || '';
         if (process.env.KOI_LOG_FILE) {
           const count = Object.values(data).reduce((n, p) => n + Object.keys(p).length, 0);
           try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Loaded ${count} models from backend\n`); } catch {}
@@ -51,14 +82,27 @@ export async function loadRemoteModels() {
       }
     }
   } catch {
-    if (process.env.KOI_LOG_FILE) {
-      try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Failed to load remote models, using local models.json fallback\n`); } catch {}
+    // Backend unreachable — fall back to local models.json ONLY when using API keys directly
+    if (!_remoteLoaded && !process.env.KOI_AUTH_TOKEN) {
+      const fallback = _getLocalFallback();
+      if (Object.keys(fallback).length > 0) {
+        modelsData = fallback;
+        if (process.env.KOI_LOG_FILE) {
+          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend unreachable, using local models.json fallback (API keys mode)\n`); } catch {}
+        }
+      }
     }
+  }
+
+  // Start background polling after first successful load
+  if (_remoteLoaded && !_pollTimer) {
+    _pollTimer = setInterval(() => loadRemoteModels(), _REMOTE_POLL_MS);
+    if (_pollTimer.unref) _pollTimer.unref(); // don't prevent Node exit
   }
 }
 
 /** Default profile used as fallback when LLM classification is unavailable. */
-export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 5 };
+export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 50, code: 50, reasoning: 30 };
 
 // ── Circuit breaker: per-provider timeout cooldown ────────────────────────
 // After N consecutive timeouts, a provider is skipped for an escalating period.
@@ -103,11 +147,13 @@ function _looksLikeApiKey(val) {
 }
 
 export function getAvailableProviders() {
-  // Gateway mode: return providers that have models in the loaded data
+  // Gateway mode: return all providers from the backend model list
   if (process.env.KOI_AUTH_TOKEN) {
     return Object.keys(modelsData);
   }
 
+  // API keys mode: only providers the user has keys for
+  // Filter modelsData to only include providers with valid API keys
   const providers = [];
   if (_looksLikeApiKey(process.env.OPENAI_API_KEY))    providers.push('openai');
   if (_looksLikeApiKey(process.env.ANTHROPIC_API_KEY)) providers.push('anthropic');
@@ -116,10 +162,11 @@ export function getAvailableProviders() {
 }
 
 // Score boost when a thinking model is selected in thinking mode.
-// Thinking trades speed for quality: better reasoning/planning/code, slower.
-const THINKING_DELTA = { code: 1, planning: 2, reasoning: 2, speed: -2 };
+// No score boost for thinking — scores already reflect base capability without thinking.
+// Thinking only affects cost (more tokens consumed) and speed (slower).
+const THINKING_DELTA = { code: 0, reasoning: 0, speed: -20 };
 
-function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0) {
+function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0, profile = null) {
   const candidates = [];
   for (const provider of providers) {
     if (!skipCooldown && _isOnCooldown(provider)) continue;
@@ -133,25 +180,31 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
 
-      // Non-thinking variant (always added if score qualifies)
+      // Check if model meets BOTH code and reasoning requirements from the profile
+      const codeScore = caps.code ?? 0;
+      const reasoningScore = caps.reasoning ?? 0;
       const taskScore = caps[taskType] ?? 0;
-      if (taskScore >= difficulty) {
-        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 5, score: taskScore, useThinking: false });
+      const reqCode = profile?.code ?? 0;
+      const reqReasoning = profile?.reasoning ?? 0;
+      const meetsBoth = codeScore >= reqCode && reasoningScore >= reqReasoning;
+      // Fallback: if no profile with both scores, use single-dimension check
+      const meetsMinimum = (reqCode > 0 || reqReasoning > 0) ? meetsBoth : (taskScore >= difficulty);
+
+      // Non-thinking variant
+      if (meetsMinimum) {
+        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false });
       }
 
-      // Thinking variant: boosted scores, lower speed, higher effective cost.
-      // Thinking uses extra tokens for reasoning: the harder the problem, the more
-      // thinking tokens are consumed. Scale cost by difficulty so the selector
-      // naturally prefers non-thinking models for easy tasks and only picks
-      // thinking when the base model can't meet the difficulty threshold.
-      //   difficulty ≤7 → ×1.5 | 8 → ×2 | 9 → ×3 | ≥10 → ×4
-      if (caps.thinking) {
-        const thinkingScore = taskScore + (THINKING_DELTA[taskType] ?? 0);
-        if (thinkingScore >= difficulty) {
-          const thinkingSpeed = (caps.speed || 5) + THINKING_DELTA.speed;
-          const costMultiplier = difficulty <= 7 ? 1.5 : difficulty === 8 ? 2 : difficulty === 9 ? 3 : 4;
-          candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: thinkingScore, useThinking: true });
-        }
+      // Thinking variant: same score, slower, different cost.
+      // Cost strategy: thinking is cheaper for hard tasks, expensive for easy:
+      //   difficulty < 60  → don't offer thinking
+      //   difficulty 60-70 → ×3 cost
+      //   difficulty 70-80 → ×1.5 cost
+      //   difficulty > 80  → ×1 cost (same price)
+      if (caps.thinking && meetsMinimum && difficulty >= 60) {
+        const thinkingSpeed = Math.max(1, (caps.speed || 30) + THINKING_DELTA.speed);
+        const costMultiplier = difficulty <= 70 ? 3 : difficulty <= 80 ? 1.5 : 1;
+        candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: taskScore, useThinking: true });
       }
     }
   }
@@ -170,7 +223,7 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
       if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
       const taskScore = caps[taskType] ?? 0;
-      candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 5, score: taskScore, useThinking: false });
+      candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false });
     }
   }
   return candidates;
@@ -179,25 +232,25 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
 /**
  * Select the cheapest text-output model whose score for taskType >= difficulty.
  * For models with thinking capability, two virtual candidates are considered:
- * one without thinking (original scores) and one with thinking (code+1, planning+2,
+ * one without thinking (original scores) and one with thinking (code+1,
  * reasoning+2, speed-2). The winner may activate thinking mode.
  *
- * @param {'code'|'planning'|'reasoning'} taskType
- * @param {number} difficulty - 1 (trivial) to 10 (expert)
+ * @param {'code'|'reasoning'} taskType
+ * @param {number} difficulty - 1-100 (code/reasoning) or 1-10 (speed)
  * @param {string[]} availableProviders - providers with API keys
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
-export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, minContextK = 0 } = {}) {
-  // Code tasks require a minimum difficulty of 6 to ensure capable models are selected.
+export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, minContextK = 0, profile = null } = {}) {
+  // Code tasks require a minimum difficulty of 50 to ensure capable models are selected.
   // Cheap/fast models can't reliably generate structured output like unified diffs.
-  if (taskType === 'code') difficulty = Math.max(difficulty, 6);
+  if (taskType === 'code') difficulty = Math.max(difficulty, 50);
 
-  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK);
+  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, profile);
 
   // If all providers are on cooldown, ignore cooldowns and pick the best available
   // so we never block LLM calls entirely.
   if (candidates.length === 0) {
-    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK);
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK, profile);
   }
 
   // No model meets the difficulty threshold — pick the one with the highest score
@@ -225,4 +278,26 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
 
   const winner = candidates[0];
   return { provider: winner.provider, model: winner.model, useThinking: winner.useThinking };
+}
+
+/**
+ * Return ALL candidate models for a task, sorted by cost (cheapest first).
+ * Used by the classifier to try multiple models if the cheapest fails.
+ */
+export function getAllCandidates(taskType, difficulty, availableProviders) {
+  let candidates = _buildCandidates(availableProviders, taskType, difficulty, false, false, 0);
+  if (candidates.length === 0) {
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, false, true, 0);
+  }
+  if (candidates.length === 0) {
+    candidates = _buildAllCandidates(availableProviders, taskType, false, 0);
+  }
+  // Sort by cost, deduplicate by model name
+  candidates.sort((a, b) => a.totalCost - b.totalCost || b.speed - a.speed);
+  const seen = new Set();
+  return candidates.filter(c => {
+    if (seen.has(c.model)) return false;
+    seen.add(c.model);
+    return true;
+  });
 }

@@ -1,114 +1,1413 @@
 {
-  "_comment": "Model pricing and capability database. Edit this file to add/update models. Prices in USD per 1M tokens. contextK in thousands (0 = unknown). Capability scores (code/planning/reasoning/speed) use 1-10 scale — models without scores are excluded from auto selection.",
-
-  "openai": {
-    "gpt-5.2":               { "inputPer1M": 1.75, "outputPer1M": 14.00, "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "speed": 6,  "code": 6,  "planning": 8,  "reasoning": 9,  "thinking": true },
-    "gpt-5.1":               { "inputPer1M": 1.25, "outputPer1M": 10.00, "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "speed": 7,  "code": 5,  "planning": 7,  "reasoning": 7,  "thinking": true },
-    "gpt-5":                 { "inputPer1M": 1.25, "outputPer1M": 10.00, "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true },
-    "gpt-5-mini":            { "inputPer1M": 0.25, "outputPer1M": 2.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true },
-    "gpt-5-nano":            { "inputPer1M": 0.05, "outputPer1M": 0.40,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true },
-    "gpt-5.2-chat-latest":   { "inputPer1M": 1.75, "outputPer1M": 14.00, "contextK": 128,  "noTemperature": true, "outputType": "text", "inputImage": true },
-    "gpt-5.1-chat-latest":   { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 128, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
-    "gpt-5-chat-latest":     { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 128, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
-    "gpt-5.2-codex":         { "inputPer1M": 1.75,  "outputPer1M": 14.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "speed": 6,  "code": 7,  "planning": 7,  "reasoning": 8,  "thinking": true },
-    "gpt-5.1-codex-max":     { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
-    "gpt-5.1-codex":         { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
-    "gpt-5-codex":           { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "thinking": true },
-    "gpt-5.2-pro":           { "inputPer1M":21.00,  "outputPer1M":168.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses", "speed": 4, "code": 9,  "planning": 8,  "reasoning": 9,  "thinking": true },
-    "gpt-5-pro":             { "inputPer1M":15.00,  "outputPer1M":120.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true, "api": "responses"  },
-    "gpt-5.1-codex-mini":    { "inputPer1M": 0.25,  "outputPer1M":  2.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
-    "codex-mini-latest":     { "inputPer1M": 1.50,  "outputPer1M":  6.00,  "contextK": 200, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": false },
-    "gpt-5-search-api":      { "inputPer1M": 1.25,  "outputPer1M": 10.00,  "contextK": 400, "noTemperature": true, "noMaxTokens": true, "outputType": "text", "inputImage": true  },
-
-    "gpt-4.1":                      { "inputPer1M": 2.00, "outputPer1M":  8.00, "contextK": 1000, "outputType": "text", "inputImage": true },
-    "gpt-4.1-mini":                 { "inputPer1M": 0.40, "outputPer1M":  1.60, "contextK": 1000, "outputType": "text", "inputImage": true },
-    "gpt-4.1-nano":                 { "inputPer1M": 0.10, "outputPer1M":  0.40, "contextK": 1000, "outputType": "text", "inputImage": true },
-
-    "gpt-4o":                       { "inputPer1M": 2.50, "outputPer1M": 10.00, "contextK":  128, "outputType": "text", "inputImage": true },
-    "gpt-4o-2024-05-13":            { "inputPer1M": 5.00, "outputPer1M": 15.00, "contextK":  128, "outputType": "text", "inputImage": true },
-    "gpt-4o-mini":                  { "inputPer1M": 0.15, "outputPer1M":  0.60, "contextK":  128, "outputType": "text", "inputImage": true },
-    "gpt-4o-search-preview":        { "inputPer1M": 2.50, "outputPer1M": 10.00, "contextK":  128, "outputType": "text", "inputImage": true  },
-    "gpt-4o-mini-search-preview":   { "inputPer1M": 0.15, "outputPer1M":  0.60, "contextK":  128, "outputType": "text", "inputImage": true  },
-
-    "gpt-realtime":                 { "inputPer1M": 4.00, "outputPer1M": 16.00, "contextK":   32, "outputType": "audio", "inputImage": false },
-    "gpt-realtime-mini":            { "inputPer1M": 0.60, "outputPer1M":  2.40, "contextK":   32, "outputType": "audio", "inputImage": false },
-    "gpt-4o-realtime-preview":      { "inputPer1M": 5.00, "outputPer1M": 20.00, "contextK":   32, "outputType": "audio", "inputImage": true  },
-    "gpt-4o-mini-realtime-preview": { "inputPer1M": 0.60, "outputPer1M":  2.40, "contextK":   16, "outputType": "audio", "inputImage": false },
-
-    "gpt-audio":                    { "inputPer1M": 2.50, "outputPer1M": 10.00, "contextK":  128, "outputType": "audio", "inputImage": false },
-    "gpt-audio-mini":               { "inputPer1M": 0.60, "outputPer1M":  2.40, "contextK":  128, "outputType": "audio", "inputImage": false },
-    "gpt-4o-audio-preview":         { "inputPer1M": 2.50, "outputPer1M": 10.00, "contextK":  128, "outputType": "audio", "inputImage": true  },
-    "gpt-4o-mini-audio-preview":    { "inputPer1M": 0.15, "outputPer1M":  0.60, "contextK":  128, "outputType": "audio", "inputImage": false },
-
-    "gpt-image-1.5":                { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
-    "chatgpt-image-latest":         { "inputPer1M": 5.00, "outputPer1M": 10.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
-    "gpt-image-1":                  { "inputPer1M": 5.00, "outputPer1M":  0.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 1, "edit": true, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4"], "resolutions": ["low","medium","high"], "qualities": ["auto","low","medium","high"] } },
-    "gpt-image-1-mini":             { "inputPer1M": 2.00, "outputPer1M":  0.00, "contextK": 0, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": false, "edit": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["low","medium"], "qualities": ["auto"] } },
-    "computer-use-preview":         { "inputPer1M": 3.00, "outputPer1M": 12.00, "contextK":    8, "outputType": "text",  "inputImage": true  },
-
-    "tts-1":                        { "inputPer1M": 15.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "audio", "inputImage": false },
-    "tts-1-hd":                     { "inputPer1M": 30.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "audio", "inputImage": false },
-    "whisper-1":                    { "inputPer1M":  0.006,"outputPer1M": 0.00, "contextK": 0, "outputType": "text",  "inputImage": false },
-
-    "sora":                         { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3","21:9"], "resolutions": ["480p","720p","1080p"], "durations": [5,10,15,20], "maxDuration": 20 } }
-  },
-
-  "kling": {
-    "kling-v3-0":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p","4k"], "durations": [5,10,15], "maxDuration": 15 } },
-    "kling-v2-0":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
-    "kling-v1-6":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
-    "kling-v1-5":     { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } }
-  },
-
-  "seedance": {
-    "seedance-2-0-pro":  { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": true, "maxRefImages": 3, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
-    "seedance-2-0-lite": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": true, "maxRefImages": 3, "withAudio": true, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
-    "seedance-1-5-pro":  { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,10], "maxDuration": 10 } },
-    "seedance-1-5-lite": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": false, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["1:1","16:9","9:16"], "resolutions": ["720p"], "durations": [5], "maxDuration": 5 } }
-  },
-
-  "google": {
-    "gemini-3.1-flash-image-preview":  { "inputPer1M": 0.20, "outputPer1M": 0.80, "contextK": 256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 14, "edit": true, "aspectRatios": ["1:1","1:4","1:8","2:3","3:2","3:4","4:1","4:3","4:5","5:4","8:1","9:16","16:9","21:9"], "resolutions": ["low","medium","high","ultra"], "qualities": ["auto","high"] } },
-    "gemini-3-pro-image-preview":      { "inputPer1M": 1.00, "outputPer1M": 8.00, "contextK": 256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": true, "aspectRatios": ["1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9"], "resolutions": ["medium","high"], "qualities": ["auto"] } }
-  },
-
   "anthropic": {
-    "claude-opus-4-6":            { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "maxOutputTokens": 128000, "outputType": "text", "inputImage": true, "speed": 5,  "code": 8,  "planning": 9,  "reasoning": 9,  "thinking": true },
-    "claude-sonnet-4-6":          { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "maxOutputTokens": 64000, "outputType": "text", "inputImage": true, "speed": 7,  "code": 7,  "planning": 7,  "reasoning": 7,  "thinking": true },
-    "claude-haiku-4-5-20251001":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "maxOutputTokens": 8192, "outputType": "text", "inputImage": true },
-    "claude-3-5-sonnet-20241022": { "inputPer1M":  3.00, "outputPer1M": 15.00, "contextK": 200, "maxOutputTokens": 8192, "outputType": "text", "inputImage": true },
-    "claude-3-5-haiku-20241022":  { "inputPer1M":  0.80, "outputPer1M":  4.00, "contextK": 200, "outputType": "text", "inputImage": true },
-    "claude-3-opus-20240229":     { "inputPer1M": 15.00, "outputPer1M": 75.00, "contextK": 200, "outputType": "text", "inputImage": true }
+    "claude-opus-4.6": {
+      "inputPer1M": 5,
+      "outputPer1M": 25,
+      "contextK": 1000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 86,
+      "reasoning": 49,
+      "thinking": true
+    },
+    "claude-sonnet-4.6": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 1000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 83,
+      "reasoning": 47,
+      "thinking": true
+    },
+    "claude-haiku-4.5": {
+      "inputPer1M": 1,
+      "outputPer1M": 5,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 55,
+      "reasoning": 41,
+      "thinking": true
+    },
+    "claude-opus-4.5": {
+      "inputPer1M": 5,
+      "outputPer1M": 25,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 78,
+      "reasoning": 66,
+      "thinking": true
+    },
+    "claude-sonnet-4.5": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 1000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 63,
+      "reasoning": 39,
+      "thinking": true
+    },
+    "claude-sonnet-4": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 57,
+      "reasoning": 40,
+      "thinking": true
+    },
+    "claude-3-haiku": {
+      "inputPer1M": 0.25,
+      "outputPer1M": 1.25,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 15,
+      "reasoning": 13
+    }
   },
-
-  "gemini": {
-    "gemini-2.0-flash-001":       { "inputPer1M": 0.10,  "outputPer1M":  0.40, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9, "code": 4,  "planning": 5,  "reasoning": 5  },
-    "gemini-2.5-flash":       { "inputPer1M": 0.15,  "outputPer1M":  0.60, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 9,  "code": 4,  "planning": 5,  "reasoning": 5,  "thinking": true },
-    "gemini-2.5-pro":         { "inputPer1M": 1.25,  "outputPer1M": 10.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 6,  "code": 5,  "planning": 5,  "reasoning": 6,  "thinking": true },
-    "gemini-1.5-pro":         { "inputPer1M": 1.25,  "outputPer1M":  5.00, "contextK": 2000, "outputType": "text",  "inputImage": true },
-    "gemini-1.5-flash":       { "inputPer1M": 0.075, "outputPer1M":  0.30, "contextK": 1000, "outputType": "text",  "inputImage": true },
-    "gemini-3-pro":           { "inputPer1M": 2.00,  "outputPer1M": 12.00, "contextK": 1000, "outputType": "text",  "inputImage": true },
-    "gemini-3-flash-preview": { "inputPer1M": 0.50,  "outputPer1M":  3.00, "contextK": 1000, "outputType": "text",  "inputImage": true,  "speed": 10, "code": 5,  "planning": 6,  "reasoning": 6,  "thinking": true },
-    "gemini-2.5-flash-image": { "inputPer1M": 0.20,  "outputPer1M":  0.80, "contextK":  256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3"], "resolutions": ["medium","high"], "qualities": ["auto"] } },
-    "gemini-3-pro-image":     { "inputPer1M": 1.00,  "outputPer1M":  8.00, "contextK":  256, "outputType": "image", "inputImage": true, "mediaCaps": { "referenceImages": true, "maxRefImages": 4, "edit": false, "aspectRatios": ["1:1","16:9","9:16","4:3","3:4","3:2","2:3"], "resolutions": ["medium","high"], "qualities": ["auto"] } },
-
-    "veo-3.1-generate-preview":      { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": true, "maxRefImages": 3, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p","4k"], "durations": [4,6,8], "maxDuration": 8 } },
-    "veo-3.1-fast-generate-preview": { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": true, "maxRefImages": 3, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [4,6,8], "maxDuration": 8 } },
-    "veo-3.0-generate-preview":      { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": true, "referenceImages": false, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [4,6,8], "maxDuration": 8 } },
-    "veo-2.0-generate-001":          { "inputPer1M": 0.00, "outputPer1M": 0.00, "contextK": 0, "outputType": "video", "inputImage": true, "mediaCaps": { "startFrame": true, "endFrame": false, "referenceImages": false, "withAudio": false, "aspectRatios": ["16:9","9:16"], "resolutions": ["720p","1080p"], "durations": [5,8], "maxDuration": 8 } }
+  "openai": {
+    "gpt-5.2-codex": {
+      "inputPer1M": 1.75,
+      "outputPer1M": 14,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 81,
+      "reasoning": 52,
+      "thinking": true
+    },
+    "gpt-5.1": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 83,
+      "reasoning": 99,
+      "thinking": true
+    },
+    "gpt-5.4": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 15,
+      "contextK": 1050,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 100,
+      "reasoning": 60,
+      "thinking": true
+    },
+    "gpt-5.2": {
+      "inputPer1M": 1.75,
+      "outputPer1M": 14,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 90,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "gpt-5.1-codex": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 70,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "gpt-5.1-chat": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 83,
+      "reasoning": 99
+    },
+    "gpt-5.1-codex-mini": {
+      "inputPer1M": 0.25,
+      "outputPer1M": 2,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 67,
+      "reasoning": 97,
+      "thinking": true
+    },
+    "gpt-5.2-chat": {
+      "inputPer1M": 1.75,
+      "outputPer1M": 14,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 90,
+      "reasoning": 100
+    },
+    "gpt-5.3-codex": {
+      "inputPer1M": 1.75,
+      "outputPer1M": 14,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 97,
+      "reasoning": 57,
+      "thinking": true
+    },
+    "gpt-5-chat": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 73,
+      "reasoning": 97
+    },
+    "gpt-5-mini": {
+      "inputPer1M": 0.25,
+      "outputPer1M": 2,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 67,
+      "reasoning": 95,
+      "thinking": true
+    },
+    "gpt-oss-20b:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 218,
+      "code": 37,
+      "reasoning": 94,
+      "thinking": true
+    },
+    "gpt-oss-120b:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 218,
+      "code": 55,
+      "reasoning": 98,
+      "thinking": true
+    },
+    "gpt-5-codex": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 74,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "gpt-5": {
+      "inputPer1M": 1.25,
+      "outputPer1M": 10,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 70,
+      "reasoning": 99,
+      "thinking": true
+    },
+    "gpt-5-nano": {
+      "inputPer1M": 0.05,
+      "outputPer1M": 0.4,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 40,
+      "reasoning": 88,
+      "thinking": true
+    },
+    "gpt-oss-120b": {
+      "inputPer1M": 0.039,
+      "outputPer1M": 0.19,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 218,
+      "code": 55,
+      "reasoning": 98,
+      "thinking": true
+    },
+    "gpt-oss-20b": {
+      "inputPer1M": 0.03,
+      "outputPer1M": 0.11,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 218,
+      "code": 37,
+      "reasoning": 94,
+      "thinking": true
+    },
+    "o1": {
+      "inputPer1M": 15,
+      "outputPer1M": 60,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 43,
+      "reasoning": 32,
+      "thinking": true
+    },
+    "o4-mini-high": {
+      "inputPer1M": 1.1,
+      "outputPer1M": 4.4,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 51,
+      "reasoning": 95,
+      "thinking": true
+    },
+    "o4-mini": {
+      "inputPer1M": 1.1,
+      "outputPer1M": 4.4,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 51,
+      "reasoning": 95,
+      "thinking": true
+    },
+    "gpt-4.1": {
+      "inputPer1M": 2,
+      "outputPer1M": 8,
+      "contextK": 1048,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 42,
+      "reasoning": 37
+    },
+    "gpt-4.1-nano": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.4,
+      "contextK": 1048,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 21,
+      "reasoning": 25
+    },
+    "gpt-4o-2024-11-20": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 39,
+      "reasoning": 15
+    },
+    "gpt-4.1-mini": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 1.6,
+      "contextK": 1048,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 36,
+      "reasoning": 49
+    },
+    "o3-mini-high": {
+      "inputPer1M": 1.1,
+      "outputPer1M": 4.4,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 36,
+      "reasoning": 27,
+      "thinking": true
+    },
+    "o3-mini": {
+      "inputPer1M": 1.1,
+      "outputPer1M": 4.4,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 37,
+      "reasoning": 27,
+      "thinking": true
+    },
+    "gpt-4o-2024-05-13": {
+      "inputPer1M": 5,
+      "outputPer1M": 15,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 39,
+      "reasoning": 15
+    },
+    "gpt-4o:extended": {
+      "inputPer1M": 6,
+      "outputPer1M": 18,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 39,
+      "reasoning": 15
+    },
+    "gpt-4o-2024-08-06": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 31,
+      "reasoning": 20
+    },
+    "gpt-3.5-turbo-0613": {
+      "inputPer1M": 1,
+      "outputPer1M": 2,
+      "contextK": 4,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 19,
+      "reasoning": 9
+    },
+    "gpt-4-0314": {
+      "inputPer1M": 30,
+      "outputPer1M": 60,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 24,
+      "reasoning": 13
+    },
+    "gpt-3.5-turbo": {
+      "inputPer1M": 0.5,
+      "outputPer1M": 1.5,
+      "contextK": 16,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 19,
+      "reasoning": 9
+    },
+    "gpt-4-turbo": {
+      "inputPer1M": 10,
+      "outputPer1M": 30,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 35,
+      "reasoning": 14
+    },
+    "gpt-4": {
+      "inputPer1M": 30,
+      "outputPer1M": 60,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 24,
+      "reasoning": 13
+    },
+    "o3": {
+      "inputPer1M": 2,
+      "outputPer1M": 8,
+      "contextK": 200,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 70,
+      "reasoning": 93,
+      "thinking": true
+    },
+    "gpt-4-turbo-preview": {
+      "inputPer1M": 10,
+      "outputPer1M": 30,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 35,
+      "reasoning": 14
+    },
+    "gpt-5.4-mini": {
+      "inputPer1M": 0.75,
+      "outputPer1M": 4.5,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 218,
+      "code": 92,
+      "reasoning": 51,
+      "thinking": true
+    },
+    "gpt-4o": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 31,
+      "reasoning": 6
+    },
+    "gpt-5.4-nano": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 1.25,
+      "contextK": 400,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 218,
+      "code": 80,
+      "reasoning": 47,
+      "thinking": true
+    }
   },
-
   "kimi": {
-    "kimi-k2.5":         { "inputPer1M": 0.45, "outputPer1M": 2.20, "contextK": 262, "outputType": "text", "inputImage": true,  "speed": 7, "code": 7, "planning": 7, "reasoning": 8, "thinking": true },
-    "kimi-k2-thinking":  { "inputPer1M": 0.47, "outputPer1M": 2.00, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 6, "code": 6, "planning": 7, "reasoning": 8, "thinking": true },
-    "kimi-k2":           { "inputPer1M": 0.60, "outputPer1M": 2.40, "contextK": 128, "outputType": "text", "inputImage": false, "speed": 7, "code": 6, "planning": 6, "reasoning": 7, "thinking": true },
-    "kimi-k2-instruct":  { "inputPer1M": 0.60, "outputPer1M": 2.40, "contextK": 128, "outputType": "text", "inputImage": false, "speed": 8, "code": 5, "planning": 5, "reasoning": 6 },
-    "kimi-k1.5-long":    { "inputPer1M": 0.40, "outputPer1M": 1.60, "contextK": 128, "outputType": "text", "inputImage": true,  "speed": 7, "code": 5, "planning": 5, "reasoning": 6, "thinking": true },
-    "kimi-k1.5":         { "inputPer1M": 0.40, "outputPer1M": 1.60, "contextK": 128, "outputType": "text", "inputImage": true,  "speed": 8, "code": 4, "planning": 5, "reasoning": 5 }
+    "kimi-k2": {
+      "inputPer1M": 0.55,
+      "outputPer1M": 2.2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 50,
+      "reasoning": 60
+    },
+    "kimi-k2-thinking": {
+      "inputPer1M": 0.47,
+      "outputPer1M": 2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 67,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "kimi-k2.5": {
+      "inputPer1M": 0.45,
+      "outputPer1M": 2.2,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 76,
+      "reasoning": 49,
+      "thinking": true
+    },
+    "kimi-k2-0905": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 50,
+      "reasoning": 60
+    }
   },
-
+  "gemini": {
+    "gemini-2.5-flash": {
+      "inputPer1M": 0.3,
+      "outputPer1M": 2.5,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 34,
+      "reasoning": 63,
+      "thinking": true
+    },
+    "gemini-3-flash-preview": {
+      "inputPer1M": 0.5,
+      "outputPer1M": 3,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 67,
+      "reasoning": 59,
+      "thinking": true
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "inputPer1M": 0.25,
+      "outputPer1M": 1.5,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 218,
+      "code": 57,
+      "reasoning": 35,
+      "thinking": true
+    },
+    "gemini-3-pro-preview": {
+      "inputPer1M": 2,
+      "outputPer1M": 12,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 86,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "gemini-3.1-pro-preview": {
+      "inputPer1M": 2,
+      "outputPer1M": 12,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 100,
+      "reasoning": 60,
+      "thinking": true
+    },
+    "gemma-3n-e4b-it:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 9,
+      "reasoning": 15
+    },
+    "gemini-2.5-flash-lite-preview-09-2025": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.4,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 275,
+      "code": 29,
+      "reasoning": 49,
+      "thinking": true
+    },
+    "gemini-2.5-flash-lite": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.4,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 218,
+      "code": 16,
+      "reasoning": 37,
+      "thinking": true
+    },
+    "gemma-3n-e2b-it:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 5,
+      "reasoning": 11
+    },
+    "gemma-3n-e4b-it": {
+      "inputPer1M": 0.02,
+      "outputPer1M": 0.04,
+      "contextK": 33,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 9,
+      "reasoning": 15
+    },
+    "gemma-3-4b-it": {
+      "inputPer1M": 0.04,
+      "outputPer1M": 0.08,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 7,
+      "reasoning": 13
+    },
+    "gemma-3-12b-it": {
+      "inputPer1M": 0.04,
+      "outputPer1M": 0.13,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 13,
+      "reasoning": 19
+    },
+    "gemma-3-27b-it:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 18,
+      "reasoning": 22
+    },
+    "gemma-3-4b-it:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 33,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 7,
+      "reasoning": 13
+    },
+    "gemma-3-12b-it:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 33,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 13,
+      "reasoning": 19
+    },
+    "gemma-3-27b-it": {
+      "inputPer1M": 0.08,
+      "outputPer1M": 0.16,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 18,
+      "reasoning": 22
+    }
+  },
   "qwen": {
-    "qwen3.5-397b-a17b": { "inputPer1M": 0.39, "outputPer1M": 2.34, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 7, "code": 7, "planning": 7, "reasoning": 8, "thinking": true },
-    "qwen3.5-32b":       { "inputPer1M": 0.10, "outputPer1M": 0.40, "contextK": 131, "outputType": "text", "inputImage": false, "speed": 8, "code": 5, "planning": 5, "reasoning": 6, "thinking": true }
+    "qwen3.5-35b-a3b": {
+      "inputPer1M": 0.1625,
+      "outputPer1M": 1.3,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 59,
+      "reasoning": 39,
+      "thinking": true
+    },
+    "qwen3.5-9b": {
+      "inputPer1M": 0.05,
+      "outputPer1M": 0.15,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 50,
+      "reasoning": 34,
+      "thinking": true
+    },
+    "qwen3-vl-32b-instruct": {
+      "inputPer1M": 0.104,
+      "outputPer1M": 0.416,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 29,
+      "reasoning": 72
+    },
+    "qwen3.5-27b": {
+      "inputPer1M": 0.195,
+      "outputPer1M": 1.56,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 67,
+      "reasoning": 44,
+      "thinking": true
+    },
+    "qwen3-max-thinking": {
+      "inputPer1M": 0.78,
+      "outputPer1M": 3.9,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 61,
+      "reasoning": 42,
+      "thinking": true
+    },
+    "qwen3.5-397b-a17b": {
+      "inputPer1M": 0.39,
+      "outputPer1M": 2.34,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 77,
+      "reasoning": 47,
+      "thinking": true
+    },
+    "qwen3-vl-8b-instruct": {
+      "inputPer1M": 0.08,
+      "outputPer1M": 0.5,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 17,
+      "reasoning": 29
+    },
+    "qwen3-vl-30b-a3b-instruct": {
+      "inputPer1M": 0.13,
+      "outputPer1M": 0.52,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 27,
+      "reasoning": 76
+    },
+    "qwen3-coder-next": {
+      "inputPer1M": 0.12,
+      "outputPer1M": 0.75,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 45,
+      "reasoning": 30
+    },
+    "qwen3-vl-235b-a22b-instruct": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 0.88,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 32,
+      "reasoning": 74
+    },
+    "qwen3-next-80b-a3b-instruct": {
+      "inputPer1M": 0.09,
+      "outputPer1M": 1.1,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 30,
+      "reasoning": 70
+    },
+    "qwen3-30b-a3b": {
+      "inputPer1M": 0.08,
+      "outputPer1M": 0.28,
+      "contextK": 41,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 26,
+      "reasoning": 70,
+      "thinking": true
+    },
+    "qwen3-max": {
+      "inputPer1M": 0.78,
+      "outputPer1M": 3.9,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 51,
+      "reasoning": 85
+    },
+    "qwen3-30b-a3b-instruct-2507": {
+      "inputPer1M": 0.09,
+      "outputPer1M": 0.3,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 24,
+      "reasoning": 23
+    },
+    "qwen3-next-80b-a3b-instruct:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 30,
+      "reasoning": 70
+    },
+    "qwen3-coder-30b-a3b-instruct": {
+      "inputPer1M": 0.07,
+      "outputPer1M": 0.27,
+      "contextK": 160,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 36,
+      "reasoning": 31
+    },
+    "qwen3.5-122b-a10b": {
+      "inputPer1M": 0.26,
+      "outputPer1M": 2.08,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 167,
+      "code": 67,
+      "reasoning": 44,
+      "thinking": true
+    }
+  },
+  "inception": {
+    "mercury-2": {
+      "inputPer1M": 0.25,
+      "outputPer1M": 0.75,
+      "contextK": 128,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 340,
+      "code": 57,
+      "reasoning": 35,
+      "thinking": true
+    }
+  },
+  "x-ai": {
+    "grok-4.1-fast": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 0.5,
+      "contextK": 2000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 38,
+      "reasoning": 36,
+      "thinking": true
+    },
+    "grok-4": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 74,
+      "reasoning": 98,
+      "thinking": true
+    },
+    "grok-code-fast-1": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 1.5,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 46,
+      "reasoning": 46,
+      "thinking": true
+    },
+    "grok-3": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 39,
+      "reasoning": 61
+    },
+    "grok-4-fast": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 0.5,
+      "contextK": 2000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 37,
+      "reasoning": 43,
+      "thinking": true
+    }
+  },
+  "minimax": {
+    "minimax-m2.5": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 1.17,
+      "contextK": 197,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 70,
+      "reasoning": 44,
+      "thinking": true
+    },
+    "minimax-m2.1": {
+      "inputPer1M": 0.27,
+      "outputPer1M": 0.95,
+      "contextK": 197,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 63,
+      "reasoning": 87,
+      "thinking": true
+    },
+    "minimax-m2": {
+      "inputPer1M": 0.255,
+      "outputPer1M": 1,
+      "contextK": 197,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 57,
+      "reasoning": 82,
+      "thinking": true
+    },
+    "minimax-m2.7": {
+      "inputPer1M": 0.3,
+      "outputPer1M": 1.2,
+      "contextK": 205,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 80,
+      "reasoning": 52,
+      "thinking": true
+    },
+    "minimax-m2.5:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 197,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 70,
+      "reasoning": 44,
+      "thinking": true
+    }
+  },
+  "stepfun": {
+    "step-3.5-flash": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.3,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 61,
+      "reasoning": 40,
+      "thinking": true
+    },
+    "step-3.5-flash:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 61,
+      "reasoning": 40,
+      "thinking": true
+    }
+  },
+  "xiaomi": {
+    "mimo-v2-flash": {
+      "inputPer1M": 0.09,
+      "outputPer1M": 0.29,
+      "contextK": 262,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 49,
+      "reasoning": 71,
+      "thinking": true
+    }
+  },
+  "z-ai": {
+    "glm-4.6v": {
+      "inputPer1M": 0.3,
+      "outputPer1M": 0.9,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 31,
+      "code": 38,
+      "reasoning": 90,
+      "thinking": true
+    },
+    "glm-4.6": {
+      "inputPer1M": 0.39,
+      "outputPer1M": 1.9,
+      "contextK": 205,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 55,
+      "reasoning": 91,
+      "thinking": true
+    },
+    "glm-5": {
+      "inputPer1M": 0.72,
+      "outputPer1M": 2.3,
+      "contextK": 80,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 83,
+      "reasoning": 52,
+      "thinking": true
+    },
+    "glm-4.7-flash": {
+      "inputPer1M": 0.06,
+      "outputPer1M": 0.4,
+      "contextK": 203,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 49,
+      "reasoning": 32,
+      "thinking": true
+    },
+    "glm-4.7": {
+      "inputPer1M": 0.39,
+      "outputPer1M": 1.75,
+      "contextK": 203,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 69,
+      "reasoning": 100,
+      "thinking": true
+    },
+    "glm-4.5-air": {
+      "inputPer1M": 0.13,
+      "outputPer1M": 0.85,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 43,
+      "reasoning": 85,
+      "thinking": true
+    },
+    "glm-4.5v": {
+      "inputPer1M": 0.6,
+      "outputPer1M": 1.8,
+      "contextK": 66,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 22,
+      "reasoning": 77,
+      "thinking": true
+    },
+    "glm-4.5": {
+      "inputPer1M": 0.6,
+      "outputPer1M": 2.2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 48,
+      "reasoning": 78,
+      "thinking": true
+    },
+    "glm-4.5-air:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 43,
+      "reasoning": 85,
+      "thinking": true
+    }
+  },
+  "allenai": {
+    "olmo-3.1-32b-instruct": {
+      "inputPer1M": 0.2,
+      "outputPer1M": 0.6,
+      "contextK": 66,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 14,
+      "reasoning": 13
+    },
+    "olmo-3.1-32b-think": {
+      "inputPer1M": 0.15,
+      "outputPer1M": 0.5,
+      "contextK": 66,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 20,
+      "reasoning": 81,
+      "thinking": true
+    }
+  },
+  "deepseek": {
+    "deepseek-v3.2": {
+      "inputPer1M": 0.26,
+      "outputPer1M": 0.38,
+      "contextK": 164,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 62,
+      "reasoning": 62,
+      "thinking": true
+    },
+    "deepseek-r1-distill-llama-70b": {
+      "inputPer1M": 0.7,
+      "outputPer1M": 0.8,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 23,
+      "reasoning": 57,
+      "thinking": true
+    },
+    "deepseek-v3.2-exp": {
+      "inputPer1M": 0.27,
+      "outputPer1M": 0.41,
+      "contextK": 164,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 62,
+      "reasoning": 62,
+      "thinking": true
+    }
+  },
+  "mistralai": {
+    "mistral-medium-3": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 54,
+      "code": 28,
+      "reasoning": 32
+    },
+    "mistral-medium-3.1": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 35,
+      "reasoning": 40
+    },
+    "devstral-medium": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 30,
+      "reasoning": 5
+    }
+  },
+  "baidu": {
+    "ernie-4.5-300b-a47b": {
+      "inputPer1M": 0.28,
+      "outputPer1M": 1.1,
+      "contextK": 123,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 27,
+      "reasoning": 43
+    }
+  },
+  "ai21": {
+    "jamba-large-1.7": {
+      "inputPer1M": 2,
+      "outputPer1M": 8,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 16,
+      "reasoning": 2
+    }
+  },
+  "meta-llama": {
+    "llama-3.2-11b-vision-instruct": {
+      "inputPer1M": 0.049,
+      "outputPer1M": 0.049,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 85,
+      "code": 10,
+      "reasoning": 2
+    },
+    "llama-4-scout": {
+      "inputPer1M": 0.08,
+      "outputPer1M": 0.3,
+      "contextK": 328,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 16,
+      "reasoning": 15
+    },
+    "llama-3.3-70b-instruct": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.32,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 22,
+      "reasoning": 8
+    },
+    "llama-3.2-1b-instruct": {
+      "inputPer1M": 0.027,
+      "outputPer1M": 0.2,
+      "contextK": 60,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 4,
+      "reasoning": 7
+    },
+    "llama-4-maverick": {
+      "inputPer1M": 0.15,
+      "outputPer1M": 0.6,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 122,
+      "code": 30,
+      "reasoning": 20
+    },
+    "llama-3-8b-instruct": {
+      "inputPer1M": 0.03,
+      "outputPer1M": 0.04,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 85,
+      "code": 9,
+      "reasoning": 7
+    },
+    "llama-3.1-70b-instruct": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 0.4,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 21,
+      "reasoning": 4
+    },
+    "llama-3.1-8b-instruct": {
+      "inputPer1M": 0.02,
+      "outputPer1M": 0.05,
+      "contextK": 16,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 167,
+      "code": 13,
+      "reasoning": 5
+    },
+    "llama-3.3-70b-instruct:free": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "contextK": 66,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 122,
+      "code": 22,
+      "reasoning": 8
+    },
+    "llama-3-70b-instruct": {
+      "inputPer1M": 0.51,
+      "outputPer1M": 0.74,
+      "contextK": 8,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 14,
+      "reasoning": 9
+    }
+  },
+  "microsoft": {
+    "phi-4": {
+      "inputPer1M": 0.065,
+      "outputPer1M": 0.14,
+      "contextK": 16,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 20,
+      "reasoning": 19
+    }
+  },
+  "nvidia": {
+    "llama-3.1-nemotron-70b-instruct": {
+      "inputPer1M": 1.2,
+      "outputPer1M": 1.2,
+      "contextK": 131,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 31,
+      "code": 21,
+      "reasoning": 12
+    }
+  },
+  "cohere": {
+    "command-a": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "contextK": 256,
+      "outputType": "text",
+      "inputImage": false,
+      "speed": 54,
+      "code": 20,
+      "reasoning": 14
+    }
   }
 }
