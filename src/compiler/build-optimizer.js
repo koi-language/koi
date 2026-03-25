@@ -7,7 +7,7 @@
  * Uses SHA-256 content hashing to detect changes and avoid redundant API calls.
  */
 
-import { LLMProvider } from '../runtime/llm-provider.js';
+import { LLMProvider } from '../runtime/llm/llm-provider.js';
 import { CacheManager } from './cache-manager.js';
 
 const PARALLEL_BATCH_SIZE = 5;

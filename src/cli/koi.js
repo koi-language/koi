@@ -202,7 +202,7 @@ function showCredits() {
 }
 
 async function compileFile(sourcePath, outputPath = null, options = {}) {
-  const { cliLogger } = await import('../runtime/cli-logger.js');
+  const { channel: cliLogger } = await import('../runtime/io/channel.js');
   const verbose = options.verbose || false;
 
   if (verbose) {
@@ -608,7 +608,7 @@ async function serveFile(sourcePath, options = {}) {
   const { existsSync: _exists } = await import('fs');
 
   const routerPath = path.resolve(__dirname, '../runtime/router.js');
-  const mcpServerPath = path.resolve(__dirname, '../runtime/mcp-agent-server.js');
+  const mcpServerPath = path.resolve(__dirname, '../runtime/mcp/mcp-agent-server.js');
   const compiledAbsPath = path.resolve(jsPath);
 
   const serveScriptPath = path.join(path.dirname(compiledAbsPath), '_mcp-serve.mjs');
@@ -971,7 +971,7 @@ if (command === 'cache') {
 
 // Handle registry
 if (command === 'registry') {
-  const { registry } = await import('../runtime/registry.js');
+  const { registry } = await import('../runtime/skills/registry.js');
   const subcommand = positional[1];
 
   if (!subcommand || subcommand === 'stats') {

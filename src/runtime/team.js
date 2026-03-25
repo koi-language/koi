@@ -1,5 +1,5 @@
-import { mcpClient } from './mcp-client.js';
-import { cliLogger } from './cli-logger.js';
+import { channel } from './io/channel.js';
+import { mcpClient } from './mcp/mcp-client.js';
 
 export class Team {
   constructor(name, members = {}) {
@@ -79,20 +79,20 @@ class TeamEventQuery {
           ? agentOrAddress
           : agentOrAddress.address;
 
-        cliLogger.progress(`[Team] Resolving MCP: ${address}...`);
+        channel.progress(`[Team] Resolving MCP: ${address}...`);
 
         // Check cache
         if (this.team._mcpResolved.has(address)) {
           agent = this.team._mcpResolved.get(address);
-          cliLogger.clear();
+          channel.clear();
         } else {
           // Resolve the MCP address
           try {
             agent = await mcpClient.resolve(address);
             this.team._mcpResolved.set(address, agent);
-            cliLogger.clear();
+            channel.clear();
           } catch (error) {
-            cliLogger.error(`[Team] Failed to resolve ${address}: ${error.message}`);
+            channel.error(`[Team] Failed to resolve ${address}: ${error.message}`);
             continue;
           }
         }
@@ -126,7 +126,7 @@ class TeamEventQuery {
       const agentName = selected.name || selected.agent.name;
 
       // Show delegation
-      cliLogger.progress(`    → [${agentName}] ${this.eventName}...`);
+      channel.progress(`    → [${agentName}] ${this.eventName}...`);
 
       // Handle both regular agents and MCP resources
       let result;
@@ -139,13 +139,13 @@ class TeamEventQuery {
       } else {
         throw new Error(`Agent ${selected.name} cannot handle event ${this.eventName}`);
       }
-      cliLogger.clear();
+      channel.clear();
       return result;
     } else if (this.selectionMode === 'all') {
       const results = [];
       for (const { name, agent } of candidates) {
         const agentName = name || agent.name;
-        cliLogger.progress(`    → [${agentName}] ${this.eventName}...`);
+        channel.progress(`    → [${agentName}] ${this.eventName}...`);
 
         if (agent.handle) {
           // Mark as delegation for proper task spec injection and delegate TTLs.
@@ -153,7 +153,7 @@ class TeamEventQuery {
         } else if (agent.send) {
           results.push(await agent.send(this.eventName, args));
         }
-        cliLogger.clear();
+        channel.clear();
       }
       return results;
     }

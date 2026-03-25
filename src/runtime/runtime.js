@@ -1,5 +1,5 @@
+import { channel } from './io/channel.js';
 import { agentRouter } from './router.js';
-import { cliLogger } from './cli-logger.js';
 
 export class Runtime {
   static async send(config) {
@@ -34,7 +34,7 @@ export class Runtime {
       // Execute delegate — no timeout, delegates run as long as needed
       const result = await query.execute(args);
 
-      cliLogger.clear();
+      channel.clear();
       return result;
     } catch (error) {
       // Handle NO_AGENT_HANDLER errors specially

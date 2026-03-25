@@ -1,14 +1,14 @@
-export { Agent } from './agent.js';
+export { Agent } from './agent/agent.js';
 export { Team } from './team.js';
-export { Skill } from './skill.js';
+export { Skill } from './skills/skill.js';
 export { Role } from './role.js';
 export { Runtime } from './runtime.js';
-export { MCPClient, mcpClient } from './mcp-client.js';
-export { Planner, PlanningAgent } from './planner.js';
-export { SkillSelector, skillSelector } from './skill-selector.js';
-export { registry, getRegistry } from './registry.js';
-export { mcpRegistry } from './mcp-registry.js';
-export { lspManager } from './lsp-manager.js';
+export { MCPClient, mcpClient } from './mcp/mcp-client.js';
+export { Planner, PlanningAgent } from './agent/planner.js';
+export { SkillSelector, skillSelector } from './skills/skill-selector.js';
+export { registry, getRegistry } from './skills/registry.js';
+export { mcpRegistry } from './mcp/mcp-registry.js';
+export { lspManager } from './lsp/lsp-manager.js';
 
 // Global registry for skill functions (for tool calling)
 export const SkillRegistry = {
