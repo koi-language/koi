@@ -101,6 +101,23 @@ export async function loadRemoteModels() {
   }
 }
 
+/**
+ * Look up a model in the remote/active models data.
+ * Returns { provider, ...modelInfo } or null if not found.
+ * Used by cost-center.js as a fallback when model isn't in the local models.json.
+ */
+export function lookupRemoteModel(modelId) {
+  for (const [provider, models] of Object.entries(modelsData)) {
+    if (provider.startsWith('_')) continue;
+    if (models[modelId]) return { provider, ...models[modelId] };
+    // Partial match
+    for (const key of Object.keys(models)) {
+      if (modelId.startsWith(key)) return { provider, ...models[key] };
+    }
+  }
+  return null;
+}
+
 /** Default profile used as fallback when LLM classification is unavailable. */
 export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 50, code: 50, reasoning: 30 };
 

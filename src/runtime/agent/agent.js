@@ -122,6 +122,39 @@ export class Agent {
   /** The root (System) agent — set once, used by slash commands like /memory. */
   static _rootAgent = null;
 
+  /**
+   * Delegate feedback mailbox — allows the parent agent to send feedback
+   * to a running delegate without aborting it.
+   *
+   * Map<slotId|agentName, string[]> — each entry is an array of pending
+   * feedback messages. The delegate checks this between actions and injects
+   * any pending messages into its context.
+   *
+   * Usage (from System agent / feedback handler):
+   *   Agent.pushDelegateFeedback('explorer', 'User says: use OAuth instead');
+   *
+   * The delegate drains its mailbox between LLM iterations.
+   */
+  static _delegateFeedback = new Map();
+
+  static pushDelegateFeedback(delegateKey, message) {
+    const key = (delegateKey || '').toLowerCase();
+    if (!Agent._delegateFeedback.has(key)) {
+      Agent._delegateFeedback.set(key, []);
+    }
+    Agent._delegateFeedback.get(key).push(message);
+  }
+
+  static drainDelegateFeedback(delegateKey) {
+    const key = (delegateKey || '').toLowerCase();
+    const messages = Agent._delegateFeedback.get(key);
+    if (messages && messages.length > 0) {
+      Agent._delegateFeedback.set(key, []);
+      return messages;
+    }
+    return null;
+  }
+
   /** Set CLI hooks from the bootstrap layer. */
   static setCliHooks(hooks) {
     Agent._cliHooks = hooks;
@@ -475,6 +508,20 @@ export class Agent {
     });
     this._activeSession = session; // Expose to actions (e.g. read_file image vision)
     session.actionContext.args = args;
+
+    // ── Task refresh: track assigned task for live feedback injection ────────
+    // When a delegate has a taskId, we snapshot its description so we can detect
+    // mid-flight updates (e.g. user feedback propagated by the System agent).
+    const _refreshTaskId = isDelegate ? (args?.taskId || null) : null;
+    let _refreshLastDesc = null;
+    if (_refreshTaskId) {
+      try {
+        const { taskManager: _tmRef } = await import('../state/task-manager.js');
+        const _t = _tmRef.get(String(_refreshTaskId));
+        if (_t) _refreshLastDesc = _t.description;
+      } catch { /* non-fatal */ }
+    }
+
     // Delegates get a fresh isolated state so parallel delegations to the same agent
     // instance never contaminate each other or the base agent's persistent state.
     session.actionContext.state = isDelegate
@@ -1303,6 +1350,43 @@ export class Agent {
                 ? `[${label} — streaming output at ${update.elapsed}s]\n${truncated}`
                 : `[${label} — streaming output at ${update.elapsed}s] (no output yet)`;
               contextMemory.add('user', msg, `${label} streaming (${update.elapsed}s)`, null);
+            }
+          }
+
+          // ── Task refresh: check if the task description was updated mid-flight ──
+          // The System agent may have updated our task's description with user feedback
+          // while we were working. If so, inject the updated spec into our context.
+          if (_refreshTaskId) {
+            try {
+              const { taskManager: _tmRefresh } = await import('../state/task-manager.js');
+              const _currentTask = _tmRefresh.get(String(_refreshTaskId));
+              if (_currentTask && _currentTask.description !== _refreshLastDesc) {
+                const _diff = _currentTask.description.slice((_refreshLastDesc || '').length).trim();
+                const _feedbackMsg = _diff
+                  ? `[TASK UPDATE] Your task has been updated with new user feedback:\n${_diff}`
+                  : `[TASK UPDATE] Your task description has been replaced:\n${_currentTask.description}`;
+                contextMemory.add('user', _feedbackMsg, 'task feedback injection', null);
+                channel.log('agent', `${this.name}: Task #${_refreshTaskId} description updated mid-flight — injected feedback into context`);
+                _refreshLastDesc = _currentTask.description;
+              }
+            } catch { /* non-fatal */ }
+          }
+
+          // ── Delegate feedback mailbox: drain pending messages from parent ──
+          // The System agent (or feedback handler) can push messages to a running
+          // delegate without aborting it. Check the mailbox between actions.
+          if (isDelegate) {
+            // Check by agent name and by slot ID
+            const _slotId = channel.getCurrentSlotId?.();
+            const _feedbackKeys = [this.name, _slotId].filter(Boolean);
+            for (const _fbKey of _feedbackKeys) {
+              const _fbMessages = Agent.drainDelegateFeedback(_fbKey);
+              if (_fbMessages) {
+                for (const _fbMsg of _fbMessages) {
+                  contextMemory.add('user', `[FEEDBACK FROM USER] ${_fbMsg}`, 'delegate feedback', null);
+                  channel.log('agent', `${this.name}: Received delegate feedback: ${_fbMsg.substring(0, 100)}`);
+                }
+              }
             }
           }
 

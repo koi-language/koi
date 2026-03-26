@@ -22,12 +22,14 @@ export class OpenAIChatLLM extends BaseLLM {
     let usage = { input: 0, output: 0 };
     let outChars = 0;
     let _thinkChars = 0;
+    let _finishReason = null;
 
     try {
       const params = this._cleanParams({
         model: this.model,
         messages,
         temperature: 0,
+        max_tokens: this.maxTokens,
         response_format: { type: 'json_object' },
         stream: true,
         stream_options: { include_usage: true }
@@ -40,6 +42,10 @@ export class OpenAIChatLLM extends BaseLLM {
       const _iterate = async () => {
         for await (const chunk of stream) {
           if (abortSignal?.aborted) break;
+          // Track finish_reason to detect output-length truncation
+          const fr = chunk.choices?.[0]?.finish_reason;
+          if (fr) _finishReason = fr;
+
           // Detect reasoning/thinking content (OpenAI reasoning models)
           const _reasoning = chunk.choices?.[0]?.delta?.reasoning_content
             || chunk.choices?.[0]?.delta?.reasoning || '';
@@ -94,11 +100,14 @@ export class OpenAIChatLLM extends BaseLLM {
     const text = buffer.trim();
     if (!text) throw new Error('OpenAI returned no content');
     // Validate that the response is complete JSON — if the stream was cut short
-    // (connection drop, timeout), the buffer will be truncated and unparseable.
+    // (connection drop, timeout, or max_tokens hit), the buffer will be truncated.
     // Throwing here lets the agent retry the LLM call instead of failing at parse.
     if (text.startsWith('{') || text.startsWith('[')) {
       try { JSON.parse(text); } catch {
-        throw new Error(`OpenAI returned truncated response (${text.length} chars): ${text.substring(0, 80)}...`);
+        const reason = _finishReason === 'length'
+          ? `output hit max_tokens limit (${this.maxTokens})`
+          : _finishReason ? `finish_reason=${_finishReason}` : 'stream ended prematurely';
+        throw new Error(`OpenAI returned truncated JSON (${reason}, ${text.length} chars): ${text.substring(0, 80)}...`);
       }
     }
     return { text, usage };

@@ -11,6 +11,7 @@
 
 // ─── Model Database (loaded from models.json) ─────────────────────────────
 import { createRequire } from 'module';
+import { lookupRemoteModel } from './auto-model-selector.js';
 const _require = createRequire(import.meta.url);
 const _modelsJson = _require('./models.json');
 
@@ -37,6 +38,11 @@ export function getFirstModelForProvider(provider) {
 }
 
 export function lookupModel(model) {
+  // Remote models (from backend) always take priority — they reflect
+  // the latest admin-managed state. Local models.json is only a fallback
+  // when the backend is unreachable.
+  const remote = lookupRemoteModel(model);
+  if (remote) return remote;
   if (MODEL_DB[model]) return MODEL_DB[model];
   // Partial match (e.g. "gpt-4o-mini-2024-07-18" → "gpt-4o-mini")
   for (const key of Object.keys(MODEL_DB)) {
@@ -52,12 +58,16 @@ export function lookupModel(model) {
  */
 export function getModelCaps(model) {
   const info = lookupModel(model);
+  // OpenAI reasoning models (thinking=true) require max_completion_tokens
+  // instead of max_tokens. Infer noMaxTokens from provider + thinking flag
+  // so this works even when models come from the backend without explicit flags.
+  const isOpenAiThinking = info?.thinking && info?.provider === 'openai';
   return {
     noTemperature:   info?.noTemperature   ?? false,
-    noMaxTokens:     info?.noMaxTokens     ?? false,
+    noMaxTokens:     info?.noMaxTokens     ?? isOpenAiThinking ?? false,
     api:             info?.api             ?? 'chat',
     thinking:        info?.thinking        ?? false,
-    maxOutputTokens: info?.maxOutputTokens ?? 0,
+    maxOutputTokens: info?.maxOutputTokens ?? (isOpenAiThinking ? 65536 : 0),
   };
 }
 

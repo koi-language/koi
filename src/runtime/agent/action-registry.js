@@ -192,7 +192,7 @@ class ActionRegistry {
 // Global singleton instance
 export const actionRegistry = new ActionRegistry();
 
-// Auto-load tools (actions) from the tools directory on module load
+// Auto-load tools from the tools directory on module load
 const toolsDir = path.join(__dirname, '..', 'tools');
 if (fs.existsSync(toolsDir)) {
   await actionRegistry.loadFromDirectory(toolsDir).catch(err => {
