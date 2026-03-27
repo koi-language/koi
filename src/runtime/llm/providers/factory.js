@@ -336,12 +336,15 @@ function _resolveVideo(req) {
 export function _calculateDifficultyBoosts(session) {
   const parts = [];
 
-  // Infrastructure errors (LLM timeout / HTTP 4xx-5xx) should NOT inflate difficulty
+  // Infrastructure errors (LLM timeout / HTTP 4xx-5xx) should NOT inflate difficulty.
+  // BUT: JSON parse failures ARE capability errors (model too weak to follow format).
   const _isInfraError = (entry) => {
+    const msg = entry.error?.message || '';
+    // JSON parse failures = model capability issue, NOT infra → count them
+    if (/failed to parse.*json|not valid json/i.test(msg)) return false;
     if (entry.action?.intent === '_llm_error') return true;
     const status = entry.error?.status ?? entry.error?.statusCode;
     if (typeof status === 'number' && status >= 400) return true;
-    const msg = entry.error?.message || '';
     if (/timed?\s*out|timeout/i.test(msg)) return true;
     return false;
   };
@@ -370,9 +373,15 @@ export function _calculateDifficultyBoosts(session) {
       _sameErrorCount++;
     }
   }
-  // Boost on 1-100 scale: each escalation step adds ~5 points
-  const difficultyBoost = _sameErrorCount >= 3 ? Math.min(Math.floor(_sameErrorCount / 3) * 5, 15) : 0;
-  if (difficultyBoost > 0) parts.push(`same error ×${_sameErrorCount}`);
+  // Boost on 1-100 scale.
+  // JSON parse failures = model can't do structured output → escalate aggressively.
+  // 1st fail: +15, 2nd: +30. Wastes no time on incapable models.
+  // Normal errors: escalate gradually (+5 per 3 errors).
+  const _isJsonParseError = _lastMsg && /failed to parse.*json|not valid json/i.test(_lastMsg);
+  const difficultyBoost = _isJsonParseError
+    ? Math.min(_sameErrorCount * 15, 30)
+    : (_sameErrorCount >= 3 ? Math.min(Math.floor(_sameErrorCount / 3) * 5, 15) : 0);
+  if (difficultyBoost > 0) parts.push(`same error ×${_sameErrorCount}${_isJsonParseError ? ' (parse)' : ''}`);
 
   // ── Loop boost (set externally) ────────────────────────────────────────
   const loopBoost = session._loopBoost || 0;

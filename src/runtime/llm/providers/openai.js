@@ -29,7 +29,7 @@ export class OpenAIChatLLM extends BaseLLM {
         model: this.model,
         messages,
         temperature: 0,
-        max_tokens: this.maxTokens,
+        max_completion_tokens: this.maxTokens,
         response_format: { type: 'json_object' },
         stream: true,
         stream_options: { include_usage: true }
@@ -127,7 +127,7 @@ export class OpenAIChatLLM extends BaseLLM {
         model: this.model,
         messages,
         temperature,
-        max_tokens: maxTokens,
+        max_completion_tokens: maxTokens,
         ...(responseFormat && { response_format: responseFormat })
       });
       const options = controller ? { signal: controller.signal } : {};
@@ -337,7 +337,7 @@ export class OpenAISearch extends BaseSearch {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: query }
       ],
-      max_tokens: maxTokens,
+      max_completion_tokens: maxTokens,
     };
     const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
     const completion = await this.client.chat.completions.create(params, options);

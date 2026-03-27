@@ -377,7 +377,7 @@ export function findSymbol(symbolName, filePaths, basePath, options = {}) {
     if (mode === 'definition' || mode === 'all') {
       for (const def of definitions) {
         if (def.name === symbolName) {
-          allDefs.push({ ...def, file: path.relative(basePath, def.file) });
+          allDefs.push({ ...def, file: def.file });
         }
       }
     }
@@ -385,7 +385,7 @@ export function findSymbol(symbolName, filePaths, basePath, options = {}) {
     if (mode === 'references' || mode === 'all') {
       for (const ref of references) {
         if (ref.name === symbolName) {
-          allRefs.push({ ...ref, file: path.relative(basePath, ref.file) });
+          allRefs.push({ ...ref, file: ref.file });
         }
       }
     }
@@ -433,7 +433,7 @@ export function listSymbols(filePaths, basePath, options = {}) {
     for (const def of definitions) {
       if (options.kind && def.kind !== options.kind) continue;
       if (options.filter && !def.name.toLowerCase().includes(options.filter.toLowerCase())) continue;
-      allDefs.push({ ...def, file: path.relative(basePath, def.file) });
+      allDefs.push({ ...def, file: def.file });
     }
   }
 

@@ -179,6 +179,22 @@ class TaskManager {
     // New tasks arriving means we're in a new plan — reset the completion guard.
     this._allCompletedNotified = false;
 
+    // Deduplicate: if an active task with the same subject already exists, return it
+    // instead of creating a duplicate. Prevents LLM retries from doubling tasks.
+    const _norm = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    const duplicate = Object.values(this._tasks).find(t =>
+      t.status !== 'deleted' && _norm(t.subject) === _norm(subject)
+    );
+    if (duplicate) {
+      // Update description if the new one is longer (more detailed)
+      if (description && description.length > (duplicate.description || '').length) {
+        duplicate.description = description;
+        duplicate.updatedAt = new Date().toISOString();
+        this._save();
+      }
+      return { ...duplicate };
+    }
+
     const id = String(this._nextId++);
     const now = new Date().toISOString();
 

@@ -26,28 +26,23 @@ export class GeminiLLM extends BaseLLM {
       stream: true
     });
 
-    // Disable extended thinking unless explicitly selected.
-    // Thinking generates internal reasoning tokens before the first response,
-    // causing 10-60s of streaming silence.
-    if (this.caps.thinking && !this.useThinking) {
-      geminiParams.extra_body = { thinking_config: { thinking_budget: 0 } };
-    }
+    // Note: thinking_config/thinking_budget is intentionally NOT sent.
+    // It causes 400 errors on many Gemini models and the performance
+    // difference is minimal. Models think briefly by default — acceptable.
 
     let buffer = '';
     let usage = { input: 0, output: 0 };
     let outChars = 0;
     let _thinkChars = 0;
 
-    try {
+    const _doStream = async (params) => {
       const options = abortSignal ? { signal: abortSignal } : {};
-      const stream = await this.client.chat.completions.create(geminiParams, options);
-
+      const stream = await this.client.chat.completions.create(params, options);
       const race = this._abortRace(abortSignal);
 
       const _iterate = async () => {
         for await (const chunk of stream) {
           if (abortSignal?.aborted) break;
-          // Gemini thinking: count empty-content chunks as ~10 tokens each
           const _gDelta = chunk.choices?.[0]?.delta?.content || '';
           if (!_gDelta && _thinkChars === 0) _thinkChars = 1;
           if (!_gDelta && _thinkChars > 0) _thinkChars += 40;
@@ -73,9 +68,33 @@ export class GeminiLLM extends BaseLLM {
 
       if (race) await Promise.race([_iterate(), race]);
       else await _iterate();
+    };
+
+    // Gemini-specific: if supportsThinkingBudget, send thinking_config to disable thinking
+    // when not explicitly selected (avoids 10-60s streaming silence).
+    // If it fails with 400, retry without it as fallback.
+    if (this.caps.thinking && !this.useThinking && this.caps.supportsThinkingBudget) {
+      geminiParams.extra_body = { thinking_config: { thinking_budget: 0 } };
+    }
+
+    try {
+      await _doStream(geminiParams);
     } catch (err) {
-      this._logFail(err.message);
-      throw err;
+      // Fallback: if 400 with extra_body, retry without it
+      if (geminiParams.extra_body && String(err.status || err.message).includes('400')) {
+        channel.log('llm', `${this.model}: 400 with thinking_config — retrying without`);
+        delete geminiParams.extra_body;
+        buffer = ''; outChars = 0; _thinkChars = 0;
+        try {
+          await _doStream(geminiParams);
+        } catch (retryErr) {
+          this._logFail(retryErr.message);
+          throw retryErr;
+        }
+      } else {
+        this._logFail(err.message);
+        throw err;
+      }
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);

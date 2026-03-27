@@ -44,7 +44,7 @@ function buildInvertedIndex(files, basePath) {
     try { content = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
     const lines = content.split('\n');
     const tokens = tokenize(content);
-    const rel = path.relative(basePath, filePath);
+    const rel = path.relative(process.cwd(), filePath);
     docLengths[rel] = tokens.length;
     totalLength += tokens.length;
 
@@ -136,7 +136,7 @@ function patternSearch(pattern, files, basePath, maxResults = 30) {
       regex.lastIndex = 0; // reset for global regex
     }
     if (matches.length > 0) {
-      results.push({ file: path.relative(basePath, filePath), matches });
+      results.push({ file: path.relative(process.cwd(), filePath), matches });
     }
   }
   return results;
@@ -155,7 +155,7 @@ function globSearch(pattern, files, basePath, maxResults = 50) {
   const regex = new RegExp(escaped, 'i');
 
   return files
-    .map(f => path.relative(basePath, f))
+    .map(f => path.relative(process.cwd(), f))
     .filter(rel => regex.test(rel))
     .slice(0, maxResults)
     .map(file => ({ file }));
@@ -320,7 +320,7 @@ export default {
               results: defs.slice(0, maxResults).map(d => ({
                 name: d.name,
                 kind: d.kind,
-                file: path.relative(searchDir, d.file),
+                file: path.relative(process.cwd(), d.file),
                 line: d.line,
                 signature: d.signature
               }))
@@ -335,14 +335,14 @@ export default {
             definitions: result.definitions.slice(0, maxResults).map(d => ({
               name: d.name,
               kind: d.kind,
-              file: path.relative(searchDir, d.file),
+              file: path.relative(process.cwd(), d.file),
               line: d.line,
               endLine: d.endLine,
               signature: d.signature
             })),
             references: result.references.slice(0, maxResults).map(r => ({
               name: r.name,
-              file: path.relative(searchDir, r.file),
+              file: path.relative(process.cwd(), r.file),
               line: r.line,
               context: r.context
             })),
@@ -404,7 +404,7 @@ export default {
               file: targetFile,
               count: deps.length,
               results: deps.map(d => ({
-                file: path.relative(searchDir, d.file),
+                file: path.relative(process.cwd(), d.file),
                 depth: d.depth
               }))
             };
@@ -419,9 +419,9 @@ export default {
             file: targetFile,
             count: impact.length,
             results: impact.map(d => ({
-              file: path.relative(searchDir, d.file),
+              file: path.relative(process.cwd(), d.file),
               depth: d.depth,
-              via: d.via ? path.relative(searchDir, d.via) : null
+              via: d.via ? path.relative(process.cwd(), d.via) : null
             }))
           };
         }

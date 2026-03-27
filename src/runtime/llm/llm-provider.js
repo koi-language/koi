@@ -602,6 +602,9 @@ Task:
 ${taskDescription}`;
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
+    if (process.env.KOI_LOG_CLASSIFIER_PROMPTS) {
+      channel.log('classify-prompt', `--- CLASSIFIER PROMPT ---\n${prompt}\n--- END ---`);
+    }
 
     // Get ALL candidate models sorted by cost (cheapest first), try each until one works
     // Classification needs a model that can follow instructions and return valid JSON.
@@ -610,6 +613,7 @@ ${taskDescription}`;
       client: this._getClient(c.provider),
       model: c.model,
       provider: c.provider,
+      caps: c.caps || {},
     }));
 
     if (_candidates.length === 0) {
@@ -634,7 +638,7 @@ ${taskDescription}`;
         // Force Chat Completions API (not Responses) — classification is a simple JSON call
         const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
         const { OpenAIChatLLM } = await import('./providers/openai.js');
-        const llm = new OpenAIChatLLM(candidate.client, candidate.model, { temperature: 0, maxTokens: 200, useThinking: false, caps: {} });
+        const llm = new OpenAIChatLLM(candidate.client, candidate.model, { temperature: 0, maxTokens: 200, useThinking: false, caps: candidate.caps || {} });
         const apiCall = llm.complete([{ role: 'user', content: prompt }]).then(r => r);
         const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(8000)]);
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
@@ -990,11 +994,24 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
       const _isDelegateReturn = _lastAction?.action?.actionType === 'delegate';
       const _isDefaultProfile = session._autoProfile?.difficulty === DEFAULT_TASK_PROFILE.difficulty && session._autoProfile?.taskType === DEFAULT_TASK_PROFILE.taskType;
       const _hasUserInput = session.actionHistory.some(e => e.action?.intent === 'prompt_user' && e.result?.answer);
-      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || (_isDefaultProfile && _hasUserInput);
+      // Agent requested reclassification via reclassify_complexity action
+      const _agentRequestedReclassify = _lastAction?.action?.intent === 'reclassify_complexity';
+      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || (_isDefaultProfile && _hasUserInput) || _agentRequestedReclassify;
 
       if (_shouldReclassify) {
         // Build classification context from: args, user message, or pending tasks
         let _classifyArgs = context?.args && Object.keys(context.args).length > 0 ? context.args : null;
+        // Agent-requested reclassify: include the reason and recent actions for better context
+        if (_agentRequestedReclassify) {
+          const _reason = _lastAction?.result?.reason || _lastAction?.action?.reason || '';
+          const _recentActions = (session.actionHistory || []).slice(-5).map(e => {
+            const intent = e.action?.intent || '';
+            const error = e.error?.message || (e.result?.success === false ? e.result.error : '');
+            return error ? `${intent} FAILED: ${error.substring(0, 80)}` : intent;
+          }).join(', ');
+          _classifyArgs = { ..._classifyArgs, escalationReason: _reason, recentActions: _recentActions };
+          channel.log('llm', `[classify] Agent requested reclassify: ${_reason}`);
+        }
         // System/coordinator agent always needs a capable model (min code:65, reasoning:60)
         // — it coordinates, delegates, and interprets results. Weak models loop endlessly.
         const _isCoordinator = agent?.hasPermission?.('delegate');
@@ -1409,10 +1426,13 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
         if (this._autoMode) markProviderTimeout(this.provider);
         throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_LABEL} (no chunks received)`);
       }
-      // Circuit breaker: timeout or connection errors put provider on cooldown
+      // Circuit breaker: only timeouts put provider on cooldown.
+      // Connection errors are transient network issues — do NOT exclude the provider,
+      // just let the normal backoff retry with the same provider. If all providers
+      // get connection errors, it's a network problem, not a provider problem.
       const _isTimeout = /timed?\s*out|timeout/i.test(_callErr.message || '');
       const _isConnError = /connection error|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed/i.test(_callErr.message || '');
-      if ((_isTimeout || _isConnError) && this._autoMode) markProviderTimeout(this.provider);
+      if (_isTimeout && !_isConnError && this._autoMode) markProviderTimeout(this.provider);
       // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
       // model is unavailable. Remove that provider from candidates so we don't hammer it
       // on every retry iteration — the agent would otherwise loop forever with the same error.
@@ -1486,7 +1506,7 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
     channel.log('llm', `Response (${responseText.length} chars, ↑${usage.input} ↓${usage.output} tokens): ${responseText.substring(0, 200)}${responseText.length > 200 ? '...' : ''}`);
 
     // Parse the response into a single action
-    const action = this._parseReactiveResponse(responseText);
+    const action = await this._parseReactiveResponse(responseText, agent);
 
     // If streaming print was active but didn't see closing quote, finalize now
     if (_spState === 'streaming') {
@@ -1588,8 +1608,9 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
   /**
    * Parse the LLM response from reactive mode into a single action object.
    * Handles edge cases like markdown wrapping or legacy array format.
+   * If parsing fails entirely, attempts a recovery call with a stronger model.
    */
-  _parseReactiveResponse(responseText) {
+  async _parseReactiveResponse(responseText, agent = null) {
     // Clean markdown code blocks
     let cleaned = responseText.trim();
     if (cleaned.startsWith('```')) {
@@ -1693,6 +1714,22 @@ Do NOT automatically continue or restart any previous task. Wait for the user to
               const firstObj = JSON.parse(block);
               return this._normalizeReactiveAction(firstObj);
             } catch { /* fall through */ }
+          }
+        }
+        // Recovery: use a fast model to convert the malformed response into valid JSON.
+        // The recovery prompt includes the available tools so the model knows the schema.
+        if (agent) {
+          try {
+            const toolDocs = actionRegistry.generatePromptDocumentation(agent);
+            const recoveryPrompt = `An LLM produced this INVALID response instead of JSON:\n\n${cleaned.substring(0, 500)}\n\nConvert it into a valid JSON action. Available actions:\n${toolDocs.substring(0, 2000)}\n\nReturn ONLY valid JSON: {"actionType":"direct","intent":"<action_name>",...}`;
+            const recovered = await this.callUtility('Return ONLY valid JSON. No markdown.', recoveryPrompt, 300);
+            channel.log('llm', `[recovery] Attempting to fix malformed response: "${cleaned.substring(0, 100)}"`);
+            const recoveredCleaned = recovered.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+            const recoveredParsed = JSON.parse(recoveredCleaned);
+            channel.log('llm', `[recovery] Success: ${JSON.stringify(recoveredParsed).substring(0, 200)}`);
+            return this._normalizeReactiveAction(recoveredParsed);
+          } catch (recoveryErr) {
+            channel.log('llm', `[recovery] Failed: ${recoveryErr.message}`);
           }
         }
         throw new Error(`Failed to parse reactive LLM response as JSON: ${firstErr.message}\nResponse: ${cleaned.substring(0, 200)}`);
@@ -1887,6 +1924,14 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 - If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, include the image file path so the delegate can re-read it if the extracted data is wrong.' : ''}
 ` : '';
 
+    // ── Project Map (workspace layout for all agents) ──
+    let projectMapBlock = '';
+    try {
+      const { getProjectMap } = await import('../code/project-map.js');
+      const projectRoot = process.env.KOI_PROJECT_ROOT || cwd;
+      projectMapBlock = await getProjectMap(projectRoot);
+    } catch { /* non-fatal */ }
+
     return `
 # RUNTIME CONTEXT
 
@@ -1898,6 +1943,7 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 | Agent | ${agentDisplayName} |${langField}${phaseField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
+${projectMapBlock ? '\n' + projectMapBlock + '\n' : ''}
 
 **LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
 ${nonInteractiveBlock}

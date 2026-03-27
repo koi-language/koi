@@ -193,6 +193,14 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
     for (const [modelName, caps] of Object.entries(providerModels)) {
       if (caps.outputType !== 'text') continue;
       if (requiresImage && !caps.inputImage) continue;
+      // Skip OpenRouter-only models in standalone mode (direct API keys).
+      // These don't exist on the provider's native API:
+      // - Suffixed variants (:free, :extended) — OpenRouter pricing tiers
+      // - gpt-oss-* — open-source models served under openai/ namespace on OR
+      if (!process.env.KOI_AUTH_TOKEN) {
+        if (modelName.includes(':')) continue;
+        if (modelName.startsWith('gpt-oss')) continue;
+      }
       // Skip models whose context window is too small for the input
       if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
@@ -209,7 +217,7 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
 
       // Non-thinking variant
       if (meetsMinimum) {
-        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false });
+        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false, caps });
       }
 
       // Thinking variant: same score, slower, different cost.
@@ -221,7 +229,7 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       if (caps.thinking && meetsMinimum && difficulty >= 60) {
         const thinkingSpeed = Math.max(1, (caps.speed || 30) + THINKING_DELTA.speed);
         const costMultiplier = difficulty <= 70 ? 3 : difficulty <= 80 ? 1.5 : 1;
-        candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: taskScore, useThinking: true });
+        candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: taskScore, useThinking: true, caps });
       }
     }
   }
@@ -237,10 +245,14 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
     for (const [modelName, caps] of Object.entries(providerModels)) {
       if (caps.outputType !== 'text') continue;
       if (requiresImage && !caps.inputImage) continue;
+      if (!process.env.KOI_AUTH_TOKEN) {
+        if (modelName.includes(':')) continue;
+        if (modelName.startsWith('gpt-oss')) continue;
+      }
       if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
       const taskScore = caps[taskType] ?? 0;
-      candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false });
+      candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false, caps });
     }
   }
   return candidates;

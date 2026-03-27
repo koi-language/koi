@@ -176,7 +176,7 @@ export default {
       try { content = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
 
       const lines = content.split('\n');
-      const relFile = path.relative(searchDir, filePath);
+      const relFile = path.relative(process.cwd(), filePath);
 
       for (let i = 0; i < lines.length; i++) {
         if (totalMatches >= maxMatches) break;

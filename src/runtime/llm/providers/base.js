@@ -81,16 +81,10 @@ export class BaseLLM {
     });
   }
 
-  /** Strip unsupported params based on model capabilities (noTemperature, noMaxTokens). */
+  /** Strip unsupported params based on model capabilities. */
   _cleanParams(params) {
     const p = { ...params };
     if (this.caps.noTemperature) delete p.temperature;
-    if (this.caps.noMaxTokens) {
-      // gpt-5.x models require max_completion_tokens instead of max_tokens
-      const val = p.max_tokens;
-      delete p.max_tokens;
-      if (val) p.max_completion_tokens = val;
-    }
     return p;
   }
 

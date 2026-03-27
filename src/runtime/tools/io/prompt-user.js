@@ -89,7 +89,7 @@ Do not print a question separately before prompt_user.`,
         }
 
         return {
-          error: 'Non-interactive mode — no user available. Do not use prompt_user. Complete the task autonomously and call return when done.',
+          answer: '[SYSTEM] Non-interactive mode — no user is present. Do NOT call prompt_user again. If your task is complete, call return with a summary. If your task is NOT complete, continue working autonomously — assume all decisions are approved and proceed without asking.',
         };
       }
       // First call — mark as consumed and let it proceed to read from the queue.
