@@ -270,9 +270,14 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
 export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, minContextK = 0, profile = null } = {}) {
-  // Code tasks require a minimum difficulty of 50 to ensure capable models are selected.
+  // Code tasks require minimum scores to ensure capable models are selected.
   // Cheap/fast models can't reliably generate structured output like unified diffs.
-  if (taskType === 'code') difficulty = Math.max(difficulty, 50);
+  if (taskType === 'code') {
+    difficulty = Math.max(difficulty, 50);
+    if (profile) {
+      profile = { ...profile, code: Math.max(profile.code || 0, 50), reasoning: Math.max(profile.reasoning || 0, 30) };
+    }
+  }
 
   let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, profile);
 

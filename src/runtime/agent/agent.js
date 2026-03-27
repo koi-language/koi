@@ -348,6 +348,45 @@ export class Agent {
       throw new Error(`Agent ${this.name} has no handler for event: ${eventName}`);
     }
 
+    // ── Task-typed parameter auto-enqueue ──────────────────────────────────
+    // When the handler declares a parameter of type Task (e.g., on develop(task: Task)),
+    // the runtime automatically creates/resolves the task, assigns ownership to this
+    // agent, marks it in_progress, and enriches args with the full task object.
+    // This ensures the agent always has a formal task to work on — no ambiguity.
+    if (handler.__paramTypes__) {
+      const taskParam = Object.entries(handler.__paramTypes__).find(([, t]) => t === 'Task');
+      if (taskParam && args) {
+        const { taskManager } = await import('../state/task-manager.js');
+        let task = null;
+
+        // 1. If a task id is provided, fetch the existing task
+        //    Accepts both task.id (canonical) and task.taskId (legacy)
+        const _tid = args.id || args.taskId;
+        if (_tid) {
+          task = taskManager.get(String(_tid));
+        }
+
+        // 2. Otherwise, create a new task from the delegation data
+        if (!task && (args.subject || args.description)) {
+          task = taskManager.create({
+            subject: args.subject || args.description?.substring(0, 80) || 'Delegated task',
+            description: args.description || '',
+          });
+        }
+
+        // 3. Assign ownership and mark in_progress
+        if (task) {
+          const updates = { owner: this.name };
+          if (task.status === 'pending') updates.status = 'in_progress';
+          taskManager.update(String(task.id), updates);
+          // Use the live task object as args — by reference, not copy.
+          // Mutations (status, description, etc.) are visible everywhere.
+          args = task;
+          channel.log('task', `[${this.name}] Auto-enqueued task #${task.id}: ${task.subject}`);
+        }
+      }
+    }
+
     try {
       // Check if handler is playbook-only (has __playbookOnly__ flag)
       if (handler.__playbookOnly__) {
@@ -893,12 +932,13 @@ export class Agent {
       // Normalize to array for uniform processing
       const actionBatch = Array.isArray(response) ? response : [response];
 
-      // Normalize actions: collect stray fields into "data" when missing
+      // Normalize actions: collect stray fields into "data" when missing,
+      // and resolve task references (task: { id: "5" } → full task object).
       for (const act of actionBatch) {
-        this._normalizeActionData(act);
+        await this._normalizeActionData(act);
         // Also normalize delegate actions inside parallel blocks
         if (act.parallel && Array.isArray(act.parallel)) {
-          for (const pa of act.parallel) this._normalizeActionData(pa);
+          for (const pa of act.parallel) await this._normalizeActionData(pa);
         }
       }
 
@@ -1597,6 +1637,33 @@ export class Agent {
             channel.log('agent', `${this.name}: Injecting user feedback: ${feedbackText.substring(0, 100)}`);
             channel.print(`\x1b[2m↳ Feedback noted — adjusting...\x1b[0m`);
 
+            // Merge feedback into the active task's description using an LLM.
+            // This ensures the delegate sees an updated, coherent task spec
+            // (not just the raw feedback appended to context).
+            try {
+              const { taskManager } = await import('../state/task-manager.js');
+              const allTasks = taskManager.list();
+              const activeTask = allTasks.find(t => t.status === 'in_progress') || allTasks.find(t => t.status === 'pending');
+              if (activeTask && this.llmProvider) {
+                const mergeSystem = 'You are a task editor. Merge user feedback into an existing task specification. Return ONLY valid JSON with "subject" and "description" fields. Keep the description precise and actionable. Do not add commentary.';
+                const mergeUser =
+                  `Current task:\n  Subject: ${activeTask.subject}\n  Description: ${activeTask.description || '(none)'}\n\n` +
+                  `User feedback (correction/refinement):\n  ${feedbackText}\n\n` +
+                  `Produce an updated task that incorporates the feedback. If the feedback contradicts the original, the feedback takes priority. Return JSON: {"subject":"...","description":"..."}`;
+                const mergeResult = await this.llmProvider.callUtility(mergeSystem, mergeUser, 500);
+                try {
+                  const cleaned = mergeResult.replace(/```(?:json)?\n?|\n?```/g, '').trim();
+                  const match = cleaned.match(/\{[\s\S]*\}/);
+                  if (match) {
+                    const merged = JSON.parse(match[0]);
+                    if (merged.subject) taskManager.update(activeTask.id, { subject: merged.subject });
+                    if (merged.description) taskManager.update(activeTask.id, { description: merged.description });
+                    channel.log('agent', `${this.name}: Task #${activeTask.id} updated with merged feedback`);
+                  }
+                } catch { /* parse failed — feedback still injected into context below */ }
+              }
+            } catch { /* non-fatal — task merge is best-effort */ }
+
             // Inject as a user correction so the LLM knows this is a mid-task correction
             contextMemory.add(
               'user',
@@ -1724,8 +1791,33 @@ export class Agent {
    * E.g. { actionType, intent, name, age } → { actionType, intent, data: { name, age } }
    * @private
    */
-  _normalizeActionData(action) {
-    if (!action || action.data || action.actionType !== 'delegate') return;
+  async _normalizeActionData(action) {
+    if (!action || action.actionType !== 'delegate') return;
+
+    // If the LLM sent a "task" field, resolve it:
+    //   - task: { id: "5" } → resolve to the LIVE task object from task manager (by reference)
+    //   - task: { subject: "...", description: "..." } → pass as data (new task, auto-created by handle())
+    // Task references are live: mutations (status, description, etc.) are visible everywhere.
+    if (action.task && !action.data) {
+      let taskData = action.task;
+      // Resolve task reference by id — returns the live object, not a copy
+      if (taskData.id && !taskData.description) {
+        try {
+          const { taskManager: _tm } = await import('../state/task-manager.js');
+          const resolved = _tm.get(String(taskData.id));
+          if (resolved) {
+            taskData = resolved; // live reference — NOT a copy
+            if (process.env.KOI_DEBUG_LLM) {
+              console.error(`[Agent:${this.name}] 🔧 Resolved task reference #${resolved.id}: "${resolved.subject}"`);
+            }
+          }
+        } catch { /* non-fatal — pass through as-is */ }
+      }
+      action.data = taskData;
+      delete action.task;
+    }
+
+    if (action.data) return;
 
     const reserved = new Set(['actionType', 'intent']);
     const data = {};
@@ -2073,7 +2165,7 @@ export class Agent {
       // Auto-mark the associated task as in_progress before delegating,
       // and completed/failed after — so the UI always reflects the real state
       // regardless of whether the LLM remembered to call task_update.
-      let _taskId = action.data?.taskId ?? resolvedAction.data?.taskId;
+      let _taskId = action.data?.id ?? action.data?.taskId ?? resolvedAction.data?.id ?? resolvedAction.data?.taskId;
       // Fallback: if taskId was omitted, find the task by matching subject.
       // This covers cases where the LLM forgot to include taskId in the delegate data.
       if (!_taskId) {
@@ -2168,9 +2260,25 @@ export class Agent {
             const update = item.value;
             if (update._isProgress) {
               if (update._inputNeeded) {
-                // Process went silent and may be waiting for input.
-                // Ask the running agent (with full context) to decide the answer.
+                // Process went silent — first classify whether it crashed or is waiting for input.
+                // _classifyShellOutput is purpose-built for this (wait/kill/ask).
+                const outputSoFar = update.output_so_far || '';
+                const preClassify = await this._classifyShellOutput(outputSoFar, resolvedAction.command || '');
+                if (preClassify === 'kill') {
+                  channel.log('shell', `${this.name}: silence → classified as crash/error, killing process`);
+                  this._shellKilledByClassifier = outputSoFar;
+                  iter.return();
+                  break;
+                }
+
+                // Not a crash — ask the running agent to decide what input to provide.
                 const answer = await this._resolveProcessInput(update, resolvedAction);
+                if (answer === '__KILL__') {
+                  // LLM determined process crashed/errored, not waiting for input
+                  this._shellKilledByClassifier = outputSoFar;
+                  iter.return();
+                  break;
+                }
                 if (answer === null && process.env.KOI_EXIT_ON_COMPLETE === '1') {
                   // Non-interactive: can't provide input — kill process and return error
                   this._shellKilledByClassifier = update.output_so_far || '';
@@ -2323,25 +2431,24 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
       const promptContext = (update.promptContext || '').replace(_ANSI_STRIP, '').trim();
       const command = resolvedAction.command || update.command || '';
 
-      const system = `You are ${this.name}. You launched a shell command that is now waiting for interactive input. Respond ONLY with valid JSON, no markdown.`;
+      const system = `You are ${this.name}. A shell command has gone silent (no output for 10+ seconds). Analyze the output and respond ONLY with valid JSON, no markdown.`;
       const user =
         `Recent task context:\n${recentContext || '(no history yet)'}\n\n` +
         `Running command: ${command}\n` +
         `Recent terminal output (last 20 lines):\n\`\`\`\n${promptContext.slice(-600)}\n\`\`\`\n\n` +
-        `The process is waiting for user input. Based on your task context, what value should you enter?\n\n` +
-        `IMPORTANT — Detect the type of prompt:\n\n` +
+        `FIRST: Determine if the process is actually waiting for input, or if it has crashed/errored/hung.\n\n` +
+        `If the output shows errors, stack traces, crashes, unhandled exceptions, or error boundaries → the process is NOT waiting for input. Set autoAnswer to "__KILL__" to terminate it.\n\n` +
+        `If the process IS genuinely waiting for interactive input, detect the type of prompt:\n\n` +
         `1. **Arrow-key menu / selector** (lines with ❯, >, ●, ○, or indented options like "~ X rename" / "+ X create"):\n` +
         `   - Analyze ALL the options listed in the menu.\n` +
-        `   - Decide which option is the CORRECT one based on the task context (e.g. "create enum" vs "rename enum" — pick the one that matches the intent).\n` +
+        `   - Decide which option is the CORRECT one based on the task context.\n` +
         `   - Count which position that option is at (0-indexed from the highlighted/first item).\n` +
-        `   - Set autoAnswer to "__MENU_SELECT__:N" where N is the 0-based index of the option to select.\n` +
-        `   - Example: if the correct option is the 3rd item → autoAnswer: "__MENU_SELECT__:2"\n` +
-        `   - Example: if the correct option is already highlighted (first item) → autoAnswer: "__MENU_SELECT__:0"\n\n` +
-        `2. **Yes/No confirmation** (e.g. "Are you sure? [Y/n]", "Continue? (y/N)"): Set autoAnswer to "y" or "n" as appropriate.\n\n` +
+        `   - Set autoAnswer to "__MENU_SELECT__:N" where N is the 0-based index.\n\n` +
+        `2. **Yes/No confirmation** (e.g. "Are you sure? [Y/n]"): Set autoAnswer to "y" or "n" as appropriate.\n\n` +
         `3. **Text input** (DB name, env, region, path, etc.): Set autoAnswer to the inferred value.\n\n` +
         `4. **Password, API key, secret, or truly unknown value**: Set autoAnswer to null.\n\n` +
         `- isSecret: true only for passwords, API keys, tokens, secrets.\n` +
-        `Reply ONLY with JSON: {"autoAnswer":"value or null","isSecret":bool,"label":"one-sentence question for the user (only when autoAnswer is null)"}`;
+        `Reply ONLY with JSON: {"autoAnswer":"value or __KILL__ or null","isSecret":bool,"label":"one-sentence description (question for user when null, or kill reason when __KILL__)"}`;
 
       const responseText = await this.llmProvider.callUtility(system, user, 200);
 
@@ -2358,6 +2465,12 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
       // Auto-answer: write directly to stdin, no user interaction needed
       if (parsed.autoAnswer != null) {
         let answer = String(parsed.autoAnswer);
+
+        // Kill: LLM determined the process crashed/errored, not waiting for input
+        if (answer === '__KILL__') {
+          channel.log('shell', `[${this.name}] process classified as crashed/errored — killing (${parsed.label || 'no reason'})`);
+          return '__KILL__';
+        }
 
         // Menu selection: send N arrow-down keys + Enter
         const menuMatch = answer.match(/^__MENU_SELECT__:(\d+)$/);

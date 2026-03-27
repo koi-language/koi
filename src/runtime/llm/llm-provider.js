@@ -865,11 +865,15 @@ ${taskDescription}`;
         // accumulate across multiple resume cycles.
         contextMemory.add(
           'user',
-          `SESSION RESUMED. The conversation history above is your complete history with this user — use it to assist them.
+          `SESSION RESUMED. The conversation history above is from a previous session.
 
-Your ONLY next action is: { "intent": "prompt_user" } — greet the user and wait for their instruction.
+Your ONLY next action is: { "intent": "prompt_user" } — ask the user what they need.
 
-Do NOT automatically continue or restart any previous task. Wait for the user to explicitly ask.`,
+CRITICAL RULES:
+- Do NOT repeat, summarize, or reference anything from the conversation history above.
+- Do NOT re-state your last response. The user already saw it.
+- Do NOT automatically continue or restart any previous task.
+- Keep your greeting SHORT (one sentence max). Just ask what they need.`,
           'Session resumed.',
           null,
           { ephemeral: true }

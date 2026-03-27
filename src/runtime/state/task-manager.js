@@ -217,12 +217,13 @@ class TaskManager {
   }
 
   /**
-   * Get a task by ID. Returns null if not found.
+   * Get a task by ID. Returns the live task object (by reference).
+   * Mutations to the returned object are reflected everywhere.
+   * Returns null if not found.
    */
   get(id) {
     this._loadIfNeeded();
-    const task = this._tasks[String(id)];
-    return task ? { ...task } : null;
+    return this._tasks[String(id)] || null;
   }
 
   /**

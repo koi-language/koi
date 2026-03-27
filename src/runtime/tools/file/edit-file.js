@@ -15,6 +15,88 @@ import path from 'path';
 
 import { parseUnifiedDiff, renderColoredDiff } from '../../util/diff-render.js';
 import { getFilePermissions, runFilePermDialog } from '../../code/file-permissions.js';
+
+/**
+ * Generate a unified diff string from two file contents.
+ * Uses a simple LCS-based line diff — no external dependencies.
+ * Returns null if contents are identical.
+ */
+function _generateUnifiedDiff(oldText, newText) {
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+
+  // Quick identity check
+  if (oldText === newText) return null;
+
+  // Build edit script using Myers-like diff (simplified: line-level LCS)
+  const edits = []; // { type: ' '|'+'|'-', line, oldIdx, newIdx }
+  let oi = 0, ni = 0;
+
+  // Simple O(n*m) LCS to find common lines
+  const lcsLen = [];
+  for (let i = 0; i <= oldLines.length; i++) {
+    lcsLen[i] = new Array(newLines.length + 1).fill(0);
+  }
+  for (let i = oldLines.length - 1; i >= 0; i--) {
+    for (let j = newLines.length - 1; j >= 0; j--) {
+      if (oldLines[i] === newLines[j]) {
+        lcsLen[i][j] = lcsLen[i + 1][j + 1] + 1;
+      } else {
+        lcsLen[i][j] = Math.max(lcsLen[i + 1][j], lcsLen[i][j + 1]);
+      }
+    }
+  }
+
+  oi = 0; ni = 0;
+  while (oi < oldLines.length || ni < newLines.length) {
+    if (oi < oldLines.length && ni < newLines.length && oldLines[oi] === newLines[ni]) {
+      edits.push({ type: ' ', line: oldLines[oi], oldIdx: oi, newIdx: ni });
+      oi++; ni++;
+    } else if (ni < newLines.length && (oi >= oldLines.length || lcsLen[oi][ni + 1] >= lcsLen[oi + 1][ni])) {
+      edits.push({ type: '+', line: newLines[ni], newIdx: ni });
+      ni++;
+    } else {
+      edits.push({ type: '-', line: oldLines[oi], oldIdx: oi });
+      oi++;
+    }
+  }
+
+  // Group edits into hunks (context of 3 lines)
+  const CTX = 3;
+  const hunks = [];
+  let hunkStart = -1;
+  for (let i = 0; i < edits.length; i++) {
+    if (edits[i].type !== ' ') {
+      const from = Math.max(0, i - CTX);
+      const to = Math.min(edits.length - 1, i + CTX);
+      if (hunkStart < 0) hunkStart = from;
+      // Extend current hunk or start new
+      if (hunks.length > 0 && from <= hunks[hunks.length - 1].end + 1) {
+        hunks[hunks.length - 1].end = to;
+      } else {
+        hunks.push({ start: from, end: to });
+      }
+    }
+  }
+
+  if (hunks.length === 0) return null;
+
+  // Render unified diff format
+  const lines = [];
+  for (const hunk of hunks) {
+    const hunkEdits = edits.slice(hunk.start, hunk.end + 1);
+    const oldStart = (hunkEdits.find(e => e.oldIdx != null)?.oldIdx ?? 0) + 1;
+    const newStart = (hunkEdits.find(e => e.newIdx != null)?.newIdx ?? 0) + 1;
+    const oldCount = hunkEdits.filter(e => e.type !== '+').length;
+    const newCount = hunkEdits.filter(e => e.type !== '-').length;
+    lines.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
+    for (const e of hunkEdits) {
+      lines.push(`${e.type}${e.line}`);
+    }
+  }
+
+  return lines.join('\n');
+}
 import { sessionTracker } from '../../state/session-tracker.js';
 import { channel } from '../../io/channel.js';
 
@@ -213,9 +295,21 @@ export default {
 
   async execute(action, agent) {
     const filePath = action.path;
-    const diffStr = action.diff;
+    let diffStr = action.diff;
 
     if (!filePath) throw new Error('edit_file: "path" field is required');
+
+    // Fallback: if the model sent full file content instead of a unified diff,
+    // compute the diff automatically so the user sees the same approval flow.
+    if (!diffStr && action.content && typeof action.content === 'string') {
+      const resolvedPath = path.resolve(filePath);
+      const oldContent = fs.existsSync(resolvedPath) ? fs.readFileSync(resolvedPath, 'utf8') : '';
+      diffStr = _generateUnifiedDiff(oldContent, action.content);
+      if (!diffStr) {
+        return { success: true, path: filePath, note: 'No changes detected (content identical)' };
+      }
+    }
+
     if (!diffStr) throw new Error('edit_file: "diff" field is required');
 
     const resolvedPath = path.resolve(filePath);

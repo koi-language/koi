@@ -1010,6 +1010,15 @@ export class KoiTranspiler {
     const params = node.params.map(p => p.name.name).join(', ');
     const handlerName = node.event.name;
 
+    // Extract parameter type annotations (e.g., { args: 'Json', task: 'Task' })
+    const paramTypes = {};
+    for (const p of node.params) {
+      if (p.type && p.type.name) {
+        paramTypes[p.name.name] = p.type.name;
+      }
+    }
+    const hasParamTypes = Object.keys(paramTypes).length > 0;
+
     // Explicit affordance statement in body takes priority; fall back to build cache
     const affordanceStmt = node.body.find(s => s.type === 'AffordanceStatement');
     const cachedDesc = affordanceStmt
@@ -1059,6 +1068,9 @@ export class KoiTranspiler {
       if (node.isPrivate) {
         code += this.emit(`${this.getIndent()}handler.__private__ = true;\n`);
       }
+      if (hasParamTypes) {
+        code += this.emit(`${this.getIndent()}handler.__paramTypes__ = ${JSON.stringify(paramTypes)};\n`);
+      }
       code += this.emit(`${this.getIndent()}return handler;\n`);
       this.indent--;
       code += this.emit(`${this.getIndent()}})(),\n`);
@@ -1085,6 +1097,29 @@ export class KoiTranspiler {
       if (node.isPrivate) {
         code += this.emit(`${this.getIndent()}handler.__private__ = true;\n`);
       }
+      if (hasParamTypes) {
+        code += this.emit(`${this.getIndent()}handler.__paramTypes__ = ${JSON.stringify(paramTypes)};\n`);
+      }
+      code += this.emit(`${this.getIndent()}return handler;\n`);
+      this.indent--;
+      code += this.emit(`${this.getIndent()}})(),\n`);
+      return code;
+    }
+
+    // Regular handler without IIFE — if we have paramTypes, we need an IIFE wrapper
+    if (hasParamTypes) {
+      let code = this.emit(`${this.getIndent()}${handlerName}: (() => {\n`);
+      this.indent++;
+      code += this.emit(`${this.getIndent()}const handler = async function(${params}) {\n`);
+      this.indent++;
+      this.inEventHandler = true;
+      for (const stmt of nonAffordanceBody) {
+        code += this.generateStatement(stmt);
+      }
+      this.inEventHandler = false;
+      this.indent--;
+      code += this.emit(`${this.getIndent()}};\n`);
+      code += this.emit(`${this.getIndent()}handler.__paramTypes__ = ${JSON.stringify(paramTypes)};\n`);
       code += this.emit(`${this.getIndent()}return handler;\n`);
       this.indent--;
       code += this.emit(`${this.getIndent()}})(),\n`);
