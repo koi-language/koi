@@ -49,6 +49,10 @@ export class SessionTracker {
   _ensureInit() {
     if (this.initialized) return;
 
+    // Don't create .koi if it doesn't exist yet — onboarding handles that.
+    const koiDir = path.join(this.projectRoot, '.koi');
+    if (!fs.existsSync(koiDir)) return;
+
     const repoExists = fs.existsSync(path.join(this.gitDir, 'HEAD'));
 
     if (repoExists) {
@@ -508,6 +512,10 @@ export class SessionTracker {
    */
   saveDisplayEntry(type, text) {
     try {
+      // Only create directory if the .koi parent already exists (onboarding creates it).
+      // This prevents premature .koi creation before the user confirms the project.
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, 'display-log.jsonl');
       fs.appendFileSync(filePath, JSON.stringify({ ts: Date.now(), type, text }) + '\n', 'utf8');
@@ -517,6 +525,8 @@ export class SessionTracker {
   /** Clear the display log (called at the start of each run after loading). */
   clearDisplayLog() {
     try {
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       const filePath = path.join(this.gitDir, 'display-log.jsonl');
       fs.mkdirSync(this.gitDir, { recursive: true });
       fs.writeFileSync(filePath, '', 'utf8');

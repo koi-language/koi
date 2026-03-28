@@ -56,7 +56,10 @@ export function renderLine(line) {
     return DIM + '─'.repeat(Math.min(cols, 60)) + RST;
   }
 
-  // Headings
+  // Headings (check most # first so #### doesn't match ###)
+  if (trimmed.startsWith('#### ')) {
+    return BOLD + renderInline(trimmed.substring(5)) + RST;
+  }
   if (trimmed.startsWith('### ')) {
     return BOLD + renderInline(trimmed.substring(4)) + RST;
   }
