@@ -343,7 +343,8 @@ export class SessionTracker {
    *  Only writes if the session dir already exists (user has already interacted). */
   saveInputHistory(entries) {
     try {
-      if (!this.initialized && !fs.existsSync(this.gitDir)) return;
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, 'input-history.json');
       fs.writeFileSync(filePath, JSON.stringify(entries), 'utf8');
@@ -368,6 +369,8 @@ export class SessionTracker {
     // Write the dialogue entry first — independent of git init.
     // This ensures conversation data is persisted even if git init fails.
     try {
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, 'dialogue.jsonl');
       fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf8');
@@ -554,7 +557,8 @@ export class SessionTracker {
    *  Conversation persistence is independent of git — no git init required. */
   saveConversation(agentName, messages) {
     try {
-      if (!this.initialized && !fs.existsSync(this.gitDir)) return;
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, `conversation-${agentName}.json`);
       fs.writeFileSync(filePath, JSON.stringify(messages), 'utf8');
@@ -564,7 +568,8 @@ export class SessionTracker {
   /** Save shared session knowledge to disk. */
   saveKnowledge(facts) {
     try {
-      if (!this.initialized && !fs.existsSync(this.gitDir)) return;
+      const koiDir = path.join(this.projectRoot, '.koi');
+      if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, 'knowledge.json');
       fs.writeFileSync(filePath, JSON.stringify(facts), 'utf8');

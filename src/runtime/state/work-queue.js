@@ -73,6 +73,9 @@ class WorkQueue {
   }
 
   _ensureDir() {
+    const root = process.env.KOI_PROJECT_ROOT || process.cwd();
+    const koiDir = path.join(root, '.koi');
+    if (!fs.existsSync(koiDir)) return;
     const dir = path.dirname(this._getFilePath());
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });

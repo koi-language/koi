@@ -1871,10 +1871,13 @@ CRITICAL RULES:
     const agentDisplayName = agent?.name || 'unknown';
     const statusPhase = agent?.state?.statusPhase || null;
     const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
-    // User language — set by System agent via update_state, propagated via globalThis
+    // User language — set by System agent via update_state, propagated via globalThis.
+    // Falls back to KOI_LANG (detected from system locale at startup).
     const stateLanguage = agent?.state?.userLanguage;
     if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
-    const userLanguage = globalThis.__koiUserLanguage || '';
+    const _langCodeMap = { en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian', pt: 'Portuguese', ja: 'Japanese', ko: 'Korean', zh: 'Chinese', ru: 'Russian', ar: 'Arabic', nl: 'Dutch', sv: 'Swedish', pl: 'Polish', tr: 'Turkish' };
+    const _koiLangFallback = process.env.KOI_LANG ? (_langCodeMap[process.env.KOI_LANG] || process.env.KOI_LANG) : '';
+    const userLanguage = globalThis.__koiUserLanguage || _koiLangFallback;
     const langField = userLanguage ? `\n| User language | ${userLanguage} |` : '';
 
     // Timezone (IANA)
