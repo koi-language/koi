@@ -137,6 +137,16 @@ Do not print a question separately before prompt_user.`,
         } catch {}
       } else if (chosen?.action === 'print') {
         channel.print(channel.renderMarkdown(chosen.text || ''));
+      } else if (chosen?.action === 'logout') {
+        // Delete token and restart so the user can log in with a different account
+        try {
+          const os = await import('os');
+          const path = await import('path');
+          const fs = await import('fs');
+          fs.unlinkSync(path.join(os.homedir(), '.koi', '.token'));
+        } catch {}
+        channel.print('Logged out. Please restart koi-cli to log in with a different account.');
+        process.exit(0);
       } else if (chosen?.action === 'exit') {
         process.exit(0);
       }

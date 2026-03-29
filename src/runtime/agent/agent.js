@@ -942,6 +942,23 @@ export class Agent {
           break;
         }
 
+        // Server errors (5xx) from the gateway — show in progress area (not persisted to history)
+        const _httpStatus = error.status ?? error.statusCode;
+        if (_httpStatus >= 500) {
+          const _s = globalThis.__koiStrings || {};
+          channel.progress(`\x1b[33m⚠ ${_s.serverError || 'Server error'}: ${error.message}\x1b[0m`);
+        }
+
+        // Auth expired = fatal, user needs to re-login
+        if (error.message?.startsWith('AUTH_EXPIRED:')) {
+          const msg = error.message.replace('AUTH_EXPIRED: ', '');
+          channel.print(`\x1b[33m⚠ ${msg}\x1b[0m`);
+          channel.log('agent', `${this.name}: Auth expired — stopping`);
+          // Delete the invalid token so next launch triggers login
+          try { const fs = await import('fs'); const os = await import('os'); const path = await import('path'); fs.unlinkSync(path.join(os.homedir(), '.koi', '.token')); } catch {}
+          break;
+        }
+
         // No providers available = fatal, don't retry (would loop forever)
         if (error.message?.startsWith('NO_PROVIDERS:')) {
           const msg = error.message.replace('NO_PROVIDERS: ', '');

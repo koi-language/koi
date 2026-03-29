@@ -53,10 +53,10 @@ export async function loadRemoteModels() {
   }
   _remoteLastAttempt = now;
 
-  const base = (process.env.KOI_API_URL || 'http://localhost:3000');
-  // Gateway mode (KOI_AUTH_TOKEN): use /gateway/models (active models for this user)
-  // API keys mode: use /gateway/models.json (all models with complete scores)
-  const endpoint = process.env.KOI_AUTH_TOKEN ? '/gateway/models' : '/gateway/models.json';
+  const base = process.env.KOI_API_URL || 'http://localhost:3000';
+  // Both gateway and API keys mode use /gateway/models.json (all models with scores).
+  // In gateway mode, the backend filters by user plan; in API keys mode, all models are returned.
+  const endpoint = '/gateway/models.json';
   try {
     const headers = { 'Accept': 'application/json' };
     if (_remoteEtag) headers['If-None-Match'] = _remoteEtag;
@@ -82,13 +82,13 @@ export async function loadRemoteModels() {
       }
     }
   } catch {
-    // Backend unreachable — fall back to local models.json ONLY when using API keys directly
-    if (!_remoteLoaded && !process.env.KOI_AUTH_TOKEN) {
+    // Backend unreachable — fall back to local models.json so the agent can still work
+    if (!_remoteLoaded) {
       const fallback = _getLocalFallback();
       if (Object.keys(fallback).length > 0) {
         modelsData = fallback;
         if (process.env.KOI_LOG_FILE) {
-          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend unreachable, using local models.json fallback (API keys mode)\n`); } catch {}
+          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend unreachable, using local models.json fallback\n`); } catch {}
         }
       }
     }

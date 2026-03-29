@@ -94,6 +94,7 @@ export class LLMProvider {
     if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
       const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
       const gatewayBase = apiBase + '/gateway';
+      channel.log('llm', `[gateway] baseURL=${gatewayBase} (KOI_API_URL=${process.env.KOI_API_URL || '(not set)'})`);
       this._koiGatewayApiBase = apiBase;
       this._koiGateway = new OpenAI({
         apiKey: process.env.KOI_AUTH_TOKEN,
@@ -1445,6 +1446,11 @@ CRITICAL RULES:
         // 429 = rate limit — put provider on cooldown
         if (_status === 429) {
           markProviderTimeout(this.provider);
+        }
+        // 401 in gateway mode = token expired/invalid — signal for re-auth
+        if (_status === 401 && this._gatewayMode) {
+          const _s = globalThis.__koiStrings || {};
+          throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
         }
         // Other 4xx (401, 403, 404) = invalid key or model — exclude provider entirely.
         if (typeof _status === 'number' && _status >= 400 && _status < 500 && _status !== 429) {
