@@ -1903,8 +1903,8 @@ To transition phase, emit update_state either alone or as the LAST action in a b
 Always set the phase that matches what you expect to do NEXT turn.
 ` : '';
 
-    // prompt_user has null permission so it's always available — check if agent is a coordinator
-    const hasPromptUser = !agent?.amnesia; // delegate agents with amnesia don't use prompt_user
+    // prompt_user requires 'prompt_user' permission — only System and ProjectOnBoarding have it
+    const hasPromptUser = agent?.hasPermission?.('prompt_user') ?? false;
 
     // Non-interactive mode: agent must act without asking for confirmation
     const nonInteractiveBlock = process.env.KOI_EXIT_ON_COMPLETE === '1' ? `

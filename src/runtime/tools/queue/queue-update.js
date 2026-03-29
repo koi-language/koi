@@ -8,7 +8,7 @@
  * - Update the subject if the scope changed
  */
 
-import { workQueue } from '../../state/work-queue.js';
+import { workQueue as _globalQueue, WorkQueue } from '../../state/work-queue.js';
 
 export default {
   type: 'queue_update',
@@ -77,7 +77,7 @@ export default {
     },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     const { id, subject, description, replaceDescription, feedback, status } = action;
 
     if (!id) {
@@ -85,6 +85,8 @@ export default {
     }
 
     try {
+      if (agent && !agent._workQueue) agent._workQueue = new WorkQueue(agent.name);
+      const queue = agent?._workQueue || _globalQueue;
       const updates = {};
       if (subject !== undefined) updates.subject = subject;
       if (description !== undefined) {
@@ -94,7 +96,7 @@ export default {
       if (feedback !== undefined) updates.feedback = feedback;
       if (status !== undefined) updates.status = status;
 
-      const item = workQueue.update(id, updates);
+      const item = queue.update(id, updates);
 
       return {
         success: true,

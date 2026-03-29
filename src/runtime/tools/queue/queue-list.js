@@ -5,7 +5,7 @@
  * check its backlog and decide what to work on next.
  */
 
-import { workQueue } from '../../state/work-queue.js';
+import { workQueue as _globalQueue, WorkQueue } from '../../state/work-queue.js';
 
 export default {
   type: 'queue_list',
@@ -32,12 +32,14 @@ export default {
     { actionType: 'direct', intent: 'queue_list', status: 'pending' },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     const { status } = action;
 
     try {
-      const items = workQueue.list(status ? { status } : {});
-      const summary = workQueue.getSummary();
+      if (agent && !agent._workQueue) agent._workQueue = new WorkQueue(agent.name);
+      const queue = agent?._workQueue || _globalQueue;
+      const items = queue.list(status ? { status } : {});
+      const summary = queue.getSummary();
 
       return {
         items,

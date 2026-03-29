@@ -10,7 +10,7 @@ import { channel } from '../../io/channel.js';
 export default {
   type: 'prompt_user',
   intent: 'prompt_user',
-  description: 'Ask the user a question or show an inline prompt. Two modes: (1) QUESTION mode: set "question" to display text, then show input below. (2) INLINE mode: set "prompt" (without "question") to show an inline prompt where the user types on the same line — ideal for shell-like prompts, e.g. { "intent": "prompt_user", "prompt": "(~/dir) $ " }. Can include "options" array for interactive menu — an "Other..." free-text option is always appended automatically so the user can express anything not covered by the choices. Returns: { answer }',
+  description: 'Ask the user a question or show an inline prompt. Modes: (1) QUESTION: set "question" for text input. (2) OPTIONS: set "question" + "options" array for interactive select menu. Always add "meta": { "allowFreeText": true } so the user can type a custom answer. (3) MULTI-SELECT: same as options but add "meta": { "allowFreeText": true, "multiSelect": true } — the user toggles checkboxes with Space and confirms with Enter. Use this when the user can pick MULTIPLE items. (4) INLINE: set "prompt" for shell-like input. Returns: { answer }',
   instructions: `Use prompt_user only for information that cannot be verified from tools, commands, files, or prior action results.
 
 Never ask the user something you can verify yourself with:
@@ -32,7 +32,7 @@ Do not print a question separately before prompt_user.`,
   // In non-interactive mode, hide when there's nothing queued to consume.
   // Visible while the initial prompt is still in the queue; hidden after it's consumed.
   hidden: () => process.env.KOI_EXIT_ON_COMPLETE === '1' && process.env._KOI_INITIAL_PROMPT_CONSUMED === '1',
-  permission: null,
+  permission: 'prompt_user',
 
   schema: {
     type: 'object',
@@ -52,6 +52,14 @@ Do not print a question separately before prompt_user.`,
       prompt: {
         type: 'string',
         description: 'Optional custom prompt for text input mode (defaults to "❯ " — no need to set this)'
+      },
+      meta: {
+        type: 'object',
+        description: 'Options: allowFreeText (true to add "Other..." option), multiSelect (true for checkbox-style multi-selection with Space to toggle)',
+        properties: {
+          allowFreeText: { type: 'boolean' },
+          multiSelect: { type: 'boolean' }
+        }
       }
     },
     required: []
@@ -60,7 +68,8 @@ Do not print a question separately before prompt_user.`,
   examples: [
     { intent: 'prompt_user', message: 'Here is the answer to your question:\n\n1. First point\n2. Second point', question: 'Do you need more details?' },
     { intent: 'prompt_user', question: 'What is your name?' },
-    { intent: 'prompt_user', question: 'Do you want to proceed?', options: ['Yes', 'No'] },
+    { intent: 'prompt_user', question: 'Do you want to proceed?', options: ['Yes', 'No'], meta: { allowFreeText: true } },
+    { intent: 'prompt_user', question: 'Which features for the MVP?', options: ['Auth', 'Dashboard', 'API', 'Admin panel'], meta: { allowFreeText: true, multiSelect: true } },
     { intent: 'prompt_user', prompt: '(~/project) $ ' }
   ],
 
@@ -147,10 +156,11 @@ Do not print a question separately before prompt_user.`,
       // Strip numbered/bulleted list lines from question — they duplicate the select menu options
       const cleanQuestion = question
         .split('\n').filter(l => !/^\s*[\d\-\*]+[\.\)]\s/.test(l)).join('\n').trim();
+      const _multiSelect = action.meta?.multiSelect === true;
       const value = await channel.select(cleanQuestion || question, options.map((opt) => ({
         title: opt,
         value: opt
-      })), 0, { meta: { allowFreeText: true } });
+      })), 0, { meta: { allowFreeText: true, multiSelect: _multiSelect } });
       return { answer: value || options[0] };
     }
 

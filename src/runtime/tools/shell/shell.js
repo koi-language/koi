@@ -24,6 +24,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 
+import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { channel } from '../../io/channel.js';
 
@@ -286,9 +287,9 @@ async function _drainPermQueue() {
     // Build the "Always allow" label based on the command's category
     const alwaysLabel = (() => {
       const cat = permissionCategory(baseCmd);
-      if (cat === 'READ')  return 'Always allow read commands in this directory';
-      if (cat === 'WRITE') return 'Always allow write commands in this directory';
-      return `Always allow ${baseCmd}`;
+      if (cat === 'READ')  return t('alwaysAllowReadCmds');
+      if (cat === 'WRITE') return t('alwaysAllowWriteCmds');
+      return t('alwaysAllowCmd').replace('{cmd}', baseCmd);
     })();
 
     // Detect dangerous patterns for the warning message
@@ -304,9 +305,9 @@ async function _drainPermQueue() {
     // Pass command + warning as meta so the UI can render the Claude-style layout
     const value = await Promise.race([
       channel.select(description, [
-        { title: 'Yes', value: 'yes' },
+        { title: t('permYes'), value: 'yes' },
         { title: alwaysLabel, value: 'always' },
-        { title: 'No', value: 'no' }
+        { title: t('permNo'), value: 'no' }
       ], 0, { meta: { type: 'bash', command, warning } }),
       _cancelToken,
     ]);
@@ -428,7 +429,7 @@ Commands that launch long-running processes MUST use "background": true. Example
 
     if (!permitted) {
       reportDone?.();
-      channel.print(`\x1b[2mSkipped\x1b[0m`);
+      channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
       yield {
         success: false,
         denied: true,

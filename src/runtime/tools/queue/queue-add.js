@@ -5,7 +5,7 @@
  * description as complete as possible, asking the user for clarification if needed.
  */
 
-import { workQueue } from '../../state/work-queue.js';
+import { workQueue as _globalQueue, WorkQueue } from '../../state/work-queue.js';
 
 export default {
   type: 'queue_add',
@@ -53,7 +53,10 @@ export default {
     }
 
     try {
-      const item = workQueue.add({
+      // Use agent's own queue; lazy-init if needed
+      if (agent && !agent._workQueue) agent._workQueue = new WorkQueue(agent.name);
+      const queue = agent?._workQueue || _globalQueue;
+      const item = queue.add({
         subject,
         description: description || '',
         owner: agent?.name || 'unknown',

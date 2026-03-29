@@ -70,6 +70,10 @@ export class FilePermissions {
     if (process.env.KOI_YES === '1') return true;
 
     const resolved = path.resolve(filePath);
+
+    // Files inside .koi/ never need permission — it's Koi's own config/data directory
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    if (resolved.startsWith(path.join(projectRoot, '.koi') + path.sep) || resolved === path.join(projectRoot, '.koi')) return true;
     const dir = path.dirname(resolved);
 
     if (level === 'write') {

@@ -5,7 +5,7 @@
  * including all accumulated feedback and discovered information.
  */
 
-import { workQueue } from '../../state/work-queue.js';
+import { workQueue as _globalQueue, WorkQueue } from '../../state/work-queue.js';
 
 export default {
   type: 'queue_get',
@@ -30,7 +30,7 @@ export default {
     { actionType: 'direct', intent: 'queue_get', id: '1' },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     const { id } = action;
 
     if (!id) {
@@ -38,7 +38,9 @@ export default {
     }
 
     try {
-      const item = workQueue.get(id);
+      if (agent && !agent._workQueue) agent._workQueue = new WorkQueue(agent.name);
+      const queue = agent?._workQueue || _globalQueue;
+      const item = queue.get(id);
       if (!item) {
         return { success: false, error: `Queue item ${id} not found` };
       }

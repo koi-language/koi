@@ -10,6 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { discoverFiles, IGNORE_DIRS, SOURCE_EXTS } from '../../code/file-discovery.js';
 import { channel } from '../../io/channel.js';
@@ -130,18 +131,18 @@ export default {
     if (!permissions.isAllowed(searchPath, 'read')) {
       channel.clearProgress();
       const agentName = agent?.name || 'Agent';
-      channel.print(`🔍 ${agentName} wants to grep: \x1b[33m${searchPath}\x1b[0m`);
+      channel.print(`🔍 ${agentName} ${t('wantsToGrep')} \x1b[33m${searchPath}\x1b[0m`);
 
       const value = await channel.select('Allow searching in this directory?', [
-        { title: 'Yes',          value: 'yes',    description: 'Allow this time' },
-        { title: 'Always allow', value: 'always', description: 'Always allow in this directory' },
-        { title: 'No',           value: 'no',     description: 'Deny access' }
+        { title: t('permYes'),          value: 'yes',    description: t('allowThisTime') },
+        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
+        { title: t('permNo'),           value: 'no',     description: t('denyAccess') }
       ]);
 
       if (value === 'always') {
         permissions.allow(searchDir, 'read');
       } else if (value !== 'yes') {
-        channel.print('\x1b[2mSkipped\x1b[0m');
+        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, message: 'User denied grep access' };
       }
     }

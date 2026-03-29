@@ -101,6 +101,9 @@ const PERMISSION_IMPLIES = {
   'read_tasks': ['write_tasks'],
 };
 
+// Cached module ref for sync WorkQueue access
+let _workQueueModule = null;
+
 export class Agent {
   /**
    * CLI hooks — injectable callbacks for UI integration.
@@ -186,8 +189,33 @@ export class Agent {
 
     this.handlers = config.handlers || {};
 
+    // Per-agent work queue — each agent has its own task backlog
+    this._workQueue = null; // lazy init to avoid import at module load
+
     // Initialize LLM provider if needed
     this.llmProvider = null;
+  }
+
+  /** Get this agent's work queue (lazy-initialized). */
+  get workQueue() {
+    if (!this._workQueue) {
+      // Sync import — WorkQueue is already loaded by queue actions
+      const { WorkQueue } = _workQueueModule || {};
+      if (WorkQueue) {
+        this._workQueue = new WorkQueue(this.name);
+      }
+    }
+    return this._workQueue;
+  }
+
+  /** Ensure work queue is initialized (async, for first access). */
+  async ensureWorkQueue() {
+    if (!this._workQueue) {
+      const mod = await import('../state/work-queue.js');
+      _workQueueModule = mod;
+      this._workQueue = new mod.WorkQueue(this.name);
+    }
+    return this._workQueue;
   }
 
   /**
@@ -350,39 +378,43 @@ export class Agent {
 
     // ── Task-typed parameter auto-enqueue ──────────────────────────────────
     // When the handler declares a parameter of type Task (e.g., on develop(task: Task)),
-    // the runtime automatically creates/resolves the task, assigns ownership to this
-    // agent, marks it in_progress, and enriches args with the full task object.
-    // This ensures the agent always has a formal task to work on — no ambiguity.
+    // the runtime resolves the task from the global TaskManager (by id) or enqueues
+    // it in the agent's own WorkQueue (by value). The global TaskManager is only
+    // for tasks created by the Planner — delegation by value goes to the agent's queue.
     if (handler.__paramTypes__) {
       const taskParam = Object.entries(handler.__paramTypes__).find(([, t]) => t === 'Task');
       if (taskParam && args) {
         const { taskManager } = await import('../state/task-manager.js');
         let task = null;
 
-        // 1. If a task id is provided, fetch the existing task
-        //    Accepts both task.id (canonical) and task.taskId (legacy)
+        // 1. If a task id is provided, fetch from the global TaskManager
+        //    (these are Planner-created tasks)
         const _tid = args.id || args.taskId;
         if (_tid) {
           task = taskManager.get(String(_tid));
+          if (task) {
+            const updates = { owner: this.name };
+            if (task.status === 'pending') updates.status = 'in_progress';
+            taskManager.update(String(task.id), updates);
+            args = task;
+            channel.log('task', `[${this.name}] Working on task #${task.id}: ${task.subject}`);
+          }
         }
 
-        // 2. Otherwise, create a new task from the delegation data
+        // 2. By value (no id) — enqueue in the agent's own WorkQueue, not the global TaskManager.
+        //    The agent sees it as its current task via args.
         if (!task && (args.subject || args.description)) {
-          task = taskManager.create({
+          const { WorkQueue } = await import('../state/work-queue.js');
+          if (!this._workQueue) this._workQueue = new WorkQueue(this.name);
+          const queueItem = this._workQueue.add({
             subject: args.subject || args.description?.substring(0, 80) || 'Delegated task',
             description: args.description || '',
+            owner: this.name,
           });
-        }
-
-        // 3. Assign ownership and mark in_progress
-        if (task) {
-          const updates = { owner: this.name };
-          if (task.status === 'pending') updates.status = 'in_progress';
-          taskManager.update(String(task.id), updates);
-          // Use the live task object as args — by reference, not copy.
-          // Mutations (status, description, etc.) are visible everywhere.
-          args = task;
-          channel.log('task', `[${this.name}] Auto-enqueued task #${task.id}: ${task.subject}`);
+          this._workQueue.update(queueItem.id, { status: 'in_progress' });
+          // Merge queue item fields into args so the agent sees them
+          args = { ...args, ...queueItem };
+          channel.log('task', `[${this.name}] Enqueued in own queue: #${queueItem.id}: ${queueItem.subject}`);
         }
       }
     }
@@ -665,7 +697,9 @@ export class Agent {
     channel.log('agent', `${this.name}: Starting reactive loop${isDelegate ? ' [delegate]' : ''}`);
 
     let isFirstCall = true;
-    let thinkingHint = 'Thinking';
+    // Helper for i18n in agent hints
+    const _h = (key, fallback) => globalThis.__koiStrings?.[key] ?? fallback ?? key;
+    let thinkingHint = _h('thinking', 'Thinking');
     let exitedOnAbort = false;
 
     // Fast-greeting: skip the first LLM call for interactive CLI agents.
@@ -721,25 +755,30 @@ export class Agent {
             if (unfinishedExtra > 0) unfinishedLines.push(`    … +${unfinishedExtra} more`);
 
             channel.print(unfinishedLines.join('\n'));
-            const choice = await cliSelect(
-              'Do you want to continue the plan?',
+            const _s = globalThis.__koiStrings || {};
+            channel.clear();
+            // Small delay to let Ink process the busy=false and render the select
+            await new Promise(r => setTimeout(r, 100));
+            const _cliSelect = (await import('../io/channel.js')).channel.select;
+            const choice = await _cliSelect(
+              _s.continueThePlan || 'Do you want to continue the plan?',
               [
-                { title: 'Continue', value: 'continue', description: 'Resume the plan where it left off' },
-                { title: 'Start fresh', value: 'fresh', description: 'Discard the plan and start over' },
+                { title: _s.yes || 'Yes', value: 'continue' },
+                { title: _s.permNo || 'No', value: 'fresh' },
               ]
             );
             Agent._cliHooks?.onBusy?.(true);
             if (choice === 'continue') {
               // User confirmed: populate the anchored panel now
               taskManager.showPanel();
-              channel.print('Resuming tasks...');
+              channel.print(_s.resumingTasks || 'Resuming tasks...');
               session._resumingTasks = true;
             } else {
               // "Start fresh" or Escape — discard ALL tasks (pending, in_progress, and completed)
               for (const t of tasks) {
                 try { taskManager.update(t.id, { status: 'deleted' }); } catch { /* non-fatal */ }
               }
-              channel.print('Plan cleared.');
+              channel.print(_s.planCleared || 'Plan cleared.');
             }
           }
         }
@@ -1105,7 +1144,7 @@ export class Agent {
                   `Return rejected: shell failed (exit code ${exitCode}) but agent claimed success`,
                   null
                 );
-                thinkingHint = 'Reconsidering — shell command failed';
+                thinkingHint = _h('reconsidering', 'Reconsidering');
                 continue;
               }
             }
@@ -1149,7 +1188,7 @@ export class Agent {
                     `Unfinished tasks remain (${_unfinished.length}): ${_unfinished.map(t => t.subject).join(', ')}`,
                     null
                   );
-                  thinkingHint = 'Resuming plan';
+                  thinkingHint = _h('resumingPlan', 'Resuming plan');
                   continue;
                 } else {
                   // All tasks done — reset recovery counter for next invocation
@@ -1191,7 +1230,7 @@ export class Agent {
                 'Task completed.',
                 null
               );
-              thinkingHint = 'Thinking';
+              thinkingHint = _h('thinking', 'Thinking');
               // Show spinner immediately so there's no gap before next callReactive
               channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint}\x1b[0m`);
               // Continue the loop — LLM will be called again and should prompt_user
@@ -1230,7 +1269,7 @@ export class Agent {
                   `Unfinished pending tasks (${_pendingOnly.length})`,
                   null
                 );
-                thinkingHint = 'Resuming plan';
+                thinkingHint = _h('resumingPlan', 'Resuming plan');
                 continue;
               } else {
                 session._promptUserRecoveryAttempts = 0;
@@ -1242,14 +1281,17 @@ export class Agent {
 
         // Delegates must NEVER prompt the user directly — convert to ask_parent.
         // Only the root (System) agent should talk to the user.
-        if ((intent === 'prompt_user' || intent === 'prompt_form') && isDelegate && _parentAnswerFn) {
+        // Delegates without explicit prompt_user permission get redirected to ask_parent.
+        // Delegates WITH the permission (e.g. ProjectOnBoarding) talk to the user directly.
+        const _hasDirectPrompt = this.hasPermission?.('prompt_user') ?? false;
+        if ((intent === 'prompt_user' || intent === 'prompt_form') && isDelegate && _parentAnswerFn && !_hasDirectPrompt) {
           const question = action.question || action.prompt || action.title || 'Need clarification';
           channel.log('agent', `${this.name}: Redirecting ${intent} → ask_parent: "${question.substring(0, 80)}"`);
           const _answer = await _parentAnswerFn(question);
           const _answerMsg = `✅ ask_parent answered: "${_answer}"\n\nContinue your task using this answer.`;
           session.recordAction(action, { answer: _answer });
           contextMemory.add('user', _answerMsg, `Parent answered: "${_answer}"`, null);
-          thinkingHint = 'Reviewing answer';
+          thinkingHint = _h('reviewingAnswer', 'Reviewing answer');
           continue;
         }
 
@@ -1454,7 +1496,7 @@ export class Agent {
                   `Task spec re-injected`,
                   null
                 );
-                thinkingHint = 'Reading task spec';
+                thinkingHint = _h('readingTaskSpec', 'Reading task spec');
                 continue;
               }
             }
@@ -1463,7 +1505,7 @@ export class Agent {
               const _answer = await _parentAnswerFn(result.question);
               const _answerMsg = `✅ ask_parent answered: "${_answer}"\n\nContinue your task using this answer. If you have no more questions, implement the task now.`;
               contextMemory.add('user', _answerMsg, `Parent answered: "${_answer}"`, null);
-              thinkingHint = 'Reviewing answer';
+              thinkingHint = _h('reviewingAnswer', 'Reviewing answer');
               continue;
             }
             // No parent answer fn available — terminate (fallback for non-delegate context).
@@ -1484,7 +1526,7 @@ export class Agent {
 
           // Update thinking hint based on what just happened
           if (result && result.success === false) {
-            thinkingHint = 'Retrying';
+            thinkingHint = _h('retrying', 'Retrying');
             // Stop batch on failure for stateful actions — screen/page state
             // diverged, so subsequent actions would operate on wrong state.
             const intent = action?.intent || '';
@@ -1507,7 +1549,7 @@ export class Agent {
             console.error(`[Agent:${this.name}] ❌ Action "${failedIntent}" failed: ${error.message}\n${error.stack}`);
           }
           session.recordAction(action, null, error);
-          thinkingHint = 'Rethinking';
+          thinkingHint = _h('rethinking', 'Rethinking');
           break;
         }
       }
@@ -2130,10 +2172,11 @@ export class Agent {
       const op = level === 'write' ? 'write to' : 'read from';
       channel.print(`🔍 ${this.name} wants to ${op}: \x1b[33m${dir}\x1b[0m`);
 
-      const value = await cliSelect(`Allow ${level} access to this directory?`, [
-        { title: 'Yes',          value: 'yes',    description: 'Allow for this batch' },
-        { title: 'Always allow', value: 'always', description: 'Always allow in this directory' },
-        { title: 'No',           value: 'no',     description: 'Deny access' }
+      const _t = (k, fb) => globalThis.__koiStrings?.[k] || fb;
+      const value = await cliSelect(_t('allowLevelAccess', `Allow ${level} access to this directory?`), [
+        { title: _t('permYes', 'Yes'),          value: 'yes',    description: _t('allowThisTime', 'Allow for this batch') },
+        { title: _t('permAlwaysAllow', 'Always allow'), value: 'always', description: _t('alwaysAllowDir', 'Always allow in this directory') },
+        { title: _t('permNo', 'No'),           value: 'no',     description: _t('denyAccess', 'Deny access') }
       ]);
 
       if (value === 'yes' || value === 'always') {
@@ -2165,7 +2208,7 @@ export class Agent {
       // Auto-mark the associated task as in_progress before delegating,
       // and completed/failed after — so the UI always reflects the real state
       // regardless of whether the LLM remembered to call task_update.
-      let _taskId = action.data?.id ?? action.data?.taskId ?? resolvedAction.data?.id ?? resolvedAction.data?.taskId;
+      let _taskId = action.data?.id ?? action.data?.taskId ?? action.task?.id ?? resolvedAction.data?.id ?? resolvedAction.data?.taskId;
       // Fallback: if taskId was omitted, find the task by matching subject.
       // This covers cases where the LLM forgot to include taskId in the delegate data.
       if (!_taskId) {
@@ -3243,8 +3286,11 @@ Be specific and concise. Never ask the user for things you or the delegate can d
       channel.clearProgress();
       // Show context: which agent is asking and what task it's working on
       const taskDesc = delegateData?.description || delegateData?.userRequest || delegateData?.goal || '';
-      const taskHint = taskDesc ? ` \x1b[2m(working on: ${taskDesc.substring(0, 120)}${taskDesc.length > 120 ? '…' : ''})\x1b[0m` : '';
-      channel.print(`\x1b[1m${delegateName}\x1b[0m needs your input${taskHint}:`);
+      const _ws = globalThis.__koiStrings || {};
+      const _workingOn = _ws.workingOn || 'working on';
+      const _needsInput = _ws.needsYourInput || 'needs your input';
+      const taskHint = taskDesc ? ` \x1b[2m(${_workingOn}: ${taskDesc.substring(0, 120)}${taskDesc.length > 120 ? '…' : ''})\x1b[0m` : '';
+      channel.print(`\x1b[1m${delegateName}\x1b[0m ${_needsInput}${taskHint}:`);
       channel.print(userQuestion);
       const cliInput = (await import('../io/channel.js')).channel.prompt;
       const userAnswer = await cliInput('❯ ');

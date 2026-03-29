@@ -36,7 +36,11 @@ import { channel } from '../io/channel.js';
 const VALID_STATUSES = ['pending', 'in_progress', 'completed', 'deleted'];
 
 class WorkQueue {
-  constructor() {
+  /**
+   * @param {string} [agentName] - Owner agent name. If omitted, uses 'system' (legacy singleton).
+   */
+  constructor(agentName) {
+    this._agentName = agentName || 'system';
     this._items = {};
     this._nextId = 1;
     this._filePath = null;
@@ -47,10 +51,11 @@ class WorkQueue {
     if (!this._filePath) {
       const root = process.env.KOI_PROJECT_ROOT || process.cwd();
       const sessionId = process.env.KOI_SESSION_ID;
+      const suffix = this._agentName !== 'system' ? `-${this._agentName}` : '';
       if (sessionId) {
-        this._filePath = path.join(root, '.koi', 'sessions', sessionId, 'queue.json');
+        this._filePath = path.join(root, '.koi', 'sessions', sessionId, `queue${suffix}.json`);
       } else {
-        this._filePath = path.join(root, '.koi', 'queue.json');
+        this._filePath = path.join(root, '.koi', `queue${suffix}.json`);
       }
     }
     return this._filePath;
@@ -287,5 +292,8 @@ class WorkQueue {
   }
 }
 
-/** Singleton work queue instance */
-export const workQueue = new WorkQueue();
+/** Export the class for per-agent instantiation */
+export { WorkQueue };
+
+/** Singleton work queue instance (legacy fallback for System agent) */
+export const workQueue = new WorkQueue('system');

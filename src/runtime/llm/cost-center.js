@@ -12,6 +12,7 @@
 // ─── Model Database (loaded from models.json) ─────────────────────────────
 import { createRequire } from 'module';
 import { lookupRemoteModel } from './auto-model-selector.js';
+import { t } from '../i18n.js';
 const _require = createRequire(import.meta.url);
 const _modelsJson = _require('./models.json');
 
@@ -188,7 +189,7 @@ class CostCenter {
 
     const out = [];
     out.push('');
-    out.push(BOLD('Session Cost Report'));
+    out.push(BOLD(t('sessionCostReport')));
     out.push(BAR);
 
     // ── Overview ──────────────────────────────────────────────────────────
@@ -196,15 +197,15 @@ class CostCenter {
       const l = label.padEnd(16);
       return `  \x1b[2m${l}\x1b[0m\x1b[36m${value}\x1b[0m`;
     };
-    out.push(overviewRow('Wall time:', fmtMs(wall)));
-    out.push(overviewRow('API time:', fmtMs(this.totalApiMs)));
+    out.push(overviewRow(t('wallTime'), fmtMs(wall)));
+    out.push(overviewRow(t('apiTime'), fmtMs(this.totalApiMs)));
 
     if (lines.added > 0 || lines.removed > 0) {
       const f = lines.files === 1 ? '1 file' : `${lines.files} files`;
       const chg = `${GRN('+' + lines.added)} ${DIM('/')} ${YLW('-' + lines.removed)} ${DIM('lines  (' + f + ')')}`;
-      out.push(`  ${DIM('Code changes:   ')}${chg}`);
+      out.push(`  ${DIM(t('codeChanges').padEnd(16))}${chg}`);
     } else {
-      out.push(overviewRow('Code changes:', 'none'));
+      out.push(overviewRow(t('codeChanges'), t('codeChangesNone')));
     }
 
     if (models.length === 0) {
@@ -246,19 +247,19 @@ class CostCenter {
       out.push('');
       out.push(BAR);
       // Header: model name + provider/ctx info + calls + api time
-      const callsInfo = `${entry.calls} call${entry.calls !== 1 ? 's' : ''}  ${fmtMs(entry.apiMs)}`;
+      const callsInfo = `${entry.calls} ${entry.calls !== 1 ? t('calls') : t('call')}  ${fmtMs(entry.apiMs)}`;
       out.push(`  ${BOLD(model)}  ${DIM('(' + entry.provider + '  ' + ctxStr + ')')}  ${DIM(callsInfo)}`);
 
       if (info) {
         const pricing = `$${info.inputPer1M.toFixed(2)}/1M in  ·  $${info.outputPer1M.toFixed(2)}/1M out`;
-        out.push(`    \x1b[2m${'Pricing:'.padEnd(LBL)}${pricing}\x1b[0m`);
+        out.push(`    \x1b[2m${t('pricing').padEnd(LBL)}${pricing}\x1b[0m`);
       }
 
       // Column header (plain, no ANSI)
       out.push(`    \x1b[2m${''.padEnd(LBL)}${'tokens'.padStart(VAL)}  ${'cost'.padStart(COST)}\x1b[0m`);
 
-      out.push(row('Input:',  fmtTokens(entry.inputTokens),  inputCost  !== null ? fmtUsd(inputCost)  : '?', pctStr, true));
-      out.push(row('Output:', fmtTokens(entry.outputTokens), outputCost !== null ? fmtUsd(outputCost) : '?', '',     true));
+      out.push(row(t('input'),  fmtTokens(entry.inputTokens),  inputCost  !== null ? fmtUsd(inputCost)  : '?', pctStr, true));
+      out.push(row(t('output'), fmtTokens(entry.outputTokens), outputCost !== null ? fmtUsd(outputCost) : '?', '',     true));
       if (entry.thinkingTokens > 0) {
         out.push(row('Thinking:', fmtTokens(entry.thinkingTokens), thinkingCost !== null ? fmtUsd(thinkingCost) : '?', 'billed as output', true));
       }
@@ -266,7 +267,7 @@ class CostCenter {
       // Subtotal — bold, padding done on plain string before ANSI
       const subtotalVal = totalCost > 0 ? fmtUsd(totalCost) : '?';
       const subtotalPadded = subtotalVal.padStart(VAL + 2 + COST);
-      out.push(`    \x1b[2m${'Subtotal:'.padEnd(LBL)}\x1b[0m\x1b[1m\x1b[36m${subtotalPadded}\x1b[0m`);
+      out.push(`    \x1b[2m${t('subtotal').padEnd(LBL)}\x1b[0m\x1b[1m\x1b[36m${subtotalPadded}\x1b[0m`);
     }
 
     // ── Grand Total ───────────────────────────────────────────────────────
@@ -274,14 +275,14 @@ class CostCenter {
     out.push(BAR);
 
     const totalAllTokens = grandInput + grandOutput + grandThinking;
-    const tokenParts = [`${fmtTokens(grandInput)} in`, `${fmtTokens(grandOutput)} out`];
+    const tokenParts = [`${fmtTokens(grandInput)} ${t('inToken')}`, `${fmtTokens(grandOutput)} ${t('outToken')}`];
     if (grandThinking > 0) tokenParts.push(`${fmtTokens(grandThinking)} thinking`);
     const tokenSummary = `${fmtTokens(totalAllTokens)}  (${tokenParts.join(' · ')})`;
-    out.push(`  \x1b[2m${'Total calls:'.padEnd(16)}\x1b[0m${grandCalls}`);
-    out.push(`  \x1b[2m${'Total tokens:'.padEnd(16)}\x1b[0m${tokenSummary}`);
+    out.push(`  \x1b[2m${t('totalCalls').padEnd(16)}\x1b[0m${grandCalls}`);
+    out.push(`  \x1b[2m${t('totalTokens').padEnd(16)}\x1b[0m${tokenSummary}`);
 
     const grandStr = fmtUsd(grandTotal);
-    out.push(`  \x1b[1m${'Grand Total:'.padEnd(16)}\x1b[0m\x1b[1m\x1b[36m${grandStr}\x1b[0m`);
+    out.push(`  \x1b[1m${t('grandTotal').padEnd(16)}\x1b[0m\x1b[1m\x1b[36m${grandStr}\x1b[0m`);
     out.push(BAR);
     out.push('');
 

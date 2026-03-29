@@ -577,7 +577,8 @@ async function runFile(sourcePath, options = {}) {
       } else {
         const pendingFile = path.join(projectRoot, '.koi', '.resume-pending');
         if (process.env.KOI_CLI_MODE === '1' && !_exists(pendingFile)) {
-          process.stderr.write(`\x1b[2mResume this session with:\nkoi-cli --resume ${sessionId}\x1b[0m\n\n`);
+          const _s = globalThis.__koiStrings || {};
+          process.stderr.write(`\x1b[2m${_s.resumeWith || 'Resume this session with:'}\nkoi-cli --resume ${sessionId}\x1b[0m\n\n`);
         }
         resolve();
       }

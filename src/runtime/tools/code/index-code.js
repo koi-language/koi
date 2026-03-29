@@ -11,6 +11,7 @@ import path from 'path';
 
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { channel } from '../../io/channel.js';
+import { t } from '../../i18n.js';
 
 export default {
   type: 'index_code',
@@ -47,10 +48,10 @@ export default {
     const permissions = getFilePermissions(agent);
     if (!permissions.isAllowed(projectDir, 'read')) {
       channel.clearProgress();
-      const value = await channel.select('Allow reading files for indexing?', [
-        { title: 'Yes', value: 'yes' },
-        { title: 'Always allow in this directory', value: 'always' },
-        { title: 'No', value: 'no' },
+      const value = await channel.select(t('allowReadForIndexing'), [
+        { title: t('permYes'), value: 'yes' },
+        { title: t('permAlwaysAllow'), value: 'always' },
+        { title: t('permNo'), value: 'no' },
       ]);
       if (value === 'always') permissions.allow(projectDir, 'read');
       else if (value !== 'yes') return { success: false, denied: true };

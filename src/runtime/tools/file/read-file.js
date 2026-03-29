@@ -12,6 +12,7 @@ import os from 'os';
 import sharp from 'sharp';
 import Tesseract from 'tesseract.js';
 
+import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { channel } from '../../io/channel.js';
 
@@ -131,18 +132,18 @@ export default {
     if (!permissions.isAllowed(resolvedPath, 'read')) {
       channel.clearProgress();
       const agentName = agent?.name || 'Agent';
-      channel.print(`📖 ${agentName} wants to read: \x1b[33m${filePath}\x1b[0m`);
+      channel.print(`📖 ${agentName} ${t('wantsToRead')} \x1b[33m${filePath}\x1b[0m`);
 
-      const value = await channel.select('Allow reading files in this directory?', [
-        { title: 'Yes', value: 'yes', description: 'Allow this time' },
-        { title: 'Always allow', value: 'always', description: 'Always allow in this directory' },
-        { title: 'No', value: 'no', description: 'Deny access' }
+      const value = await channel.select(t('allowReadFiles'), [
+        { title: t('permYes'), value: 'yes', description: t('allowThisTime') },
+        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
+        { title: t('permNo'), value: 'no', description: t('denyAccess') }
       ]);
 
       if (value === 'always') {
         permissions.allow(targetDir, 'read');
       } else if (value !== 'yes') {
-        channel.print(`\x1b[2mSkipped\x1b[0m`);
+        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, message: 'User denied file access' };
       }
     }

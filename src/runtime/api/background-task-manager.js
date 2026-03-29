@@ -7,12 +7,13 @@
 
 import path from 'path';
 import { channel } from '../io/channel.js';
+import { t } from '../i18n.js';
 
 function progressBar(done, total, width = 10) {
   const pct = Math.round((done / total) * 100);
   const filled = Math.round((done / total) * width);
   const bar = '▰'.repeat(filled) + '▱'.repeat(width - filled);
-  return `indexing ${bar} ${pct}%`;
+  return `${t('indexing')} ${bar} ${pct}%`;
 }
 
 class BackgroundTaskManager {
@@ -172,8 +173,22 @@ class BackgroundTaskManager {
    */
   restartSemanticIndexing() {
     if (!this._lastIndexProjectDir || !this._lastIndexLlmProvider) return;
-    channel.log('background', 'restartSemanticIndexing — new dependency added, re-indexing');
+    channel.log('background', 'restartSemanticIndexing — re-indexing');
     return this.rerun('semantic-index', this._indexingFn(this._lastIndexProjectDir, this._lastIndexLlmProvider));
+  }
+
+  /**
+   * Schedule a debounced re-index after file changes.
+   * Waits 30s after the last file change before re-indexing,
+   * so rapid writes don't trigger multiple index builds.
+   */
+  scheduleReindex() {
+    if (!this._lastIndexProjectDir || !this._lastIndexLlmProvider) return;
+    if (this._reindexTimer) clearTimeout(this._reindexTimer);
+    this._reindexTimer = setTimeout(() => {
+      this._reindexTimer = null;
+      this.restartSemanticIndexing();
+    }, 30_000);
   }
 }
 

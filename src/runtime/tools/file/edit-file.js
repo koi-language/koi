@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { t } from '../../i18n.js';
 import { parseUnifiedDiff, renderColoredDiff } from '../../util/diff-render.js';
 import { getFilePermissions, runFilePermDialog } from '../../code/file-permissions.js';
 
@@ -393,16 +394,16 @@ export default {
 
     if (permitted) {
       const reason = permissions.autoApprovalReason(resolvedPath);
-      if (reason) channel.print(`\x1b[2m✓ Auto-approved: ${filePath} (${reason})\x1b[0m`);
+      if (reason) channel.print(`\x1b[2m✓ ${t('autoApproved')} ${filePath} (${reason})\x1b[0m`);
     } else {
       const agentName = agent?.name || 'Agent';
-      channel.print(`🔧 ${agentName} wants to edit: \x1b[33m${filePath}\x1b[0m`);
+      channel.print(`🔧 ${agentName} ${t('wantsToEdit')} \x1b[33m${filePath}\x1b[0m`);
 
       const value = await runFilePermDialog(() => channel.select('Allow this file change?', [
-        { title: 'Yes', value: 'yes', description: 'Apply this time' },
-        { title: 'Always allow this file', value: 'always', description: 'Always allow writes to THIS file' },
+        { title: t('permYes'), value: 'yes', description: t('allowThisTime') },
+        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
         { title: 'No, but', value: 'feedback', description: 'Reject and give instructions to retry' },
-        { title: 'No', value: 'no', description: 'Skip this change' }
+        { title: t('permNo'), value: 'no', description: t('denyAccess') }
       ]));
 
       if (value === 'always') {
@@ -412,19 +413,22 @@ export default {
         permitted = true;
       } else if (value === 'feedback') {
         const feedback = await channel.prompt('> ');
-        channel.print(`\x1b[2mSkipped\x1b[0m`);
+        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, feedback, message: `User rejected the edit with feedback: ${feedback}` };
       }
     }
 
     if (!permitted) {
-      channel.print(`\x1b[2mSkipped\x1b[0m`);
+      channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
       return { success: false, denied: true, message: 'User denied file change' };
     }
 
     fs.writeFileSync(resolvedPath, newContent, 'utf8');
     if (sessionTracker) sessionTracker.trackFile(resolvedPath, content);
-    channel.print(`\x1b[2mDone\x1b[0m`);
+    channel.print(`\x1b[2m${t('done')}\x1b[0m`);
+
+    // Schedule background re-indexing after file changes
+    try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}
 
     return { success: true, path: filePath };
   }
