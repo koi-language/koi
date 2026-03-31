@@ -604,8 +604,18 @@ export class KoiTranspiler {
    * @returns {{ taintedVars: Set<string>, discriminator: { varName: string, values: string[] }|null }}
    */
   _analyzeTaint(lines) {
-    // Seed: context variables are always tainted (come from runtime)
-    const taintedVars = new Set(['state', 'args', 'userMessage', 'nonInteractive', 'agentName']);
+    // Classify context variables by volatility:
+    // - DYNAMIC (tainted): changes between turns → content goes to __dynamicParts
+    // - STATIC: constant for the session → content stays in __staticParts
+    //
+    // Only variables that change BETWEEN LLM CALLS should be tainted.
+    // Variables from env or agent config are constant for the entire session.
+    const taintedVars = new Set([
+      'state',        // changes (phase transitions, permissions) — but discriminator handles phase
+      'args',         // task args — can change on delegation
+      'userMessage',  // changes every turn
+      // NOT tainted: nonInteractive (env var, constant), agentName (constant)
+    ]);
 
     // First pass: collect @let assignments and propagate taint
     for (const rawLine of lines) {
@@ -699,11 +709,11 @@ export class KoiTranspiler {
       cacheAware ? 'const __staticParts = [];' : '',
       cacheAware ? 'const __dynamicParts = [];' : '',
       cacheAware ? 'let __cacheKey = null;' : '',
-      cacheAware ? 'let __inDynamic = false;' : '', // once dynamic content appears in a variant, rest goes to dynamic
-      'const __parts = [];', // still used for non-cache-aware fallback within @if blocks
+      cacheAware ? 'const __dynStack = [];' : '', // stack-based: push on tainted @if, pop on }, only dynamic when stack is non-empty
+      'const __parts = [];',
       'const __images = [];',
       'const __str = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);',
-      cacheAware ? 'const __push = (v) => __inDynamic ? __dynamicParts.push(v) : __staticParts.push(v);' : '',
+      cacheAware ? 'const __push = (v) => __dynStack.length > 0 ? __dynamicParts.push(v) : __staticParts.push(v);' : '',
     ].filter(Boolean);
 
 
@@ -759,7 +769,7 @@ export class KoiTranspiler {
           const discMatch = cond.match(/^(\w+)\s*===\s*['"]([^'"]+)['"]\s*$/);
           if (discMatch && discMatch[1] === discriminator.varName) {
             inDiscriminatorBranch = true;
-            jsLines.push(`__inDynamic = false;`); // reset for each variant
+            jsLines.push(`__dynStack.length = 0;`); // reset for each variant
             jsLines.push(`if (${cond}) {`);
             ifDepth++;
             continue;
@@ -767,9 +777,10 @@ export class KoiTranspiler {
         }
 
         // Nested @if inside a discriminator branch: if condition is tainted,
-        // everything from here on in this variant goes to dynamic
+        // push onto dynamic stack (content inside this @if goes to dynamic,
+        // but content AFTER the closing } returns to static)
         if (cacheAware && inDiscriminatorBranch && this._isTainted(cond, taintedVars)) {
-          jsLines.push(`__inDynamic = true;`);
+          jsLines.push(`__dynStack.push(true);`);
         }
 
         jsLines.push(`if (${cond}) {`);
@@ -821,7 +832,11 @@ export class KoiTranspiler {
         ifDepth = Math.max(0, ifDepth - 1);
         if (cacheAware && ifDepth === 0 && inDiscriminatorBranch) {
           inDiscriminatorBranch = false;
-          jsLines.push(`__inDynamic = false;`); // reset after variant branch
+          jsLines.push(`__dynStack.length = 0;`); // reset after variant branch
+        } else if (cacheAware && inDiscriminatorBranch) {
+          // Pop the dynamic stack when closing a nested tainted @if
+          // Content after this } returns to static (if stack becomes empty)
+          jsLines.push(`if (__dynStack.length > 0) __dynStack.pop();`);
         }
         jsLines.push('}');
         continue;
@@ -908,11 +923,11 @@ export class KoiTranspiler {
         if (seg.type === 'text' && seg.value.trim()) {
           jsLines.push(`${push}(${JSON.stringify(seg.value)});`);
         } else if (seg.type === 'expr') {
-          // If cache-aware and expr is tainted, switch to dynamic from here
-          if (pushFn && taintedVars && this._isTainted(seg.value, taintedVars)) {
-            jsLines.push(`__inDynamic = true;`);
-          }
+          // If cache-aware and expr is tainted, push to dynamic just for this value
+          const _exprTainted = pushFn && taintedVars && this._isTainted(seg.value, taintedVars);
+          if (_exprTainted) jsLines.push(`__dynStack.push(true);`);
           jsLines.push(`${push}(__str(${seg.value}));`);
+          if (_exprTainted) jsLines.push(`__dynStack.pop();`);
         } else if (seg.type === 'fragment') {
           jsLines.push(`${push}(fragments.${seg.value});`);
         }
@@ -924,14 +939,18 @@ export class KoiTranspiler {
         return `__str(${s.value})`;
       });
       if (parts.length > 0) {
-        // If any expression is tainted and we're in cache-aware mode, mark dynamic
+        // If any expression is tainted, push/pop dynamic just for this line
         if (pushFn && taintedVars) {
           const hasTaintedExpr = segments.some(s => s.type === 'expr' && this._isTainted(s.value, taintedVars));
           if (hasTaintedExpr) {
-            jsLines.push(`__inDynamic = true;`);
+            jsLines.push(`__dynStack.push(true);`);
           }
         }
         jsLines.push(`${push}(${parts.join(' + ')});`);
+        if (pushFn && taintedVars) {
+          const hasTaintedExpr = segments.some(s => s.type === 'expr' && this._isTainted(s.value, taintedVars));
+          if (hasTaintedExpr) jsLines.push(`__dynStack.pop();`);
+        }
       }
     }
   }

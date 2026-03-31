@@ -595,99 +595,110 @@ export class LLMProvider {
       !argsStr && playbookText ? `Role: ${playbookText.substring(0, 300)}...` : '',
     ].filter(Boolean).join('\n');
 
-    const prompt = `Return ONLY valid JSON using this exact shape:
-{"code":0-100,"reasoning":0-100}
+    const prompt = `Pick the ONE category (A-Z) that best matches this task. Return ONLY: {"cat":"X"}
 
-Score how much coding ability and reasoning ability this task requires.
+CATEGORIES:
 
-- code = how much coding / programming / codebase-understanding skill is needed
-- reasoning = how much analysis / planning / diagnosis / judgment is needed
+A: Greeting, hello, goodbye, casual chat, small talk
+B: Simple factual question (no code involved) — "what time is it?", "what's the capital of France?"
+C: Summarize, explain, or compare something non-technical — "summarize this article", "compare these plans"
+D: Ask the user for information, gather requirements, onboarding conversation
+E: Simple text/config change — rename a variable, fix a typo, change a string, update a version number
+F: Write a simple script or query — small Python script, single SQL query, bash one-liner
+G: Look up / find something in the codebase — "where is auth implemented?", "find the email config"
+H: Explain how something works in the codebase — "how does the login flow work?", "what does this function do?"
+I: Read and understand code to answer a question — "what system does the frontend use for email?"
+J: Simple bug fix in one file — off-by-one, null check, wrong condition, missing import
+K: Add basic UI element — new button, form field, simple component, style change
+L: Add form validation, input handling, basic interactivity
+M: Implement a small feature (one file, straightforward) — add an endpoint, add a column, add a filter
+N: Review or audit code — PR review, security review, code quality check
+O: Run CLI commands or interact with external services — railway, docker, kubectl, aws, heroku, ssh, checking env vars, viewing logs, managing deploys
+P: Investigate infrastructure / DevOps issue — "why aren't emails sending?", "check production logs", "debug the deploy pipeline"
+Q: Implement a feature touching 2-3 files — new API endpoint with DB + route + handler
+R: Integrate an external service — Stripe, SendGrid, OAuth provider, S3, push notifications
+S: Fix a bug that spans multiple files or requires understanding a flow
+T: Plan implementation — break a feature into tasks, design the approach, create a roadmap
+U: Coordinate / delegate — route tasks to agents, manage execution, orchestrate multi-step workflows
+V: Database work — schema migration, complex queries, data modeling, indexing, performance tuning
+W: Refactor across multiple files — rename a concept everywhere, extract a module, reorganize structure
+X: Debug a complex issue — race condition, intermittent failure, production-only bug, performance problem
+Y: Design architecture — system design, API design, multi-service coordination, scalability planning
+Z: Expert-level engineering — compiler, distributed systems, CRDT, custom protocol, AST manipulation
 
-Score both independently.
-Both can be high, both can be low, or one can be high and the other low.
+EXAMPLES (3+ per category):
 
-IMPORTANT:
-- Any task that requires writing code should usually have code >= 40.
-- Any task that requires reading, reviewing, or understanding existing code should usually have code >= 40.
-- Use code 50+ when the task involves non-trivial implementation, debugging, modifying an existing codebase, or making decisions inside real code.
-- Use code below 40 only when the task does not really require programming skill (for example: typo fixes in plain text, general conversation, summarization, asking questions, or product discussion without code).
-
-CALIBRATION — most tasks should land in the 40-60 range.
-Only score 70+ for genuinely complex work.
-- 80+ means very complex: multi-file refactors, race conditions, architecture redesigns, distributed coordination, or similarly difficult work.
-- A typical "add a feature" or "fix a bug" task is usually 50-60, not 70-80.
-- Only score 70+ if the task truly involves deep complexity, multiple interacting systems, unusual risk, or expert-level design.
-- Do not average the two scores together. Judge them independently.
-- Prefer multiples of 10. Use other numbers only if truly needed.
-
-CRITICAL — coordination and delegation tasks:
-Agents that coordinate, delegate, plan, or route tasks to other agents require STRONG instruction-following ability. They must parse complex rules, format JSON correctly, choose the right delegate, and never hallucinate actions. Score these at LEAST reasoning:60, code:60. A coordinator that uses a weak model will loop, invent invalid phases, or generate content instead of delegating — which is catastrophic.
-Similarly, agents that plan implementation (break features into tasks) need to understand code architecture to create good plans — score at least code:50, reasoning:60.
-
-Scale guide:
-- 0-10: almost none
-- 20: trivial
-- 30: very simple
-- 40: basic programming ability required
-- 50: moderate programming / code understanding required
-- 60: substantial
-- 70: complex
-- 80: very complex
-- 90: expert
-- 100: top-end expert / frontier difficulty
-
-Examples:
-- "rename a variable in code" -> {"code":40,"reasoning":10}
-- "fix a typo in a UI label inside the codebase" -> {"code":40,"reasoning":10}
-- "change a button color in the frontend code" -> {"code":40,"reasoning":10}
-- "write a SQL query to list active users from one table" -> {"code":40,"reasoning":20}
-- "create a small Python script to rename files in a folder" -> {"code":40,"reasoning":30}
-- "add basic form validation to a signup page" -> {"code":50,"reasoning":30}
-- "implement pagination in an existing table" -> {"code":50,"reasoning":40}
-
-- "tell me the weather" -> {"code":0,"reasoning":10}
-- "greet the user and ask what they need" -> {"code":0,"reasoning":10}
-- "ask the user questions about their project" -> {"code":0,"reasoning":20}
-- "onboarding conversation: gather user requirements" -> {"code":0,"reasoning":40}
-- "summarize this article" -> {"code":0,"reasoning":20}
-- "compare these two pricing plans" -> {"code":0,"reasoning":30}
-
-- "plan the implementation: create tasks for a database schema" -> {"code":50,"reasoning":60}
-- "plan: break down a feature into implementation steps" -> {"code":50,"reasoning":60}
-- "coordinate: delegate tasks to developers and report results" -> {"code":60,"reasoning":60}
-- "execute pending tasks by delegating to the right agent" -> {"code":60,"reasoning":60}
-- "research the best approach for email verification" -> {"code":10,"reasoning":50}
-
-- "explore the codebase and find where auth is implemented" -> {"code":40,"reasoning":40}
-- "review a pull request and point out likely issues" -> {"code":50,"reasoning":50}
-- "find where this API endpoint is called and explain the flow" -> {"code":50,"reasoning":50}
-- "fix a bug in an existing React component" -> {"code":50,"reasoning":40}
-- "add a settings page to the backoffice with a new DB table" -> {"code":60,"reasoning":50}
-- "integrate Stripe payments into an existing app" -> {"code":60,"reasoning":60}
-- "debug why login sometimes fails in production" -> {"code":60,"reasoning":70}
-
-- "fix a race condition in concurrent API requests" -> {"code":80,"reasoning":80}
-- "refactor the entire auth flow across 10 files" -> {"code":80,"reasoning":70}
-- "migrate a large Node.js codebase from JavaScript to TypeScript" -> {"code":80,"reasoning":70}
-- "design a multi-tenant architecture with isolation" -> {"code":50,"reasoning":80}
-- "design a zero-downtime migration strategy for a live payment system" -> {"code":60,"reasoning":90}
-- "implement distributed locking across services" -> {"code":90,"reasoning":80}
-- "build a static analyzer using AST traversal" -> {"code":90,"reasoning":80}
-- "design a CRDT for collaborative editing" -> {"code":90,"reasoning":90}
-- "create a compiler for a new programming language" -> {"code":100,"reasoning":90}
+A: "hello", "hola qué tal", "good morning", "bye", "thanks!", "hey there"
+B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles"
+C: "summarize this article", "compare React vs Vue", "explain what Kubernetes is", "pros and cons of microservices"
+D: "what kind of project do you want?", "gather requirements from the user", "ask what stack they prefer", "onboarding: collect project details"
+E: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0", "change button color to blue"
+F: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB", "Python script to parse CSV"
+G: "where is the auth middleware?", "find where password reset is handled", "locate the email sending code", "find all API routes"
+H: "how does the login flow work?", "explain the billing system", "what happens when a user signs up?", "walk me through the deployment pipeline"
+I: "what email provider does the backend use?", "what ORM is this project using?", "what authentication strategy is implemented?", "what database engine are we using?"
+J: "fix the null pointer on line 42", "the button doesn't disable after click", "off-by-one error in pagination", "missing await on async call", "forgot to handle the empty array case"
+K: "add a logout button to the navbar", "add a loading spinner", "create a 404 page", "add a dark mode toggle", "put a back button on the settings page"
+L: "add email validation to the signup form", "validate the phone number format", "add a character counter to the textarea", "make the form show inline errors"
+M: "add a GET /health endpoint", "add a 'role' column to the users table", "add a search filter to the user list", "create a simple CRUD for tags"
+N: "review this pull request", "check this code for security issues", "audit the API for OWASP top 10", "review the database queries for N+1 problems"
+O: "run railway variables to check the config", "docker compose logs backend", "check if the SSL cert is valid", "list running pods in staging", "ssh into the server and check disk space", "show me the environment variables on production", "restart the backend service on Railway"
+P: "why aren't password reset emails arriving?", "the deploy failed, investigate", "production API is slow, check the logs", "the CI pipeline broke after the last merge", "find out why the Docker build takes 20 minutes"
+Q: "add user profile endpoint with DB + route + tests", "implement email verification flow", "add a comments feature to posts", "create an invite system with token generation"
+R: "integrate Stripe for payments", "add Google OAuth login", "set up SendGrid for transactional emails", "integrate S3 for file uploads", "add Slack notifications"
+S: "the checkout flow sometimes charges twice", "login works on web but fails on mobile", "the search returns stale results after edit", "images upload but don't show in the gallery"
+T: "plan how to implement the notification system", "break down the migration to TypeScript", "design the implementation approach for multi-tenancy", "create tasks for the new onboarding flow"
+U: "coordinate the implementation of features 1-5", "delegate tasks to developers and track progress", "execute the planned migration steps", "route this to the right team member"
+V: "add an index to speed up user lookups", "migrate from SQL to Drizzle ORM", "design the schema for a chat system", "optimize the slow analytics query", "add a many-to-many relation between tags and posts"
+W: "rename 'workspace' to 'organization' everywhere", "extract the auth logic into a shared module", "split the monolith API into separate route files", "move all DB queries into a repository layer"
+X: "race condition in concurrent checkout", "memory leak in the WebSocket handler", "intermittent 502 errors in production", "the app freezes after 24h of uptime", "deadlock between the payment and inventory services"
+Y: "design the architecture for real-time collaboration", "plan the multi-region deployment strategy", "design an event-driven architecture for order processing", "API gateway design for microservices"
+Z: "build a custom template engine", "implement Raft consensus for our cluster", "write a CSS parser from scratch", "implement operational transforms for collaborative editing", "create a custom query language"
 
 Task:
 
 ${taskDescription}`;
+
+    // Category → profile mapping
+    const CATEGORY_PROFILES = {
+      A: { code: 0,   reasoning: 10,  thinking: false },
+      B: { code: 0,   reasoning: 10,  thinking: false },
+      C: { code: 0,   reasoning: 30,  thinking: false },
+      D: { code: 0,   reasoning: 40,  thinking: false },
+      E: { code: 40,  reasoning: 10,  thinking: false },
+      F: { code: 40,  reasoning: 30,  thinking: false },
+      G: { code: 50,  reasoning: 50,  thinking: true },
+      H: { code: 60,  reasoning: 60,  thinking: true },
+      I: { code: 60,  reasoning: 60,  thinking: true },
+      J: { code: 60,  reasoning: 50,  thinking: true },
+      K: { code: 50,  reasoning: 30,  thinking: true },
+      L: { code: 50,  reasoning: 40,  thinking: true },
+      M: { code: 60,  reasoning: 50,  thinking: true },
+      N: { code: 60,  reasoning: 60,  thinking: true },
+      O: { code: 50,  reasoning: 70,  thinking: true },
+      P: { code: 60,  reasoning: 75,  thinking: true },
+      Q: { code: 70,  reasoning: 60,  thinking: true },
+      R: { code: 70,  reasoning: 70,  thinking: true },
+      S: { code: 70,  reasoning: 70,  thinking: true },
+      T: { code: 60,  reasoning: 70,  thinking: true },
+      U: { code: 60,  reasoning: 70,  thinking: true },
+      V: { code: 70,  reasoning: 60,  thinking: true },
+      W: { code: 75,  reasoning: 70,  thinking: true },
+      X: { code: 80,  reasoning: 80,  thinking: true },
+      Y: { code: 60,  reasoning: 85,  thinking: true },
+      Z: { code: 90,  reasoning: 85,  thinking: true },
+    };
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
     if (process.env.KOI_LOG_CLASSIFIER_PROMPTS) {
       channel.log('classify-prompt', `--- CLASSIFIER PROMPT ---\n${prompt}\n--- END ---`);
     }
 
-    // Get ALL candidate models sorted by cost (cheapest first), try each until one works
-    // Classification needs a model that can follow instructions and return valid JSON.
-    const _allModels = getAllCandidates('reasoning', 30, this._availableProviders || getAvailableProviders());
+    // Get candidate models for classification, sorted by cost (cheapest first).
+    // The classifier MUST be a competent model — a weak model (like nano) will underestimate
+    // task complexity and then get selected for the task itself, creating a feedback loop.
+    // Minimum reasoning:40 ensures we skip nano/haiku/lite but allow flash/gpt-5.1 as classifiers.
+    const _allModels = getAllCandidates('reasoning', 40, this._availableProviders || getAvailableProviders());
     const _candidates = _allModels.map(c => ({
       client: this._getClient(c.provider),
       model: c.model,
@@ -714,33 +725,41 @@ ${taskDescription}`;
     for (const candidate of _candidates) {
       channel.log('llm', `[classify] Trying ${candidate.model}...`);
       try {
-        // Force Chat Completions API (not Responses) — classification is a simple JSON call
+        // Use the correct adapter for each provider (OpenAI Chat/Responses, Anthropic, Gemini).
+        // In gateway mode, all providers route through the OpenAI-compatible gateway.
         const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
-        const { OpenAIChatLLM } = await import('./providers/openai.js');
-        const llm = new OpenAIChatLLM(candidate.client, candidate.model, { temperature: 0, maxTokens: 200, useThinking: false, caps: candidate.caps || {} });
+        const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
+        const llm = createLLM(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens: 800, useThinking: false });
         const apiCall = llm.complete([{ role: 'user', content: prompt }]).then(r => r);
-        const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(8000)]);
+        const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(15000)]);
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
         costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
         channel.log('llm', `[classify] Raw response: ${content.substring(0, 200)}`);
         const _stripped = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
         const json = JSON.parse(_stripped);
-        // New format: { code: 0-100, reasoning: 0-100 }
+        // Category format: { cat: "A"-"Z" }
+        if (json.cat) {
+          const cat = String(json.cat).toUpperCase().charAt(0);
+          const catProfile = CATEGORY_PROFILES[cat];
+          if (catProfile) {
+            const { code: codeScore, reasoning: reasoningScore, thinking: needsThinking } = catProfile;
+            const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
+            const difficulty = Math.max(codeScore, reasoningScore);
+            const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking };
+            channel.log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} thinking=${needsThinking}`);
+            return profile;
+          }
+          channel.log('llm', `[classify] Unknown category "${cat}" from ${candidate.model}`);
+        }
+        // Fallback: direct scores format { code: 0-100, reasoning: 0-100, thinking: true/false }
         if (json.code != null && json.reasoning != null) {
           const codeScore = Math.min(100, Math.max(0, Number(json.code)));
           const reasoningScore = Math.min(100, Math.max(0, Number(json.reasoning)));
-          // Primary task type = whichever dimension scores higher
+          const needsThinking = json.thinking === true || json.thinking === 'true';
           const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
-          // Difficulty = the higher of the two (the model needs to be at least this capable)
           const difficulty = Math.max(codeScore, reasoningScore);
-          const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore };
-          channel.log('llm', `[classify] Result: code=${codeScore} reasoning=${reasoningScore} → ${taskType}:${difficulty}/100`);
-          return profile;
-        }
-        // Legacy format: { taskType, difficulty }
-        if (json.taskType && json.difficulty) {
-          const profile = { taskType: json.taskType, difficulty: Math.min(100, Math.max(1, Number(json.difficulty))) };
-          channel.log('llm', `[classify] Result (legacy): ${profile.taskType} difficulty=${profile.difficulty}/100`);
+          const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking };
+          channel.log('llm', `[classify] Direct scores: code=${codeScore} reasoning=${reasoningScore} thinking=${needsThinking}`);
           return profile;
         }
         channel.log('llm', `[classify] Invalid shape from ${candidate.model}: ${JSON.stringify(json)}`);
@@ -1104,15 +1123,28 @@ CRITICAL RULES:
 
       const _lastAction = session.actionHistory.at(-1);
       const _isDelegateReturn = _lastAction?.action?.actionType === 'delegate';
-      const _isDefaultProfile = session._autoProfile?.difficulty === DEFAULT_TASK_PROFILE.difficulty && session._autoProfile?.taskType === DEFAULT_TASK_PROFILE.taskType;
-      const _hasUserInput = session.actionHistory.some(e => e.action?.intent === 'prompt_user' && e.result?.answer);
+      // Reclassify when the user sent a new message — flag is set by prompt_user action in agent.js
+      const _isNewUserMessage = !!session._needsReclassify;
+      if (_isNewUserMessage) session._needsReclassify = false;
       // Agent requested reclassification via reclassify_complexity action
       const _agentRequestedReclassify = _lastAction?.action?.intent === 'reclassify_complexity';
-      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || (_isDefaultProfile && _hasUserInput) || _agentRequestedReclassify;
+      // Detect loops: same action repeated 3+ times → model is too weak, reclassify with escalation context
+      const _recentActions = (session.actionHistory || []).slice(-3);
+      const _isLoop = _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === _recentActions[0]?.action?.intent);
+      // Always reclassify: on first call, new user message, delegate return, agent request, or loop.
+      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || _isNewUserMessage || _agentRequestedReclassify || _isLoop;
 
       if (_shouldReclassify) {
-        // Build classification context from: args, user message, or pending tasks
+        // Build classification context — try every source of context, never give up.
+        // Priority: explicit args > user message > pending tasks > agent role description
         let _classifyArgs = context?.args && Object.keys(context.args).length > 0 ? context.args : null;
+        // Loop detected: the agent is stuck repeating the same action — include escalation context
+        if (_isLoop) {
+          const _loopAction = _recentActions[0]?.action?.intent || 'unknown';
+          const _loopCount = _recentActions.length;
+          _classifyArgs = { ..._classifyArgs, escalationReason: `Agent stuck in loop: repeated "${_loopAction}" ${_loopCount} times. Current model is too weak — score higher.` };
+          channel.log('llm', `[classify] Loop detected: ${_loopAction} ×${_loopCount} — reclassifying`);
+        }
         // Agent-requested reclassify: include the reason and recent actions for better context
         if (_agentRequestedReclassify) {
           const _reason = _lastAction?.result?.reason || _lastAction?.action?.reason || '';
@@ -1136,16 +1168,19 @@ CRITICAL RULES:
             }
           } catch {}
         }
+        // Last resort: classify the agent's role — a coordinator agent needs a capable model
+        // even before the user types anything. Let the LLM decide, not a hardcoded constant.
+        if (!_classifyArgs && agent?.description) {
+          _classifyArgs = { agentRole: agent.description.substring(0, 500) };
+        }
 
-        if (!_classifyArgs) {
-          session._autoProfile = DEFAULT_TASK_PROFILE;
-          channel.log('llm', `[classify] No args — default profile`);
-        } else {
+        if (_classifyArgs) {
           session._autoProfile = await this._inferTaskProfile(agent?.description, _classifyArgs, agentName);
-          if (process.env.KOI_DEBUG_LLM) {
-            const _reason = isFirstCall ? 'first call' : _isDelegateReturn ? 'delegate returned' : 'no cached profile';
-            console.error(`[Auto] Reclassifying (${_reason})`);
-          }
+        }
+        // Only fall back to DEFAULT if we truly have zero context AND the LLM call failed
+        if (!session._autoProfile) {
+          session._autoProfile = DEFAULT_TASK_PROFILE;
+          channel.log('llm', `[classify] No context available — fallback default profile`);
         }
       }
       const profile = session._autoProfile;
@@ -1813,7 +1848,6 @@ CRITICAL RULES:
 
     // Structured cache-aware playbook from compiler taint analysis
     if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
-      // Safety: ensure all parts are strings (guard against [object Object])
       const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
       return {
         _cacheKey: playbook._cacheKey,

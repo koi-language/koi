@@ -101,6 +101,11 @@ class Channel {
   endAction(success, detail) { this.printCompact(success ? `  ✓ ${detail || ''}` : `  ✗ ${detail || ''}`); }
   /** Reset action grouping (e.g. after user interaction). */
   resetActionGroup() {}
+  /** Whether the channel has a streaming UI provider (e.g. Ink) that uses a dynamic area. */
+  hasStreamingProvider() { return false; }
+
+  /** Whether a semantic scope is currently active. */
+  hasScope() { return false; }
   /** Open a semantic scope that groups subsequent actions. */
   beginScope(type, description) {}
   /** Close the current semantic scope. */

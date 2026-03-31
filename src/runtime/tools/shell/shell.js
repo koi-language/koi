@@ -371,12 +371,13 @@ async function _drainPermQueue() {
     _activeSelectCancel = () => _cancelDialog(null);
 
     // Pass command + warning as meta so the UI can render the Claude-style layout
+    const _shellHeader = `${agentName || 'Agent'} ${t('wantsToExecute') || 'wants to execute shell command'}`;
     const value = await Promise.race([
-      channel.select(description, [
+      channel.select('', [
         { title: t('permYes'), value: 'yes' },
         { title: alwaysLabel, value: 'always' },
         { title: t('permNo'), value: 'no' }
-      ], 0, { meta: { type: 'bash', command, warning } }),
+      ], 0, { meta: { type: 'bash', command, warning, header: _shellHeader } }),
       _cancelToken,
     ]);
 
@@ -517,7 +518,8 @@ When a command requires sudo, just use sudo normally in the command. The system 
     const effectiveEnv = sudoEnv ? { ...process.env, ...sudoEnv } : { ...process.env };
 
     // Background launch: spawn detached, don't wait for completion.
-    if (background) {
+    // Never use background when inside a parallel scope — the scope needs to wait for all results.
+    if (background && !channel.hasScope()) {
       const bgChild = spawn(USER_SHELL, _shellArgs(effectiveCommand), {
         cwd: cwd || process.cwd(),
         env: effectiveEnv,
@@ -545,18 +547,18 @@ When a command requires sudo, just use sudo normally in the command. The system 
         channel.clearProgress();
 
         if (code !== 0) {
-          channel.endAction(false, `background crashed · exit ${code}`);
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground crashed · exit ${code}\x1b[0m`);
           _bgNotify?.(`[System notification] Background process crashed: "${cmdPreview}" exited with code ${code}.${stderrStr ? ` Error output:\n${stderrStr}` : ''} Please handle this.`);
         } else {
-          // Finished cleanly — replaces the progress bar PID line with a ✓ in scroll
-          channel.endAction(true, 'background finished');
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground finished\x1b[0m`);
         }
       });
 
       bgChild.unref();
       reportDone?.();
       if (!isSilent) {
-        channel.beginAction('shell', cmdPreview);
+        channel.resetActionGroup();
+        channel.printCompact(`\x1b[1m⏺\x1b[0m \x1b[1mShell\x1b[0m\x1b[2m(${cmdPreview})\x1b[0m`);
         channel.progress(`\x1b[2m↗  background · PID ${bgChild.pid}\x1b[0m`);
       }
       yield { success: true, background: true, pid: bgChild.pid };
@@ -578,14 +580,26 @@ When a command requires sudo, just use sudo normally in the command. The system 
       return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
     };
 
+    const _inScope = !isSilent && channel.hasScope();
     if (!isSilent) {
       channel.beginAction('shell', cmdPreview);
       descriptionShown = true;
-      channel.progress(`\x1b[2m→  running for 0s\x1b[0m`);
-      timerInterval = setInterval(() => {
-        const elapsed = _fmtElapsed(Date.now() - startTime);
-        channel.progress(`\x1b[2m→  running for ${elapsed}\x1b[0m`);
-      }, 1000);
+      // Inside a scope (parallel shells), skip the progress spinner — it would clutter the grouped display
+      if (!_inScope) {
+        const _timeoutStr = timeoutMs !== 120000
+          ? (() => { const s = Math.round(timeoutMs / 1000); return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; })()
+          : null;
+        const _progressLine = (elapsed) => {
+          let line = `  \x1b[2m⎿\x1b[0m  \x1b[2mRunning… (${elapsed}`;
+          if (_timeoutStr) line += ` · timeout ${_timeoutStr}`;
+          line += ')\x1b[0m';
+          return line;
+        };
+        channel.progress(_progressLine('0s'));
+        timerInterval = setInterval(() => {
+          channel.progress(_progressLine(_fmtElapsed(Date.now() - startTime)));
+        }, 1000);
+      }
     }
 
     // State for generator coordination
@@ -920,17 +934,50 @@ When a command requires sudo, just use sudo normally in the command. The system 
       const stdoutStr = combinedStr;
       const elapsed = _fmtElapsed(Date.now() - startTime);
 
+      // Show output preview (first 3 lines + collapse the rest)
+      const _PREVIEW_LINES = 3;
+      const _showOutputPreview = (output, isError = false) => {
+        if (isSilent) return;
+        const lines = (output || '').split('\n').filter(l => l.trim());
+        if (_inScope) {
+          // Inside parallel scope: compact one-line summary
+          const preview = lines.length > 0 ? lines[0].substring(0, 80) : (t('noOutput') || 'No output');
+          const extra = lines.length > 1 ? ` … +${lines.length - 1} lines` : '';
+          channel.endAction(!isError, `${preview}${extra}`);
+          return;
+        }
+        if (lines.length === 0) {
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(${t('noOutput') || 'No output'})\x1b[0m`);
+          return;
+        }
+        const visible = lines.slice(0, _PREVIEW_LINES);
+        const hidden = lines.length - visible.length;
+        visible.forEach((line, i) => {
+          const prefix = i === 0 ? '  \x1b[2m⎿\x1b[0m  ' : '     ';
+          channel.printCompact(`${prefix}\x1b[2m${line.substring(0, 120)}\x1b[0m`);
+        });
+        if (hidden > 0) {
+          channel.printCompact(`     \x1b[38;2;120;120;120m… +${hidden} lines\x1b[0m`);
+        }
+      };
+
+      // Show timeout hint if defined (skip inside scope — too noisy)
+      const _showTimeout = () => {
+        if (isSilent || _inScope || timeoutMs === 120000) return;
+        const s = Math.round(timeoutMs / 1000);
+        const tStr = s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+        channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(timeout ${tStr})\x1b[0m`);
+      };
+
       if (closeError) {
         _shellOutputCallback?.(false);
         reportDone?.();
-        if (!isSilent) channel.endAction(false, closeError.message);
+        if (!isSilent) { _showOutputPreview(closeError.message, true); _showTimeout(); }
         yield { success: false, exitCode: 1, stdout: '', stderr: '', error: closeError.message };
       } else if (closeCode !== 0) {
-        if (!isSilent) {
-          channel.endAction(false, `exit ${closeCode} (${elapsed})`);
-        }
         _shellOutputCallback?.(false);
         reportDone?.();
+        if (!isSilent) { _showOutputPreview(stderrStr || combinedStr, true); _showTimeout(); }
         yield {
           success: false,
           exitCode: closeCode || 1,
@@ -939,13 +986,12 @@ When a command requires sudo, just use sudo normally in the command. The system 
           error: stderrStr || combinedStr || `Command exited with code ${closeCode}`
         };
       } else {
-        if (!isSilent) {
-          channel.endAction(true, `(${elapsed})`);
-        }
         _shellOutputCallback?.(false);
         reportDone?.();
+        if (!isSilent) { _showOutputPreview(combinedStr); _showTimeout(); }
         yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrStr };
       }
+      // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.
     } finally {
       // Clean up if the generator was aborted early (consumer broke out of for await).
       if (!isClosed) {

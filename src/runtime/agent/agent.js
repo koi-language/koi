@@ -717,14 +717,15 @@ export class Agent {
     // + prompt_user on iteration 0 without calling the LLM at all.
     // This eliminates the 2-5s startup delay and ensures prompt_user runs in the
     // sequential path (so slash commands like /cost are properly intercepted).
-    const FAST_GREETINGS = [
+    // Use i18n greetings if available, otherwise fallback
+    const _greetingsI18n = (globalThis.__koiStrings?.greetings) || [
       "What can I build for you?",
       "Ready. What's the task?",
       "What do you need?",
       "Go ahead.",
       "What are we working on?",
     ];
-    const _fastGreetMsg = FAST_GREETINGS[Math.floor(Math.random() * FAST_GREETINGS.length)];
+    const _fastGreetMsg = _greetingsI18n[Math.floor(Math.random() * _greetingsI18n.length)];
     const isFastGreeting = !isDelegate
       && !contextMemory.hasHistory()
       && !session.mcpErrors
@@ -876,11 +877,11 @@ export class Agent {
       let response;
 
       if (isFastGreeting && session.iteration === 0) {
-        // Skip LLM call — show greeting then prompt directly (instant startup)
+        // Skip LLM call — show greeting + transition to routing instantly (zero tokens)
         channel.log('agent', `${this.name}: Fast-greeting (skipping LLM on iteration 0)`);
         response = [
-          { actionType: 'direct', intent: 'print', message: _fastGreetMsg },
-          { actionType: 'direct', intent: 'prompt_user' }
+          { actionType: 'direct', intent: 'prompt_user', question: _fastGreetMsg },
+          { actionType: 'direct', intent: 'update_state', updates: { statusPhase: 'routing' } }
         ];
         isFirstCall = false;
       } else {
@@ -1058,6 +1059,12 @@ export class Agent {
           // the same directory — pre-granting here ensures they only ask once.
           await this._preflightParallelPermissions(group);
 
+          // If all parallel actions are shell commands, group them under a single ⏺ Shell scope
+          const _allShells = group.every(pa => pa.intent === 'shell');
+          if (_allShells && group.length > 1) {
+            channel.beginScope('Shell', `${group.length} commands`);
+          }
+
           // Per-delegate timeout: if a delegate hangs (no LLM response, stuck permission, etc.)
           // it should not block the entire parallel group forever.
           const parallelResults = await Promise.all(group.map(async (pa) => {
@@ -1080,6 +1087,11 @@ export class Agent {
               return { action: pa, result: null, error };
             }
           }));
+
+          // Close shell scope if opened
+          if (_allShells && group.length > 1) {
+            channel.endScope(true);
+          }
 
           // All parallel delegates completed — log summary for diagnostics
           {
@@ -1363,10 +1375,12 @@ export class Agent {
 
           channel.clear();
 
-          // Emit endAction for tool actions
+          // Emit endAction for tool actions — only show on failure
           if (_isGroupedTool) {
             const _ok = result?.success !== false && !result?.denied;
-            channel.endAction(_ok, _ok ? '' : (result?.error ? result.error.substring(0, 60) : 'failed'));
+            if (!_ok) {
+              channel.endAction(false, result?.error ? result.error.substring(0, 60) : 'failed');
+            }
           }
 
           // Intercept slash commands from prompt_user (e.g. /history, /diff, /undo)
@@ -1406,6 +1420,11 @@ export class Agent {
               // Reset recovery counter for the new request
               session._recoveryAttempts = 0;
             } catch { /* non-fatal */ }
+          }
+
+          // Flag the session for reclassification — the user's new message may require a different model.
+          if (intent === 'prompt_user' && result?.answer) {
+            session._needsReclassify = true;
           }
 
           // Save input history, dialogue, and context memory after prompt_user
@@ -2211,25 +2230,24 @@ export class Agent {
     }
     if (toCheck.size === 0) return;
 
-    // Ask once per unique (dir, level) — sequentially to avoid concurrent prompts
+    // Ask once per unique (dir, level) — sequentially to avoid concurrent prompts.
+    // Permission dialogs go through select() only (interactive zone), never to Static log.
     for (const { dir, level } of toCheck.values()) {
       channel.clearProgress();
       const op = level === 'write' ? 'write to' : 'read from';
-      channel.print(`🔍 ${this.name} wants to ${op}: \x1b[33m${dir}\x1b[0m`);
-
       const _t = (k, fb) => globalThis.__koiStrings?.[k] || fb;
-      const value = await cliSelect(_t('allowLevelAccess', `Allow ${level} access to this directory?`), [
-        { title: _t('permYes', 'Yes'),          value: 'yes',    description: _t('allowThisTime', 'Allow for this batch') },
-        { title: _t('permAlwaysAllow', 'Always allow'), value: 'always', description: _t('alwaysAllowDir', 'Always allow in this directory') },
-        { title: _t('permNo', 'No'),           value: 'no',     description: _t('denyAccess', 'Deny access') }
-      ]);
+      const _header = `${this.name} ${level === 'write' ? _t('wantsToWrite', 'wants to write') : _t('wantsToRead', 'wants to read')}`.replace(':', '');
+      const _dirBase = path.basename(dir);
+      const value = await cliSelect('', [
+        { title: _t('permYes', 'Yes'),  value: 'yes' },
+        { title: `${_t('permAlwaysAllow', 'Always allow')} (${_dirBase}/)`, value: 'always' },
+        { title: _t('permNo', 'No'),   value: 'no' }
+      ], 0, { meta: { type: 'bash', header: _header, command: dir } });
 
       if (value === 'yes' || value === 'always') {
-        // Grant so all parallel actions (and the "always" case, future calls) skip the dialog
         permissions.allow(dir, level);
         channel.log('permissions', `Pre-granted ${level} for parallel group: ${dir}`);
       }
-      // If 'no': don't grant — individual actions will surface a denial result
     }
   }
 

@@ -132,19 +132,16 @@ export default {
     if (!permissions.isAllowed(resolvedPath, 'read')) {
       channel.clearProgress();
       const agentName = agent?.name || 'Agent';
-      channel.print(`📖 ${agentName} ${t('wantsToRead')} \x1b[33m${filePath}\x1b[0m`);
-
-      const value = await channel.select(t('allowReadFiles'), [
-        { title: t('permYes'), value: 'yes', description: t('allowThisTime') },
-        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
-        { title: t('permNo'), value: 'no', description: t('denyAccess') }
-      ]);
+      const _dirBase = path.basename(path.dirname(resolvedPath));
+      const value = await channel.select('', [
+        { title: t('permYes'), value: 'yes' },
+        { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
+        { title: t('permNo'), value: 'no' }
+      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToRead')}`.replace(':', ''), command: `Read(${filePath})` } });
 
       if (value === 'always') {
-        const grantedDir = permissions.allowProject(resolvedPath);
-        if (grantedDir) channel.print(`\x1b[2m✓ Read access granted for project: ${grantedDir}\x1b[0m`);
+        permissions.allowProject(resolvedPath);
       } else if (value !== 'yes') {
-        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, message: 'User denied file access' };
       }
     }

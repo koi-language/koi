@@ -118,8 +118,10 @@ export function lookupRemoteModel(modelId) {
   return null;
 }
 
-/** Default profile used as fallback when LLM classification is unavailable. */
-export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 50, code: 50, reasoning: 30 };
+/** Last-resort fallback — only used when there's zero context AND the LLM classifier fails.
+ *  In practice, the classifier always runs (on args, user message, pending tasks, or agent role).
+ *  This is deliberately conservative: moderate scores, thinking on. */
+export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 70, code: 70, reasoning: 70, thinking: true };
 
 // ── Circuit breaker: per-provider timeout cooldown ────────────────────────
 // After N consecutive timeouts, a provider is skipped for an escalating period.
@@ -178,13 +180,10 @@ export function getAvailableProviders() {
   return providers;
 }
 
-// Score boost when a thinking model is selected in thinking mode.
-// No score boost for thinking — scores already reflect base capability without thinking.
-// Thinking only affects cost (more tokens consumed) and speed (slower).
-const THINKING_DELTA = { code: 0, reasoning: 0, speed: -20 };
-
 function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0, profile = null) {
   const candidates = [];
+  const wantsThinking = profile?.thinking ?? false;
+
   for (const provider of providers) {
     if (!skipCooldown && _isOnCooldown(provider)) continue;
     const providerModels = modelsData[provider];
@@ -205,31 +204,38 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       if (minContextK > 0 && caps.contextK > 0 && caps.contextK < minContextK) continue;
       const totalCost = (caps.inputPer1M || 0) + (caps.outputPer1M || 0);
 
-      // Check if model meets BOTH code and reasoning requirements from the profile
-      const codeScore = caps.code ?? 0;
-      const reasoningScore = caps.reasoning ?? 0;
-      const taskScore = caps[taskType] ?? 0;
       const reqCode = profile?.code ?? 0;
       const reqReasoning = profile?.reasoning ?? 0;
-      const meetsBoth = codeScore >= reqCode && reasoningScore >= reqReasoning;
-      // Fallback: if no profile with both scores, use single-dimension check
-      const meetsMinimum = (reqCode > 0 || reqReasoning > 0) ? meetsBoth : (taskScore >= difficulty);
 
-      // Non-thinking variant
-      if (meetsMinimum) {
-        candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false, caps });
+      // ── Non-thinking variant: use base scores ──
+      if (!wantsThinking) {
+        const codeScore = caps.code ?? 0;
+        const reasoningScore = caps.reasoning ?? 0;
+        const taskScore = caps[taskType] ?? 0;
+        const meetsBoth = codeScore >= reqCode && reasoningScore >= reqReasoning;
+        const meetsMinimum = (reqCode > 0 || reqReasoning > 0) ? meetsBoth : (taskScore >= difficulty);
+        if (meetsMinimum) {
+          candidates.push({ provider, model: modelName, totalCost, speed: caps.speed || 30, score: taskScore, useThinking: false, caps });
+        }
       }
 
-      // Thinking variant: same score, slower, different cost.
-      // Cost strategy: thinking is cheaper for hard tasks, expensive for easy:
-      //   difficulty < 60  → don't offer thinking
-      //   difficulty 60-70 → ×3 cost
-      //   difficulty 70-80 → ×1.5 cost
-      //   difficulty > 80  → ×1 cost (same price)
-      if (caps.thinking && meetsMinimum && difficulty >= 60) {
-        const thinkingSpeed = Math.max(1, (caps.speed || 30) + THINKING_DELTA.speed);
-        const costMultiplier = difficulty <= 70 ? 3 : difficulty <= 80 ? 1.5 : 1;
-        candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: taskScore, useThinking: true, caps });
+      // ── Thinking variant: use thinking scores (codeThinking/reasoningThinking) ──
+      // Falls back to base scores if thinking scores are not available.
+      if (caps.thinking && wantsThinking) {
+        const codeScore = caps.codeThinking ?? caps.code ?? 0;
+        const reasoningScore = caps.reasoningThinking ?? caps.reasoning ?? 0;
+        const taskScore = taskType === 'code' ? codeScore : reasoningScore;
+        const meetsBoth = codeScore >= reqCode && reasoningScore >= reqReasoning;
+        const meetsMinimum = (reqCode > 0 || reqReasoning > 0) ? meetsBoth : (taskScore >= difficulty);
+        if (meetsMinimum) {
+          const thinkingSpeed = Math.max(1, (caps.speed || 30) - 20);
+          // Cost strategy: thinking is cheaper for hard tasks, expensive for easy:
+          //   difficulty 60-70 → ×3 cost
+          //   difficulty 70-80 → ×1.5 cost
+          //   difficulty > 80  → ×1 cost (same price)
+          const costMultiplier = difficulty <= 70 ? 3 : difficulty <= 80 ? 1.5 : 1;
+          candidates.push({ provider, model: modelName, totalCost: totalCost * costMultiplier, speed: thinkingSpeed, score: taskScore, useThinking: true, caps });
+        }
       }
     }
   }
@@ -260,12 +266,12 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
 
 /**
  * Select the cheapest text-output model whose score for taskType >= difficulty.
- * For models with thinking capability, two virtual candidates are considered:
- * one without thinking (original scores) and one with thinking (code+1,
- * reasoning+2, speed-2). The winner may activate thinking mode.
+ * When profile.thinking is true, only thinking candidates are considered (using
+ * codeThinking/reasoningThinking scores). Falls back to non-thinking if no
+ * thinking model qualifies.
  *
  * @param {'code'|'reasoning'} taskType
- * @param {number} difficulty - 1-100 (code/reasoning) or 1-10 (speed)
+ * @param {number} difficulty - 1-100
  * @param {string[]} availableProviders - providers with API keys
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
@@ -280,6 +286,12 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   }
 
   let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, profile);
+
+  // If thinking was requested but no thinking model qualifies, fall back to non-thinking
+  if (candidates.length === 0 && profile?.thinking) {
+    const noThinkingProfile = { ...profile, thinking: false };
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, noThinkingProfile);
+  }
 
   // If all providers are on cooldown, ignore cooldowns and pick the best available
   // so we never block LLM calls entirely.
@@ -307,7 +319,13 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   candidates.sort((a, b) => {
     const costDiff = a.totalCost - b.totalCost;
     if (Math.abs(costDiff) > 0.0001) return costDiff;
-    return b.speed - a.speed;
+    // At equal cost, prefer the more capable model (sum of code + reasoning), not the faster one.
+    // Use thinking scores if the candidate was selected with thinking enabled.
+    const aCode = a.useThinking ? (a.caps?.codeThinking ?? a.caps?.code ?? 0) : (a.caps?.code ?? 0);
+    const aReas = a.useThinking ? (a.caps?.reasoningThinking ?? a.caps?.reasoning ?? 0) : (a.caps?.reasoning ?? 0);
+    const bCode = b.useThinking ? (b.caps?.codeThinking ?? b.caps?.code ?? 0) : (b.caps?.code ?? 0);
+    const bReas = b.useThinking ? (b.caps?.reasoningThinking ?? b.caps?.reasoning ?? 0) : (b.caps?.reasoning ?? 0);
+    return (bCode + bReas) - (aCode + aReas);
   });
 
   const winner = candidates[0];
@@ -317,11 +335,12 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
 /**
  * Return ALL candidate models for a task, sorted by cost (cheapest first).
  * Used by the classifier to try multiple models if the cheapest fails.
+ * Accepts an optional profile to control thinking/score selection.
  */
-export function getAllCandidates(taskType, difficulty, availableProviders) {
-  let candidates = _buildCandidates(availableProviders, taskType, difficulty, false, false, 0);
+export function getAllCandidates(taskType, difficulty, availableProviders, profile = null) {
+  let candidates = _buildCandidates(availableProviders, taskType, difficulty, false, false, 0, profile);
   if (candidates.length === 0) {
-    candidates = _buildCandidates(availableProviders, taskType, difficulty, false, true, 0);
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, false, true, 0, profile);
   }
   if (candidates.length === 0) {
     candidates = _buildAllCandidates(availableProviders, taskType, false, 0);

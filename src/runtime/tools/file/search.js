@@ -206,18 +206,16 @@ export default {
     if (!permissions.isAllowed(searchDir, 'read')) {
       channel.clearProgress();
       const agentName = agent?.name || 'Agent';
-      channel.print(`🔍 ${agentName} ${t('wantsToSearch')} \x1b[33m${searchDir}\x1b[0m`);
-
-      const value = await channel.select(t('allowSearchDir'), [
-        { title: t('permYes'), value: 'yes', description: t('allowThisTime') },
-        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
-        { title: t('permNo'), value: 'no', description: t('denyAccess') }
-      ]);
+      const _dirBase = path.basename(searchDir);
+      const value = await channel.select('', [
+        { title: t('permYes'),  value: 'yes' },
+        { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
+        { title: t('permNo'),   value: 'no' }
+      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToSearch')}`.replace(':', ''), command: `Search(${searchDir})` } });
 
       if (value === 'always') {
         permissions.allow(searchDir, 'read');
       } else if (value !== 'yes') {
-        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, message: 'User denied search access' };
       }
     }

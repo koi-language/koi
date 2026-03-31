@@ -17,24 +17,28 @@ const DIM  = '\x1b[2m';
 const BOLD = '\x1b[1m';
 const RST  = '\x1b[0m';
 
+// Accent color for links, inline code, types, functions, etc.
+// Overridable via setAccentColor() — called by the CLI theme layer.
+let ACCENT = '\x1b[36m'; // default: standard cyan
+export function setAccentColor(ansiCode) { ACCENT = ansiCode; }
+
 // ── Inline formatting ────────────────────────────────────────────────────────
 
 function renderInline(text) {
   // Links FIRST — before any ANSI codes are inserted, so URL regexes match cleanly.
-  // Render as blue underline (no OSC 8 — Ink TUI doesn't support it).
-  // Markdown links: [label](url) → blue underlined label
+  // Markdown links: [label](url) → accent underlined label
   text = text.replace(
     /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
-    '\x1b[38;5;75m\x1b[4m$1\x1b[24m\x1b[39m'
+    (_, label) => `${ACCENT}\x1b[4m${label}\x1b[24m\x1b[39m`
   );
-  // Bare URLs: http(s)://... → blue underlined URL
+  // Bare URLs: http(s)://... → accent underlined URL
   text = text.replace(
     /(^|[\s(])(https?:\/\/[^\s)\]>*]+)/g,
-    '$1\x1b[38;5;75m\x1b[4m$2\x1b[24m\x1b[39m'
+    (_, pre, url) => `${pre}${ACCENT}\x1b[4m${url}\x1b[24m\x1b[39m`
   );
 
-  // Inline code: `code` → cyan
-  text = text.replace(/`([^`]+)`/g, '\x1b[36m$1\x1b[39m');
+  // Inline code: `code` → accent
+  text = text.replace(/`([^`]+)`/g, (_, code) => `${ACCENT}${code}\x1b[39m`);
 
   // Bold: **text** → bold
   text = text.replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[22m');
@@ -163,10 +167,10 @@ const _SH = {
   STRING:   '\x1b[38;5;114m',  // green — string literals
   NUMBER:   '\x1b[38;5;208m',  // orange — numbers
   COMMENT:  '\x1b[38;5;242m',  // gray — comments
-  TYPE:     '\x1b[38;5;81m',   // cyan — types, classes, interfaces
-  FUNC:     '\x1b[38;5;69m',   // blue — function names
-  PUNCT:    '\x1b[38;5;250m',  // light gray — brackets, braces, parens
-  PROP:     '\x1b[38;5;152m',  // light blue — property names
+  get TYPE()  { return ACCENT; },  // accent — types, classes, interfaces
+  get FUNC()  { return ACCENT; },  // accent — function names
+  PUNCT:    '\x1b[38;5;250m',    // light gray — brackets, braces, parens
+  get PROP()  { return ACCENT; },  // accent — property names
   RST:      '\x1b[0m',
 };
 

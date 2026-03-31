@@ -22,6 +22,7 @@ export default {
   wantsToSearch: 'wants to search:',
   wantsToGrep: 'wants to grep:',
   wantsToWrite: 'wants to write to:',
+  wantsToExecute: 'wants to execute shell command',
   skipped: 'Skipped',
   done: 'Done',
   noChanges: 'No changes',

@@ -392,29 +392,23 @@ export default {
     const permissions = getFilePermissions(agent);
     let permitted = permissions.isAllowed(resolvedPath, 'write');
 
-    if (permitted) {
-      const reason = permissions.autoApprovalReason(resolvedPath);
-      if (reason) channel.print(`\x1b[2m✓ ${t('autoApproved')} ${filePath} (${reason})\x1b[0m`);
-    } else {
+    if (!permitted) {
       const agentName = agent?.name || 'Agent';
-      channel.print(`🔧 ${agentName} ${t('wantsToEdit')} \x1b[33m${filePath}\x1b[0m`);
-
-      const value = await runFilePermDialog(() => channel.select('Allow this file change?', [
-        { title: t('permYes'), value: 'yes', description: t('allowThisTime') },
-        { title: t('permAlwaysAllow'), value: 'always', description: t('alwaysAllowDir') },
-        { title: 'No, but', value: 'feedback', description: 'Reject and give instructions to retry' },
-        { title: t('permNo'), value: 'no', description: t('denyAccess') }
-      ]));
+      const _dirBase = path.basename(path.dirname(resolvedPath));
+      const value = await runFilePermDialog(() => channel.select('', [
+        { title: t('permYes'), value: 'yes' },
+        { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
+        { title: 'No, but give feedback', value: 'feedback' },
+        { title: t('permNo'), value: 'no' }
+      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToEdit')}`.replace(':', ''), command: `Edit(${filePath})` } }));
 
       if (value === 'always') {
-        const grantedDir = permissions.allowProject(resolvedPath);
-        if (grantedDir) channel.print(`\x1b[2m✓ Write access granted for project: ${grantedDir}\x1b[0m`);
+        permissions.allowProject(resolvedPath);
         permitted = true;
       } else if (value === 'yes') {
         permitted = true;
       } else if (value === 'feedback') {
         const feedback = await channel.prompt('> ');
-        channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, feedback, message: `User rejected the edit with feedback: ${feedback}` };
       }
     }
