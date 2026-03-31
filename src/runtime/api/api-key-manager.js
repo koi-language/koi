@@ -102,7 +102,7 @@ async function _promptForApiKey(executor, { provider, keyName, providerName, all
  * @param {Agent} agent - The agent instance to use for executing the prompt action
  */
 export async function promptMissingApiKeys(agent) {
-  // When authenticated via koi-cli.ai account, API keys are not needed —
+  // When authenticated via braxil.ai account, API keys are not needed —
   // the gateway proxies LLM calls using the auth token.
   if (process.env.KOI_AUTH_TOKEN) return;
 
@@ -173,7 +173,7 @@ export async function ensureApiKey(provider, agent) {
 
   if (process.env[keyName]) return process.env[keyName];
 
-  // When authenticated via koi-cli.ai account, the gateway handles provider access.
+  // When authenticated via braxil.ai account, the gateway handles provider access.
   if (process.env.KOI_AUTH_TOKEN) return '__KOI_ACCOUNT__';
 
   const providerName = PROVIDER_NAMES[provider] || provider;

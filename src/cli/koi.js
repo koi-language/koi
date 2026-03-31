@@ -576,10 +576,7 @@ async function runFile(sourcePath, options = {}) {
         process.exit(code);
       } else {
         const pendingFile = path.join(projectRoot, '.koi', '.resume-pending');
-        if (process.env.KOI_CLI_MODE === '1' && !_exists(pendingFile)) {
-          const _s = globalThis.__koiStrings || {};
-          process.stderr.write(`\x1b[2m${_s.resumeWith || 'Resume this session with:'}\nkoi-cli --resume ${sessionId}\x1b[0m\n\n`);
-        }
+        // Resume hint is handled by the CLI (braxil.js), not the language runtime.
         resolve();
       }
     });

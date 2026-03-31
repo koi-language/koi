@@ -87,10 +87,10 @@ export class LLMProvider {
     this.maxTokens = config.max_tokens || 16000; // Fallback; per-model limit set in BaseLLM via caps.maxOutputTokens
     this._useThinking = false; // Set to true by auto-selector when thinking variant wins
 
-    // ── koi-cli.ai account mode: route all LLM calls through the gateway ──────
+    // ── braxil.ai account mode: route all LLM calls through the gateway ──────
     // The gateway is OpenAI-compatible and handles provider selection server-side.
     // No need to hardcode providers — they come dynamically from GET /gateway/models.
-    // Production: https://api.koi-cli.ai/gateway  Local: http://localhost:3000/gateway
+    // Production: https://api.braxil.ai/gateway  Local: http://localhost:3000/gateway
     if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
       const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
       const gatewayBase = apiBase + '/gateway';
@@ -171,7 +171,7 @@ export class LLMProvider {
   // =========================================================================
 
   /**
-   * Fetch available providers from the koi-cli.ai gateway and update
+   * Fetch available providers from the braxil.ai gateway and update
    * _availableProviders accordingly. Called at startup and on 400 errors
    * (e.g. "key not configured") to re-sync.
    */
@@ -217,7 +217,7 @@ export class LLMProvider {
    */
   async _ensureAnyProvider(agent) {
     if (this._availableProviders.length > 0) return;
-    // Gateway mode: all providers are available via the koi-cli.ai backend
+    // Gateway mode: all providers are available via the braxil.ai backend
     if (this._koiGateway) return;
 
     const { channel: cliLogger } = await import('../io/channel.js');
@@ -2852,7 +2852,7 @@ Output ONLY the JSON array, no explanation.`;
       channel.log('memory', `Embedding request: provider=${_provider}, textLen=${text.length}, attempt=${attempt}, preview="${text.substring(0, 80).replace(/\n/g, ' ')}..."`);
 
       try {
-        // Gateway mode: use koi-cli.ai backend for embeddings
+        // Gateway mode: use braxil.ai backend for embeddings
         if (process.env.KOI_AUTH_TOKEN) {
           if (!this._gatewayEmbeddingInstance) {
             const { GatewayEmbedding } = await import('./providers/gateway.js');

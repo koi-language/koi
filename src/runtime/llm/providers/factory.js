@@ -164,7 +164,7 @@ function _resolveLLM(req) {
 function _resolveEmbedding(req) {
   const { clients } = req;
 
-  // Gateway mode: route through koi-cli.ai backend
+  // Gateway mode: route through braxil.ai backend
   if (process.env.KOI_AUTH_TOKEN) {
     const instance = new GatewayEmbedding();
     return { instance, provider: 'koi-gateway', model: 'text-embedding-3-small', useThinking: false };
@@ -191,7 +191,7 @@ function _resolveEmbedding(req) {
 function _resolveSearch(req) {
   const { clients } = req;
 
-  // Gateway mode: route through koi-cli.ai backend (skip if forced model is set —
+  // Gateway mode: route through braxil.ai backend (skip if forced model is set —
   // forced mode means we're bypassing the gateway for direct API access)
   if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_DEFAULT_MODEL) {
     const instance = new GatewaySearch();

@@ -1,7 +1,7 @@
 /**
- * Gateway providers — used when the user is authenticated via a koi-cli.ai account.
+ * Gateway providers — used when the user is authenticated via a braxil.ai account.
  *
- * All calls are routed through the koi-cli.ai backend gateway, which proxies
+ * All calls are routed through the braxil.ai backend gateway, which proxies
  * to the actual providers server-side (OpenAI, Gemini, Kling, Seedance, etc.).
  *
  * The gateway exposes a UNIFIED API inspired by fal.ai's pattern:
