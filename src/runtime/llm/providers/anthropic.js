@@ -50,7 +50,7 @@ export class AnthropicLLM extends BaseLLM {
     }
 
     let buffer = '';
-    let usage = { input: 0, output: 0 };
+    let usage = { input: 0, output: 0, cachedInput: 0 };
     let outChars = 0;
     let _thinkChars = 0;
 
@@ -69,6 +69,7 @@ export class AnthropicLLM extends BaseLLM {
 
           if (event.type === 'message_start') {
             usage.input = event.message?.usage?.input_tokens || 0;
+            usage.cachedInput = event.message?.usage?.cache_read_input_tokens || 0;
           } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
             const delta = event.delta.text || '';
             if (delta) {
@@ -141,11 +142,12 @@ export class AnthropicLLM extends BaseLLM {
     if (maxTokens > 4096) {
       params.stream = true;
       let buffer = '';
-      const usage = { input: 0, output: 0, thinking: 0 };
+      const usage = { input: 0, output: 0, thinking: 0, cachedInput: 0 };
       const stream = await this.client.messages.create(params);
       for await (const event of stream) {
         if (event.type === 'message_start') {
           usage.input = event.message?.usage?.input_tokens || 0;
+          usage.cachedInput = event.message?.usage?.cache_read_input_tokens || 0;
         } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
           buffer += event.delta.text || '';
         } else if (event.type === 'message_delta') {
@@ -162,6 +164,7 @@ export class AnthropicLLM extends BaseLLM {
       input: message.usage?.input_tokens || 0,
       output: message.usage?.output_tokens || 0,
       thinking: 0,
+      cachedInput: message.usage?.cache_read_input_tokens || 0,
     };
     const thinkingBlocks = message.content.filter(b => b.type === 'thinking');
     if (thinkingBlocks.length > 0) {

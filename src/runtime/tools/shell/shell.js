@@ -23,10 +23,78 @@
 
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import { fileURLToPath } from 'url';
 
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { channel } from '../../io/channel.js';
+
+// ── sudo askpass support ──────────────────────────────────────────────────────
+// When a command uses sudo, we set SUDO_ASKPASS to a platform-specific script
+// that shows a native GUI dialog instead of prompting in the terminal.
+// The reason WHY sudo is needed is passed via KOI_SUDO_REASON env var.
+
+const __filename = fileURLToPath(import.meta.url);
+const __shellDir = path.dirname(__filename);
+
+/** Ensure the platform-specific askpass script is available and return its path. */
+let _askpassPath = null;
+function _getAskpassPath() {
+  if (_askpassPath) return _askpassPath;
+
+  const platform = process.platform;
+  const scriptName = platform === 'darwin' ? 'askpass-macos.sh' : 'askpass-linux.sh';
+
+  // In a pkg binary, files in the snapshot are read-only and may not be
+  // executable. Extract the script to a temp path (like spawn-helper).
+  const srcPath = path.join(__shellDir, scriptName);
+  const tmpPath = path.join(os.tmpdir(), `koi-${scriptName}`);
+
+  try {
+    // Always overwrite to keep the script up-to-date across versions.
+    const content = fs.readFileSync(srcPath, 'utf-8');
+    fs.writeFileSync(tmpPath, content, { mode: 0o755 });
+    _askpassPath = tmpPath;
+    channel.log('shell', `askpass script ready: ${tmpPath}`);
+  } catch (e) {
+    channel.log('shell', `askpass extraction failed: ${e.message}`);
+    return null;
+  }
+
+  return _askpassPath;
+}
+
+/**
+ * Build env overrides for SUDO_ASKPASS so that ANY sudo invocation (direct or
+ * inside a child script) shows a native GUI dialog instead of a terminal prompt.
+ *
+ * All dialog texts are resolved here via the runtime i18n `t()` function so the
+ * askpass script doesn't need to know the language — it just displays the env vars.
+ * This also handles the case where the LLM's description is in a different language
+ * than the system locale (e.g. user speaks Spanish but system is English).
+ */
+function _sudoAskpassEnv(description) {
+  const askpass = _getAskpassPath();
+  if (!askpass) return null;
+  return {
+    SUDO_ASKPASS: askpass,
+    KOI_SUDO_TITLE: t('sudoDialogTitle'),
+    KOI_SUDO_HEADER: t('sudoDialogHeader'),
+    KOI_SUDO_RLABEL: t('sudoDialogReasonLabel'),
+    KOI_SUDO_REASON: description || t('sudoDialogDefaultReason'),
+  };
+}
+
+/**
+ * Transform a command so that every `sudo` invocation uses -A (askpass mode).
+ * Skips if sudo already has -A. Handles: `sudo cmd`, `&& sudo cmd`, `; sudo cmd`, `| sudo cmd`.
+ */
+function _injectSudoA(command) {
+  // Replace `sudo` (word boundary) that is NOT already followed by -A
+  return command.replace(/\bsudo\b(?!\s+-A)/g, 'sudo -A');
+}
 
 // Use the user's preferred shell so that PATH and shell functions loaded via
 // .zshrc/.bashrc (e.g. nvm, rbenv, pyenv, conda, fnm) are available.
@@ -345,7 +413,9 @@ export default {
 
 If an action fails, do not guess. Choose another valid action only if it is meaningfully different and can resolve the issue.
 
-Commands that launch long-running processes MUST use "background": true. Examples: npm start, flutter run, python server.py, open -a Simulator.`,
+Commands that launch long-running processes MUST use "background": true. Examples: npm start, flutter run, python server.py, open -a Simulator.
+
+When a command requires sudo, just use sudo normally in the command. The system will automatically show a secure native OS dialog to request the password — never prompt for passwords in the terminal. Make sure the "description" field clearly explains WHY elevated privileges are needed so the user understands the reason in the dialog (e.g. "Need to install nginx system-wide via apt" rather than "Running apt install").`,
   thinkingHint: (action) => `Executing ${extractBaseCommand(action.command || '')}`,
   permission: 'execute',
   hidden: false,
@@ -374,7 +444,7 @@ Commands that launch long-running processes MUST use "background": true. Example
   ],
 
   async * execute(action, agent) {
-    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, stream_interval = 30000 } = action;
+    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, stream_interval = 10000 } = action;
 
     if (!command) {
       throw new Error('shell: "command" field is required');
@@ -438,11 +508,19 @@ Commands that launch long-running processes MUST use "background": true. Example
       return;
     }
 
+    // ── sudo askpass: always inject SUDO_ASKPASS so that ANY sudo (direct or
+    // inside child scripts) shows a native GUI dialog instead of terminal prompt.
+    // If the direct command contains `sudo`, also rewrite to `sudo -A`.
+    const sudoEnv = _sudoAskpassEnv(description);
+    const hasSudo = /\bsudo\b/.test(command);
+    const effectiveCommand = hasSudo ? _injectSudoA(command) : command;
+    const effectiveEnv = sudoEnv ? { ...process.env, ...sudoEnv } : { ...process.env };
+
     // Background launch: spawn detached, don't wait for completion.
     if (background) {
-      const bgChild = spawn(USER_SHELL, _shellArgs(command), {
+      const bgChild = spawn(USER_SHELL, _shellArgs(effectiveCommand), {
         cwd: cwd || process.cwd(),
-        env: { ...process.env },
+        env: effectiveEnv,
         stdio: ['ignore', 'ignore', 'pipe'],  // pipe stderr to catch startup errors
         detached: true
       });
@@ -467,30 +545,19 @@ Commands that launch long-running processes MUST use "background": true. Example
         channel.clearProgress();
 
         if (code !== 0) {
-          // Crashed: show error + stderr indented below
-          if (stderrStr) {
-            channel.printCompact(`\x1b[31m↗  ${cmdPreview} (crashed · code ${code})\x1b[0m`);
-            const dimmedStderr = stderrStr
-              .split('\n')
-              .map(line => `\x1b[2m   ${line}\x1b[0m`)
-              .join('\n');
-            channel.print(dimmedStderr);
-          } else {
-            channel.print(`\x1b[31m↗  ${cmdPreview} (crashed · code ${code})\x1b[0m`);
-          }
+          channel.endAction(false, `background crashed · exit ${code}`);
           _bgNotify?.(`[System notification] Background process crashed: "${cmdPreview}" exited with code ${code}.${stderrStr ? ` Error output:\n${stderrStr}` : ''} Please handle this.`);
         } else {
           // Finished cleanly — replaces the progress bar PID line with a ✓ in scroll
-          channel.print(`\x1b[2m✓  ${cmdPreview} (finished)\x1b[0m`);
+          channel.endAction(true, 'background finished');
         }
       });
 
       bgChild.unref();
       reportDone?.();
       if (!isSilent) {
-        channel.printCompact(description);
-        // Show PID in progress bar (replaceable) instead of scroll (permanent)
-        channel.progress(`\x1b[2m↗  ${cmdPreview} (background · PID ${bgChild.pid})\x1b[0m`);
+        channel.beginAction('shell', cmdPreview);
+        channel.progress(`\x1b[2m↗  background · PID ${bgChild.pid}\x1b[0m`);
       }
       yield { success: true, background: true, pid: bgChild.pid };
       return;
@@ -512,16 +579,12 @@ Commands that launch long-running processes MUST use "background": true. Example
     };
 
     if (!isSilent) {
-      channel.progress(`\x1b[2m→  ${cmdPreview} (running for 0s)\x1b[0m`);
+      channel.beginAction('shell', cmdPreview);
+      descriptionShown = true;
+      channel.progress(`\x1b[2m→  running for 0s\x1b[0m`);
       timerInterval = setInterval(() => {
         const elapsed = _fmtElapsed(Date.now() - startTime);
-        // Show description in the progress bar after 2s so the user sees
-        // what's happening for long-running commands.
-        if (!descriptionShown && Date.now() - startTime >= 2000) {
-          channel.printCompact(description);
-          descriptionShown = true;
-        }
-        channel.progress(`\x1b[2m→  ${cmdPreview} (running for ${elapsed})\x1b[0m`);
+        channel.progress(`\x1b[2m→  running for ${elapsed}\x1b[0m`);
       }, 1000);
     }
 
@@ -541,12 +604,38 @@ Commands that launch long-running processes MUST use "background": true. Example
     let _passwordPending = false;
     let _inputNeededInfo = null; // Set by _scheduleDetect; consumed by the generator loop.
 
+    // Stale output detection: fingerprint last N lines to detect repeating output.
+    // After _STALE_THRESHOLD consecutive identical fingerprints, flag the yield as stale.
+    const _ANSI_RE = /\x1b\[[0-9;]*[mABCDEFGHJKLMPSTfhinsu]/g;
+    const _TIMESTAMP_RE = /\d{1,2}:\d{2}(:\d{2})?(\.\d+)?/g;
+    const _NUMBERS_RE = /\b\d+\b/g;
+    let _lastOutputFingerprint = '';
+    let _staleCount = 0;
+    const _STALE_THRESHOLD = 2; // consecutive identical fingerprints to flag as stale (~4s with active output)
+
+    function _computeFingerprint(output) {
+      const lines = output.split('\n').slice(-20);
+      return lines.join('\n')
+        .replace(_ANSI_RE, '')
+        .replace(_TIMESTAMP_RE, '')
+        .replace(_NUMBERS_RE, '#')
+        .trim()
+        .slice(-300);
+    }
+
     // Fast-path password detection: matches sudo/ssh/git prompts like:
     //   "[sudo] password for user:"  "Password:"  "Enter passphrase for key '...':"
     // Fires _passwordPromptCallback immediately — no 10s wait, no LLM round-trip.
+    //
+    // SKIP when sudoEnv is active: the native GUI askpass dialog handles sudo
+    // passwords, so the terminal prompt would be redundant.
     const PASSWORD_PROMPT_RE = /(?:(?:\[sudo\]\s+)?password(?:\s+for\s+\S+)?|passphrase(?:\s+for\s+key\s+'\S+')?)\s*:\s*$/im;
 
     function _checkPasswordPrompt(text) {
+      // When askpass is active, ALL password prompts from sudo are handled by
+      // the native GUI dialog — skip terminal detection entirely to avoid the
+      // redundant 🔑 prompt in the TUI.
+      if (sudoEnv) return false;
       if (_passwordPending || !_passwordPromptCallback) return false;
       const m = text.match(PASSWORD_PROMPT_RE);
       if (!m) return false;
@@ -663,12 +752,12 @@ Commands that launch long-running processes MUST use "background": true. Example
     };
     if (usePty) {
       // ── PTY path: node-pty (all platforms) ────────────────────────────────
-      ptyProc = _pty.spawn(USER_SHELL, _shellArgs(command), {
+      ptyProc = _pty.spawn(USER_SHELL, _shellArgs(effectiveCommand), {
         name: 'xterm-256color',
         cols: 220,
         rows: 50,
         cwd: cwd || process.cwd(),
-        env: { ...process.env },
+        env: effectiveEnv,
       });
 
       proc = {
@@ -696,9 +785,9 @@ Commands that launch long-running processes MUST use "background": true. Example
       // ── Plain spawn fallback ───────────────────────────────────────────────
       // node-pty unavailable or semaphore limit reached.
       // Output may be buffered for programs that check isatty().
-      child = spawn(USER_SHELL, _shellArgs(command), {
+      child = spawn(USER_SHELL, _shellArgs(effectiveCommand), {
         cwd: cwd || process.cwd(),
-        env: { ...process.env },
+        env: effectiveEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -737,7 +826,9 @@ Commands that launch long-running processes MUST use "background": true. Example
     // Kick off the interactive-prompt detector immediately so that commands
     // producing zero output (e.g. `sudo` writing "Password:" to /dev/tty,
     // not stdout/stderr) are still detected after 10 s of silence.
-    _scheduleDetect();
+    // Skip when askpass is active: the GUI dialog handles sudo auth, so silence
+    // during the dialog is expected and should NOT trigger _inputNeeded.
+    if (!sudoEnv) _scheduleDetect();
 
     // Timeout and abort handler are set up AFTER proc is assigned above.
     timeout = setTimeout(() => proc.kill(), timeoutMs);
@@ -782,25 +873,36 @@ Commands that launch long-running processes MUST use "background": true. Example
 
               // After writing auto-input, check if the process responds.
               // If it stays silent for 8s, the input likely didn't work (e.g. interactive
-              // menu that requires a real TTY). Kill the process and report the failure.
+              // menu that requires a real TTY). Re-yield _inputNeeded so the agent/LLM
+              // can decide what to do (instead of killing without consultation).
               const _outputLenBefore = Buffer.concat(outputChunks).length;
               await new Promise(r => setTimeout(r, 8000));
               if (!isClosed) {
                 const _outputLenAfter = Buffer.concat(outputChunks).length;
                 if (_outputLenAfter === _outputLenBefore) {
-                  channel.log('shell', `[agent-input] process did not respond after auto-input — killing (likely needs interactive TTY)`);
-                  proc.kill();
-                  // Wait for close event
-                  await new Promise(r => setTimeout(r, 500));
+                  channel.log('shell', `[agent-input] process did not respond after auto-input — re-escalating to agent`);
+                  const _lastLines = Buffer.concat(outputChunks).toString().split('\n').slice(-20).join('\n');
+                  _inputNeededInfo = { promptContext: _lastLines + '\n\n[Previous auto-input did not produce any response after 8s. Process may need a real TTY or the input was incorrect.]' };
+                  _notify();
                 }
               }
             }
           } else {
+            // Stale output detection: compare fingerprint of last 20 lines.
+            const fp = _computeFingerprint(outputSoFar);
+            if (fp && fp === _lastOutputFingerprint) {
+              _staleCount++;
+            } else {
+              _staleCount = 0;
+            }
+            _lastOutputFingerprint = fp;
+
             yield {
               _isProgress: true,
               output_so_far: outputSoFar,
               elapsed,
-              command: cmdPreview
+              command: cmdPreview,
+              ...(_staleCount >= _STALE_THRESHOLD ? { _isStale: true } : {}),
             };
           }
         }
@@ -821,21 +923,11 @@ Commands that launch long-running processes MUST use "background": true. Example
       if (closeError) {
         _shellOutputCallback?.(false);
         reportDone?.();
+        if (!isSilent) channel.endAction(false, closeError.message);
         yield { success: false, exitCode: 1, stdout: '', stderr: '', error: closeError.message };
       } else if (closeCode !== 0) {
         if (!isSilent) {
-          if (!descriptionShown) channel.printCompact(`${description}`);
-          const errOut = stderrStr || combinedStr;
-          if (errOut) {
-            channel.printCompact(`\x1b[31m✗  ${cmdPreview} (${elapsed})\x1b[0m`);
-            const dimmed = errOut
-              .split('\n')
-              .map(line => `\x1b[2m   ${line}\x1b[0m`)
-              .join('\n');
-            channel.print(dimmed);
-          } else {
-            channel.print(`\x1b[31m✗  ${cmdPreview} (${elapsed})\x1b[0m`);
-          }
+          channel.endAction(false, `exit ${closeCode} (${elapsed})`);
         }
         _shellOutputCallback?.(false);
         reportDone?.();
@@ -848,8 +940,7 @@ Commands that launch long-running processes MUST use "background": true. Example
         };
       } else {
         if (!isSilent) {
-          if (!descriptionShown) channel.printCompact(`${description}`);
-          channel.print(`\x1b[2m✓  ${cmdPreview} (${elapsed})\x1b[0m`);
+          channel.endAction(true, `(${elapsed})`);
         }
         _shellOutputCallback?.(false);
         reportDone?.();

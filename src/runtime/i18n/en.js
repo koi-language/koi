@@ -68,4 +68,5 @@ export default {
   readingTaskSpec: 'Reading task spec',
   reconsidering: 'Reconsidering — shell command failed',
   processingResponseFrom: 'Processing response from',
+  scanningProject: 'scanning project...',
 };

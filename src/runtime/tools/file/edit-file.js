@@ -407,7 +407,8 @@ export default {
       ]));
 
       if (value === 'always') {
-        permissions.allowFile(resolvedPath);
+        const grantedDir = permissions.allowProject(resolvedPath);
+        if (grantedDir) channel.print(`\x1b[2m✓ Write access granted for project: ${grantedDir}\x1b[0m`);
         permitted = true;
       } else if (value === 'yes') {
         permitted = true;

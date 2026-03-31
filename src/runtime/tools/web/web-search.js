@@ -10,7 +10,7 @@ import { resolve as resolveModel } from '../../llm/providers/factory.js';
 export default {
   type: 'web_search',
   intent: 'web_search',
-  description: 'Search the internet for current information. Returns titles, URLs, and snippets. Use when you need up-to-date data beyond your training knowledge.',
+  description: 'Search the internet for current information. Returns titles, URLs, and snippets. Use when you need up-to-date data beyond your training knowledge. Also use as fallback when web_fetch fails on a URL — search for the topic to find the correct/updated URL, then web_fetch the result.',
   thinkingHint: 'Searching the web',
   permission: 'web_access',
 

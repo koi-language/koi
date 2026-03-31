@@ -466,10 +466,13 @@ export class Agent {
     // Get available skill functions for tool calling
     const tools = this.getSkillFunctions();
 
-    // Extract playbook content if it's an object (transpiler stores it as {type, content})
-    const playbookContent = typeof playbook === 'object' && playbook.content
-      ? playbook.content
-      : playbook;
+    // Extract playbook content if it's an object (transpiler stores it as {type, content}).
+    // Cache-aware structured results { _cacheKey, static, dynamic } pass through as-is.
+    const playbookContent = typeof playbook === 'object' && playbook?._cacheKey !== undefined
+      ? playbook  // structured compose result — handled by playbookResolver
+      : typeof playbook === 'object' && playbook?.content
+        ? playbook.content
+        : playbook;
 
     // Evaluate template string with context (interpolate ${...} expressions)
     // Create a function that evaluates the template in the context of args and state
@@ -502,7 +505,10 @@ export class Agent {
       }
     };
 
-    const interpolatedPlaybook = evaluateTemplate(playbookContent, context);
+    // Skip template evaluation for structured compose results (already fully resolved)
+    const interpolatedPlaybook = typeof playbookContent === 'object' && playbookContent?._cacheKey !== undefined
+      ? playbookContent
+      : evaluateTemplate(playbookContent, context);
 
     // Use skillSelector for semantic skill selection instead of passing all skills
     // This improves accuracy by only passing relevant tools to the LLM
@@ -541,6 +547,10 @@ export class Agent {
             // Pick up any images produced by compose resolvers (stored via _normalizeComposeResult)
             playbookResolver._pendingImages = this._composePendingImages || null;
             this._composePendingImages = null;
+            // Cache-aware structured result: pass through directly (no template eval needed)
+            if (typeof rawText === 'object' && rawText?._cacheKey !== undefined) {
+              return rawText;
+            }
             const content = typeof rawText === 'object' && rawText.content ? rawText.content : rawText;
             return evaluateTemplate(content, { args, state: this.state });
           } catch {
@@ -718,7 +728,7 @@ export class Agent {
     const isFastGreeting = !isDelegate
       && !contextMemory.hasHistory()
       && !session.mcpErrors
-      && interpolatedPlaybook.includes('__FAST_GREETING__');
+      && (typeof interpolatedPlaybook === 'string' ? interpolatedPlaybook : JSON.stringify(interpolatedPlaybook)).includes('__FAST_GREETING__');
 
     // Track the active agent so CLI hooks can access its LLM provider
     Agent._lastActiveAgent = this;
@@ -1337,9 +1347,27 @@ export class Agent {
           }
           channel.planning(channel.buildActionDisplay(this.name, action));
 
+          // Reset action grouping for user-facing actions (print, prompt, delegate)
+          const _userFacing = new Set(['print', 'prompt_user', 'call_llm', 'return']);
+          if (_userFacing.has(intent) || action.actionType === 'delegate') {
+            channel.resetActionGroup();
+          }
+
+          // For tool actions that don't manage their own display (shell does its own),
+          // emit beginAction so consecutive reads/writes/edits are visually grouped.
+          const _GROUPED_TOOLS = new Set(['read_file', 'edit_file', 'write_file', 'search', 'search_replace', 'grep', 'semantic_code_search', 'web_search', 'web_fetch']);
+          const _isGroupedTool = _GROUPED_TOOLS.has(intent);
+          if (_isGroupedTool) channel.beginAction(intent, action.path || action.pattern || action.query || '');
+
           let { result } = await this._executeAction(action, action, session.actionContext);
 
           channel.clear();
+
+          // Emit endAction for tool actions
+          if (_isGroupedTool) {
+            const _ok = result?.success !== false && !result?.denied;
+            channel.endAction(_ok, _ok ? '' : (result?.error ? result.error.substring(0, 60) : 'failed'));
+          }
 
           // Intercept slash commands from prompt_user (e.g. /history, /diff, /undo)
           while (intent === 'prompt_user' && typeof result?.answer === 'string' && result.answer.startsWith('/')) {
@@ -2315,8 +2343,15 @@ export class Agent {
           // Manual iteration (instead of for-await) so we can pass values back
           // via iter.next(value) — required for the _inputNeeded two-way protocol.
           const iter = maybeGen[Symbol.asyncIterator]();
+          const iterState = { killed: false }; // Coordinates async classify callbacks with the generator
+          let _classifyLastDispatch = 0;       // Timestamp-based rate limiter (replaces boolean guard)
+          const _CLASSIFY_COOLDOWN = 3000;     // Min 3s between classification dispatches
+
+          this._shellKilledByClassifier = null;
+          this._shellKilledNonInteractive = false;
+
           let item = await iter.next();
-          while (!item.done) {
+          while (!item.done && !iterState.killed) {
             const update = item.value;
             if (update._isProgress) {
               if (update._inputNeeded) {
@@ -2327,7 +2362,8 @@ export class Agent {
                 if (preClassify === 'kill') {
                   channel.log('shell', `${this.name}: silence → classified as crash/error, killing process`);
                   this._shellKilledByClassifier = outputSoFar;
-                  iter.return();
+                  iterState.killed = true;
+                  try { iter.return(); } catch {}
                   break;
                 }
 
@@ -2336,14 +2372,16 @@ export class Agent {
                 if (answer === '__KILL__') {
                   // LLM determined process crashed/errored, not waiting for input
                   this._shellKilledByClassifier = outputSoFar;
-                  iter.return();
+                  iterState.killed = true;
+                  try { iter.return(); } catch {}
                   break;
                 }
                 if (answer === null && process.env.KOI_EXIT_ON_COMPLETE === '1') {
                   // Non-interactive: can't provide input — kill process and return error
                   this._shellKilledByClassifier = update.output_so_far || '';
                   this._shellKilledNonInteractive = true;
-                  iter.return();
+                  iterState.killed = true;
+                  try { iter.return(); } catch {}
                   break;
                 }
                 item = await iter.next(answer);
@@ -2352,26 +2390,32 @@ export class Agent {
                 this._pendingProgressUpdates.push({ action, update });
 
                 // Fire-and-forget LLM classification of shell output.
-                // If the process hit a fatal error, kill it via iter.return() which
-                // triggers the generator's finally block (process cleanup).
-                // We set _shellKilledByClassifier so we can provide a synthetic error result.
+                // Uses timestamp-based rate limiter: at most 1 dispatch per 5 seconds.
+                // Stale output (_isStale) bypasses the cooldown to escalate quickly.
+                // Progress heuristics skip classification for obvious download/build progress.
                 const outputSoFar = update.output_so_far || '';
                 const cmd = update.command || resolvedAction.command || '';
-                if (outputSoFar.length > 50 && (action.intent || action.type) === 'shell' && !this._shellClassifyInFlight) {
-                  this._shellClassifyInFlight = true;
-                  this._classifyShellOutput(outputSoFar, cmd).then(verdict => {
-                    this._shellClassifyInFlight = false;
-                    if (verdict === 'kill') {
+                const isShell = (action.intent || action.type) === 'shell';
+                const isStale = !!update._isStale;
+                const now = Date.now();
+                const cooldownOk = isStale || (now - _classifyLastDispatch >= _CLASSIFY_COOLDOWN);
+
+                if (outputSoFar.length > 50 && isShell && cooldownOk) {
+                  _classifyLastDispatch = now;
+                  this._classifyShellOutput(outputSoFar, cmd, { isStale }).then(verdict => {
+                    if (verdict === 'kill' && !iterState.killed) {
                       channel.log('shell', `[${this.name}] LLM classified output as fatal error — killing process`);
                       this._shellKilledByClassifier = outputSoFar;
-                      iter.return(); // triggers generator finally → proc.kill()
+                      iterState.killed = true;
+                      try { iter.return(); } catch {} // triggers generator finally → proc.kill()
                     }
                     // 'ask' verdict is handled naturally by the _inputNeeded path
                     // when the process goes silent after asking for input
-                  }).catch(() => { this._shellClassifyInFlight = false; });
+                  }).catch(() => {});
                 }
 
                 item = await iter.next();
+                if (iterState.killed) break;
               }
             } else {
               result = update;
@@ -2413,9 +2457,12 @@ export class Agent {
 
   /**
    * Classify streaming shell output using a fast/cheap LLM call.
+   * @param {string} output - Raw shell output
+   * @param {string} command - The command being run
+   * @param {{ isStale?: boolean }} [opts] - Options (isStale: output appears to be repeating)
    * @returns {'wait'|'kill'|{ask: string}} — wait (keep going), kill (fatal error), or ask (needs user input)
    */
-  async _classifyShellOutput(output, command) {
+  async _classifyShellOutput(output, command, { isStale = false } = {}) {
     if (!this.llmProvider) return 'wait';
     const _ANSI_STRIP = /\x1b\[[0-9;]*[mABCDEFGHJKLMPSTfhinsu]/g;
     const clean = output.replace(_ANSI_STRIP, '').trim();
@@ -2424,6 +2471,9 @@ export class Agent {
 
     try {
       const system = 'Classify shell output. Return ONLY valid JSON, no markdown.';
+      const staleNote = isStale
+        ? '\n\nNOTE: The output appears to be repeating the same content for a sustained period. The process may be stuck in a loop or printing the same error repeatedly. Consider whether this is a fatal condition that will not resolve on its own.'
+        : '';
       const user = `A shell command is running and has produced output. Classify the situation.
 
 Command: ${command}
@@ -2434,10 +2484,10 @@ ${lastLines.slice(-1500)}
 
 Respond with ONE of:
 - {"action":"wait"} — process is running normally (compiling, downloading, starting up, showing logs, warnings). Keep waiting.
-- {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash). It should be killed so the agent can fix the problem.
+- {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash, stuck in infinite loop). It should be killed so the agent can fix the problem.
 - {"action":"ask","question":"what to ask the user"} — process is interactively asking for input (a question, a prompt, a confirmation). The question field should contain what the process is asking.
 
-IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements).`;
+IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements, infinite error loops).${staleNote}`;
 
       const raw = await this.llmProvider.callSummary(system, user);
       const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim());
@@ -2595,8 +2645,13 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
         if (typeof value === 'function') {
           resolvedFragments[key] = value();
         } else if (value && value.__isCompose__) {
-          // Recursively resolve nested compose prompts
-          resolvedFragments[key] = await this._executeComposePrompt(value, _composeArgs);
+          // Recursively resolve nested compose prompts.
+          // Flatten structured results — fragments must be strings for interpolation.
+          let nestedResult = await this._executeComposePrompt(value, _composeArgs);
+          if (typeof nestedResult === 'object' && nestedResult?._cacheKey !== undefined) {
+            nestedResult = [nestedResult.static, nestedResult.dynamic].filter(Boolean).join('\n');
+          }
+          resolvedFragments[key] = nestedResult;
         } else {
           resolvedFragments[key] = value || '';
         }
@@ -2638,6 +2693,14 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
    * agent._composePendingImages for the playbookResolver to pick up.
    */
   _normalizeComposeResult(result) {
+    // Cache-aware structured result from compiler taint analysis.
+    // Pass through for the top-level caller (playbookResolver) to handle.
+    // Nested composes flatten this in _executeComposePrompt before use as fragments.
+    if (typeof result === 'object' && result?._cacheKey !== undefined && result?.static !== undefined) {
+      if (result.images) this._composePendingImages = result.images;
+      else this._composePendingImages = null;
+      return result;
+    }
     if (typeof result === 'object' && result?.text && result?.images) {
       this._composePendingImages = result.images;
       return result.text;
@@ -2784,12 +2847,19 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
           // The parent will re-show naturally when it resumes after this await.
           channel.clearSlotById(_parentSlotId);
           const originalDisplayName = teamMember.agent.displayName;
+          // Open semantic scope for known agent types so their tool calls are grouped
+          const _scopeMap = { Explorer: 'Explore', BrowserNavigator: 'Web', MobileNavigator: 'Web' };
+          const _scopeType = _scopeMap[teamMember.agent.name] || null;
+          const _scopeDesc = currentData?.question || currentData?.subject || currentData?.description?.substring(0, 80) || teamMember.event;
+          if (_scopeType) channel.beginScope(_scopeType, _scopeDesc);
+
           try {
             if (teamMember.alias) {
               teamMember.agent.displayName = teamMember.alias;
             }
             result = await channel.withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
           } finally {
+            if (_scopeType) channel.endScope();
             channel.clearSlotById(_delegateSlot);
             teamMember.agent.displayName = originalDisplayName;
             channel.unregisterSlotMeta(_delegateSlot);

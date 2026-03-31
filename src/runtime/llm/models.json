@@ -10,7 +10,8 @@
       "code": 75,
       "reasoning": 86,
       "thinking": true,
-      "noTemperature": true
+      "noTemperature": true,
+      "cachedInputPer1M": 0.175
     },
     "gpt-5.1": {
       "inputPer1M": 1.25,
@@ -22,7 +23,8 @@
       "code": 48,
       "reasoning": 48,
       "thinking": true,
-      "noTemperature": true
+      "noTemperature": true,
+      "cachedInputPer1M": 0.125
     },
     "gpt-5.2": {
       "inputPer1M": 1.75,
@@ -34,7 +36,8 @@
       "code": 77,
       "reasoning": 81,
       "thinking": true,
-      "noTemperature": true
+      "noTemperature": true,
+      "cachedInputPer1M": 0.175
     },
     "gpt-5.3-codex": {
       "inputPer1M": 1.75,
@@ -46,7 +49,8 @@
       "code": 93,
       "reasoning": 94,
       "thinking": true,
-      "noTemperature": true
+      "noTemperature": true,
+      "cachedInputPer1M": 0.175
     },
     "gpt-5.4-nano": {
       "inputPer1M": 0.2,
@@ -58,21 +62,11 @@
       "code": 61,
       "reasoning": 67,
       "thinking": true,
-      "noTemperature": true
+      "noTemperature": true,
+      "cachedInputPer1M": 0.02
     }
   },
   "anthropic": {
-    "claude-sonnet-4-6": {
-      "inputPer1M": 3,
-      "outputPer1M": 15,
-      "contextK": 1000,
-      "outputType": "text",
-      "inputImage": true,
-      "speed": 49,
-      "code": 81,
-      "reasoning": 78,
-      "thinking": true
-    },
     "claude-opus-4-6": {
       "inputPer1M": 5,
       "outputPer1M": 25,
@@ -82,7 +76,22 @@
       "speed": 47,
       "code": 83,
       "reasoning": 81,
-      "thinking": true
+      "thinking": true,
+      "supportsThinkingBudget": true,
+      "cachedInputPer1M": 0.5
+    },
+    "claude-sonnet-4-6": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "contextK": 1000,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 49,
+      "code": 81,
+      "reasoning": 78,
+      "thinking": true,
+      "supportsThinkingBudget": true,
+      "cachedInputPer1M": 0.3
     },
     "claude-3-haiku": {
       "inputPer1M": 0.25,
@@ -92,34 +101,11 @@
       "inputImage": true,
       "speed": 122,
       "code": 12,
-      "reasoning": 22
-    }
-  },
-  "inception": {
-    "mercury-2": {
-      "inputPer1M": 0.25,
-      "outputPer1M": 0.75,
-      "contextK": 128,
-      "outputType": "text",
-      "inputImage": false,
-      "speed": 201,
-      "code": 53,
-      "reasoning": 57,
-      "thinking": true
+      "reasoning": 22,
+      "cachedInputPer1M": 0.03
     }
   },
   "gemini": {
-    "gemini-2.5-flash": {
-      "inputPer1M": 0.3,
-      "outputPer1M": 2.5,
-      "contextK": 1049,
-      "outputType": "text",
-      "inputImage": true,
-      "speed": 185,
-      "code": 31,
-      "reasoning": 36,
-      "thinking": true
-    },
     "gemini-3-flash-preview": {
       "inputPer1M": 0.5,
       "outputPer1M": 3,
@@ -129,7 +115,21 @@
       "speed": 167,
       "code": 66,
       "reasoning": 61,
-      "thinking": true
+      "thinking": true,
+      "cachedInputPer1M": 0.05
+    },
+    "gemini-2.5-flash": {
+      "inputPer1M": 0.3,
+      "outputPer1M": 2.5,
+      "contextK": 1049,
+      "outputType": "text",
+      "inputImage": true,
+      "speed": 185,
+      "code": 31,
+      "reasoning": 36,
+      "thinking": true,
+      "supportsThinkingBudget": true,
+      "cachedInputPer1M": 0.03
     },
     "gemini-3.1-pro-preview": {
       "inputPer1M": 2,
@@ -140,7 +140,8 @@
       "speed": 31,
       "code": 97,
       "reasoning": 100,
-      "thinking": true
+      "thinking": true,
+      "cachedInputPer1M": 0.2
     },
     "gemini-2.5-flash-lite": {
       "inputPer1M": 0.1,
@@ -151,7 +152,9 @@
       "speed": 231,
       "code": 13,
       "reasoning": 22,
-      "thinking": true
+      "thinking": true,
+      "supportsThinkingBudget": true,
+      "cachedInputPer1M": 0.01
     }
   }
 }

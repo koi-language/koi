@@ -376,28 +376,82 @@ export class LLMProvider {
   /**
    * Log LLM request (system + user prompts)
    */
-  logRequest(model, systemPrompt, userPrompt, context = '') {
+  logRequest(model, systemPrompt, userPrompt, context = '', cacheBoundary = 0) {
     if (process.env.KOI_DEBUG_LLM !== '1') return;
 
-    console.error('─'.repeat(80));
-    console.error(`[LLM Debug] Request - Model: ${model}${context ? ' | ' + context : ''}`);
-    console.error('System Prompt:');
-    console.error(this.formatDebugText(systemPrompt));
+    const W = 80;
+    const CYAN = '\x1b[36m';
+    const YELLOW = '\x1b[33m';
+    const GREEN = '\x1b[32m';
+    const DIM = '\x1b[2m';
+    const BOLD = '\x1b[1m';
+    const RESET = '\x1b[0m';
+
+    console.error(DIM + '─'.repeat(W) + RESET);
+    console.error(`${BOLD}[LLM Debug]${RESET} Request - Model: ${CYAN}${model}${RESET}${context ? ' | ' + context : ''}`);
+
+    // System prompt with cache boundary visualization
+    const sysText = Array.isArray(systemPrompt)
+      ? systemPrompt.map(p => p.type === 'text' ? p.text : `[${p.type}]`).join('\n')
+      : String(systemPrompt ?? '');
+
+    if (cacheBoundary > 0 && cacheBoundary < sysText.length) {
+      const staticPart = sysText.substring(0, cacheBoundary);
+      const dynamicPart = sysText.substring(cacheBoundary);
+      const staticLines = staticPart.split('\n').length;
+      const dynamicLines = dynamicPart.split('\n').length;
+      const staticChars = staticPart.length;
+      const dynamicChars = dynamicPart.length;
+
+      // Static header
+      console.error(`${GREEN}${BOLD}${'─'.repeat(4)} STATIC PROMPT (${staticLines} lines, ${staticChars} chars) ${'─'.repeat(Math.max(0, W - 38 - String(staticLines).length - String(staticChars).length))}${RESET}`);
+      const sLines = _truncB64Debug(staticPart).split('\n');
+      for (const line of sLines) console.error(`${GREEN}>${RESET} ${DIM}${line}${RESET}`);
+
+      // Dynamic header
+      console.error(`${YELLOW}${BOLD}${'─'.repeat(4)} DYNAMIC PROMPT (${dynamicLines} lines, ${dynamicChars} chars) ${'─'.repeat(Math.max(0, W - 39 - String(dynamicLines).length - String(dynamicChars).length))}${RESET}`);
+      const dLines = _truncB64Debug(dynamicPart).split('\n');
+      for (const line of dLines) console.error(`${YELLOW}>${RESET} ${DIM}${line}${RESET}`);
+    } else {
+      console.error('System Prompt:');
+      console.error(this.formatDebugText(systemPrompt));
+    }
+
     console.error('============');
     console.error('User Prompt:');
     console.error('============');
     console.error(this.formatDebugText(userPrompt));
-    console.error('─'.repeat(80));
+    console.error(DIM + '─'.repeat(W) + RESET);
   }
 
   /**
    * Log LLM response
    */
-  logResponse(content, context = '') {
+  logResponse(content, context = '', usage = null) {
     if (process.env.KOI_DEBUG_LLM !== '1') return;
 
-    console.error(`\n[LLM Debug] Response${context ? ' - ' + context : ''} (${content.length} chars)`);
-    console.error('─'.repeat(80));
+    const W = 80;
+    const DIM = '\x1b[2m';
+    const CYAN = '\x1b[36m';
+    const GREEN = '\x1b[32m';
+    const YELLOW = '\x1b[33m';
+    const MAGENTA = '\x1b[35m';
+    const BOLD = '\x1b[1m';
+    const RST = '\x1b[0m';
+    const fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+
+    let usageStr = '';
+    if (usage) {
+      const parts = [];
+      if (usage.input)       parts.push(`${CYAN}↑${fmtTk(usage.input)} in${RST}`);
+      if (usage.cachedInput) parts.push(`${GREEN}⚡${fmtTk(usage.cachedInput)} cached${RST}`);
+      if (usage.thinking)    parts.push(`${MAGENTA}💭${fmtTk(usage.thinking)} thinking${RST}`);
+      if (usage.output)      parts.push(`${YELLOW}↓${fmtTk(usage.output)} out${RST}`);
+      if (parts.length > 0) usageStr = '  ' + parts.join('  ');
+    }
+
+    console.error(`\n${BOLD}[LLM Debug]${RST} Response${context ? ' - ' + context : ''} (${content.length} chars)${usageStr}`);
+    console.error(DIM + '─'.repeat(W) + RST);
 
     // Try to format JSON for better readability
     let formattedContent = content;
@@ -533,10 +587,12 @@ export class LLMProvider {
    * Falls back to keyword heuristic if the LLM call fails.
    */
   async _inferTaskProfile(playbookText, args, agentName) {
+    // The classifier should focus on the TASK (args), not the agent's playbook.
+    const argsStr = args ? JSON.stringify(args) : '';
     const taskDescription = [
       agentName ? `Agent: ${agentName}` : '',
-      playbookText ? `Role: ${playbookText}` : '',
-      args ? 'Task: ' + JSON.stringify(args) : '',
+      argsStr ? `Task: ${argsStr.substring(0, 1000)}` : '',
+      !argsStr && playbookText ? `Role: ${playbookText.substring(0, 300)}...` : '',
     ].filter(Boolean).join('\n');
 
     const prompt = `Return ONLY valid JSON using this exact shape:
@@ -550,20 +606,30 @@ Score how much coding ability and reasoning ability this task requires.
 Score both independently.
 Both can be high, both can be low, or one can be high and the other low.
 
-CALIBRATION — most tasks are 40-60. Only score 70+ for genuinely complex work.
-- 80+ means "very complex" — multi-file refactors, race conditions, architecture redesigns. Most tasks are NOT this hard.
-- A typical "add a feature" or "fix a bug" task is 50-60, not 70-80.
-- Planning/exploration tasks are usually reasoning 40-60, not 70+.
-- Only score 70+ if the task genuinely involves deep complexity, multiple interacting systems, or high risk.
+IMPORTANT:
+- Any task that requires writing code should usually have code >= 40.
+- Any task that requires reading, reviewing, or understanding existing code should usually have code >= 40.
+- Use code 50+ when the task involves non-trivial implementation, debugging, modifying an existing codebase, or making decisions inside real code.
+- Use code below 40 only when the task does not really require programming skill (for example: typo fixes in plain text, general conversation, summarization, asking questions, or product discussion without code).
+
+CALIBRATION — most tasks should land in the 40-60 range.
+Only score 70+ for genuinely complex work.
+- 80+ means very complex: multi-file refactors, race conditions, architecture redesigns, distributed coordination, or similarly difficult work.
+- A typical "add a feature" or "fix a bug" task is usually 50-60, not 70-80.
+- Only score 70+ if the task truly involves deep complexity, multiple interacting systems, unusual risk, or expert-level design.
 - Do not average the two scores together. Judge them independently.
 - Prefer multiples of 10. Use other numbers only if truly needed.
+
+CRITICAL — coordination and delegation tasks:
+Agents that coordinate, delegate, plan, or route tasks to other agents require STRONG instruction-following ability. They must parse complex rules, format JSON correctly, choose the right delegate, and never hallucinate actions. Score these at LEAST reasoning:60, code:60. A coordinator that uses a weak model will loop, invent invalid phases, or generate content instead of delegating — which is catastrophic.
+Similarly, agents that plan implementation (break features into tasks) need to understand code architecture to create good plans — score at least code:50, reasoning:60.
 
 Scale guide:
 - 0-10: almost none
 - 20: trivial
 - 30: very simple
-- 40: simple but requires some understanding
-- 50: moderate
+- 40: basic programming ability required
+- 50: moderate programming / code understanding required
 - 60: substantial
 - 70: complex
 - 80: very complex
@@ -571,28 +637,40 @@ Scale guide:
 - 100: top-end expert / frontier difficulty
 
 Examples:
-- "rename a variable" -> {"code":20,"reasoning":10}
-- "fix a typo in a label" -> {"code":20,"reasoning":10}
-- "change a button color" -> {"code":20,"reasoning":10}
+- "rename a variable in code" -> {"code":40,"reasoning":10}
+- "fix a typo in a UI label inside the codebase" -> {"code":40,"reasoning":10}
+- "change a button color in the frontend code" -> {"code":40,"reasoning":10}
 - "write a SQL query to list active users from one table" -> {"code":40,"reasoning":20}
+- "create a small Python script to rename files in a folder" -> {"code":40,"reasoning":30}
 - "add basic form validation to a signup page" -> {"code":50,"reasoning":30}
-- "create a small Python script to rename files in a folder" -> {"code":50,"reasoning":30}
 - "implement pagination in an existing table" -> {"code":50,"reasoning":40}
+
 - "tell me the weather" -> {"code":0,"reasoning":10}
-- "summarize this article" -> {"code":0,"reasoning":30}
-- "compare these two pricing plans" -> {"code":0,"reasoning":40}
-- "research the best approach for email verification" -> {"code":10,"reasoning":60}
-- "explore the codebase and find where auth is implemented" -> {"code":60,"reasoning":40}
-- "find where this API endpoint is called and explain the flow" -> {"code":60,"reasoning":50}
-- "fix a bug in an existing React component" -> {"code":60,"reasoning":50}
+- "greet the user and ask what they need" -> {"code":0,"reasoning":10}
+- "ask the user questions about their project" -> {"code":0,"reasoning":20}
+- "onboarding conversation: gather user requirements" -> {"code":0,"reasoning":40}
+- "summarize this article" -> {"code":0,"reasoning":20}
+- "compare these two pricing plans" -> {"code":0,"reasoning":30}
+
+- "plan the implementation: create tasks for a database schema" -> {"code":50,"reasoning":60}
+- "plan: break down a feature into implementation steps" -> {"code":50,"reasoning":60}
+- "coordinate: delegate tasks to developers and report results" -> {"code":60,"reasoning":60}
+- "execute pending tasks by delegating to the right agent" -> {"code":60,"reasoning":60}
+- "research the best approach for email verification" -> {"code":10,"reasoning":50}
+
+- "explore the codebase and find where auth is implemented" -> {"code":40,"reasoning":40}
+- "review a pull request and point out likely issues" -> {"code":50,"reasoning":50}
+- "find where this API endpoint is called and explain the flow" -> {"code":50,"reasoning":50}
+- "fix a bug in an existing React component" -> {"code":50,"reasoning":40}
 - "add a settings page to the backoffice with a new DB table" -> {"code":60,"reasoning":50}
-- "integrate Stripe payments into an existing app" -> {"code":70,"reasoning":60}
-- "debug why login sometimes fails in production" -> {"code":70,"reasoning":70}
-- "fix a race condition in concurrent API requests" -> {"code":80,"reasoning":70}
+- "integrate Stripe payments into an existing app" -> {"code":60,"reasoning":60}
+- "debug why login sometimes fails in production" -> {"code":60,"reasoning":70}
+
+- "fix a race condition in concurrent API requests" -> {"code":80,"reasoning":80}
 - "refactor the entire auth flow across 10 files" -> {"code":80,"reasoning":70}
 - "migrate a large Node.js codebase from JavaScript to TypeScript" -> {"code":80,"reasoning":70}
-- "design a multi-tenant architecture with isolation" -> {"code":60,"reasoning":90}
-- "design a zero-downtime migration strategy for a live payment system" -> {"code":70,"reasoning":90}
+- "design a multi-tenant architecture with isolation" -> {"code":50,"reasoning":80}
+- "design a zero-downtime migration strategy for a live payment system" -> {"code":60,"reasoning":90}
 - "implement distributed locking across services" -> {"code":90,"reasoning":80}
 - "build a static analyzer using AST traversal" -> {"code":90,"reasoning":80}
 - "design a CRDT for collaborative editing" -> {"code":90,"reasoning":90}
@@ -809,8 +887,37 @@ ${taskDescription}`;
     //   on every LLM call so the system prompt is never stale.
     if (isFirstCall || !contextMemory.hasHistory() || playbookResolver) {
       const freshPlaybook = playbookResolver ? await playbookResolver() : playbook;
-      const systemPrompt = await this._buildReactiveSystemPrompt(agent, freshPlaybook);
-      contextMemory.setSystem(systemPrompt);
+      const systemPromptResult = await this._buildReactiveSystemPrompt(agent, freshPlaybook);
+      // DEBUG: detect [object Object] contamination
+      if (process.env.KOI_DEBUG_LLM) {
+        const _dbgStr = typeof systemPromptResult === 'string' ? systemPromptResult
+          : typeof systemPromptResult === 'object' ? (systemPromptResult.static + '\n' + systemPromptResult.dynamic) : '';
+        if (_dbgStr.includes('[object Object]')) {
+          console.error('[DEBUG] [object Object] detected in system prompt!');
+          console.error('[DEBUG] freshPlaybook type:', typeof freshPlaybook, freshPlaybook?._cacheKey);
+          console.error('[DEBUG] systemPromptResult type:', typeof systemPromptResult, systemPromptResult?._cacheKey);
+          if (typeof freshPlaybook === 'object') {
+            console.error('[DEBUG] freshPlaybook.static contains [oO]:', String(freshPlaybook.static || '').includes('[object Object]'));
+            console.error('[DEBUG] freshPlaybook.dynamic contains [oO]:', String(freshPlaybook.dynamic || '').includes('[object Object]'));
+          }
+        }
+      }
+      // Structured cache-aware prompt: store boundary for cache_control injection
+      if (typeof systemPromptResult === 'object' && systemPromptResult?._cacheKey !== undefined) {
+        const fullPrompt = systemPromptResult.static + '\n\n' + systemPromptResult.dynamic;
+        contextMemory.setSystem(fullPrompt);
+        session._promptCacheBoundary = systemPromptResult.static.length;
+        session._promptCacheKey = systemPromptResult._cacheKey;
+      } else {
+        // Safety: ensure we always pass a string to setSystem
+        const _sysStr = typeof systemPromptResult === 'string' ? systemPromptResult
+          : typeof systemPromptResult === 'object' && systemPromptResult?.static
+            ? [systemPromptResult.static, systemPromptResult.dynamic].filter(Boolean).join('\n\n')
+            : String(systemPromptResult || '');
+        contextMemory.setSystem(_sysStr);
+        session._promptCacheBoundary = 0;
+        session._promptCacheKey = null;
+      }
       // Reset userMessage after compose resolver has consumed it —
       // it should only be non-null on the turn the user actually typed something.
       agent._lastUserMessage = null;
@@ -1017,18 +1124,10 @@ CRITICAL RULES:
           _classifyArgs = { ..._classifyArgs, escalationReason: _reason, recentActions: _recentActions };
           channel.log('llm', `[classify] Agent requested reclassify: ${_reason}`);
         }
-        // System/coordinator agent always needs a capable model (min code:65, reasoning:60)
-        // — it coordinates, delegates, and interprets results. Weak models loop endlessly.
-        const _isCoordinator = agent?.hasPermission?.('delegate');
-        if (_isCoordinator && !_classifyArgs) {
-          session._autoProfile = { taskType: 'code', difficulty: 65, code: 65, reasoning: 60 };
-          channel.log('llm', `[classify] Coordinator agent — min profile code:65, reasoning:60`);
-        } else {
         if (!_classifyArgs && agent?._lastUserMessage) {
           _classifyArgs = { userRequest: agent._lastUserMessage };
         }
         if (!_classifyArgs) {
-          // Check for pending tasks — use them as classification context
           try {
             const { taskManager: _tm } = await import('../state/task-manager.js');
             const _pending = _tm.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
@@ -1037,12 +1136,17 @@ CRITICAL RULES:
             }
           } catch {}
         }
-        session._autoProfile = await this._inferTaskProfile(agent?.description, _classifyArgs, agentName);
-        if (process.env.KOI_DEBUG_LLM) {
-          const _reason = isFirstCall ? 'first call' : _isDelegateReturn ? 'delegate returned' : 'no cached profile';
-          console.error(`[Auto] Reclassifying (${_reason})`);
+
+        if (!_classifyArgs) {
+          session._autoProfile = DEFAULT_TASK_PROFILE;
+          channel.log('llm', `[classify] No args — default profile`);
+        } else {
+          session._autoProfile = await this._inferTaskProfile(agent?.description, _classifyArgs, agentName);
+          if (process.env.KOI_DEBUG_LLM) {
+            const _reason = isFirstCall ? 'first call' : _isDelegateReturn ? 'delegate returned' : 'no cached profile';
+            console.error(`[Auto] Reclassifying (${_reason})`);
+          }
         }
-        } // close else from coordinator check
       }
       const profile = session._autoProfile;
 
@@ -1188,6 +1292,49 @@ CRITICAL RULES:
       }
     }
 
+    // ── Inject cache_control breakpoints for models that support prompt caching ──
+    // Anthropic + Gemini (via OpenRouter): need explicit cache_control on content blocks.
+    // OpenAI: caching is automatic with allow_prompt_caching (backend-side), no breakpoints needed.
+    // We cache the system message because it's the largest stable content (playbooks, tools, rules).
+    // Gemini only supports 1 breakpoint; Anthropic supports multiple — system msg covers both.
+    {
+      const _cacheCaps = getModelCaps(this.model);
+      if (_cacheCaps.supportsCaching && this.provider !== 'openai') {
+        const _sysIdx = messages.findIndex(m => m.role === 'system');
+        if (_sysIdx >= 0) {
+          const _sysContent = messages[_sysIdx].content;
+          const _boundary = session?._promptCacheBoundary || 0;
+
+          if (typeof _sysContent === 'string' && _boundary > 0) {
+            // Cache-aware: split into static (cached) + dynamic (not cached) blocks.
+            // The cache_control breakpoint after the static block tells the provider
+            // to cache only the static prefix. Dynamic content changes every turn.
+            const _staticBlock = _sysContent.substring(0, _boundary);
+            const _dynamicBlock = _sysContent.substring(_boundary);
+            messages[_sysIdx] = {
+              role: 'system',
+              content: [
+                { type: 'text', text: _staticBlock, cache_control: { type: 'ephemeral', ttl: '1h' } },
+                { type: 'text', text: _dynamicBlock },
+              ],
+            };
+          } else if (typeof _sysContent === 'string') {
+            // No boundary — cache the entire system message as a single block
+            messages[_sysIdx] = {
+              role: 'system',
+              content: [{ type: 'text', text: _sysContent, cache_control: { type: 'ephemeral', ttl: '1h' } }],
+            };
+          } else if (Array.isArray(_sysContent)) {
+            // Already an array — add cache_control to the last text block
+            const _lastText = _sysContent.map(p => p.type).lastIndexOf('text');
+            if (_lastText >= 0) {
+              _sysContent[_lastText] = { ..._sysContent[_lastText], cache_control: { type: 'ephemeral', ttl: '1h' } };
+            }
+          }
+        }
+      }
+    }
+
     // Debug: log what attachments (if any) are being sent to the LLM
     if (process.env.KOI_DEBUG_LLM) {
       if (_debugAttachPaths.length > 0) {
@@ -1201,12 +1348,26 @@ CRITICAL RULES:
     const msgCount = messages.filter(m => m.role === 'user' || m.role === 'assistant').length;
     const lastUserMsg = messages.filter(m => m.role === 'user').pop();
     const lastUserMsgText = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : JSON.stringify(lastUserMsg?.content || '');
-    channel.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, last user msg: ${lastUserMsgText.length} chars)`);
+
+    // Estimate input tokens from total message chars (~4 chars/token)
+    const _totalChars = messages.reduce((sum, m) => {
+      const c = m.content;
+      if (typeof c === 'string') return sum + c.length;
+      if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || '').length, 0);
+      return sum;
+    }, 0);
+    const _estInputTokens = Math.ceil(_totalChars / 4);
+
+    // Update status line with estimated input tokens before sending
+    const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    channel.setInfo('tokens', `↑${_fmtTk(_estInputTokens)} tokens · ${this.provider}/${this.model}`);
+
+    channel.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, ~${_estInputTokens} tokens, last user msg: ${lastUserMsgText.length} chars)`);
     channel.log('llm', `Last user msg preview: ${lastUserMsgText.substring(0, 300)}${lastUserMsgText.length > 300 ? '...' : ''}`);
 
     // Real-time streaming callback: updates the token footer as chunks arrive.
     // Also detects print intent and streams the message content to the UI in real-time.
-    const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    // (_fmtTk defined above for input token estimate)
 
     // Streaming print state machine
     let _spState = 'init';       // 'init' | 'found_print' | 'streaming' | 'done' | 'skip'
@@ -1217,6 +1378,9 @@ CRITICAL RULES:
     let _printStreamed = false;  // true once streaming print was active
     let _lineBuf = '';           // line buffer — holds partial line until \n
     let _tableBuf = [];          // buffered table rows for batch rendering
+    let _inCodeBlock = false;    // inside a ``` code block
+    let _codeLang = '';          // language of current code block
+    let _codeLines = [];         // buffered code lines for syntax highlighting
 
     const _flushTableBuf = () => {
       if (_tableBuf.length > 0) {
@@ -1228,6 +1392,16 @@ CRITICAL RULES:
     // Flush complete lines from _lineBuf to the UI with markdown formatting.
     // Tables are buffered until a non-table line arrives (or flush=true).
     // If flush=true, also emit the remaining partial line (end of message).
+    const _flushCodeBlock = () => {
+      if (_codeLines.length === 0) return;
+      // Render the buffered code block as a single markdown code block,
+      // then pass through renderMarkdown for syntax highlighting.
+      const codeBlock = '```' + _codeLang + '\n' + _codeLines.join('\n') + '\n```';
+      channel.printStreaming(channel.renderMarkdown(codeBlock) + '\n');
+      _codeLines = [];
+      _codeLang = '';
+    };
+
     const _flushLines = (flush = false) => {
       let idx;
       while ((idx = _lineBuf.indexOf('\n')) !== -1) {
@@ -1235,6 +1409,27 @@ CRITICAL RULES:
         _lineBuf = _lineBuf.slice(idx + 1);
 
         const trimmed = line.trim();
+
+        // Code block start: ```lang
+        if (trimmed.startsWith('```') && !_inCodeBlock) {
+          _flushTableBuf();
+          _inCodeBlock = true;
+          _codeLang = trimmed.substring(3).trim();
+          _codeLines = [];
+          continue;
+        }
+        // Code block end: ```
+        if (trimmed === '```' && _inCodeBlock) {
+          _inCodeBlock = false;
+          _flushCodeBlock();
+          continue;
+        }
+        // Inside code block — collect raw lines
+        if (_inCodeBlock) {
+          _codeLines.push(line);
+          continue;
+        }
+
         // Detect table rows: starts and ends with |
         if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
           _tableBuf.push(line);
@@ -1249,6 +1444,11 @@ CRITICAL RULES:
       }
 
       if (flush) {
+        // Flush remaining code block
+        if (_inCodeBlock) {
+          _inCodeBlock = false;
+          _flushCodeBlock();
+        }
         // Flush remaining table buffer
         _flushTableBuf();
         // Flush remaining partial line
@@ -1413,7 +1613,7 @@ CRITICAL RULES:
       // its own streaming format, thinking config, and message formatting.
       const agentInfo = agent ? `Agent: ${agent.name}` : '';
       const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
-      this.logRequest(this.model, systemPrompt, messages.filter(m => m.role === 'user').pop()?.content || '', `Reactive ${agentInfo}`);
+      this.logRequest(this.model, systemPrompt, messages.filter(m => m.role === 'user').pop()?.content || '', `Reactive ${agentInfo}`, session?._promptCacheBoundary || 0);
 
       const llm = this._createLLM();
       response = await llm.streamReactive(messages, {
@@ -1422,7 +1622,7 @@ CRITICAL RULES:
         onHeartbeat: _heartbeat,
       });
 
-      this.logResponse(response.text, `Reactive ${agentInfo}`);
+      this.logResponse(response.text, `Reactive ${agentInfo}`, response.usage);
     } catch (_callErr) {
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
@@ -1500,7 +1700,7 @@ CRITICAL RULES:
     session.lastUsage = { input: usage.input, output: usage.output, thinking: usage.thinking || 0 };
 
     // Record to global cost center (thinking tokens count as output for billing)
-    costCenter.recordUsage(_effectiveModel, _effectiveProvider, usage.input, usage.output, _apiMs, usage.thinking || 0);
+    costCenter.recordUsage(_effectiveModel, _effectiveProvider, usage.input, usage.output, _apiMs, usage.thinking || 0, usage.cachedInput || 0);
 
     // Update token display with final accurate counts (only show ↑ when input > 0)
     {
@@ -1601,9 +1801,43 @@ CRITICAL RULES:
    * generic execution engine rules and available actions.
    */
   async _buildReactiveSystemPrompt(agent, playbook = null) {
-    const base = await this._buildSystemPrompt(agent);
-    if (!playbook?.trim()) return base;
-    return `${playbook.trim()}\n\n${base}`;
+    const { static: staticBase, dynamic } = await this._buildSystemPrompt(agent);
+    // Layout for maximum cache hit rate:
+    //   1. Agent header (agent + phase — static per variant, cacheable)
+    //   2. Static generic rules (output contract, golden rule, action model, tools) — never changes
+    //   3. Agent playbook (changes per agent but stable within an agent's session)
+    //   4. Dynamic runtime context (timestamp, task counts, phase) — changes every turn
+    const agentName = agent?.name || 'unknown';
+    const phase = agent?.state?.statusPhase || null;
+    const agentHeader = `Agent: ${agentName}${phase ? ' — Phase: ' + phase : ''}`;
+
+    // Structured cache-aware playbook from compiler taint analysis
+    if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
+      // Safety: ensure all parts are strings (guard against [object Object])
+      const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
+      return {
+        _cacheKey: playbook._cacheKey,
+        static: [agentHeader, staticBase, _s(playbook.static)].filter(Boolean).join('\n\n'),
+        dynamic: [_s(playbook.dynamic), dynamic].filter(Boolean).join('\n\n'),
+      };
+    }
+
+    // Legacy: plain string playbook (or flatten object without _cacheKey)
+    const parts = [agentHeader, staticBase];
+    let playbookStr = '';
+    if (typeof playbook === 'string') {
+      playbookStr = playbook.trim();
+    } else if (typeof playbook === 'object' && playbook !== null) {
+      // Flatten any object that slipped through without _cacheKey
+      playbookStr = typeof playbook.static === 'string' && typeof playbook.dynamic === 'string'
+        ? [playbook.static, playbook.dynamic].filter(Boolean).join('\n')
+        : typeof playbook.text === 'string'
+          ? playbook.text
+          : String(playbook);
+    }
+    if (playbookStr) parts.push(playbookStr);
+    parts.push(dynamic);
+    return parts.join('\n\n');
   }
 
   // ── Provider-specific streaming methods (_callOpenAIReactive, etc.) ───────
@@ -1945,24 +2179,11 @@ You are running in non-interactive (headless) mode. There is no human to answer 
       projectMapBlock = await getProjectMap(projectRoot);
     } catch { /* non-fatal */ }
 
-    return `
-# RUNTIME CONTEXT
-
-| Field | Value |
-|---|---|
-| Working directory | \`${cwd}\` |
-| Timestamp | ${now} |
-| Timezone | ${timezone || 'unknown'} |
-| Agent | ${agentDisplayName} |${langField}${phaseField}
-
-All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
-${projectMapBlock ? '\n' + projectMapBlock + '\n' : ''}
-
-**LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
-${nonInteractiveBlock}
-
-REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.
-${phaseSystemBlock}
+    // ── Prompt layout: STATIC content first (cacheable), DYNAMIC content last ──
+    // LLM prompt caching works on identical prefixes — the longer the unchanging
+    // prefix, the higher the cache hit rate. Static rules/tools go first;
+    // runtime context (timestamp, phase, cwd) goes at the end.
+    const staticPart = `
 ========================================
 OUTPUT CONTRACT (MUST FOLLOW)
 ========================================
@@ -2103,6 +2324,25 @@ FINAL NON-NEGOTIABLE RULES
 ${resourceSection}${intentNesting}
 
 CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.${koiMd}`;
+
+    // ── Dynamic section: runtime context, project map, language, non-interactive ──
+    // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
+    // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
+    const dynamic = `Agent: ${agentDisplayName}${statusPhase ? ' — Phase: ' + statusPhase : ''} | ${now} | ${timezone || 'unknown'}
+${phaseSystemBlock}
+# RUNTIME CONTEXT
+
+| Field | Value |
+|---|---|
+| Working directory | \`${cwd}\` |${langField}
+
+All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
+${projectMapBlock ? '\n' + projectMapBlock + '\n' : ''}
+**LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
+${nonInteractiveBlock}
+REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
+
+    return { static: staticPart, dynamic };
 
   }
 

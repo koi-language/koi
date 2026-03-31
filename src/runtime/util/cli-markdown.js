@@ -156,10 +156,143 @@ export function renderTable(lines) {
   return out.join('\n');
 }
 
+// ── Syntax highlighting for code blocks ──────────────────────────────────────
+
+const _SH = {
+  KEYWORD:  '\x1b[38;5;198m',  // pink — keywords (const, function, if, return, etc.)
+  STRING:   '\x1b[38;5;114m',  // green — string literals
+  NUMBER:   '\x1b[38;5;208m',  // orange — numbers
+  COMMENT:  '\x1b[38;5;242m',  // gray — comments
+  TYPE:     '\x1b[38;5;81m',   // cyan — types, classes, interfaces
+  FUNC:     '\x1b[38;5;69m',   // blue — function names
+  PUNCT:    '\x1b[38;5;250m',  // light gray — brackets, braces, parens
+  PROP:     '\x1b[38;5;152m',  // light blue — property names
+  RST:      '\x1b[0m',
+};
+
+// Language-agnostic keywords that cover JS/TS/Python/Go/Rust/Java/etc.
+const _KEYWORDS = new Set([
+  'const','let','var','function','return','if','else','for','while','do',
+  'switch','case','break','continue','class','extends','new','this','super',
+  'import','export','from','default','async','await','yield','throw','try',
+  'catch','finally','typeof','instanceof','in','of','delete','void',
+  'true','false','null','undefined','NaN','Infinity',
+  // Python
+  'def','elif','except','lambda','pass','raise','with','as','is','not','and','or',
+  'None','True','False','self','print','nonlocal','global',
+  // Go/Rust
+  'fn','pub','mod','use','impl','trait','struct','enum','match','mut','ref','type',
+  'package','func','defer','go','chan','select','range','map',
+  // Java/C
+  'public','private','protected','static','final','abstract','interface','implements',
+  'void','int','string','boolean','float','double','long','char',
+]);
+
+export function highlightCode(code, lang) {
+  // Token-based approach: split each line into tokens, classify, colorize, rejoin.
+  // Avoids regex-on-ANSI issues by processing raw text only.
+  return code.split('\n').map(line => {
+    // Full-line comments
+    if (/^\s*\/\//.test(line)) return _SH.COMMENT + line + _SH.RST;
+    if (/^\s*#(?!!)/.test(line)) return _SH.COMMENT + line + _SH.RST;
+    if (/^\s*\/\*/.test(line)) return _SH.COMMENT + line + _SH.RST;
+    if (/^\s*\*/.test(line)) return _SH.COMMENT + line + _SH.RST; // multi-line comment continuation
+
+    // Tokenize: split into strings, comments, words, numbers, punctuation, whitespace
+    const tokens = [];
+    let i = 0;
+    while (i < line.length) {
+      const ch = line[i];
+
+      // Whitespace
+      if (/\s/.test(ch)) {
+        let j = i;
+        while (j < line.length && /\s/.test(line[j])) j++;
+        tokens.push({ type: 'ws', value: line.slice(i, j) });
+        i = j;
+        continue;
+      }
+
+      // Inline comment: //
+      if (ch === '/' && line[i + 1] === '/') {
+        tokens.push({ type: 'comment', value: line.slice(i) });
+        break;
+      }
+
+      // Strings: "..." '...' `...`
+      if (ch === '"' || ch === "'" || ch === '`') {
+        let j = i + 1;
+        while (j < line.length && line[j] !== ch) {
+          if (line[j] === '\\') j++; // skip escaped char
+          j++;
+        }
+        tokens.push({ type: 'string', value: line.slice(i, j + 1) });
+        i = j + 1;
+        continue;
+      }
+
+      // Numbers: 0x..., 0b..., digits
+      if (/\d/.test(ch) || (ch === '.' && /\d/.test(line[i + 1] || ''))) {
+        let j = i;
+        if (ch === '0' && (line[i + 1] === 'x' || line[i + 1] === 'b')) j += 2;
+        while (j < line.length && /[\d.a-fA-F_eE+-]/.test(line[j])) j++;
+        tokens.push({ type: 'number', value: line.slice(i, j) });
+        i = j;
+        continue;
+      }
+
+      // Words (identifiers, keywords)
+      if (/[a-zA-Z_$]/.test(ch)) {
+        let j = i;
+        while (j < line.length && /[a-zA-Z0-9_$]/.test(line[j])) j++;
+        const word = line.slice(i, j);
+        if (_KEYWORDS.has(word)) {
+          tokens.push({ type: 'keyword', value: word });
+        } else if (/^[A-Z]/.test(word)) {
+          tokens.push({ type: 'type', value: word });
+        } else if (line[j] === '(') {
+          tokens.push({ type: 'func', value: word });
+        } else {
+          tokens.push({ type: 'ident', value: word });
+        }
+        i = j;
+        continue;
+      }
+
+      // Multi-char operators
+      const two = line.slice(i, i + 2);
+      if (two === '=>' || two === '->' || two === '::' || two === '?.' || two === '??' || two === '!=') {
+        tokens.push({ type: 'punct', value: two });
+        i += 2;
+        continue;
+      }
+
+      // Single-char punctuation
+      tokens.push({ type: 'punct', value: ch });
+      i++;
+    }
+
+    // Colorize tokens
+    return tokens.map(t => {
+      switch (t.type) {
+        case 'keyword': return _SH.KEYWORD + t.value + _SH.RST;
+        case 'string':  return _SH.STRING + t.value + _SH.RST;
+        case 'number':  return _SH.NUMBER + t.value + _SH.RST;
+        case 'comment': return _SH.COMMENT + t.value + _SH.RST;
+        case 'type':    return _SH.TYPE + t.value + _SH.RST;
+        case 'func':    return _SH.FUNC + t.value + _SH.RST;
+        case 'punct':   return _SH.PUNCT + t.value + _SH.RST;
+        default:        return t.value;
+      }
+    }).join('');
+  }).join('\n');
+}
+
 // ── Full-text rendering ──────────────────────────────────────────────────────
 
 /**
  * Convert markdown text to ANSI-formatted terminal output.
+ * Supports code blocks with syntax highlighting.
  * @param {string} text - Raw markdown text
  * @returns {string} ANSI-formatted text
  */
@@ -169,14 +302,48 @@ export function renderMarkdown(text) {
   const lines = text.split('\n');
   const result = [];
   let tableBuf = [];
+  let codeBuf = null;  // null = not in code block, { lang, lines } = inside
+  const cols = process.stdout.columns || parseInt(process.env.COLUMNS) || 80;
+  const codeWidth = Math.min(cols - 4, 100);
 
   for (const line of lines) {
     const trimmed = line.trim();
+
+    // Code block start: ```lang
+    if (trimmed.startsWith('```') && codeBuf === null) {
+      if (tableBuf.length > 0) {
+        result.push(renderTable(tableBuf));
+        tableBuf = [];
+      }
+      const lang = trimmed.substring(3).trim().toLowerCase();
+      codeBuf = { lang, lines: [] };
+      continue;
+    }
+
+    // Code block end: ```
+    if (trimmed === '```' && codeBuf !== null) {
+      const code = codeBuf.lines.join('\n');
+      const highlighted = highlightCode(code, codeBuf.lang);
+      result.push('');
+      for (const hl of highlighted.split('\n')) {
+        result.push('    ' + hl);
+      }
+      result.push('');
+      codeBuf = null;
+      continue;
+    }
+
+    // Inside code block — collect raw lines (no markdown processing)
+    if (codeBuf !== null) {
+      codeBuf.lines.push(line);
+      continue;
+    }
+
+    // Normal markdown processing
     if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
       tableBuf.push(line);
       continue;
     }
-    // Non-table line — flush any buffered table
     if (tableBuf.length > 0) {
       result.push(renderTable(tableBuf));
       tableBuf = [];
@@ -184,7 +351,16 @@ export function renderMarkdown(text) {
     result.push(renderLine(line));
   }
 
-  // Flush remaining table
+  // Flush remaining buffers
+  if (codeBuf !== null) {
+    const code = codeBuf.lines.join('\n');
+    const highlighted = highlightCode(code, codeBuf.lang);
+    result.push('');
+    for (const hl of highlighted.split('\n')) {
+      result.push('    ' + hl);
+    }
+    result.push('');
+  }
   if (tableBuf.length > 0) {
     result.push(renderTable(tableBuf));
   }

@@ -17,6 +17,7 @@
  */
 
 import path from 'path';
+import fs from 'fs';
 
 /**
  * Check if `dir` is equal to or a subdirectory of `allowedDir`.
@@ -25,6 +26,29 @@ function isSubdirOf(dir, allowedDir) {
   const normalized = path.resolve(dir) + path.sep;
   const normalizedAllowed = path.resolve(allowedDir) + path.sep;
   return normalized.startsWith(normalizedAllowed) || path.resolve(dir) === path.resolve(allowedDir);
+}
+
+/**
+ * Find the project root for a given file path by walking up and looking for
+ * project markers (package.json, Cargo.toml, pyproject.toml, go.mod, etc.).
+ * Returns the project root directory, or null if no marker found.
+ */
+const PROJECT_MARKERS = ['package.json', 'Cargo.toml', 'pyproject.toml', 'go.mod', 'pom.xml', 'build.gradle', 'Gemfile', 'pubspec.yaml', '.git'];
+
+function findProjectRoot(filePath) {
+  let dir = path.resolve(path.dirname(filePath));
+  const root = path.parse(dir).root;
+  while (dir !== root) {
+    for (const marker of PROJECT_MARKERS) {
+      try {
+        if (fs.existsSync(path.join(dir, marker))) return dir;
+      } catch { /* ignore */ }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
 }
 
 export class FilePermissions {
@@ -56,6 +80,24 @@ export class FilePermissions {
   allowFile(filePath) {
     const resolved = path.resolve(filePath);
     if (!this.writeFiles.includes(resolved)) this.writeFiles.push(resolved);
+  }
+
+  /**
+   * Grant write permission for the entire PROJECT that contains the file.
+   * Finds the project root (package.json, Cargo.toml, etc.) and grants write
+   * for that directory. Does NOT grant parent or sibling projects.
+   * Falls back to the file's immediate directory if no project root is found.
+   * @param {string} filePath - absolute or relative path to a file in the project
+   * @returns {string|null} the project root that was granted, or null
+   */
+  allowProject(filePath) {
+    const resolved = path.resolve(filePath);
+    const projectRoot = findProjectRoot(resolved);
+    const grantDir = projectRoot || path.dirname(resolved);
+    this.allow(grantDir, 'write');
+    // Also grant read for the project
+    this.allow(grantDir, 'read');
+    return grantDir;
   }
 
   /**

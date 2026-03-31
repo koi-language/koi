@@ -13,18 +13,120 @@ import { channel } from '../../io/channel.js';
 export class GeminiLLM extends BaseLLM {
   get providerName() { return 'gemini'; }
 
+  // ── Explicit context caching for Gemini direct API ──────────────────────
+  // Creates a CachedContent resource via the Gemini REST API and references
+  // it in subsequent calls via extra_body.google.cached_content.
+  // Only used when talking directly to generativelanguage.googleapis.com
+  // (not via gateway/OpenRouter which has its own caching mechanism).
+
+  // ── Cache pool: Map<fingerprint, { name, expiresAt }> ──
+  // Multiple agents/playbooks can have different system prompts running
+  // concurrently. Each gets its own CachedContent resource, keyed by fingerprint.
+  /** @type {Map<string, { name: string, expiresAt: number }>} */
+  _cachePool = new Map();
+
+  /**
+   * Create or reuse a Gemini CachedContent for the system prompt.
+   * Returns the cache name to pass via extra_body, or null if caching is unavailable.
+   */
+  async _ensureCache(messages) {
+    // Only for direct Gemini API (not gateway/OpenRouter)
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey || !this.caps.supportsCaching) return null;
+    // Don't cache if going through gateway (baseURL won't be generativelanguage)
+    const baseURL = this.client?.baseURL || '';
+    if (!baseURL.includes('generativelanguage.googleapis.com')) return null;
+
+    // Extract system prompt text
+    const sysMsg = messages.find(m => m.role === 'system');
+    if (!sysMsg) return null;
+    const sysText = typeof sysMsg.content === 'string'
+      ? sysMsg.content
+      : Array.isArray(sysMsg.content)
+        ? sysMsg.content.filter(p => p.type === 'text').map(p => p.text).join('\n')
+        : '';
+
+    // Minimum ~1024 tokens (~4096 chars) for caching to be worthwhile
+    if (sysText.length < 4096) return null;
+
+    // Fingerprint: first+last 200 chars + length (fast, detects prompt changes)
+    const fp = sysText.slice(0, 200) + sysText.slice(-200) + ':' + sysText.length;
+
+    // Reuse existing cache if still valid
+    const existing = this._cachePool.get(fp);
+    if (existing && Date.now() < existing.expiresAt) {
+      return existing.name;
+    }
+
+    // Evict expired entries
+    for (const [k, v] of this._cachePool) {
+      if (Date.now() >= v.expiresAt) this._cachePool.delete(k);
+    }
+
+    // Create new cache
+    try {
+      const ttlSeconds = 3600; // 1 hour
+      const url = `https://generativelanguage.googleapis.com/v1beta/cachedContents`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          model: `models/${this.model}`,
+          systemInstruction: { parts: [{ text: sysText }] },
+          contents: [],
+          ttl: `${ttlSeconds}s`,
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        channel.log('llm', `[gemini-cache] Create failed (${res.status}): ${errBody.slice(0, 200)}`);
+        return null;
+      }
+
+      const data = await res.json();
+      this._cachePool.set(fp, { name: data.name, expiresAt: Date.now() + (ttlSeconds - 60) * 1000 });
+      channel.log('llm', `[gemini-cache] Created: ${data.name} (TTL ${ttlSeconds}s, pool size: ${this._cachePool.size})`);
+      return data.name;
+    } catch (err) {
+      channel.log('llm', `[gemini-cache] Create error: ${err.message}`);
+      return null;
+    }
+  }
+
   async streamReactive(messages, opts = {}) {
     const { abortSignal, onChunk, onHeartbeat } = opts;
     this._logStart();
 
+    // Try to use explicit context caching for the system prompt
+    const cacheName = await this._ensureCache(messages);
+
+    // When using cached content, remove system message from messages
+    // (it's already in the cache — sending it again wastes tokens)
+    const effectiveMessages = cacheName
+      ? messages.filter(m => m.role !== 'system')
+      : messages;
+
     // Note: stream_options not supported by Gemini's OpenAI-compatible API
     const geminiParams = this._cleanParams({
       model: this.model,
-      messages,
+      messages: effectiveMessages,
       temperature: 0,
       response_format: { type: 'json_object' },
       stream: true
     });
+
+    // Reference cached content via extra_body
+    if (cacheName) {
+      geminiParams.extra_body = {
+        ...(geminiParams.extra_body || {}),
+        google: { cached_content: cacheName },
+      };
+    }
 
     // Note: thinking_config/thinking_budget is intentionally NOT sent.
     // It causes 400 errors on many Gemini models and the performance
@@ -61,6 +163,7 @@ export class GeminiLLM extends BaseLLM {
               input: chunk.usage.prompt_tokens || 0,
               output: chunk.usage.completion_tokens || 0,
               thinking: chunk.usage.completion_tokens_details?.reasoning_tokens || 0,
+              cachedInput: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
             };
           }
         }
@@ -74,7 +177,10 @@ export class GeminiLLM extends BaseLLM {
     // when not explicitly selected (avoids 10-60s streaming silence).
     // If it fails with 400, retry without it as fallback.
     if (this.caps.thinking && !this.useThinking && this.caps.supportsThinkingBudget) {
-      geminiParams.extra_body = { thinking_config: { thinking_budget: 0 } };
+      geminiParams.extra_body = {
+        ...(geminiParams.extra_body || {}),
+        thinking_config: { thinking_budget: 0 },
+      };
     }
 
     try {
@@ -130,13 +236,20 @@ export class GeminiLLM extends BaseLLM {
     const controller = timeoutMs ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
+    // Try cached content for system prompt
+    const cacheName = await this._ensureCache(messages);
+    const effectiveMessages = cacheName
+      ? messages.filter(m => m.role !== 'system')
+      : messages;
+
     try {
       const params = this._cleanParams({
         model: this.model,
-        messages,
+        messages: effectiveMessages,
         temperature,
         max_tokens: maxTokens,
-        ...(responseFormat && { response_format: responseFormat })
+        ...(responseFormat && { response_format: responseFormat }),
+        ...(cacheName && { extra_body: { google: { cached_content: cacheName } } }),
       });
       const options = controller ? { signal: controller.signal } : {};
       const completion = await this.client.chat.completions.create(params, options);
@@ -145,6 +258,7 @@ export class GeminiLLM extends BaseLLM {
         input: completion.usage?.prompt_tokens || 0,
         output: completion.usage?.completion_tokens || 0,
         thinking: completion.usage?.completion_tokens_details?.reasoning_tokens || 0,
+        cachedInput: completion.usage?.prompt_tokens_details?.cached_tokens || 0,
       };
       return { text, usage };
     } finally {

@@ -69,6 +69,7 @@ export function getModelCaps(model) {
     api:             info?.api             ?? 'chat',
     thinking:        info?.thinking        ?? false,
     maxOutputTokens: info?.maxOutputTokens ?? (isOpenAiThinking ? 65536 : 0),
+    supportsCaching: info?.cachedInputPer1M != null,
   };
 }
 
@@ -112,17 +113,19 @@ class CostCenter {
    * @param {number} outputTokens  - Content output tokens (NOT including thinking)
    * @param {number} apiMs      - Duration of the HTTP call in ms
    * @param {number} thinkingTokens - Reasoning/thinking tokens (billed as output)
+   * @param {number} cachedInputTokens - Cached input tokens (billed at reduced rate)
    */
-  recordUsage(model, provider, inputTokens, outputTokens, apiMs = 0, thinkingTokens = 0) {
+  recordUsage(model, provider, inputTokens, outputTokens, apiMs = 0, thinkingTokens = 0, cachedInputTokens = 0) {
     if (!this._models.has(model)) {
-      this._models.set(model, { provider, calls: 0, inputTokens: 0, outputTokens: 0, thinkingTokens: 0, apiMs: 0 });
+      this._models.set(model, { provider, calls: 0, inputTokens: 0, outputTokens: 0, thinkingTokens: 0, cachedInputTokens: 0, apiMs: 0 });
     }
     const entry = this._models.get(model);
-    entry.calls          += 1;
-    entry.inputTokens    += inputTokens    || 0;
-    entry.outputTokens   += outputTokens   || 0;
-    entry.thinkingTokens += thinkingTokens || 0;
-    entry.apiMs          += apiMs          || 0;
+    entry.calls              += 1;
+    entry.inputTokens        += inputTokens        || 0;
+    entry.outputTokens       += outputTokens       || 0;
+    entry.thinkingTokens     += thinkingTokens     || 0;
+    entry.cachedInputTokens  += cachedInputTokens  || 0;
+    entry.apiMs              += apiMs              || 0;
 
     this.totalApiMs += apiMs || 0;
   }
@@ -218,19 +221,25 @@ class CostCenter {
 
     // ── Per-model breakdown ───────────────────────────────────────────────
     let grandTotal = 0;
-    let grandInput = 0, grandOutput = 0, grandThinking = 0, grandCalls = 0;
+    let grandInput = 0, grandOutput = 0, grandThinking = 0, grandCached = 0, grandCalls = 0;
 
     for (const [model, entry] of models) {
       const info = lookupModel(model);
-      const inputCost    = info ? (entry.inputTokens    / 1_000_000) * info.inputPer1M  : null;
+      // Cached tokens are a subset of input — uncached = input - cached.
+      // Cached tokens are billed at cachedInputPer1M (much cheaper).
+      const uncachedInput = Math.max(0, entry.inputTokens - entry.cachedInputTokens);
+      const inputCost    = info ? (uncachedInput / 1_000_000) * info.inputPer1M : null;
+      const cachedCost   = info?.cachedInputPer1M != null
+        ? (entry.cachedInputTokens / 1_000_000) * info.cachedInputPer1M : null;
       // Thinking tokens are billed at output rate
       const outputCost   = info ? (entry.outputTokens   / 1_000_000) * info.outputPer1M : null;
       const thinkingCost = info ? (entry.thinkingTokens / 1_000_000) * info.outputPer1M : null;
-      const totalCost    = (inputCost ?? 0) + (outputCost ?? 0) + (thinkingCost ?? 0);
+      const totalCost    = (inputCost ?? 0) + (cachedCost ?? 0) + (outputCost ?? 0) + (thinkingCost ?? 0);
       grandTotal    += totalCost;
       grandInput    += entry.inputTokens;
       grandOutput   += entry.outputTokens;
       grandThinking += entry.thinkingTokens;
+      grandCached   += entry.cachedInputTokens;
       grandCalls    += entry.calls;
 
       const ctxK   = info?.contextK ?? null;
@@ -251,7 +260,10 @@ class CostCenter {
       out.push(`  ${BOLD(model)}  ${DIM('(' + entry.provider + '  ' + ctxStr + ')')}  ${DIM(callsInfo)}`);
 
       if (info) {
-        const pricing = `$${info.inputPer1M.toFixed(2)}/1M in  ·  $${info.outputPer1M.toFixed(2)}/1M out`;
+        let pricing = `$${info.inputPer1M.toFixed(2)}/1M in  ·  $${info.outputPer1M.toFixed(2)}/1M out`;
+        if (info.cachedInputPer1M != null) {
+          pricing += `  ·  $${info.cachedInputPer1M.toFixed(2)}/1M cached`;
+        }
         out.push(`    \x1b[2m${t('pricing').padEnd(LBL)}${pricing}\x1b[0m`);
       }
 
@@ -259,6 +271,10 @@ class CostCenter {
       out.push(`    \x1b[2m${''.padEnd(LBL)}${'tokens'.padStart(VAL)}  ${'cost'.padStart(COST)}\x1b[0m`);
 
       out.push(row(t('input'),  fmtTokens(entry.inputTokens),  inputCost  !== null ? fmtUsd(inputCost)  : '?', pctStr, true));
+      if (entry.cachedInputTokens > 0) {
+        const cachePct = entry.inputTokens > 0 ? Math.round(entry.cachedInputTokens / entry.inputTokens * 100) : 0;
+        out.push(row('  Cached:', fmtTokens(entry.cachedInputTokens), cachedCost !== null ? fmtUsd(cachedCost) : '?', `${cachePct}% cache hit`, true));
+      }
       out.push(row(t('output'), fmtTokens(entry.outputTokens), outputCost !== null ? fmtUsd(outputCost) : '?', '',     true));
       if (entry.thinkingTokens > 0) {
         out.push(row('Thinking:', fmtTokens(entry.thinkingTokens), thinkingCost !== null ? fmtUsd(thinkingCost) : '?', 'billed as output', true));
@@ -277,6 +293,7 @@ class CostCenter {
     const totalAllTokens = grandInput + grandOutput + grandThinking;
     const tokenParts = [`${fmtTokens(grandInput)} ${t('inToken')}`, `${fmtTokens(grandOutput)} ${t('outToken')}`];
     if (grandThinking > 0) tokenParts.push(`${fmtTokens(grandThinking)} thinking`);
+    if (grandCached > 0) tokenParts.push(`${fmtTokens(grandCached)} cached`);
     const tokenSummary = `${fmtTokens(totalAllTokens)}  (${tokenParts.join(' · ')})`;
     out.push(`  \x1b[2m${t('totalCalls').padEnd(16)}\x1b[0m${grandCalls}`);
     out.push(`  \x1b[2m${t('totalTokens').padEnd(16)}\x1b[0m${tokenSummary}`);

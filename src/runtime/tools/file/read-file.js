@@ -141,7 +141,8 @@ export default {
       ]);
 
       if (value === 'always') {
-        permissions.allow(targetDir, 'read');
+        const grantedDir = permissions.allowProject(resolvedPath);
+        if (grantedDir) channel.print(`\x1b[2m✓ Read access granted for project: ${grantedDir}\x1b[0m`);
       } else if (value !== 'yes') {
         channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
         return { success: false, denied: true, message: 'User denied file access' };

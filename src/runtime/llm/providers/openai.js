@@ -68,6 +68,9 @@ export class OpenAIChatLLM extends BaseLLM {
               thinking: chunk.usage.reasoning_tokens
                 || chunk.usage.completion_tokens_details?.reasoning_tokens
                 || 0,
+              cachedInput: chunk.usage.prompt_tokens_details?.cached_tokens
+                || chunk.usage.prompt_tokens_details?.cached_input_tokens
+                || 0,
             };
           }
         }
@@ -138,6 +141,9 @@ export class OpenAIChatLLM extends BaseLLM {
         output: completion.usage?.completion_tokens || 0,
         thinking: completion.usage?.reasoning_tokens
           || completion.usage?.completion_tokens_details?.reasoning_tokens
+          || 0,
+        cachedInput: completion.usage?.prompt_tokens_details?.cached_tokens
+          || completion.usage?.prompt_tokens_details?.cached_input_tokens
           || 0,
       };
       return { text, usage };
@@ -237,6 +243,8 @@ export class OpenAIResponsesLLM extends BaseLLM {
               output: event.response.usage.output_tokens || 0,
               thinking: event.response.usage.reasoning_tokens
                 || event.response.usage.output_tokens_details?.reasoning_tokens
+                || 0,
+              cachedInput: event.response.usage.input_tokens_details?.cached_tokens
                 || 0,
             };
           }

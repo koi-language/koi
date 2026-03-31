@@ -77,7 +77,7 @@ function _deriveFilename(url, res) {
 export default {
   type: 'web_fetch',
   intent: 'web_fetch',
-  description: 'Fetch a URL and return its content as readable text, or download files (PDF, ZIP, images, etc.) to disk. For web pages, extracts main content (like Firefox Reader View); for JSON APIs, returns raw JSON; for binary files (PDF, ZIP, images), downloads and saves to disk. Fields: "url" (required), optional "saveTo" (local file path to save the downloaded file — required for binary downloads, optional for any URL), optional "mode" ("readable"|"raw"), optional "maxChars" (default 8000). When downloading PDFs or binary files, always provide "saveTo". Returns: { success, url, savedTo?, fileSize?, text?, contentType }',
+  description: 'Fetch a URL and return its content as readable text, or download files (PDF, ZIP, images, etc.) to disk. For web pages, extracts main content (like Firefox Reader View); for JSON APIs, returns raw JSON; for binary files (PDF, ZIP, images), downloads and saves to disk. Fields: "url" (required), optional "saveTo" (local file path to save the downloaded file — required for binary downloads, optional for any URL), optional "mode" ("readable"|"raw"), optional "maxChars" (default 8000). When downloading PDFs or binary files, always provide "saveTo". Returns: { success, url, savedTo?, fileSize?, text?, contentType }. IMPORTANT: If web_fetch fails (404, timeout, redirect, empty), do NOT give up — use web_search to find the correct or updated URL, then web_fetch the result.',
   permission: 'web_access',
   thinkingHint: (action) => {
     try { return `Fetching from ${new URL(action.url).hostname}`; } catch { return 'Fetching URL'; }

@@ -92,6 +92,20 @@ class Channel {
   clear() { process.stderr.write('\r\x1b[K'); }
   clearProgress() { this.clear(); }
 
+  // ── Action Grouping ────────────────────────────────────────────────────
+  // Default no-op stubs. TerminalChannel overrides with visual grouping.
+
+  /** Signal the start of an action (type + detail). */
+  beginAction(type, detail) { this.printCompact(`⏺ ${type}(${detail})`); }
+  /** Signal the end of an action (success + detail). */
+  endAction(success, detail) { this.printCompact(success ? `  ✓ ${detail || ''}` : `  ✗ ${detail || ''}`); }
+  /** Reset action grouping (e.g. after user interaction). */
+  resetActionGroup() {}
+  /** Open a semantic scope that groups subsequent actions. */
+  beginScope(type, description) {}
+  /** Close the current semantic scope. */
+  endScope(success) {}
+
   // ── Input ───────────────────────────────────────────────────────────────
 
   /**

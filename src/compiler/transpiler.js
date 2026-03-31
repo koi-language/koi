@@ -595,28 +595,136 @@ export class KoiTranspiler {
   }
 
   /**
+   * Taint analysis: classify template variables as static or dynamic (tainted).
+   * Tainted = depends on runtime state (callAction, state, args, userMessage).
+   * Also detects discriminator patterns: top-level @if (taintedVar === 'literal')
+   * that define prompt variants for cache optimization.
+   *
+   * @param {string[]} lines - Template lines
+   * @returns {{ taintedVars: Set<string>, discriminator: { varName: string, values: string[] }|null }}
+   */
+  _analyzeTaint(lines) {
+    // Seed: context variables are always tainted (come from runtime)
+    const taintedVars = new Set(['state', 'args', 'userMessage', 'nonInteractive', 'agentName']);
+
+    // First pass: collect @let assignments and propagate taint
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      const letMatch = trimmed.match(/^@let\s+(\w+)\s*=\s*(.+)$/);
+      if (!letMatch) continue;
+      const [, varName, expr] = letMatch;
+      // callAction is always tainted
+      if (expr.includes('callAction')) {
+        taintedVars.add(varName);
+        continue;
+      }
+      // Check if expr references any tainted variable
+      for (const tv of taintedVars) {
+        if (new RegExp(`\\b${tv}\\b`).test(expr)) {
+          taintedVars.add(varName);
+          break;
+        }
+      }
+    }
+
+    // Second pass: detect discriminator — top-level @if (taintedVar === 'literal')
+    // grouped by variable. ≥2 literal values on a tainted var = discriminator.
+    const candidates = new Map(); // varName → Set<literal>
+    let depth = 0;
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (trimmed === '}') { depth = Math.max(0, depth - 1); continue; }
+      const ifMatch = trimmed.match(/^@if\s*\((.+)\)\s*\{$/);
+      if (ifMatch) {
+        if (depth === 0) {
+          // Check for pattern: var === 'literal' or var === "literal"
+          const condMatch = ifMatch[1].match(/^(\w+)\s*===\s*['"]([^'"]+)['"]\s*$/);
+          if (condMatch) {
+            const [, varName, literal] = condMatch;
+            if (taintedVars.has(varName)) {
+              if (!candidates.has(varName)) candidates.set(varName, new Set());
+              candidates.get(varName).add(literal);
+            }
+          }
+        }
+        depth++;
+        continue;
+      }
+      if (/^@(?:else\s+)?if\s*\(/.test(trimmed) || /^@else\s*\{/.test(trimmed)) {
+        // else-if / else at current depth — don't change depth
+      }
+    }
+
+    // Pick the discriminator with the most variants (typically 'phase')
+    let discriminator = null;
+    for (const [varName, values] of candidates) {
+      if (values.size >= 2) {
+        if (!discriminator || values.size > discriminator.values.length) {
+          discriminator = { varName, values: [...values] };
+        }
+      }
+    }
+
+    return { taintedVars, discriminator };
+  }
+
+  /**
+   * Check if an expression references any tainted variable.
+   * @param {string} expr - JavaScript expression
+   * @param {Set<string>} taintedVars - Set of tainted variable names
+   * @returns {boolean}
+   */
+  _isTainted(expr, taintedVars) {
+    for (const tv of taintedVars) {
+      if (new RegExp(`\\b${tv}\\b`).test(expr)) return true;
+    }
+    return false;
+  }
+
+  /**
    * Compile compose template directives into a JavaScript resolver body.
    * Handles: {{fragmentName}}, @let, @if, {{expr}}, plain text.
+   *
+   * When a discriminator is detected (e.g., @if phase === 'routing'), generates
+   * cache-aware code that returns { _cacheKey, static, dynamic } instead of a
+   * single string, enabling LLM prompt prefix caching.
    */
   _compileComposeTemplate(template, fragmentNames) {
     const lines = template.split('\n');
+    const { taintedVars, discriminator } = this._analyzeTaint(lines);
+    const cacheAware = !!discriminator;
+
     const jsLines = [
       'const { args, state, agentName, userMessage, nonInteractive } = context || {};',
-      'const __parts = [];',
+      cacheAware ? 'const __staticParts = [];' : '',
+      cacheAware ? 'const __dynamicParts = [];' : '',
+      cacheAware ? 'let __cacheKey = null;' : '',
+      cacheAware ? 'let __inDynamic = false;' : '', // once dynamic content appears in a variant, rest goes to dynamic
+      'const __parts = [];', // still used for non-cache-aware fallback within @if blocks
       'const __images = [];',
-      'const __str = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);'
-    ];
+      'const __str = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);',
+      cacheAware ? 'const __push = (v) => __inDynamic ? __dynamicParts.push(v) : __staticParts.push(v);' : '',
+    ].filter(Boolean);
 
+
+    // In cache-aware mode, __push routes to __staticParts or __dynamicParts.
+    // We use __parts.push for the legacy single-string path.
+    const pushFn = cacheAware ? '__push' : '__parts.push';
 
     let textBuffer = [];
     const flushText = () => {
       if (textBuffer.length === 0) return;
       const text = textBuffer.join('\n');
       if (text.trim()) {
-        jsLines.push(`__parts.push(${JSON.stringify(text)});`);
+        jsLines.push(`${pushFn}(${JSON.stringify(text)});`);
       }
       textBuffer = [];
     };
+
+    // Track @if nesting depth to detect discriminator branches (depth === 0)
+    let ifDepth = 0;
+    // Whether we're inside a discriminator variant branch
+    let inDiscriminatorBranch = false;
 
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
@@ -633,6 +741,10 @@ export class KoiTranspiler {
           jsLines.push(`  __images.push({ data: ${varName}.screenshot, mimeType: ${varName}.mimeType || 'image/jpeg' });`);
           jsLines.push(`}`);
         }
+        // Set cache key when the discriminator variable is assigned
+        if (cacheAware && varName === discriminator.varName) {
+          jsLines.push(`__cacheKey = ${varName};`);
+        }
         continue;
       }
 
@@ -640,7 +752,28 @@ export class KoiTranspiler {
       const ifMatch = trimmed.match(/^@if\s*\((.+)\)\s*\{$/);
       if (ifMatch) {
         flushText();
-        jsLines.push(`if (${ifMatch[1]}) {`);
+        const cond = ifMatch[1];
+
+        // Detect discriminator branch: top-level @if on the discriminator variable
+        if (cacheAware && ifDepth === 0 && discriminator) {
+          const discMatch = cond.match(/^(\w+)\s*===\s*['"]([^'"]+)['"]\s*$/);
+          if (discMatch && discMatch[1] === discriminator.varName) {
+            inDiscriminatorBranch = true;
+            jsLines.push(`__inDynamic = false;`); // reset for each variant
+            jsLines.push(`if (${cond}) {`);
+            ifDepth++;
+            continue;
+          }
+        }
+
+        // Nested @if inside a discriminator branch: if condition is tainted,
+        // everything from here on in this variant goes to dynamic
+        if (cacheAware && inDiscriminatorBranch && this._isTainted(cond, taintedVars)) {
+          jsLines.push(`__inDynamic = true;`);
+        }
+
+        jsLines.push(`if (${cond}) {`);
+        ifDepth++;
         continue;
       }
 
@@ -648,7 +781,6 @@ export class KoiTranspiler {
       const elseIfMatch = trimmed.match(/^@else\s+if\s*\((.+)\)\s*\{$/);
       if (elseIfMatch) {
         flushText();
-        // Replace the preceding closing } with } else if
         if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
           jsLines[jsLines.length - 1] = `} else if (${elseIfMatch[1]}) {`;
         } else {
@@ -660,7 +792,6 @@ export class KoiTranspiler {
       // @else {  — replaces the preceding }
       if (/^@else\s*\{$/.test(trimmed)) {
         flushText();
-        // Replace the preceding closing } with } else
         if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
           jsLines[jsLines.length - 1] = `} else {`;
         } else {
@@ -687,6 +818,11 @@ export class KoiTranspiler {
       // Closing } on its own line
       if (trimmed === '}') {
         flushText();
+        ifDepth = Math.max(0, ifDepth - 1);
+        if (cacheAware && ifDepth === 0 && inDiscriminatorBranch) {
+          inDiscriminatorBranch = false;
+          jsLines.push(`__inDynamic = false;`); // reset after variant branch
+        }
         jsLines.push('}');
         continue;
       }
@@ -694,7 +830,7 @@ export class KoiTranspiler {
       // Line contains {{expr}} interpolation(s) (including fragment references)
       if (/\{\{.+?\}\}/.test(trimmed)) {
         flushText();
-        this._compileInterpolatedLine(rawLine, fragmentNames, jsLines);
+        this._compileInterpolatedLine(rawLine, fragmentNames, jsLines, cacheAware ? pushFn : null, taintedVars);
         continue;
       }
 
@@ -704,8 +840,15 @@ export class KoiTranspiler {
 
     flushText();
 
-    jsLines.push("const __text = __parts.filter(Boolean).join('\\n');");
-    jsLines.push("return __images.length > 0 ? { text: __text, images: __images } : __text;");
+    if (cacheAware) {
+      jsLines.push("const __static = __staticParts.filter(Boolean).join('\\n');");
+      jsLines.push("const __dynamic = __dynamicParts.filter(Boolean).join('\\n');");
+      jsLines.push("if (__images.length > 0) return { _cacheKey: __cacheKey, static: __static, dynamic: __dynamic, images: __images };");
+      jsLines.push("return { _cacheKey: __cacheKey, static: __static, dynamic: __dynamic };");
+    } else {
+      jsLines.push("const __text = __parts.filter(Boolean).join('\\n');");
+      jsLines.push("return __images.length > 0 ? { text: __text, images: __images } : __text;");
+    }
 
     return jsLines.join('\n');
   }
@@ -715,7 +858,8 @@ export class KoiTranspiler {
    * into __parts.push() calls. If {{expr}} matches a known fragment name, it emits
    * a fragment inclusion; otherwise it emits an interpolated expression.
    */
-  _compileInterpolatedLine(line, fragmentNames, jsLines) {
+  _compileInterpolatedLine(line, fragmentNames, jsLines, pushFn = null, taintedVars = null) {
+    const push = pushFn || '__parts.push';
     let remaining = line;
 
     // Collect all segments of this line. If ALL interpolations are inline expressions
@@ -762,11 +906,15 @@ export class KoiTranspiler {
     if (hasFragment) {
       for (const seg of segments) {
         if (seg.type === 'text' && seg.value.trim()) {
-          jsLines.push(`__parts.push(${JSON.stringify(seg.value)});`);
+          jsLines.push(`${push}(${JSON.stringify(seg.value)});`);
         } else if (seg.type === 'expr') {
-          jsLines.push(`__parts.push(__str(${seg.value}));`);
+          // If cache-aware and expr is tainted, switch to dynamic from here
+          if (pushFn && taintedVars && this._isTainted(seg.value, taintedVars)) {
+            jsLines.push(`__inDynamic = true;`);
+          }
+          jsLines.push(`${push}(__str(${seg.value}));`);
         } else if (seg.type === 'fragment') {
-          jsLines.push(`__parts.push(fragments.${seg.value});`);
+          jsLines.push(`${push}(fragments.${seg.value});`);
         }
       }
     } else {
@@ -776,7 +924,14 @@ export class KoiTranspiler {
         return `__str(${s.value})`;
       });
       if (parts.length > 0) {
-        jsLines.push(`__parts.push(${parts.join(' + ')});`);
+        // If any expression is tainted and we're in cache-aware mode, mark dynamic
+        if (pushFn && taintedVars) {
+          const hasTaintedExpr = segments.some(s => s.type === 'expr' && this._isTainted(s.value, taintedVars));
+          if (hasTaintedExpr) {
+            jsLines.push(`__inDynamic = true;`);
+          }
+        }
+        jsLines.push(`${push}(${parts.join(' + ')});`);
       }
     }
   }
@@ -1058,7 +1213,10 @@ export class KoiTranspiler {
         code += this.emit(`${this.getIndent()}    if (typeof __p__ === 'function') return __p__(args, state);\n`);
         code += this.emit(`${this.getIndent()}    return __p__ || '';\n`);
         code += this.emit(`${this.getIndent()}  }));\n`);
-        code += this.emit(`${this.getIndent()}  return __resolved__.join('\\n');\n`);
+        // If only one part and it's a structured cache-aware result, pass through directly
+        code += this.emit(`${this.getIndent()}  if (__resolved__.length === 1 && typeof __resolved__[0] === 'object' && __resolved__[0]?._cacheKey !== undefined) return __resolved__[0];\n`);
+        // Flatten any structured results that appear alongside other parts
+        code += this.emit(`${this.getIndent()}  return __resolved__.map(__r__ => typeof __r__ === 'object' && __r__?._cacheKey !== undefined ? [__r__.static, __r__.dynamic].filter(Boolean).join('\\n') : __r__).join('\\n');\n`);
         code += this.emit(`${this.getIndent()}};\n`);
       }
 
