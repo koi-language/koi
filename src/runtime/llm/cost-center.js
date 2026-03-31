@@ -271,10 +271,14 @@ class CostCenter {
       out.push(`    \x1b[2m${''.padEnd(LBL)}${'tokens'.padStart(VAL)}  ${'cost'.padStart(COST)}\x1b[0m`);
 
       out.push(row(t('input'),  fmtTokens(entry.inputTokens),  inputCost  !== null ? fmtUsd(inputCost)  : '?', pctStr, true));
-      if (entry.cachedInputTokens > 0) {
-        const cachePct = entry.inputTokens > 0 ? Math.round(entry.cachedInputTokens / entry.inputTokens * 100) : 0;
-        out.push(row('  Cached:', fmtTokens(entry.cachedInputTokens), cachedCost !== null ? fmtUsd(cachedCost) : '?', `${cachePct}% cache hit`, true));
-      }
+      // Always show cached line so user can see cache savings
+      const cachePct = entry.inputTokens > 0 ? Math.round(entry.cachedInputTokens / entry.inputTokens * 100) : 0;
+      const cacheSaved = info?.cachedInputPer1M != null && info?.inputPer1M
+        ? (entry.cachedInputTokens / 1_000_000) * (info.inputPer1M - info.cachedInputPer1M) : 0;
+      const cacheExtra = entry.cachedInputTokens > 0
+        ? `${cachePct}% cache hit` + (cacheSaved > 0 ? `  saved ${fmtUsd(cacheSaved)}` : '')
+        : 'no cache';
+      out.push(row('  Cached:', fmtTokens(entry.cachedInputTokens), cachedCost !== null ? fmtUsd(cachedCost) : '?', cacheExtra, true));
       out.push(row(t('output'), fmtTokens(entry.outputTokens), outputCost !== null ? fmtUsd(outputCost) : '?', '',     true));
       if (entry.thinkingTokens > 0) {
         out.push(row('Thinking:', fmtTokens(entry.thinkingTokens), thinkingCost !== null ? fmtUsd(thinkingCost) : '?', 'billed as output', true));
@@ -293,10 +297,23 @@ class CostCenter {
     const totalAllTokens = grandInput + grandOutput + grandThinking;
     const tokenParts = [`${fmtTokens(grandInput)} ${t('inToken')}`, `${fmtTokens(grandOutput)} ${t('outToken')}`];
     if (grandThinking > 0) tokenParts.push(`${fmtTokens(grandThinking)} thinking`);
-    if (grandCached > 0) tokenParts.push(`${fmtTokens(grandCached)} cached`);
     const tokenSummary = `${fmtTokens(totalAllTokens)}  (${tokenParts.join(' · ')})`;
     out.push(`  \x1b[2m${t('totalCalls').padEnd(16)}\x1b[0m${grandCalls}`);
     out.push(`  \x1b[2m${t('totalTokens').padEnd(16)}\x1b[0m${tokenSummary}`);
+
+    // Cache summary
+    const grandCachePct = grandInput > 0 ? Math.round(grandCached / grandInput * 100) : 0;
+    // Compute total savings from cache across all models
+    let grandCacheSaved = 0;
+    for (const [model, entry] of models) {
+      const info = lookupModel(model);
+      if (info?.cachedInputPer1M != null && info?.inputPer1M) {
+        grandCacheSaved += (entry.cachedInputTokens / 1_000_000) * (info.inputPer1M - info.cachedInputPer1M);
+      }
+    }
+    const cacheStr = `${fmtTokens(grandCached)} / ${fmtTokens(grandInput)} input  (${grandCachePct}%)`;
+    const savedStr = grandCacheSaved > 0 ? `  \x1b[32msaved ${fmtUsd(grandCacheSaved)}\x1b[0m` : '';
+    out.push(`  \x1b[2m${'Cache:'.padEnd(16)}\x1b[0m${cacheStr}${savedStr}`);
 
     const grandStr = fmtUsd(grandTotal);
     out.push(`  \x1b[1m${t('grandTotal').padEnd(16)}\x1b[0m\x1b[1m\x1b[36m${grandStr}\x1b[0m`);
