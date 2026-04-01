@@ -615,8 +615,8 @@ G: Look up / find something in the codebase — "where is auth implemented?", "f
 H: Explain how something works in the codebase — "how does the login flow work?", "what does this function do?"
 I: Read and understand code to answer a question — "what system does the frontend use for email?"
 J: Simple bug fix in one file — off-by-one, null check, wrong condition, missing import
-K: Add basic UI element — new button, form field, simple component, style change
-L: Add form validation, input handling, basic interactivity
+K: UI design / visual adaptation — adapt colors from a reference image, redesign a page's look and feel, create a new visual design, match a mockup/screenshot, restyle CSS to look like a reference, create or significantly change page layouts. Requires vision and strong code output.
+L: Add form validation, input handling, basic interactivity, add a simple UI element (button, toggle, spinner)
 M: Implement a small feature (one file, straightforward) — add an endpoint, add a column, add a filter
 N: Review or audit code — PR review, security review, code quality check
 O: Run CLI commands, launch apps, interact with external services — railway, docker, kubectl, aws, heroku, ssh, emulators, simulators, dev servers, checking env vars, viewing logs, managing deploys, running/testing the app
@@ -640,14 +640,14 @@ A: "hello", "hola qué tal", "good morning", "bye", "thanks!", "hey there"
 B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles"
 C: "summarize this article", "compare React vs Vue", "explain what Kubernetes is", "pros and cons of microservices"
 D: "what kind of project do you want?", "gather requirements from the user", "ask what stack they prefer", "onboarding: collect project details"
-E: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0", "change button color to blue"
+E: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0"
 F: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB", "Python script to parse CSV"
 G: "where is the auth middleware?", "find where password reset is handled", "locate the email sending code", "find all API routes"
 H: "how does the login flow work?", "explain the billing system", "what happens when a user signs up?", "walk me through the deployment pipeline"
 I: "what email provider does the backend use?", "what ORM is this project using?", "what authentication strategy is implemented?", "what database engine are we using?"
 J: "fix the null pointer on line 42", "the button doesn't disable after click", "off-by-one error in pagination", "missing await on async call", "forgot to handle the empty array case"
-K: "add a logout button to the navbar", "add a loading spinner", "create a 404 page", "add a dark mode toggle", "put a back button on the settings page"
-L: "add email validation to the signup form", "validate the phone number format", "add a character counter to the textarea", "make the form show inline errors"
+K: "adapt the colors to match this screenshot", "redesign the page to look like the mockup", "change the CSS to match the reference image", "create a landing page design from scratch", "restyle this page with a dark theme", "make this look like the attached design", "change button color to blue", "the colors are wrong, look at this image and fix them"
+L: "add email validation to the signup form", "validate the phone number format", "add a character counter to the textarea", "make the form show inline errors", "add a logout button to the navbar", "add a loading spinner", "create a 404 page", "add a dark mode toggle"
 M: "add a GET /health endpoint", "add a 'role' column to the users table", "add a search filter to the user list", "create a simple CRUD for tags"
 N: "review this pull request", "check this code for security issues", "audit the API for OWASP top 10", "review the database queries for N+1 problems"
 O: "run railway variables to check the config", "docker compose logs backend", "check if the SSL cert is valid", "list running pods in staging", "ssh into the server and check disk space", "show me the environment variables on production", "restart the backend service on Railway", "run the app in an iOS simulator", "launch the app on an Android emulator", "start the dev server", "run flutter run", "npm start"
@@ -679,7 +679,7 @@ ${taskDescription}`;
       H: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
       I: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
       J: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
-      K: { code: 50,  reasoning: 30,  thinking: true,  risk: 10 },
+      K: { code: 80,  reasoning: 70,  thinking: true,  risk: 10 },
       L: { code: 50,  reasoning: 40,  thinking: true,  risk: 10 },
       M: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
       N: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
@@ -1214,7 +1214,22 @@ CRITICAL RULES:
           channel.log('llm', `[classify] No context available — fallback default profile`);
         }
       }
-      const profile = session._autoProfile;
+      let profile = session._autoProfile;
+
+      // Escalate model on repeated LLM errors (truncated JSON, parse failures, etc.)
+      // The classifier may keep returning the same category, so we force-bump scores
+      // to break out of the "weak model → truncated → reclassify → same model" loop.
+      if (_isLoop && _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === '_llm_error')) {
+        const _bump = Math.min(30, _recentActions.length * 10); // 30 for 3 errors, capped
+        profile = {
+          ...profile,
+          code: Math.min(100, (profile.code || 50) + _bump),
+          reasoning: Math.min(100, (profile.reasoning || 50) + _bump),
+          difficulty: Math.min(100, (profile.difficulty || 50) + _bump),
+        };
+        session._autoProfile = profile;
+        channel.log('llm', `[classify] LLM error escalation: bumped scores by +${_bump} → code:${profile.code}, reasoning:${profile.reasoning}`);
+      }
 
       // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
       const _requiresImage = !!(session._pendingImages?.length > 0) ||
