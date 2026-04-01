@@ -429,6 +429,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       cwd: { type: 'string', description: 'Working directory for the command (optional)' },
       background: { type: 'boolean', description: 'If true, launch without waiting for completion. Use for commands that start long-running processes: apps, emulators, dev servers (e.g. flutter run, open -a Simulator, npm start).' },
       timeout: { type: 'number', description: 'Timeout in milliseconds before the command is killed (default: 120000 = 2 min). Set higher for long-running commands like terraform apply, docker build, long test suites.' },
+      silent_timeout: { type: 'number', description: 'How long (ms) to wait without output before checking if the process is stuck (default: 10000 = 10s). Set higher for inherently slow commands that produce no output for long periods: nmap, nikto, sqlmap, gobuster, ffuf, large compilations, video encoding.' },
       stream_interval: { type: 'number', description: 'How often (in ms) to snapshot streaming output for agent analysis during long-running commands (default: 30000 = 30s). Set lower for commands where you want more frequent progress checks.' }
     },
     required: ['command', 'description']
@@ -445,7 +446,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
   ],
 
   async * execute(action, agent) {
-    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, stream_interval = 10000 } = action;
+    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, silent_timeout: silentTimeoutMs = 10000, stream_interval = 10000 } = action;
 
     if (!command) {
       throw new Error('shell: "command" field is required');
@@ -735,7 +736,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
         // _passwordPending prevents re-triggering while the agent is deciding.
         _inputNeededInfo = { promptContext: lastLines };
         _notify(); // Wake the generator so it yields _inputNeeded to the agent.
-      }, 10000);
+      }, silentTimeoutMs);
     };
 
     // Helper: wire up the 'close' and 'error' events shared by both spawn paths.

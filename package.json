@@ -72,6 +72,7 @@
     "openai": "^6.16.0",
     "peggy": "^5.0.6",
     "playwright": "^1.50.0",
+    "pngquant-bin": "^9.0.0",
     "prompts": "^2.4.2",
     "sharp": "^0.34.5",
     "source-map": "^0.7.6",

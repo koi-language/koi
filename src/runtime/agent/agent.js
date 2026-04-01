@@ -625,6 +625,13 @@ export class Agent {
     this._activeSession = session; // Expose to actions (e.g. read_file image vision)
     session.actionContext.args = args;
 
+    // Inject images propagated from parent agent (e.g. user attached a screenshot,
+    // System consumed it, then delegated to developer — developer should see the image too)
+    if (this._pendingImagesToPropagate?.length > 0) {
+      session._pendingImages = this._pendingImagesToPropagate;
+      this._pendingImagesToPropagate = null;
+    }
+
     // ── Task refresh: track assigned task for live feedback injection ────────
     // When a delegate has a taskId, we snapshot its description so we can detect
     // mid-flight updates (e.g. user feedback propagated by the System agent).
@@ -1082,19 +1089,34 @@ export class Agent {
       // discard the entire batch, exclude this provider, and retry with another model.
       const _hasRefusal = actionBatch.some(a => a._refused) ||
         (actionBatch.some(a => a.parallel && Array.isArray(a.parallel) && a.parallel.some(p => p._refused)));
-      if (_hasRefusal && this.llmProvider?._autoMode) {
+      if (_hasRefusal && this.llmProvider?._autoMode && !session._complianceExhausted) {
         const _currentProvider = session._autoProvider || this.llmProvider.provider;
         const _currentRisk = session._autoProfile?.risk ?? 0;
-        if (!session._declinedProviders) session._declinedProviders = new Map(); // provider → { risk, until }
-        const _cooldownMs = Math.min(60, Math.ceil(_currentRisk / 2)) * 60 * 1000; // risk/2 minutes, max 1 hour
-        const _prev = session._declinedProviders.get(_currentProvider);
-        const _newRisk = Math.max(_prev?.risk ?? 0, _currentRisk);
-        session._declinedProviders.set(_currentProvider, { risk: _newRisk, until: Date.now() + _cooldownMs });
-        const _cooldownMins = Math.min(60, Math.ceil(_currentRisk / 2));
-        channel.log('agent', `${this.name}: Model refused task (provider: ${_currentProvider}, risk: ${_currentRisk}, cooldown: ${_cooldownMins}min). Retrying with different provider.`);
-        channel.printCompact(`\x1b[33m⚠ Model declined — trying another provider\x1b[0m`);
-        // Don't record the refusal in action history — retry as if it never happened
-        continue; // skip to next while loop iteration → new LLM call with excluded provider
+        if (!session._declinedProviders) session._declinedProviders = new Map();
+        if (!session._complianceRetries) session._complianceRetries = 0;
+        session._complianceRetries++;
+
+        // Max 3 retries — after that, all providers refused, let the last response through
+        if (session._complianceRetries > 3) {
+          channel.log('agent', `${this.name}: All providers refused (${session._complianceRetries} attempts). Giving up compliance rotation.`);
+          session._complianceExhausted = true; // Stop retrying until next user message
+          session._declinedProviders.clear();
+          // Strip _refused from actions so they execute normally
+          for (const a of actionBatch) { delete a._refused; }
+          // Fall through to execute the action normally
+        } else {
+          const _cooldownMs = Math.min(60, Math.ceil(_currentRisk / 2)) * 60 * 1000;
+          const _prev = session._declinedProviders.get(_currentProvider);
+          const _newRisk = Math.max(_prev?.risk ?? 0, _currentRisk);
+          session._declinedProviders.set(_currentProvider, { risk: _newRisk, until: Date.now() + _cooldownMs });
+          const _cooldownMins = Math.min(60, Math.ceil(_currentRisk / 2));
+          channel.log('agent', `${this.name}: Model refused task (provider: ${_currentProvider}, risk: ${_currentRisk}, cooldown: ${_cooldownMins}min, attempt ${session._complianceRetries}/3). Retrying.`);
+          continue;
+        }
+      }
+      // If compliance exhausted and still getting refusals, just strip and execute
+      if (_hasRefusal && session._complianceExhausted) {
+        for (const a of actionBatch) { delete a._refused; }
       }
 
       let terminated = false;
@@ -1396,6 +1418,13 @@ export class Agent {
           const _isGroupedTool = _GROUPED_TOOLS.has(intent);
           if (_isGroupedTool) channel.beginAction(intent, action.path || action.pattern || action.query || '');
 
+          // Propagate user-attached images to delegate agent so it sees them too.
+          // session._lastConsumedImages is set by llm-provider after injecting images.
+          if (action.actionType === 'delegate' && session._lastConsumedImages?.length > 0) {
+            this._lastConsumedImages = session._lastConsumedImages;
+            session._lastConsumedImages = null;
+          }
+
           let { result } = await this._executeAction(action, action, session.actionContext);
 
           channel.clear();
@@ -1450,6 +1479,10 @@ export class Agent {
           // Flag the session for reclassification — the user's new message may require a different model.
           if (intent === 'prompt_user' && result?.answer) {
             session._needsReclassify = true;
+            // New user message → reset compliance exhaustion so providers get a fresh chance
+            session._complianceExhausted = false;
+            session._complianceRetries = 0;
+            session._declinedProviders?.clear();
           }
 
           // Save input history, dialogue, and context memory after prompt_user
@@ -2434,6 +2467,11 @@ export class Agent {
                   try { iter.return(); } catch {}
                   break;
                 }
+                if (answer === '__WAIT__') {
+                  // LLM determined process is running normally (slow command) — don't write to stdin, just continue waiting
+                  item = await iter.next(null);
+                  continue;
+                }
                 if (answer === null && process.env.KOI_EXIT_ON_COMPLETE === '1') {
                   // Non-interactive: can't provide input — kill process and return error
                   this._shellKilledByClassifier = update.output_so_far || '';
@@ -2545,7 +2583,9 @@ Respond with ONE of:
 - {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash, stuck in infinite loop). It should be killed so the agent can fix the problem.
 - {"action":"ask","question":"what to ask the user"} — process is interactively asking for input (a question, a prompt, a confirmation). The question field should contain what the process is asking.
 
-IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements, infinite error loops).${staleNote}`;
+IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements, infinite error loops).
+
+Many commands are inherently slow and produce little or no output for extended periods — this is NORMAL. Examples: nmap, nikto, gobuster, sqlmap, ffuf, wget, rsync, docker build, npm install, compilation, test suites, database migrations, video encoding. If the command is slow-by-nature and started successfully, ALWAYS return "wait". Silence is NOT an error.${staleNote}`;
 
       const raw = await this.llmProvider.callSummary(system, user);
       const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim());
@@ -2605,6 +2645,8 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
         `Running command: ${command}\n` +
         `Recent terminal output (last 20 lines):\n\`\`\`\n${promptContext.slice(-600)}\n\`\`\`\n\n` +
         `FIRST: Determine if the process is actually waiting for input, or if it has crashed/errored/hung.\n\n` +
+        `IMPORTANT: Many commands are inherently slow and produce no output for long periods — this is NORMAL behavior, NOT a hang or crash. Examples: nmap (port scanning), nikto, gobuster, sqlmap, ffuf, wget (large files), rsync, docker build, npm install, compilation, test suites, database migrations, video encoding. If the command is one of these slow-by-nature tools and the output shows it started successfully (e.g. "Starting Nmap"), return {"autoAnswer":null,"isSecret":false,"label":"Process is running normally, just slow"} — do NOT kill it.\n\n` +
+        `Only use __KILL__ for CLEAR fatal errors visible in the output (stack traces, "command not found", segfaults, unhandled exceptions). "No recent output" alone is NEVER a reason to kill.\n\n` +
         `If the output shows errors, stack traces, crashes, unhandled exceptions, or error boundaries → the process is NOT waiting for input. Set autoAnswer to "__KILL__" to terminate it.\n\n` +
         `If the process IS genuinely waiting for interactive input, detect the type of prompt:\n\n` +
         `1. **Arrow-key menu / selector** (lines with ❯, >, ●, ○, or indented options like "~ X rename" / "+ X create"):\n` +
@@ -2629,6 +2671,13 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
       } catch { /* ignore */ }
 
       if (!parsed) return null;
+
+      // "Just slow" — LLM determined process is running normally, no input needed
+      // autoAnswer=null + label contains "running normally" or "just slow" → let it continue
+      if (parsed.autoAnswer === null && parsed.label && /running normally|just slow|still running|in progress|working/i.test(parsed.label)) {
+        channel.log('shell', `[${this.name}] process classified as running normally — continuing to wait (${parsed.label})`);
+        return '__WAIT__';
+      }
 
       // Auto-answer: write directly to stdin, no user interaction needed
       if (parsed.autoAnswer != null) {
@@ -2944,6 +2993,11 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
             if (teamMember.alias) {
               teamMember.agent.displayName = teamMember.alias;
             }
+            // Propagate user-attached images to delegate so it can see them too
+            if (this._lastConsumedImages?.length > 0) {
+              teamMember.agent._pendingImagesToPropagate = [...this._lastConsumedImages];
+              this._lastConsumedImages = null; // only propagate once
+            }
             result = await channel.withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
           } finally {
             if (_scopeType) channel.endScope();
@@ -2972,6 +3026,11 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
             subject: _routerData?.subject || null,
           });
           channel.clearSlotById(_routerParentSlotId);
+          // Propagate user-attached images to delegate
+          if (this._lastConsumedImages?.length > 0) {
+            best.agent._pendingImagesToPropagate = [...this._lastConsumedImages];
+            this._lastConsumedImages = null;
+          }
           let routerResult;
           try {
             routerResult = await channel.withSlot(_routerSlot, () => best.agent.handle(best.event, _routerData, true));

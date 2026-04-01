@@ -129,12 +129,15 @@ function _resolveLLM(req) {
         if (!entry) return true;
         // Cooldown expired → provider is available again
         if (_now >= entry.until) { _declined.delete(p); return true; }
-        // Exclude if current risk >= the risk level they refused at
+        // Exclude provider for tasks at same or higher risk than what they refused
         return _currentRisk < entry.risk;
       })
     : availableProviders;
 
   // ── Select best model ──────────────────────────────────────────────────
+  if (_declined?.size > 0) {
+    channel.log('llm', `[auto] Provider filter: available=[${availableProviders.join(',')}] filtered=[${_filteredProviders.join(',')}] declined=[${[..._declined.entries()].map(([p,e]) => `${p}(risk${e.risk})`).join(',')}] taskRisk=${_currentRisk}`);
+  }
   const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, minContextK, profile });
   if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
   const provider = selected.provider;

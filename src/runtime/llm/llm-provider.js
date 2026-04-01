@@ -1066,6 +1066,29 @@ CRITICAL RULES:
       session._lastFeedbackIdx = session.actionHistory.length;
 
       if (newEntries.length > 0) {
+        // Scan ALL new entries for prompt_user with attachments/images — not just the last one.
+        // When the LLM returns a batch like [prompt_user, update_state], the last entry is
+        // update_state but the images are on the prompt_user result.
+        let commitContext = '';
+        for (const entry of newEntries) {
+          if (entry.error) continue;
+          const _intent = entry.action.intent || entry.action.type;
+          if (_intent === 'prompt_user' && entry.result?.answer != null) {
+            const _answerText = typeof entry.result.answer === 'string'
+              ? entry.result.answer
+              : (entry.result.answer?.text ?? '');
+            if (_answerText) {
+              commitContext = await this._searchRelevantCommits(_answerText);
+              await contextMemory.hydrate(_answerText);
+            }
+            // Capture image attachments so we can inject them into the next LLM message
+            const _atts = Array.isArray(entry.result.attachments)
+              ? entry.result.attachments.filter(a => a.type === 'image' && fs.existsSync(a.path))
+              : [];
+            if (_atts.length > 0) session._pendingImages = _atts;
+          }
+        }
+
         // Add intermediate entries (all except last) as plain messages without "Continue."
         for (let i = 0; i < newEntries.length - 1; i++) {
           const entry = newEntries[i];
@@ -1073,33 +1096,21 @@ CRITICAL RULES:
           contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent, classified);
         }
 
-        // Process the last entry with full handling (commit context, hydrate, images, "Continue.")
+        // Process the last entry with full handling (commit context, images, "Continue.")
         const lastEntry = newEntries[newEntries.length - 1];
         const classified = classifyFeedback(lastEntry.action, lastEntry.result, lastEntry.error);
 
-        // Inject relevant commit context when user just spoke (after prompt_user)
-        let commitContext = '';
-        if (!lastEntry.error) {
-          const lastIntent = lastEntry.action.intent || lastEntry.action.type;
-          if (lastIntent === 'prompt_user' && lastEntry.result?.answer != null) {
-            const _answerText = typeof lastEntry.result.answer === 'string'
-              ? lastEntry.result.answer
-              : (lastEntry.result.answer?.text ?? '');
-            if (_answerText) {
-              commitContext = await this._searchRelevantCommits(_answerText);
-              await contextMemory.hydrate(_answerText);
-            }
-            // Capture image attachments so we can inject them into the next LLM message
-            const _atts = Array.isArray(lastEntry.result.attachments)
-              ? lastEntry.result.attachments.filter(a => a.type === 'image' && fs.existsSync(a.path))
-              : [];
-            session._pendingImages = _atts.length > 0 ? _atts : null;
-          }
-        }
-
         // Build the immediate content (full detail + commit context + continue)
-        const immediate = `${classified.immediate}${commitContext}\nContinue.`;
-        contextMemory.add('user', immediate, classified.shortTerm, classified.permanent, classified);
+        // Include image paths in context memory so agents can re-reference them later
+        const _imgPaths = session._pendingImages?.map(a => a.path).filter(Boolean) || [];
+        const _imgRef = _imgPaths.length > 0
+          ? `\n[Attached images: ${_imgPaths.map(p => `"${p}"`).join(', ')}]`
+          : '';
+        const immediate = `${classified.immediate}${_imgRef}${commitContext}\nContinue.`;
+        const _shortWithImg = _imgPaths.length > 0
+          ? `${classified.shortTerm || ''} [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
+          : classified.shortTerm;
+        contextMemory.add('user', immediate, _shortWithImg, classified.permanent, classified);
 
         // Queue MCP image results for multimodal injection into the next LLM call.
         // Skip if the compose resolver already injected images (e.g. frame_server_state
@@ -1255,12 +1266,74 @@ CRITICAL RULES:
       if (lastUserIdx >= 0) {
         const textContent = typeof messages[lastUserIdx].content === 'string'
           ? messages[lastUserIdx].content : '';
-        const imageParts = session._pendingImages.map(att => {
-          const ext = path.extname(att.path).toLowerCase().slice(1);
-          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          const b64 = fs.readFileSync(att.path).toString('base64');
-          return { mime, b64, path: att.path };
-        });
+
+        // Optimize images before sending to LLM:
+        // - PNG: pngquant (60-80% reduction, near-lossless) + sharp resize
+        // - JPEG: sharp resize + quality 80
+        const _MAX_IMG_DIM = 1568;
+        const _optimizeImage = async (imgPath) => {
+          try {
+            const raw = fs.readFileSync(imgPath);
+            const ext = path.extname(imgPath).toLowerCase().slice(1);
+            const isJpeg = ext === 'jpg' || ext === 'jpeg';
+            const isPng = ext === 'png';
+
+            // If already small enough (<200KB), use as-is
+            if (raw.length < 200_000) {
+              return { mime: isJpeg ? 'image/jpeg' : `image/${ext}`, b64: raw.toString('base64') };
+            }
+
+            let optimized = raw;
+            let mime = isJpeg ? 'image/jpeg' : `image/${ext}`;
+
+            // Step 1: Resize with sharp (all formats)
+            try {
+              const sharp = (await import('sharp')).default;
+              if (isJpeg) {
+                optimized = await sharp(raw).resize(_MAX_IMG_DIM, _MAX_IMG_DIM, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
+                mime = 'image/jpeg';
+              } else {
+                optimized = await sharp(raw).resize(_MAX_IMG_DIM, _MAX_IMG_DIM, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
+                mime = 'image/png';
+              }
+            } catch (sharpErr) {
+              channel.log('llm', `[image] sharp resize failed: ${sharpErr.message}`);
+            }
+
+            // Step 2: For PNGs, run pngquant for aggressive palette-based compression
+            if (isPng || mime === 'image/png') {
+              try {
+                const { execFileSync } = require('child_process');
+                const pngquantBin = require('pngquant-bin');
+                const tmpIn = path.join(os.tmpdir(), `koi-pq-in-${Date.now()}.png`);
+                const tmpOut = path.join(os.tmpdir(), `koi-pq-out-${Date.now()}.png`);
+                fs.writeFileSync(tmpIn, optimized);
+                execFileSync(typeof pngquantBin === 'object' ? pngquantBin.default : pngquantBin,
+                  ['--quality=65-80', '--speed=3', '--force', '--output', tmpOut, tmpIn],
+                  { timeout: 10000 });
+                const pqResult = fs.readFileSync(tmpOut);
+                channel.log('llm', `[image] pngquant ${path.basename(imgPath)}: ${(optimized.length/1024).toFixed(0)}KB → ${(pqResult.length/1024).toFixed(0)}KB`);
+                optimized = pqResult;
+                try { fs.unlinkSync(tmpIn); } catch {}
+                try { fs.unlinkSync(tmpOut); } catch {}
+              } catch (pqErr) {
+                channel.log('llm', `[image] pngquant failed: ${pqErr.message}, using sharp output`);
+              }
+            }
+
+            channel.log('llm', `[image] Optimized ${path.basename(imgPath)}: ${(raw.length/1024).toFixed(0)}KB → ${(optimized.length/1024).toFixed(0)}KB (${mime})`);
+            return { mime, b64: optimized.toString('base64') };
+          } catch {
+            return null;
+          }
+        };
+
+        const imageParts = (await Promise.all(
+          session._pendingImages.map(async att => {
+            const opt = await _optimizeImage(att.path);
+            return opt ? { ...opt, path: att.path } : null;
+          })
+        )).filter(Boolean);
         if (this.provider === 'anthropic') {
           messages[lastUserIdx] = {
             role: 'user',
@@ -1283,6 +1356,7 @@ CRITICAL RULES:
           _debugAttachPaths.push(...imageParts.map(p => p.path));
         }
       }
+      session._lastConsumedImages = [...session._pendingImages]; // preserve for delegate propagation
       session._pendingImages = null; // consume — don't re-send in subsequent calls
     }
 
@@ -1718,8 +1792,14 @@ CRITICAL RULES:
           const _s = globalThis.__koiStrings || {};
           throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
         }
+        // 413 = payload too large — drop pending images and retry (don't exclude provider)
+        if (_status === 413 && session?._pendingImages?.length > 0) {
+          channel.log('llm', `[auto] 413 Payload Too Large — dropping ${session._pendingImages.length} pending image(s) and retrying`);
+          session._pendingImages = null;
+        }
         // Other 4xx (401, 403, 404) = invalid key or model — exclude provider entirely.
-        if (typeof _status === 'number' && _status >= 400 && _status < 500 && _status !== 429) {
+        // 413 = payload too large — NOT the provider's fault, don't exclude it.
+        if (typeof _status === 'number' && _status >= 400 && _status < 500 && _status !== 429 && _status !== 413) {
           const _badProvider = this.provider;
           const _idx = this._availableProviders.indexOf(_badProvider);
           if (_idx !== -1) {
