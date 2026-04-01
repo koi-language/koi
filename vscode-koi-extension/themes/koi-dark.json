@@ -69,10 +69,65 @@
       }
     },
     {
-      "name": "Prompt Directives",
+      "name": "Prompt Directives (@if, @let, @else)",
       "scope": [
         "keyword.control.directive.koi",
         "punctuation.definition.directive.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Directive Condition Parens",
+      "scope": [
+        "punctuation.definition.condition.begin.koi",
+        "punctuation.definition.condition.end.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Directive Condition Expression",
+      "scope": [
+        "variable.other.expression.koi",
+        "meta.directive.condition.koi"
+      ],
+      "settings": {
+        "foreground": "#c4b5fd"
+      }
+    },
+    {
+      "name": "Directive Variable (@let name)",
+      "scope": "variable.other.directive.koi",
+      "settings": {
+        "foreground": "#67e8f9"
+      }
+    },
+    {
+      "name": "Directive Function Calls",
+      "scope": "entity.name.function.expression.koi",
+      "settings": {
+        "foreground": "#fbbf24"
+      }
+    },
+    {
+      "name": "Directive Assignment & Operators",
+      "scope": [
+        "keyword.operator.assignment.koi",
+        "keyword.operator.comparison.koi",
+        "keyword.operator.expression.koi"
+      ],
+      "settings": {
+        "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Block Braces { } (distinct from {{ }})",
+      "scope": [
+        "punctuation.section.block.begin.koi",
+        "punctuation.section.block.end.koi"
       ],
       "settings": {
         "foreground": "#f472b6"

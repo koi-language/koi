@@ -14,7 +14,7 @@ import { channel } from '../../io/channel.js';
 export default {
   type: 'prompt_form',
   intent: 'prompt_form',
-  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. Returns: { answers: { [fieldLabel]: string } }',
+  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Returns: { answers: { [fieldLabel]: string } }',
   thinkingHint: 'Waiting for your input',
   permission: null,
 

@@ -39,6 +39,12 @@ export default {
       cliLogger.log('state', `[phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase}`);
     }
 
-    return { state_updated: true, state: agent.state };
+    // Filter internal fields (prefixed with _) from the result shown to the LLM.
+    // Internal fields like _skillContents are used by the runtime but shouldn't bloat the user prompt.
+    const visibleState = {};
+    for (const [k, v] of Object.entries(agent.state)) {
+      if (!k.startsWith('_')) visibleState[k] = v;
+    }
+    return { state_updated: true, state: visibleState };
   }
 };

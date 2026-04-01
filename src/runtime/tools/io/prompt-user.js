@@ -27,7 +27,9 @@ When you need to explain something and ask a follow-up:
 - put the explanation in "message"
 - put the single question in "question"
 
-Do not print a question separately before prompt_user.`,
+Do not print a question separately before prompt_user.
+
+IMPORTANT: When presenting options that involve technical decisions (tech stacks, frameworks, databases, deployment, architecture, etc.), do NOT use prompt_user — use prompt_form instead. prompt_form supports "description" and "recommended" fields on each option, so the user sees a brief explanation of what each choice means. The user may not be technical. Always include a "Let me decide" / "No preference" option.`,
   thinkingHint: 'Processing your answer',
   // In non-interactive mode, hide when there's nothing queued to consume.
   // Visible while the initial prompt is still in the queue; hidden after it's consumed.

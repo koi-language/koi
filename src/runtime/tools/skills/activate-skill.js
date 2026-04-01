@@ -61,13 +61,21 @@ export default {
       return { activated: false, error: `Failed to read ${skill.location}: ${err.message}` };
     }
 
-    // Add to agent state.skills (dedup)
+    // Store skill name in agent state (for prompt display).
+    // Skill CONTENT is injected by the runtime directly into the system prompt —
+    // it does NOT go through state to avoid bloating the user prompt with duplicate content.
     const currentSkills = Array.isArray(agent.state?.skills) ? [...agent.state.skills] : [];
     if (!currentSkills.includes(skillName)) {
       currentSkills.push(skillName);
     }
 
-    // Update agent state
+    // Store content in state._skillContents (internal, not serialized to user prompt).
+    // The runtime reads this for system prompt injection.
+    const currentContents = agent.state?._skillContents || {};
+    currentContents[skillName] = content;
+    agent.state._skillContents = currentContents;
+
+    // Only names go to state
     await agent.callAction('update_state', { updates: { skills: currentSkills } });
 
     // List resources in the skill directory

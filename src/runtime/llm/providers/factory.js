@@ -119,8 +119,23 @@ function _resolveLLM(req) {
   const boosts = session ? _calculateDifficultyBoosts(session) : { total: 0, parts: [] };
   const effectiveDifficulty = Math.min(100, baseDifficulty + boosts.total);
 
+  // ── Filter out declined providers (models that refused tasks at this risk level) ────
+  const _declined = session?._declinedProviders; // Map<provider, { risk, until }>
+  const _currentRisk = profile?.risk ?? 0;
+  const _now = Date.now();
+  const _filteredProviders = _declined?.size > 0
+    ? availableProviders.filter(p => {
+        const entry = _declined.get(p);
+        if (!entry) return true;
+        // Cooldown expired → provider is available again
+        if (_now >= entry.until) { _declined.delete(p); return true; }
+        // Exclude if current risk >= the risk level they refused at
+        return _currentRisk < entry.risk;
+      })
+    : availableProviders;
+
   // ── Select best model ──────────────────────────────────────────────────
-  const selected = selectAutoModel(taskType, effectiveDifficulty, availableProviders, { requiresImage, minContextK, profile });
+  const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, minContextK, profile });
   if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
   const provider = selected.provider;
   const model    = selected.model;

@@ -17,7 +17,7 @@ import { channel } from '../../io/channel.js';
 export default {
   type: 'add_dependency',
   intent: 'add_dependency',
-  description: 'Register a local project directory as a development dependency. Use when the user mentions a related project (e.g. "../backend", "../shared-lib") that should be indexed and searchable. Also supports "list" and "remove" operations. Fields: "path" (directory), "name" (display name), "reason" (why it\'s a dependency), "operation" (add|remove|list, default: add)',
+  description: 'Register a LOCAL SIBLING PROJECT DIRECTORY as a workspace dependency so it can be indexed and searched. This is NOT for installing packages (npm, pip, flutter pub, etc.) — use shell for that. Only for linking related local projects like "../backend", "../shared-lib". Fields: "path" (directory path to sibling project), "name" (display name), "reason" (why), "operation" (add|remove|list, default: add)',
   thinkingHint: (action) => `Registering dependency: ${action.path || 'listing'}`,
   permission: 'read',
   hidden: false,
@@ -76,6 +76,16 @@ export default {
         channel.print(`Dependency removed: ${action.path}`);
       }
       return { success: result.removed, ...result };
+    }
+
+    // Reject if the path is inside the current project (implicit, not a dependency)
+    const resolved = path.resolve(action.path);
+    const projRoot = path.resolve(projectDir);
+    if (resolved === projRoot || resolved.startsWith(projRoot + path.sep)) {
+      return {
+        success: false,
+        error: `"${action.path}" is inside the current project — it's already indexed implicitly. add_dependency is only for EXTERNAL sibling projects (e.g. "../backend"). To install packages, use shell (npm install, flutter pub add, pip install, etc.).`,
+      };
     }
 
     // Default: add

@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 import { t } from '../../i18n.js';
+import { getProjectMap, ensureProjectScan } from '../../code/project-map.js';
 
 export default {
   type: 'project_info',
@@ -45,7 +46,6 @@ export default {
     // ── Stack & project map ──────────────────────────────────────────
     if (section === 'all' || section === 'stack') {
       try {
-        const { getProjectMap } = await import('../code/project-map.js');
         result.projectMap = await getProjectMap(projectRoot);
       } catch (err) {
         result.projectMap = `Error: ${err.message}`;
@@ -60,7 +60,6 @@ export default {
           result.structure = fs.readFileSync(scanPath, 'utf8');
         } else {
           // Generate on demand if not cached
-          const { ensureProjectScan } = await import('../code/project-map.js');
           result.structure = await ensureProjectScan(projectRoot);
         }
       } catch (err) {

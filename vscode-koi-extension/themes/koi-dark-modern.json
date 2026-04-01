@@ -46,10 +46,41 @@
       "name": "Koi - Prompt Directives",
       "scope": [
         "keyword.control.directive.koi",
-        "punctuation.definition.directive.koi"
+        "punctuation.definition.directive.koi",
+        "punctuation.definition.condition.begin.koi",
+        "punctuation.definition.condition.end.koi",
+        "keyword.operator.assignment.koi",
+        "keyword.operator.comparison.koi",
+        "keyword.operator.expression.koi",
+        "punctuation.section.block.begin.koi",
+        "punctuation.section.block.end.koi"
       ],
       "settings": {
         "foreground": "#f472b6"
+      }
+    },
+    {
+      "name": "Koi - Directive Expression",
+      "scope": [
+        "variable.other.expression.koi",
+        "meta.directive.condition.koi"
+      ],
+      "settings": {
+        "foreground": "#c4b5fd"
+      }
+    },
+    {
+      "name": "Koi - Directive Variable",
+      "scope": "variable.other.directive.koi",
+      "settings": {
+        "foreground": "#67e8f9"
+      }
+    },
+    {
+      "name": "Koi - Directive Function Calls",
+      "scope": "entity.name.function.expression.koi",
+      "settings": {
+        "foreground": "#fbbf24"
       }
     },
     {

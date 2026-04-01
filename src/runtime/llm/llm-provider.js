@@ -23,6 +23,7 @@ import { costCenter, getModelCaps } from './cost-center.js';
 
 import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
 import { channel } from '../io/channel.js';
+import { getProjectMap as _getProjectMap } from '../code/project-map.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -587,13 +588,18 @@ export class LLMProvider {
    * Falls back to keyword heuristic if the LLM call fails.
    */
   async _inferTaskProfile(playbookText, args, agentName) {
-    // The classifier should focus on the TASK (args), not the agent's playbook.
-    const argsStr = args ? JSON.stringify(args) : '';
-    const taskDescription = [
-      agentName ? `Agent: ${agentName}` : '',
-      argsStr ? `Task: ${argsStr.substring(0, 1000)}` : '',
-      !argsStr && playbookText ? `Role: ${playbookText.substring(0, 300)}...` : '',
-    ].filter(Boolean).join('\n');
+    // The classifier should focus on the TASK content, not metadata.
+    // Extract the actual task text from args — avoid passing raw JSON to the classifier
+    // as it confuses cheap models into misclassifying.
+    const _taskText = args
+      ? (args.userRequest || args.answer || args.description || args.instruction ||
+         args.subject || args.question || args.agentRole ||
+         (args.pendingTasks ? `Pending tasks: ${args.pendingTasks}` : null) ||
+         JSON.stringify(args).substring(0, 500))
+      : null;
+    const taskDescription = _taskText
+      ? `Task: ${_taskText.substring(0, 1000)}`
+      : (playbookText ? `Role: ${playbookText.substring(0, 300)}` : 'No task provided');
 
     const prompt = `Pick the ONE category (A-Z) that best matches this task. Return ONLY: {"cat":"X"}
 
@@ -613,7 +619,7 @@ K: Add basic UI element — new button, form field, simple component, style chan
 L: Add form validation, input handling, basic interactivity
 M: Implement a small feature (one file, straightforward) — add an endpoint, add a column, add a filter
 N: Review or audit code — PR review, security review, code quality check
-O: Run CLI commands or interact with external services — railway, docker, kubectl, aws, heroku, ssh, checking env vars, viewing logs, managing deploys
+O: Run CLI commands, launch apps, interact with external services — railway, docker, kubectl, aws, heroku, ssh, emulators, simulators, dev servers, checking env vars, viewing logs, managing deploys, running/testing the app
 P: Investigate infrastructure / DevOps issue — "why aren't emails sending?", "check production logs", "debug the deploy pipeline"
 Q: Implement a feature touching 2-3 files — new API endpoint with DB + route + handler
 R: Integrate an external service — Stripe, SendGrid, OAuth provider, S3, push notifications
@@ -625,6 +631,8 @@ W: Refactor across multiple files — rename a concept everywhere, extract a mod
 X: Debug a complex issue — race condition, intermittent failure, production-only bug, performance problem
 Y: Design architecture — system design, API design, multi-service coordination, scalability planning
 Z: Expert-level engineering — compiler, distributed systems, CRDT, custom protocol, AST manipulation
+
+If NONE of the above categories fit, pick the closest one. Never return a category with scores below 40 for a real task.
 
 EXAMPLES (3+ per category):
 
@@ -642,7 +650,7 @@ K: "add a logout button to the navbar", "add a loading spinner", "create a 404 p
 L: "add email validation to the signup form", "validate the phone number format", "add a character counter to the textarea", "make the form show inline errors"
 M: "add a GET /health endpoint", "add a 'role' column to the users table", "add a search filter to the user list", "create a simple CRUD for tags"
 N: "review this pull request", "check this code for security issues", "audit the API for OWASP top 10", "review the database queries for N+1 problems"
-O: "run railway variables to check the config", "docker compose logs backend", "check if the SSL cert is valid", "list running pods in staging", "ssh into the server and check disk space", "show me the environment variables on production", "restart the backend service on Railway"
+O: "run railway variables to check the config", "docker compose logs backend", "check if the SSL cert is valid", "list running pods in staging", "ssh into the server and check disk space", "show me the environment variables on production", "restart the backend service on Railway", "run the app in an iOS simulator", "launch the app on an Android emulator", "start the dev server", "run flutter run", "npm start"
 P: "why aren't password reset emails arriving?", "the deploy failed, investigate", "production API is slow, check the logs", "the CI pipeline broke after the last merge", "find out why the Docker build takes 20 minutes"
 Q: "add user profile endpoint with DB + route + tests", "implement email verification flow", "add a comments feature to posts", "create an invite system with token generation"
 R: "integrate Stripe for payments", "add Google OAuth login", "set up SendGrid for transactional emails", "integrate S3 for file uploads", "add Slack notifications"
@@ -661,32 +669,32 @@ ${taskDescription}`;
 
     // Category → profile mapping
     const CATEGORY_PROFILES = {
-      A: { code: 0,   reasoning: 10,  thinking: false },
-      B: { code: 0,   reasoning: 10,  thinking: false },
-      C: { code: 0,   reasoning: 30,  thinking: false },
-      D: { code: 0,   reasoning: 40,  thinking: false },
-      E: { code: 40,  reasoning: 10,  thinking: false },
-      F: { code: 40,  reasoning: 30,  thinking: false },
-      G: { code: 50,  reasoning: 50,  thinking: true },
-      H: { code: 60,  reasoning: 60,  thinking: true },
-      I: { code: 60,  reasoning: 60,  thinking: true },
-      J: { code: 60,  reasoning: 50,  thinking: true },
-      K: { code: 50,  reasoning: 30,  thinking: true },
-      L: { code: 50,  reasoning: 40,  thinking: true },
-      M: { code: 60,  reasoning: 50,  thinking: true },
-      N: { code: 60,  reasoning: 60,  thinking: true },
-      O: { code: 50,  reasoning: 70,  thinking: true },
-      P: { code: 60,  reasoning: 75,  thinking: true },
-      Q: { code: 70,  reasoning: 60,  thinking: true },
-      R: { code: 70,  reasoning: 70,  thinking: true },
-      S: { code: 70,  reasoning: 70,  thinking: true },
-      T: { code: 60,  reasoning: 70,  thinking: true },
-      U: { code: 60,  reasoning: 70,  thinking: true },
-      V: { code: 70,  reasoning: 60,  thinking: true },
-      W: { code: 75,  reasoning: 70,  thinking: true },
-      X: { code: 80,  reasoning: 80,  thinking: true },
-      Y: { code: 60,  reasoning: 85,  thinking: true },
-      Z: { code: 90,  reasoning: 85,  thinking: true },
+      A: { code: 0,   reasoning: 10,  thinking: false, risk: 0 },
+      B: { code: 0,   reasoning: 10,  thinking: false, risk: 0 },
+      C: { code: 0,   reasoning: 30,  thinking: false, risk: 0 },
+      D: { code: 0,   reasoning: 40,  thinking: false, risk: 0 },
+      E: { code: 40,  reasoning: 10,  thinking: false, risk: 10 },
+      F: { code: 40,  reasoning: 30,  thinking: false, risk: 10 },
+      G: { code: 50,  reasoning: 50,  thinking: true,  risk: 10 },
+      H: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
+      I: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
+      J: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
+      K: { code: 50,  reasoning: 30,  thinking: true,  risk: 10 },
+      L: { code: 50,  reasoning: 40,  thinking: true,  risk: 10 },
+      M: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
+      N: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
+      O: { code: 50,  reasoning: 70,  thinking: true,  risk: 70 },
+      P: { code: 60,  reasoning: 75,  thinking: true,  risk: 60 },
+      Q: { code: 70,  reasoning: 60,  thinking: true,  risk: 30 },
+      R: { code: 70,  reasoning: 70,  thinking: true,  risk: 40 },
+      S: { code: 70,  reasoning: 70,  thinking: true,  risk: 30 },
+      T: { code: 60,  reasoning: 70,  thinking: true,  risk: 10 },
+      U: { code: 60,  reasoning: 70,  thinking: true,  risk: 20 },
+      V: { code: 70,  reasoning: 60,  thinking: true,  risk: 20 },
+      W: { code: 75,  reasoning: 70,  thinking: true,  risk: 20 },
+      X: { code: 80,  reasoning: 80,  thinking: true,  risk: 30 },
+      Y: { code: 60,  reasoning: 85,  thinking: true,  risk: 10 },
+      Z: { code: 90,  reasoning: 85,  thinking: true,  risk: 20 },
     };
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
@@ -742,11 +750,11 @@ ${taskDescription}`;
           const cat = String(json.cat).toUpperCase().charAt(0);
           const catProfile = CATEGORY_PROFILES[cat];
           if (catProfile) {
-            const { code: codeScore, reasoning: reasoningScore, thinking: needsThinking } = catProfile;
+            const { code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel = 0 } = catProfile;
             const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
             const difficulty = Math.max(codeScore, reasoningScore);
-            const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking };
-            channel.log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} thinking=${needsThinking}`);
+            const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel };
+            channel.log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} thinking=${needsThinking} risk=${riskLevel}`);
             return profile;
           }
           channel.log('llm', `[classify] Unknown category "${cat}" from ${candidate.model}`);
@@ -921,11 +929,22 @@ ${taskDescription}`;
           }
         }
       }
+      // Inject active skill contents into the static part of the prompt.
+      // Skills are stable once activated — they belong in the cached prefix.
+      // Content is stored in agent.state._skillContents (per-invocation, not serialized to user prompt).
+      const _skillContents = agent.state?._skillContents;
+      const _skillBlock = _skillContents && Object.keys(_skillContents).length > 0
+        ? '\n\n# Active Skill Instructions\n\n' + Object.entries(_skillContents).map(
+            ([name, content]) => `## Skill: ${name}\n\n${content}`
+          ).join('\n\n---\n\n')
+        : '';
+
       // Structured cache-aware prompt: store boundary for cache_control injection
       if (typeof systemPromptResult === 'object' && systemPromptResult?._cacheKey !== undefined) {
-        const fullPrompt = systemPromptResult.static + '\n\n' + systemPromptResult.dynamic;
+        const staticWithSkills = systemPromptResult.static + _skillBlock;
+        const fullPrompt = staticWithSkills + '\n\n' + systemPromptResult.dynamic;
         contextMemory.setSystem(fullPrompt);
-        session._promptCacheBoundary = systemPromptResult.static.length;
+        session._promptCacheBoundary = staticWithSkills.length;
         session._promptCacheKey = systemPromptResult._cacheKey;
       } else {
         // Safety: ensure we always pass a string to setSystem
@@ -933,7 +952,7 @@ ${taskDescription}`;
           : typeof systemPromptResult === 'object' && systemPromptResult?.static
             ? [systemPromptResult.static, systemPromptResult.dynamic].filter(Boolean).join('\n\n')
             : String(systemPromptResult || '');
-        contextMemory.setSystem(_sysStr);
+        contextMemory.setSystem(_sysStr + _skillBlock);
         session._promptCacheBoundary = 0;
         session._promptCacheKey = null;
       }
@@ -1126,6 +1145,7 @@ CRITICAL RULES:
       // Reclassify when the user sent a new message — flag is set by prompt_user action in agent.js
       const _isNewUserMessage = !!session._needsReclassify;
       if (_isNewUserMessage) session._needsReclassify = false;
+      channel.log('llm', `[classify] Reclassify check: needsReclassify=${_isNewUserMessage}, hasProfile=${!!session._autoProfile}, isFirstCall=${isFirstCall}, isDelegateReturn=${_isDelegateReturn}`);
       // Agent requested reclassification via reclassify_complexity action
       const _agentRequestedReclassify = _lastAction?.action?.intent === 'reclassify_complexity';
       // Detect loops: same action repeated 3+ times → model is too weak, reclassify with escalation context
@@ -1547,6 +1567,8 @@ CRITICAL RULES:
       if (buffered) _processStreamingChars(buffered);
     };
 
+    let _complianceAborted = false;
+
     const _onStreamChunk = (_delta, estOutTokens) => {
       _markContentReceived(); // Real content arrived — cancel total timeout
       _resetTimer();          // Reset inactivity timer
@@ -1555,6 +1577,15 @@ CRITICAL RULES:
       if (_spState === 'done' || _spState === 'skip') return;
 
       _spBuf += _delta;
+
+      // Early compliance detection: if we see "wont_do" in the stream, abort immediately.
+      // This saves tokens — no need to wait for the full response.
+      if (!_complianceAborted && _spBuf.includes('"wont_do"')) {
+        _complianceAborted = true;
+        _spState = 'skip';
+        channel.log('llm', `[compliance] Early abort: detected "wont_do" in stream`);
+        return;
+      }
 
       if (_spState === 'init') {
         // Wait for intent field
@@ -1749,6 +1780,13 @@ CRITICAL RULES:
     }
 
     channel.log('llm', `Response (${responseText.length} chars, ↑${usage.input} ↓${usage.output} tokens): ${responseText.substring(0, 200)}${responseText.length > 200 ? '...' : ''}`);
+
+    // If compliance abort was detected during streaming, return a synthetic refused action
+    // without parsing the full response. This saves processing and prevents executing refused content.
+    if (_complianceAborted) {
+      channel.log('llm', `[compliance] Returning synthetic refused action (stream aborted on wont_do)`);
+      return { actionType: 'direct', intent: 'print', message: '', _refused: true };
+    }
 
     // Parse the response into a single action
     const action = await this._parseReactiveResponse(responseText, agent);
@@ -2028,11 +2066,26 @@ CRITICAL RULES:
       return actions;
     };
 
+    // Extract user_request_compliance from first batch element (if present).
+    // This is a separate declaration from the actions — strip it before processing.
+    const _extractCompliance = (items) => {
+      if (items.length > 0 && items[0].user_request_compliance) {
+        const compliance = items[0].user_request_compliance;
+        items.shift(); // remove compliance declaration from actions
+        if (compliance !== 'will_do') {
+          // Mark all remaining actions as refused
+          for (const a of items) a._refused = true;
+          channel.log('llm', `[compliance] Model declared "${compliance}" for user request`);
+        }
+      }
+      return items;
+    };
+
     // Handle batched actions: { "batch": [action1, action2, ...] }
     // Items may be regular actions OR { "parallel": [...] } groups.
     if (parsed.batch && Array.isArray(parsed.batch) && parsed.batch.length > 0) {
       this.logDebug(`Reactive response batched ${parsed.batch.length} actions`);
-      let actions = parsed.batch.map(a => this._normalizeBatchItem(a));
+      let actions = _extractCompliance(parsed.batch).map(a => this._normalizeBatchItem(a));
       _injectPreamble(actions);
       return actions.length === 1 ? actions[0] : actions;
     }
@@ -2042,7 +2095,7 @@ CRITICAL RULES:
       if (parsed.length === 0) {
         throw new Error('Reactive response was an empty array');
       }
-      let actions = parsed.map(a => this._normalizeReactiveAction(a));
+      let actions = _extractCompliance(parsed).map(a => this._normalizeReactiveAction(a));
       _injectPreamble(actions);
       return actions.length === 1 ? actions[0] : actions;
     }
@@ -2095,6 +2148,17 @@ CRITICAL RULES:
    * Normalize a single action object from a reactive response.
    */
   _normalizeReactiveAction(parsed) {
+    // Strip compliance fields (batch-level or legacy inline)
+    if (parsed.user_request_compliance) {
+      if (parsed.user_request_compliance !== 'will_do') parsed._refused = true;
+      delete parsed.user_request_compliance;
+    }
+    if (parsed._compliance) {
+      if (parsed._compliance !== 'will_do') parsed._refused = true;
+      delete parsed._compliance;
+    }
+
+
     // Safety net: if actionType is not "direct"/"delegate", the LLM put the intent there
     if (parsed.actionType && parsed.actionType !== 'direct' && parsed.actionType !== 'delegate') {
       if (!parsed.intent) {
@@ -2208,9 +2272,8 @@ You are running in non-interactive (headless) mode. There is no human to answer 
     // ── Project Map (workspace layout for all agents) ──
     let projectMapBlock = '';
     try {
-      const { getProjectMap } = await import('../code/project-map.js');
       const projectRoot = process.env.KOI_PROJECT_ROOT || cwd;
-      projectMapBlock = await getProjectMap(projectRoot);
+      projectMapBlock = await _getProjectMap(projectRoot);
     } catch { /* non-fatal */ }
 
     // ── Prompt layout: STATIC content first (cacheable), DYNAMIC content last ──

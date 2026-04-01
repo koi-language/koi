@@ -14,6 +14,11 @@ import { channel } from '../io/channel.js';
 // so concurrent delegates to the same agent don't produce false "infinite loop" errors.
 const _callStackStorage = new AsyncLocalStorage();
 
+// Per-invocation state: each delegate invocation of an agent gets its own isolated state
+// object, so parallel delegates of the same agent don't share/overwrite each other's phase.
+// The main (non-delegate) agent uses this.state directly.
+const _invocationStateStorage = new AsyncLocalStorage();
+
 // Per-slot context memory map: parallel delegates of the same agent instance each
 // get their own ContextMemory. Keyed by slot ID (from channel.getCurrentSlotId()).
 // The main (non-delegate) agent uses the '_main' key.
@@ -173,12 +178,32 @@ export class Agent {
     this.usesTeams = config.usesTeams || []; // Teams this agent uses as a client
     this.usesMCPNames = config.usesMCP || []; // MCP server names this agent uses
     this.llm = config.llm || { provider: 'auto', model: 'auto', temperature: 0.2 };
-    this.state = config.state || {};
+    this._rootState = config.state || {};
     this.playbooks = config.playbooks || {};
     this.resilience = config.resilience || null;
     this.amnesia = config.amnesia || false;
     this.exposesMCP = config.exposesMCP || false;
     this.contextMemoryState = null; // Serialized ContextMemory state across playbook executions
+
+    // state getter/setter: uses per-invocation state when inside a delegation,
+    // falls back to root state for the main (non-delegated) agent.
+    Object.defineProperty(this, 'state', {
+      get() {
+        const invState = _invocationStateStorage.getStore();
+        return invState ?? this._rootState;
+      },
+      set(val) {
+        const invState = _invocationStateStorage.getStore();
+        if (invState) {
+          // Inside a delegation: update the invocation-local state object in place
+          Object.keys(invState).forEach(k => delete invState[k]);
+          Object.assign(invState, val);
+        } else {
+          this._rootState = val;
+        }
+      },
+      configurable: true,
+    });
 
     // Never allow peers to be null - use a proxy that throws helpful error
     if (config.peers) {
@@ -365,10 +390,20 @@ export class Agent {
       });
     }
 
-    if (!_fromDelegation) {
-      channel.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${eventName}...\x1b[0m`);
+    // Delegated invocations run inside an isolated state context so parallel
+    // delegates of the same agent don't share/overwrite each other's phase.
+    if (_fromDelegation) {
+      const freshState = {};
+      return _invocationStateStorage.run(freshState, () =>
+        this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn)
+      );
     }
 
+    channel.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${eventName}...\x1b[0m`);
+    return this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn);
+  }
+
+  async _handleInner(eventName, args, _fromDelegation, _parentAnswerFn) {
     const handler = this.handlers[eventName];
     if (!handler) {
       channel.clear();
@@ -1042,6 +1077,26 @@ export class Agent {
 
       // Process each action in the batch sequentially.
       // Items with { parallel: [...] } are executed concurrently via Promise.all.
+      // ── COMPLIANCE CHECK: detect model refusal ────────────────────────────
+      // If any action in the batch has _refused=true (from _compliance:"refuse"),
+      // discard the entire batch, exclude this provider, and retry with another model.
+      const _hasRefusal = actionBatch.some(a => a._refused) ||
+        (actionBatch.some(a => a.parallel && Array.isArray(a.parallel) && a.parallel.some(p => p._refused)));
+      if (_hasRefusal && this.llmProvider?._autoMode) {
+        const _currentProvider = session._autoProvider || this.llmProvider.provider;
+        const _currentRisk = session._autoProfile?.risk ?? 0;
+        if (!session._declinedProviders) session._declinedProviders = new Map(); // provider → { risk, until }
+        const _cooldownMs = Math.min(60, Math.ceil(_currentRisk / 2)) * 60 * 1000; // risk/2 minutes, max 1 hour
+        const _prev = session._declinedProviders.get(_currentProvider);
+        const _newRisk = Math.max(_prev?.risk ?? 0, _currentRisk);
+        session._declinedProviders.set(_currentProvider, { risk: _newRisk, until: Date.now() + _cooldownMs });
+        const _cooldownMins = Math.min(60, Math.ceil(_currentRisk / 2));
+        channel.log('agent', `${this.name}: Model refused task (provider: ${_currentProvider}, risk: ${_currentRisk}, cooldown: ${_cooldownMins}min). Retrying with different provider.`);
+        channel.printCompact(`\x1b[33m⚠ Model declined — trying another provider\x1b[0m`);
+        // Don't record the refusal in action history — retry as if it never happened
+        continue; // skip to next while loop iteration → new LLM call with excluded provider
+      }
+
       let terminated = false;
       for (const action of actionBatch) {
         if (!session.canContinue()) break;
@@ -1158,36 +1213,6 @@ export class Agent {
         // CHECK TERMINAL ACTION
         if ((action.intent || action.type) === 'return') {
           let returnData = action.data || {};
-
-          // ── SHELL FAILURE GUARD ──────────────────────────────────────────
-          // If the agent claims success but recent shell actions failed,
-          // bounce the agent back to reconsider instead of silently propagating
-          // a false-positive result to the caller.
-          if (returnData.success === true && isDelegate) {
-            const recentShellFailures = session.actionHistory
-              .filter(e => {
-                const eIntent = e.action?.intent || e.action?.type;
-                return eIntent === 'shell' && e.result && (e.result.success === false || (e.result.exitCode != null && e.result.exitCode !== 0));
-              });
-            if (recentShellFailures.length > 0) {
-              const lastFail = recentShellFailures[recentShellFailures.length - 1];
-              const exitCode = lastFail.result?.exitCode || '?';
-              // Only bounce once to avoid infinite loops
-              if (!session._shellFailureGuardTriggered) {
-                session._shellFailureGuardTriggered = true;
-                channel.log('agent', `${this.name}: Shell failure guard — agent returned success:true but shell exited with code ${exitCode}. Bouncing back.`);
-                session.recordAction(action, returnData);
-                contextMemory.add(
-                  'user',
-                  `⚠️ RETURN REJECTED: You returned { "success": true } but a shell command in this session failed with exit code ${exitCode}. A failed shell command (especially a test run) means the task did NOT succeed. Review the shell output above and return { "success": false } with the actual error, or fix the issue and re-run the command before claiming success.`,
-                  `Return rejected: shell failed (exit code ${exitCode}) but agent claimed success`,
-                  null
-                );
-                thinkingHint = _h('reconsidering', 'Reconsidering');
-                continue;
-              }
-            }
-          }
 
           // Apply state updates if present
           if (returnData && typeof returnData === 'object' && (returnData.state_updates || returnData.stateUpdates)) {
@@ -1449,6 +1474,21 @@ export class Agent {
           }
 
           session.recordAction(action, result);
+
+          // ── Ephemeral delegate info ──────────────────────────────────────
+          // When a delegate returns, store ephemeral info so compose templates
+          // can use @if (delegate) { ... } to show context-specific instructions.
+          // Cleared at the start of the next LLM call (see _buildReactiveSystemPrompt).
+          if (action.actionType === 'delegate') {
+            const _delegateAgent = (action.intent || '').split('::')[0];
+            const _delegateEvent = (action.intent || '').split('::')[1] || '';
+            this._ephemeralDelegate = {
+              agent: _delegateAgent,
+              event: _delegateEvent,
+              success: result?.success !== false && !result?.error,
+              data: result || null,
+            };
+          }
 
           // ── Auto-register external project dependencies ──────────────────
           // When any action touches a file outside the project root (read_file,
@@ -2682,9 +2722,38 @@ IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the proces
         args: _composeArgs || {},
         state: this.state || {},
         agentName: this.name,
-        userMessage: this._lastUserMessage ?? _composeArgs?.goal ?? null,
-        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1'
+        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1',
+        // User object — accessible as user.message, user.language, user.email, etc.
+        user: {
+          message: this._lastUserMessage ?? _composeArgs?.goal ?? null,
+          language: this.state?.userLanguage || null,
+          email: process.env.KOI_LOGIN_EMAIL || null,
+          name: process.env.KOI_LOGIN_NAME || null,
+          plan: process.env.KOI_PLAN_NAME || null,
+        },
       };
+
+      // Inject team agent variables — each team member gets a variable with ephemeral .result
+      // Usage in .koi: @if (projectOnboarding.result) { ... projectOnboarding.result.data ... }
+      const _ephemeral = this._ephemeralDelegate;
+      const _allTeams = [...(this.usesTeams || []), ...(this.peers ? [this.peers] : [])];
+      for (const team of _allTeams) {
+        if (!team?.members) continue;
+        for (const [memberKey, memberAgent] of Object.entries(team.members)) {
+          if (memberAgent === this) continue; // skip self
+          context[memberKey] = {
+            name: memberAgent.name || memberKey,
+            // .result is ephemeral — only set when this specific agent just returned
+            result: (_ephemeral && _ephemeral.agent === memberKey) ? {
+              success: _ephemeral.success,
+              data: _ephemeral.data,
+              event: _ephemeral.event,
+            } : null,
+          };
+        }
+      }
+      // Clear ephemeral delegate after injecting — it's one-shot.
+      if (this._ephemeralDelegate) this._ephemeralDelegate = null;
       try {
         const result = await composeDef.resolve(resolvedFragments, callAction, context);
         return this._normalizeComposeResult(result);

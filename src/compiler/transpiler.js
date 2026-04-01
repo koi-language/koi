@@ -613,9 +613,24 @@ export class KoiTranspiler {
     const taintedVars = new Set([
       'state',        // changes (phase transitions, permissions) — but discriminator handles phase
       'args',         // task args — can change on delegation
-      'userMessage',  // changes every turn
+      'user',         // user.message changes every turn, user.language can change
       // NOT tainted: nonInteractive (env var, constant), agentName (constant)
     ]);
+
+    // Detect team agent variables used in the template (e.g., projectOnboarding.result)
+    // These are ephemeral — only populated when that agent just returned.
+    const agentVars = new Set();
+    const _reservedVars = new Set(['state', 'args', 'user', 'agentName', 'nonInteractive', 'callAction', 'context']);
+    for (const rawLine of lines) {
+      const matches = rawLine.matchAll(/\b(\w+)\.result\b/g);
+      for (const m of matches) {
+        const varName = m[1];
+        if (!_reservedVars.has(varName)) {
+          agentVars.add(varName);
+          taintedVars.add(varName);
+        }
+      }
+    }
 
     // First pass: collect @let assignments and propagate taint
     for (const rawLine of lines) {
@@ -668,14 +683,14 @@ export class KoiTranspiler {
     // Pick the discriminator with the most variants (typically 'phase')
     let discriminator = null;
     for (const [varName, values] of candidates) {
-      if (values.size >= 2) {
+      if (values.size >= 1) {
         if (!discriminator || values.size > discriminator.values.length) {
           discriminator = { varName, values: [...values] };
         }
       }
     }
 
-    return { taintedVars, discriminator };
+    return { taintedVars, discriminator, agentVars };
   }
 
   /**
@@ -701,11 +716,29 @@ export class KoiTranspiler {
    */
   _compileComposeTemplate(template, fragmentNames) {
     const lines = template.split('\n');
-    const { taintedVars, discriminator } = this._analyzeTaint(lines);
-    const cacheAware = !!discriminator;
+    const { taintedVars, discriminator, agentVars } = this._analyzeTaint(lines);
+    // Enable cache-aware mode (static/dynamic split) whenever there are tainted variables,
+    // not just when a discriminator is detected. This allows prompt caching even for agents
+    // with a single phase — their static content (rules, examples) gets cached.
+    const hasTaintedContent = lines.some(l => {
+      const t = l.trim();
+      // @if with tainted condition → there IS dynamic content
+      const ifMatch = t.match(/^@if\s*\((.+)\)\s*\{$/);
+      if (ifMatch && this._isTainted(ifMatch[1], taintedVars)) return true;
+      // {{expr}} with tainted variable
+      if (/\{\{.+?\}\}/.test(t)) {
+        const exprs = [...t.matchAll(/\{\{(.+?)\}\}/g)].map(m => m[1]);
+        if (exprs.some(e => this._isTainted(e, taintedVars))) return true;
+      }
+      return false;
+    });
+    const cacheAware = hasTaintedContent;
 
+    // Build destructuring with all known variables + any agent variables found in template
+    const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user'];
+    const _allVars = [..._baseVars, ...agentVars];
     const jsLines = [
-      'const { args, state, agentName, userMessage, nonInteractive } = context || {};',
+      `const { ${_allVars.join(', ')} } = context || {};`,
       cacheAware ? 'const __staticParts = [];' : '',
       cacheAware ? 'const __dynamicParts = [];' : '',
       cacheAware ? 'let __cacheKey = null;' : '',
@@ -752,7 +785,7 @@ export class KoiTranspiler {
           jsLines.push(`}`);
         }
         // Set cache key when the discriminator variable is assigned
-        if (cacheAware && varName === discriminator.varName) {
+        if (cacheAware && discriminator && varName === discriminator.varName) {
           jsLines.push(`__cacheKey = ${varName};`);
         }
         continue;
@@ -776,10 +809,10 @@ export class KoiTranspiler {
           }
         }
 
-        // Nested @if inside a discriminator branch: if condition is tainted,
-        // push onto dynamic stack (content inside this @if goes to dynamic,
-        // but content AFTER the closing } returns to static)
-        if (cacheAware && inDiscriminatorBranch && this._isTainted(cond, taintedVars)) {
+        // If condition is tainted, push onto dynamic stack (content inside goes to dynamic,
+        // but content AFTER the closing } returns to static).
+        // Works both inside discriminator branches and at top level (no discriminator).
+        if (cacheAware && this._isTainted(cond, taintedVars)) {
           jsLines.push(`__dynStack.push(true);`);
         }
 
@@ -792,6 +825,10 @@ export class KoiTranspiler {
       const elseIfMatch = trimmed.match(/^@else\s+if\s*\((.+)\)\s*\{$/);
       if (elseIfMatch) {
         flushText();
+        // Remove any dynStack pop that was inserted after the preceding } (it's not a final close)
+        if (cacheAware && jsLines.length > 0 && jsLines[jsLines.length - 1].includes('__dynStack')) {
+          jsLines.pop(); // remove the pop
+        }
         if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
           jsLines[jsLines.length - 1] = `} else if (${elseIfMatch[1]}) {`;
         } else {
@@ -803,6 +840,10 @@ export class KoiTranspiler {
       // @else {  — replaces the preceding }
       if (/^@else\s*\{$/.test(trimmed)) {
         flushText();
+        // Remove any dynStack pop that was inserted after the preceding }
+        if (cacheAware && jsLines.length > 0 && jsLines[jsLines.length - 1].includes('__dynStack')) {
+          jsLines.pop();
+        }
         if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
           jsLines[jsLines.length - 1] = `} else {`;
         } else {
@@ -818,7 +859,7 @@ export class KoiTranspiler {
         continue;
       }
 
-      // } @else if (...) { on the same line
+      // } @else if (...) { on the same line — NOT a final close, so no pop
       const sameLineElseIfMatch = trimmed.match(/^\}\s*@else\s+if\s*\((.+)\)\s*\{$/);
       if (sameLineElseIfMatch) {
         flushText();
@@ -830,15 +871,16 @@ export class KoiTranspiler {
       if (trimmed === '}') {
         flushText();
         ifDepth = Math.max(0, ifDepth - 1);
+        jsLines.push('}');
         if (cacheAware && ifDepth === 0 && inDiscriminatorBranch) {
           inDiscriminatorBranch = false;
           jsLines.push(`__dynStack.length = 0;`); // reset after variant branch
-        } else if (cacheAware && inDiscriminatorBranch) {
-          // Pop the dynamic stack when closing a nested tainted @if
-          // Content after this } returns to static (if stack becomes empty)
+        } else if (cacheAware) {
+          // Pop the dynamic stack AFTER the closing } — not inside the block.
+          // If the condition was false, the block didn't execute, but we still
+          // need to pop the push that happened before the @if.
           jsLines.push(`if (__dynStack.length > 0) __dynStack.pop();`);
         }
-        jsLines.push('}');
         continue;
       }
 
@@ -976,6 +1018,18 @@ export class KoiTranspiler {
   }
 
   generateTeam(node) {
+    // Validate team member names — 'user' is reserved for the user context object
+    const _reserved = new Set(['user', 'state', 'args', 'agentName', 'nonInteractive', 'callAction', 'context']);
+    for (const member of node.members) {
+      const memberName = member.key?.name || member.key;
+      if (_reserved.has(memberName)) {
+        throw new Error(
+          `Team "${node.name.name}": member name "${memberName}" is a reserved word in Koi. ` +
+          `Reserved names: ${[..._reserved].join(', ')}. Please choose a different name.`
+        );
+      }
+    }
+
     let code = this.emit(`const ${node.name.name} = new Team('${node.name.name}', {\n`, node);
     this.indent++;
     for (const member of node.members) {
