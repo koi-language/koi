@@ -14,6 +14,7 @@ import { resolve as resolveModel } from '../../llm/providers/factory.js';
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { channel } from '../../io/channel.js';
 
 export default {
@@ -87,22 +88,58 @@ export default {
     channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 60)}..."`);
 
     // Call provider with normalized parameters
-    const result = await instance.generate(prompt, {
-      aspectRatio: action.aspectRatio || '1:1',
-      resolution: action.resolution || 'medium',
-      quality: action.quality || 'auto',
-      n: action.n || 1,
-      outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
-      referenceImages,
-    });
+    let result;
+    try {
+      result = await instance.generate(prompt, {
+        aspectRatio: action.aspectRatio || '1:1',
+        resolution: action.resolution || 'medium',
+        quality: action.quality || 'auto',
+        n: action.n || 1,
+        outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
+        referenceImages,
+      });
+    } catch (genErr) {
+      const errMsg = genErr.message || String(genErr);
+      // Detect common error types for the agent to interpret
+      const isContentPolicy = /safety|policy|nsfw|blocked|prohibited|inappropriate|harmful/i.test(errMsg);
+      const isTimeout = /timeout|timed out|deadline/i.test(errMsg);
+      const isQuota = /quota|rate.limit|429|too many/i.test(errMsg);
+      const errorType = isContentPolicy ? 'content_policy' : isTimeout ? 'timeout' : isQuota ? 'rate_limit' : 'generation_error';
+      return {
+        success: false,
+        provider: resolved.provider,
+        model: resolved.model,
+        error: errMsg,
+        errorType,
+        capabilities: caps,
+      };
+    }
 
-    // Save images to disk if saveTo is specified
-    if (action.saveTo && result.images?.length) {
-      const saveDir = path.resolve(action.saveTo);
+    // Always save images to disk — use saveTo if specified, otherwise temp dir
+    if (result.images?.length) {
+      const saveDir = path.join(os.tmpdir(), 'braxil-images');
       if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
       for (let i = 0; i < result.images.length; i++) {
         const img = result.images[i];
+        // Download from URL if no base64 data
+        if (!img.b64 && img.url) {
+          try {
+            const resp = await fetch(img.url);
+            if (resp.ok) {
+              const contentType = resp.headers.get('content-type') || '';
+              const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'png';
+              const filename = `image_${Date.now()}_${i}.${ext}`;
+              const filePath = path.join(saveDir, filename);
+              const buffer = Buffer.from(await resp.arrayBuffer());
+              fs.writeFileSync(filePath, buffer);
+              img.savedTo = filePath;
+              channel.log('image', `Downloaded and saved: ${filePath} (${(buffer.length / 1024).toFixed(0)}KB)`);
+            }
+          } catch (dlErr) {
+            channel.log('image', `Failed to download ${img.url}: ${dlErr.message}`);
+          }
+        }
         if (img.b64) {
           const ext = action.outputFormat || 'png';
           const filename = `image_${Date.now()}_${i}.${ext}`;
@@ -114,12 +151,35 @@ export default {
       }
     }
 
+    // Verify images were actually generated
+    const images = result.images || [];
+    const hasImages = images.length > 0 && images.some(img => img.url || img.b64 || img.savedTo);
+    if (!hasImages) {
+      return {
+        success: false,
+        provider: resolved.provider,
+        model: resolved.model,
+        error: result.error || result.message || 'Image generation returned no images. The model may have rejected the prompt (content policy) or timed out.',
+        capabilities: caps,
+      };
+    }
+
+    // Build a clean response with only saved paths (strip large b64 data)
+    const savedImages = images
+      .filter(img => img.savedTo || img.url)
+      .map(img => ({
+        ...(img.savedTo ? { savedTo: img.savedTo } : {}),
+        ...(img.url ? { url: img.url } : {}),
+        ...(img.width ? { width: img.width } : {}),
+        ...(img.height ? { height: img.height } : {}),
+      }));
+
     return {
       success: true,
       provider: resolved.provider,
       model: resolved.model,
-      capabilities: caps,
-      images: result.images,
+      imageCount: savedImages.length,
+      images: savedImages,
       usage: result.usage,
     };
   }

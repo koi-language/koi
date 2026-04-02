@@ -1487,29 +1487,55 @@ export class Agent {
             const _bgAgentName = intent.split('::')[0];
             channel.markSlotBackground?.(_bgAgentName);
             const _bgAction = { ...action };
-            if (!session._bgRunningCount) session._bgRunningCount = 0;
-            session._bgRunningCount++;
+            const _bgEntry = { promise: null, action: _bgAction, intent, startedAt: Date.now() };
+            const _bgContextMemory = contextMemory;
+            const _bgChannel = channel;
+            const _bgSession = session;
+            const _bgIntent = intent;
             const _bgPromise = this._executeAction(_bgAction, _bgAction, session.actionContext)
-              .then(({ result: bgResult }) => ({ action: _bgAction, result: bgResult, error: null }))
-              .catch(err => ({ action: _bgAction, result: null, error: err }))
+              .then(({ result: bgResult }) => {
+                // Inject result into context memory so System knows about it
+                const _agent = _bgIntent.split('::')[0];
+                const _preview = bgResult ? JSON.stringify(bgResult).substring(0, 300) : 'null';
+                _bgContextMemory.add('user',
+                  `Background task completed: ${_bgIntent} returned: ${_preview}\nInform the user about the result.`,
+                  `Background ${_agent} done`, null);
+                _bgSession.recordAction(_bgAction, bgResult);
+                _bgChannel.log('agent', `Background delegate completed: ${_bgIntent}`);
+                return { action: _bgAction, result: bgResult, error: null };
+              })
+              .catch(err => {
+                const _agent = _bgIntent.split('::')[0];
+                _bgContextMemory.add('user',
+                  `Background task FAILED: ${_bgIntent} — ${err.message}`,
+                  `Background ${_agent} failed`, null);
+                _bgSession.recordAction(_bgAction, { _background: true, success: false, error: err.message });
+                _bgChannel.log('agent', `Background delegate failed: ${_bgIntent} — ${err.message}`);
+                return { action: _bgAction, result: null, error: err };
+              })
               .finally(() => {
-                // Update background count in footer immediately when delegate finishes
-                session._bgRunningCount = Math.max(0, (session._bgRunningCount || 1) - 1);
-                if (session._bgRunningCount > 0) {
-                  channel.setInfo('background', `↗ ${session._bgRunningCount} background`);
+                // Remove from list and update footer
+                const idx = _bgSession._backgroundDelegates?.indexOf(_bgEntry);
+                if (idx >= 0) _bgSession._backgroundDelegates.splice(idx, 1);
+                const remaining = _bgSession._backgroundDelegates?.length || 0;
+                if (remaining > 0) {
+                  _bgChannel.setInfo('background', `↗ ${remaining} background`);
                 } else {
-                  channel.setInfo('background', null);
+                  _bgChannel.setInfo('background', null);
                 }
+                // Wake up the prompt if System is waiting for user input
+                // by submitting a synthetic "background task done" signal
+                try {
+                  const _uiBridge = Agent._cliHooks?.getUiBridge?.();
+                  if (_uiBridge?.submitInput) {
+                    _uiBridge.submitInput({ text: '', _backgroundResult: true });
+                  }
+                } catch { /* non-fatal */ }
               });
-            session._backgroundDelegates.push({
-              promise: _bgPromise,
-              action: _bgAction,
-              intent,
-              startedAt: Date.now(),
-            });
+            _bgEntry.promise = _bgPromise;
+            session._backgroundDelegates.push(_bgEntry);
             const _bgAgent = intent.split('::')[0];
             channel.log('agent', `${this.name}: Background delegate started: ${intent}`);
-            channel.printCompact(`\x1b[2m  ↗ ${_bgAgent} running in background — I'll notify you when it's done.\x1b[0m`);
             // Record as "started" — the real result comes later
             session.recordAction(action, { _background: true, status: 'running', message: `${intent} running in background` });
             // Tell the LLM to wait for user input instead of spinning
@@ -1549,11 +1575,16 @@ export class Agent {
 
           // Re-enter busy state after prompt_user resolves
           if (intent === 'prompt_user') {
+            // Check if this is a synthetic wake-up from a background delegate completing
+            const _isBgWakeup = result && typeof result === 'object' && result._backgroundResult;
+            if (_isBgWakeup) {
+              // Don't echo to user — the result was already injected into context memory
+              // by the .then() handler. Just continue the loop so the LLM sees it.
+              result = { answer: '' };
+            }
             Agent._cliHooks?.onBusy?.(true);
-            // Immediately show thinking spinner so the user sees the agent is working
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
-            // Track user message for compose template {{userMessage}} variable
-            this._lastUserMessage = result?.answer || null;
+            this._lastUserMessage = _isBgWakeup ? null : (result?.answer || null);
 
             // Share with session tracker so delegate commits can also use the user's request
             if (sessionTracker && this._lastUserMessage) {
