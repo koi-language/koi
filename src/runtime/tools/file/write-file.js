@@ -68,15 +68,22 @@ export default {
       const agentName = agent?.name || 'Agent';
       const _dirBase = path.basename(path.dirname(resolvedPath));
       const _header = `${agentName} ${exists ? t('wantsToEdit') : t('wantsToCreate')}`.replace(':', '');
+      const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+      const _isInProject = resolvedPath.startsWith(path.resolve(projectRoot) + path.sep);
+      const _acceptLabel = _isInProject ? t('permAcceptEdits') || 'Accept all edits in this project' : `${t('permAlwaysAllow')} (${_dirBase}/)`;
       const value = await runFilePermDialog(() => channel.select('', [
         { title: t('permYes'), value: 'yes' },
-        { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
+        { title: _acceptLabel, value: 'always' },
         { title: 'No, but give feedback', value: 'feedback' },
         { title: t('permNo'), value: 'no' }
       ], 0, { meta: { type: 'bash', header: _header, command: `${exists ? 'Edit' : 'Write'}(${filePath})` } }));
 
       if (value === 'always') {
-        permissions.allowProject(resolvedPath);
+        if (_isInProject) {
+          permissions.enableAcceptEdits();
+        } else {
+          permissions.allowProject(resolvedPath);
+        }
         permitted = true;
       } else if (value === 'yes') {
         permitted = true;

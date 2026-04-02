@@ -23,7 +23,6 @@ import { costCenter, getModelCaps } from './cost-center.js';
 
 import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
 import { channel } from '../io/channel.js';
-import { getProjectMap as _getProjectMap } from '../code/project-map.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -637,7 +636,7 @@ If NONE of the above categories fit, pick the closest one. Never return a catego
 EXAMPLES (3+ per category):
 
 A: "hello", "hola qué tal", "good morning", "bye", "thanks!", "hey there"
-B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles"
+B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles", "generate an image of a cat", "create a picture of a sunset", "make me a logo", "generate a video of a dog running", "create audio narration for this text", "draw a kitten", "make an illustration of a mountain"
 C: "summarize this article", "compare React vs Vue", "explain what Kubernetes is", "pros and cons of microservices"
 D: "what kind of project do you want?", "gather requirements from the user", "ask what stack they prefer", "onboarding: collect project details"
 E: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0"
@@ -1186,6 +1185,19 @@ CRITICAL RULES:
           }).join(', ');
           _classifyArgs = { ..._classifyArgs, escalationReason: _reason, recentActions: _recentActions };
           channel.log('llm', `[classify] Agent requested reclassify: ${_reason}`);
+        }
+        // Phase-change reclassify: include recent action results for better context.
+        // After understanding→implementing, the agent has read files/PDFs that reveal true complexity.
+        if (_isNewUserMessage && !_isLoop && !_agentRequestedReclassify && session.actionHistory?.length > 0) {
+          const _recentResults = session.actionHistory.slice(-3).map(e => {
+            const intent = e.action?.intent || '';
+            const resultStr = typeof e.result === 'string' ? e.result.substring(0, 200)
+              : (e.result?.content?.substring?.(0, 200) || e.result?.description?.substring?.(0, 200) || '');
+            return resultStr ? `${intent}: ${resultStr}` : intent;
+          }).filter(Boolean).join('\n');
+          if (_recentResults && _classifyArgs) {
+            _classifyArgs = { ..._classifyArgs, recentContext: _recentResults };
+          }
         }
         if (!_classifyArgs && agent?._lastUserMessage) {
           _classifyArgs = { userRequest: agent._lastUserMessage };
@@ -1975,22 +1987,18 @@ CRITICAL RULES:
     //   2. Static generic rules (output contract, golden rule, action model, tools) — never changes
     //   3. Agent playbook (changes per agent but stable within an agent's session)
     //   4. Dynamic runtime context (timestamp, task counts, phase) — changes every turn
-    const agentName = agent?.name || 'unknown';
-    const phase = agent?.state?.statusPhase || null;
-    const agentHeader = `Agent: ${agentName}${phase ? ' — Phase: ' + phase : ''}`;
-
     // Structured cache-aware playbook from compiler taint analysis
     if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
       const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
       return {
         _cacheKey: playbook._cacheKey,
-        static: [agentHeader, staticBase, _s(playbook.static)].filter(Boolean).join('\n\n'),
+        static: [staticBase, _s(playbook.static)].filter(Boolean).join('\n\n'),
         dynamic: [_s(playbook.dynamic), dynamic].filter(Boolean).join('\n\n'),
       };
     }
 
     // Legacy: plain string playbook (or flatten object without _cacheKey)
-    const parts = [agentHeader, staticBase];
+    const parts = [staticBase];
     let playbookStr = '';
     if (typeof playbook === 'string') {
       playbookStr = playbook.trim();
@@ -2288,7 +2296,7 @@ CRITICAL RULES:
     const hasTeams = agent && agent.usesTeams && agent.usesTeams.length > 0;
     const resourceSection = await this._buildSmartResourceSection(agent);
     const intentNesting = hasTeams ? '\nIMPORTANT: Do NOT nest "intent" inside "data". The "intent" field must be at the top level.' : '';
-    const koiMd = agent.hasPermission('read_koi_md') ? this._loadKoiMd() : '';
+    const koiMd = this._loadKoiMd(); // Always inject — project specs apply to all agents
 
     // ── Runtime Context block (universal for all agents) ──
     // Use local time with UTC offset so the LLM knows the user's timezone.
@@ -2364,18 +2372,13 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 - If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, include the image file path so the delegate can re-read it if the extracted data is wrong.' : ''}
 ` : '';
 
-    // ── Project Map (workspace layout for all agents) ──
-    let projectMapBlock = '';
-    try {
-      const projectRoot = process.env.KOI_PROJECT_ROOT || cwd;
-      projectMapBlock = await _getProjectMap(projectRoot);
-    } catch { /* non-fatal */ }
+    // BRAXIL.md / CLAUDE.md is already injected via koiMd (_loadKoiMd) above.
 
     // ── Prompt layout: STATIC content first (cacheable), DYNAMIC content last ──
     // LLM prompt caching works on identical prefixes — the longer the unchanging
     // prefix, the higher the cache hit rate. Static rules/tools go first;
     // runtime context (timestamp, phase, cwd) goes at the end.
-    const staticPart = `
+    const staticPart = `${koiMd}
 ========================================
 OUTPUT CONTRACT (MUST FOLLOW)
 ========================================
@@ -2515,12 +2518,12 @@ FINAL NON-NEGOTIABLE RULES
 
 ${resourceSection}${intentNesting}
 
-CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.${koiMd}`;
+CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 
     // ── Dynamic section: runtime context, project map, language, non-interactive ──
     // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
     // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
-    const dynamic = `Agent: ${agentDisplayName}${statusPhase ? ' — Phase: ' + statusPhase : ''} | ${now} | ${timezone || 'unknown'}
+    const dynamic = `${now} | ${timezone || 'unknown'}
 ${phaseSystemBlock}
 # RUNTIME CONTEXT
 
@@ -2529,7 +2532,6 @@ ${phaseSystemBlock}
 | Working directory | \`${cwd}\` |${langField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
-${projectMapBlock ? '\n' + projectMapBlock + '\n' : ''}
 **LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
 ${nonInteractiveBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
@@ -2539,23 +2541,32 @@ REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new inten
   }
 
   /**
-   * Load KOI.md from the project root (cwd) if it exists.
+   * Load BRAXIL.md (or KOI.md) from the project root (cwd) if it exists.
    * Similar to CLAUDE.md — project-specific instructions appended to the system prompt.
    */
   _loadKoiMd() {
     const candidates = [
+      path.join(process.cwd(), 'BRAXIL.md'),
+      path.join(process.cwd(), 'braxil.md'),
+      path.join(process.cwd(), 'CLAUDE.md'),
+      path.join(process.cwd(), 'claude.md'),
       path.join(process.cwd(), 'KOI.md'),
       path.join(process.cwd(), 'koi.md'),
     ];
+    // Find the first candidate that exists — on case-insensitive FS (macOS),
+    // BRAXIL.md and braxil.md resolve to the same file, so just use the first hit.
+    let found = null;
     for (const filePath of candidates) {
-      if (fs.existsSync(filePath)) {
-        try {
-          const content = fs.readFileSync(filePath, 'utf8').trim();
-          if (content) {
-            return `\n\nPROJECT INSTRUCTIONS (from KOI.md):\n${content}`;
-          }
-        } catch { /* ignore read errors */ }
-      }
+      if (fs.existsSync(filePath)) { found = filePath; break; }
+    }
+    if (found) {
+      try {
+        const content = fs.readFileSync(found, 'utf8').trim();
+        const name = path.basename(found);
+        if (content) {
+          return `\n\n── PROJECT SPECIFICATIONS (from ${name}) ──────────────────────────\n${content}\n── END ${name} ──────────────────────────────────────────────────`;
+        }
+      } catch { /* ignore read errors */ }
     }
     return '';
   }
@@ -2680,7 +2691,7 @@ REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new inten
           params = [...new Set([...paramMatches].map(m => m[1]))];
         }
 
-        handlers.push({ name: handlerName, description, params });
+        handlers.push({ name: handlerName, description, params, isAsync: !!handlerFn?.__async__ });
       }
 
       result.push({
@@ -2742,7 +2753,8 @@ REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new inten
           doc += `${resource.agentDescription}\n`;
         }
         for (const handler of resource.intents) {
-          doc += ` - ${handler.name}: ${handler.description}\n`;
+          const _asyncTag = handler.isAsync ? ' [async — runs in background, add "await": true to wait]' : '';
+          doc += ` - ${handler.name}${_asyncTag}: ${handler.description}\n`;
           if (handler.params?.length > 0) {
             doc += `    In: { ${handler.params.map(p => `"${p}"`).join(', ')} }\n`;
           }

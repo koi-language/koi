@@ -700,6 +700,18 @@ export class KoiTranspiler {
    * @returns {boolean}
    */
   _isTainted(expr, taintedVars) {
+    // Static properties of tainted objects — these never change during a session
+    // so @if conditions using them should be treated as static (cacheable).
+    const _staticProps = /\buser\.(interactive|email|name|plan)\b/;
+    if (_staticProps.test(expr)) {
+      // Check if the expr ONLY references static props (no other tainted vars)
+      const _withoutStatic = expr.replace(_staticProps, '');
+      let _hasTainted = false;
+      for (const tv of taintedVars) {
+        if (new RegExp(`\\b${tv}\\b`).test(_withoutStatic)) { _hasTainted = true; break; }
+      }
+      if (!_hasTainted) return false;
+    }
     for (const tv of taintedVars) {
       if (new RegExp(`\\b${tv}\\b`).test(expr)) return true;
     }
@@ -732,7 +744,10 @@ export class KoiTranspiler {
       }
       return false;
     });
-    const cacheAware = hasTaintedContent;
+    // Always enable cache-aware mode for compose templates.
+    // Even fully-static templates benefit: the entire content goes to __staticParts
+    // and gets a cache breakpoint, so the LLM provider can cache the prefix.
+    const cacheAware = true;
 
     // Build destructuring with all known variables + any agent variables found in template
     const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user'];
@@ -1299,6 +1314,9 @@ export class KoiTranspiler {
       if (node.isPrivate) {
         code += this.emit(`${this.getIndent()}handler.__private__ = true;\n`);
       }
+      if (node.isAsync) {
+        code += this.emit(`${this.getIndent()}handler.__async__ = true;\n`);
+      }
       if (hasParamTypes) {
         code += this.emit(`${this.getIndent()}handler.__paramTypes__ = ${JSON.stringify(paramTypes)};\n`);
       }
@@ -1327,6 +1345,9 @@ export class KoiTranspiler {
       }
       if (node.isPrivate) {
         code += this.emit(`${this.getIndent()}handler.__private__ = true;\n`);
+      }
+      if (node.isAsync) {
+        code += this.emit(`${this.getIndent()}handler.__async__ = true;\n`);
       }
       if (hasParamTypes) {
         code += this.emit(`${this.getIndent()}handler.__paramTypes__ = ${JSON.stringify(paramTypes)};\n`);

@@ -33,10 +33,14 @@ export default {
       agent.state[key] = updates[key];
     });
 
-    // Log phase transitions
+    // Log phase transitions and trigger reclassification
     if (updates.statusPhase && updates.statusPhase !== oldPhase) {
       const { channel } = await import('../../io/channel.js'); const cliLogger = channel;
       cliLogger.log('state', `[phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase}`);
+      // Phase change = agent now has more context → reclassify to pick the right model.
+      // E.g. understanding→implementing: agent read the requirements, complexity may differ.
+      const session = agent._activeSession;
+      if (session) session._needsReclassify = true;
     }
 
     // Filter internal fields (prefixed with _) from the result shown to the LLM.

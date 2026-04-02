@@ -83,6 +83,118 @@ async function extractPdfPageImages(page, pdfjsLib) {
   return images;
 }
 
+/**
+ * Install minimal DOM polyfills that pdfjs-dist needs at module load time.
+ * Must be called BEFORE any import('pdfjs-dist/...').
+ */
+function _ensurePdfjsPolyfills() {
+  if (typeof globalThis.DOMMatrix !== 'undefined') return; // already polyfilled or real browser
+
+  globalThis.DOMMatrix = class DOMMatrix {
+    constructor(init) {
+      const v = Array.isArray(init) ? init : [1, 0, 0, 1, 0, 0];
+      this.a = v[0] ?? 1; this.b = v[1] ?? 0; this.c = v[2] ?? 0;
+      this.d = v[3] ?? 1; this.e = v[4] ?? 0; this.f = v[5] ?? 0;
+      this.m11 = this.a; this.m12 = this.b; this.m21 = this.c;
+      this.m22 = this.d; this.m41 = this.e; this.m42 = this.f;
+      this.m13 = 0; this.m14 = 0; this.m23 = 0; this.m24 = 0;
+      this.m31 = 0; this.m32 = 0; this.m33 = 1; this.m34 = 0;
+      this.m43 = 0; this.m44 = 1; this.is2D = true; this.isIdentity = false;
+    }
+    multiplySelf(o) {
+      const a = this.a * o.a + this.c * o.b, b = this.b * o.a + this.d * o.b;
+      const c = this.a * o.c + this.c * o.d, d = this.b * o.c + this.d * o.d;
+      const e = this.a * o.e + this.c * o.f + this.e, f = this.b * o.e + this.d * o.f + this.f;
+      this.a = a; this.b = b; this.c = c; this.d = d; this.e = e; this.f = f;
+      return this;
+    }
+    translate(tx, ty) { return this.multiplySelf(new DOMMatrix([1, 0, 0, 1, tx, ty])); }
+    scale(sx, sy) { return this.multiplySelf(new DOMMatrix([sx, 0, 0, sy ?? sx, 0, 0])); }
+    inverse() {
+      const det = this.a * this.d - this.b * this.c;
+      if (!det) return new DOMMatrix();
+      return new DOMMatrix([this.d / det, -this.b / det, -this.c / det, this.a / det,
+        (this.c * this.f - this.d * this.e) / det, (this.b * this.e - this.a * this.f) / det]);
+    }
+    transformPoint(p) {
+      return { x: this.a * (p?.x || 0) + this.c * (p?.y || 0) + this.e,
+               y: this.b * (p?.x || 0) + this.d * (p?.y || 0) + this.f };
+    }
+    static fromMatrix(o) { return new DOMMatrix([o?.a ?? 1, o?.b ?? 0, o?.c ?? 0, o?.d ?? 1, o?.e ?? 0, o?.f ?? 0]); }
+  };
+
+  if (typeof globalThis.ImageData === 'undefined') {
+    globalThis.ImageData = class ImageData { constructor(d, w, h) { this.data = d; this.width = w; this.height = h; } };
+  }
+  if (typeof globalThis.Path2D === 'undefined') {
+    globalThis.Path2D = class Path2D { constructor() {} moveTo() {} lineTo() {} bezierCurveTo() {} closePath() {} rect() {} };
+  }
+}
+
+/**
+ * Load pdfjs-dist in pkg binary by extracting the ESM files from the snapshot
+ * to ~/.koi/runtime/{version}/pdfjs-dist/ on real disk, then importing from there.
+ * Cached — only extracts once per version.
+ */
+let _pdfjsCached = null;
+async function _loadPdfjsFromCache() {
+  if (_pdfjsCached) return _pdfjsCached;
+
+  const version = process.env.KOI_VERSION || 'dev';
+  const cacheDir = path.join(os.homedir(), '.koi', 'runtime', version, 'pdfjs-dist');
+  const targetFile = path.join(cacheDir, 'pdf.mjs');
+  const markerFile = path.join(cacheDir, '.extracted');
+
+  if (!fs.existsSync(markerFile)) {
+    // Find pdfjs-dist in the snapshot via require.resolve
+    const { createRequire } = await import('module');
+    const _req = createRequire(__filename || process.argv[1]);
+    let snapshotDir;
+    try {
+      const resolved = _req.resolve('pdfjs-dist/legacy/build/pdf.mjs');
+      snapshotDir = path.dirname(resolved);
+    } catch {
+      throw new Error('pdfjs-dist not found in snapshot — PDF reading unavailable');
+    }
+
+    // Extract all files from the legacy/build directory
+    if (fs.existsSync(cacheDir)) {
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(cacheDir, { recursive: true });
+
+    const files = fs.readdirSync(snapshotDir);
+    for (const file of files) {
+      const src = path.join(snapshotDir, file);
+      const dest = path.join(cacheDir, file);
+      try {
+        const stat = fs.statSync(src);
+        if (stat.isFile()) {
+          fs.copyFileSync(src, dest);
+        }
+      } catch { /* skip unreadable files */ }
+    }
+
+    fs.writeFileSync(markerFile, version, 'utf8');
+    channel.log('read_file', `Extracted pdfjs-dist to ${cacheDir}`);
+  }
+
+  // Suppress pdfjs warnings about missing optional deps (@napi-rs/canvas)
+  const _origWarn = console.warn;
+  console.warn = (...args) => {
+    const msg = String(args[0] || '');
+    if (msg.startsWith('Warning: Cannot') || msg.includes('@napi-rs/canvas')) return;
+    _origWarn.apply(console, args);
+  };
+  try {
+    const { pathToFileURL } = await import('url');
+    _pdfjsCached = await import(pathToFileURL(targetFile).href);
+  } finally {
+    console.warn = _origWarn;
+  }
+  return _pdfjsCached;
+}
+
 export default {
   type: 'read_file',
   intent: 'read_file',
@@ -196,17 +308,18 @@ export default {
     // --- PDF support ---
     if (resolvedPath.toLowerCase().endsWith('.pdf')) {
       try {
-        // Try direct import first (works in pkg binary and when pdfjs-dist is a
-        // direct dependency). Fall back to createRequire from cwd (works when this
-        // module is symlinked via npm link and pdfjs-dist lives in the host project).
+        // Polyfill DOM APIs that pdfjs requires even for text extraction.
+        // Must be set BEFORE import() — pdfjs accesses them at module load time.
+        _ensurePdfjsPolyfills();
+
+        // Load pdfjs-dist. Direct import works in dev; in pkg binary, pdfjs-dist
+        // is ESM-only so neither require() nor import() work from the snapshot.
+        // Fallback: extract the .mjs file to a real disk cache and import from there.
         let pdfjsLib;
         try {
           pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
         } catch {
-          const { createRequire } = await import('module');
-          const _require = createRequire(path.join(process.cwd(), '__placeholder.js'));
-          const pdfjsPath = _require.resolve('pdfjs-dist/legacy/build/pdf.mjs');
-          pdfjsLib = await import(pdfjsPath);
+          pdfjsLib = await _loadPdfjsFromCache();
         }
         // Suppress benign "standardFontDataUrl" warnings from pdfjs
         pdfjsLib.VerbosityLevel && pdfjsLib.setVerbosityLevel?.(0);
@@ -245,32 +358,54 @@ export default {
           for (let i = 1; i <= maxPage; i++) pagesToRead.push(i);
         }
 
-        // Extract text from selected pages, preserving line breaks.
+        // Extract text and images from selected pages.
         // pdfjs items have a transform matrix where [5] is the Y coordinate.
         // When Y changes between items, it means a new line in the PDF layout.
         const pageTexts = [];
+        const _pdfImages = []; // { page, index, width, height, path }
+        const session = agent?._activeSession;
+        const _pdfImgDir = path.join(os.tmpdir(), 'koi-pdf-images');
+
         for (const pageNum of pagesToRead) {
           const page = await doc.getPage(pageNum);
           const textContent = await page.getTextContent();
           const items = textContent.items.filter(i => i.str !== undefined);
-          if (!items.length) {
+
+          // Extract images from every page. Save to temp files so the model
+          // can inspect them via read_file. Small sets (≤3 total) are auto-attached
+          // as vision input; larger sets are listed so the model picks which to view.
+          try {
             const images = await extractPdfPageImages(page, pdfjsLib);
-            if (images.length) {
-              const cachePath = path.join(os.homedir(), '.koi', 'tesseract-data');
-              if (!fs.existsSync(cachePath)) {
-                fs.mkdirSync(cachePath, { recursive: true });
-              }
-              for (const image of images) {
-                const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } }).png().withMetadata({ density: 300 }).toBuffer();
-                const { data } = await Tesseract.recognize(pngBuffer, 'eng', { cachePath, user_defined_dpi: '300' });
-                const ocrText = data?.text ? data.text.trim() : '';
-                if (ocrText) {
-                  pageTexts.push(`--- Page ${pageNum} (OCR) ---\n${ocrText}`);
-                }
+            if (images.length > 0) {
+              if (!fs.existsSync(_pdfImgDir)) fs.mkdirSync(_pdfImgDir, { recursive: true });
+              for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
+                const image = images[imgIdx];
+                if (image.width < 50 || image.height < 50) continue;
+                const imgPath = path.join(_pdfImgDir, `pdf-p${pageNum}-img${imgIdx}-${Date.now()}.png`);
+                await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
+                  .png().toFile(imgPath);
+                _pdfImages.push({ page: pageNum, index: imgIdx, width: image.width, height: image.height, path: imgPath });
               }
             }
-            continue;
+
+            // Pages with no text: try OCR as fallback
+            if (!items.length && images.length > 0) {
+              const cachePath = path.join(os.homedir(), '.koi', 'tesseract-data');
+              if (!fs.existsSync(cachePath)) fs.mkdirSync(cachePath, { recursive: true });
+              for (const image of images) {
+                const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } }).png().withMetadata({ density: 300 }).toBuffer();
+                try {
+                  const { data } = await Tesseract.recognize(pngBuffer, 'eng', { cachePath, user_defined_dpi: '300' });
+                  const ocrText = data?.text ? data.text.trim() : '';
+                  if (ocrText) pageTexts.push(`--- Page ${pageNum} (OCR) ---\n${ocrText}`);
+                } catch { /* OCR failed */ }
+              }
+            }
+          } catch (imgErr) {
+            channel.log('read_file', `PDF image extraction failed on page ${pageNum}: ${imgErr.message}`);
           }
+
+          if (!items.length) continue;
 
           let lines = [];
           let currentLine = '';
@@ -279,11 +414,9 @@ export default {
           for (const item of items) {
             const y = item.transform ? item.transform[5] : null;
             if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) {
-              // Y position changed — new line
               lines.push(currentLine);
               currentLine = item.str;
             } else {
-              // Same line — append with space if needed
               if (currentLine && item.str && !currentLine.endsWith(' ') && !item.str.startsWith(' ')) {
                 currentLine += ' ' + item.str;
               } else {
@@ -300,10 +433,33 @@ export default {
           }
         }
 
+        // Handle PDF images: ≤3 → auto-attach for vision; >3 → list paths so model picks
+        const _AUTO_ATTACH_MAX = 3;
+        if (_pdfImages.length > 0) {
+          const autoAttach = _pdfImages.length <= _AUTO_ATTACH_MAX;
+          if (autoAttach && session) {
+            if (!session._pendingImages) session._pendingImages = [];
+            for (const img of _pdfImages) {
+              session._pendingImages.push({ path: img.path, type: 'image' });
+              channel.log('read_file', `PDF p${img.page} image auto-attached: ${img.path}`);
+            }
+          }
+          const _imgLines = _pdfImages.map(i =>
+            `  - Page ${i.page}, image ${i.index} (${i.width}×${i.height}): ${i.path}${autoAttach ? ' [attached]' : ''}`
+          ).join('\n');
+          const _header = autoAttach
+            ? `--- Images (${_pdfImages.length}, attached for vision) ---`
+            : `--- Images (${_pdfImages.length} found — use read_file to inspect) ---`;
+          pageTexts.push(`${_header}\n${_imgLines}`);
+        }
+
         const text = pageTexts.join('\n\n').trim();
 
+        if (!text && _pdfImages.length === 0) {
+          return { success: true, path: filePath, type: 'pdf', totalPages, content: '(No extractable text or images found in PDF.)', hint: 'This PDF has no text layer and no extractable images.' };
+        }
         if (!text) {
-          return { success: true, path: filePath, type: 'pdf', totalPages, content: '(No extractable text found in PDF — OCR was attempted but no text was recognized.)', hint: 'This PDF has no text layer. OCR was attempted but returned no text.' };
+          return { success: true, path: filePath, type: 'pdf', totalPages, content: `(No extractable text, but ${_pdfImages.length} image(s) attached for vision.)` };
         }
 
         // Apply line numbering and truncation like regular files
@@ -340,7 +496,7 @@ export default {
           ...(!action.pages && totalPages > MAX_PDF_PAGES && { hint: `PDF has ${totalPages} pages but only first ${MAX_PDF_PAGES} were read. Use "pages" field (e.g. "1-5") to read specific pages.` })
         };
       } catch (err) {
-        return { success: false, error: `Failed to read PDF: ${err.message}` };
+        return { success: false, error: `Failed to read PDF: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}` };
       }
     }
 

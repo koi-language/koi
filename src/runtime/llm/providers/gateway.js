@@ -200,15 +200,13 @@ export class GatewayImageGen extends BaseImageGen {
   }
 
   async generate(prompt, opts = {}) {
-    const payload = {
-      model: this.model,
-      prompt,
-      n: opts.n || 1,
-      aspect_ratio: opts.aspectRatio || '1:1',
-      resolution: opts.resolution || 'medium',
-      quality: opts.quality || 'auto',
-      output_format: opts.outputFormat || 'png',
-    };
+    // Only include fields that the gateway/fal understand — omit undefined/unsupported
+    const payload = { model: this.model, prompt };
+    if (opts.n && opts.n > 1) payload.num_images = opts.n;
+    if (opts.aspectRatio) payload.aspect_ratio = opts.aspectRatio;
+    if (opts.outputFormat) payload.output_format = opts.outputFormat;
+    // resolution/quality are normalized params mapped by the backend, pass through if set
+    if (opts.resolution) payload.resolution = opts.resolution;
 
     if (opts.referenceImages?.length) {
       payload.reference_images = opts.referenceImages.map(ref => ({
@@ -217,7 +215,7 @@ export class GatewayImageGen extends BaseImageGen {
       }));
     }
 
-    const res = await fetch(`${getGatewayBase()}/media/image/generate`, {
+    const res = await fetch(`${getGatewayBase()}/fal/generate`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(payload),

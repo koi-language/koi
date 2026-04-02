@@ -578,7 +578,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
 
     const _fmtElapsed = (ms) => {
       const s = Math.floor(ms / 1000);
-      return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+      return s >= 60 ? (s % 60 === 0 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 60)}m ${s % 60}s`) : `${s}s`;
     };
 
     const _inScope = !isSilent && channel.hasScope();
@@ -588,7 +588,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       // Inside a scope (parallel shells), skip the progress spinner — it would clutter the grouped display
       if (!_inScope) {
         const _timeoutStr = timeoutMs !== 120000
-          ? (() => { const s = Math.round(timeoutMs / 1000); return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; })()
+          ? (() => { const s = Math.round(timeoutMs / 1000); return s >= 60 ? (s % 60 === 0 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 60)}m ${s % 60}s`) : `${s}s`; })()
           : null;
         const _progressLine = (elapsed) => {
           let line = `  \x1b[2m⎿\x1b[0m  \x1b[2mRunning… (${elapsed}`;
@@ -939,7 +939,14 @@ When a command requires sudo, just use sudo normally in the command. The system 
       const _PREVIEW_LINES = 3;
       const _showOutputPreview = (output, isError = false) => {
         if (isSilent) return;
-        const lines = (output || '').split('\n').filter(l => l.trim());
+        // Strip ANSI codes and \r-based progress lines (webpack/npm overwrite in-place).
+        // Resolve \r by keeping only the last segment after the final \r on each line.
+        const _clean = (output || '')
+          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')  // strip ANSI
+          .split('\n')
+          .map(l => { const parts = l.split('\r'); return parts[parts.length - 1]; }) // resolve \r
+          .filter(l => l.trim());
+        const lines = _clean;
         if (_inScope) {
           // Inside parallel scope: compact one-line summary
           const preview = lines.length > 0 ? lines[0].substring(0, 80) : (t('noOutput') || 'No output');
@@ -966,7 +973,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       const _showTimeout = () => {
         if (isSilent || _inScope || timeoutMs === 120000) return;
         const s = Math.round(timeoutMs / 1000);
-        const tStr = s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+        const tStr = s >= 60 ? (s % 60 === 0 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 60)}m ${s % 60}s`) : `${s}s`;
         channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(timeout ${tStr})\x1b[0m`);
       };
 

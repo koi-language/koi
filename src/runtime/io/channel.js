@@ -198,6 +198,9 @@ class Channel {
   /** Unregister metadata for a slot. */
   unregisterSlotMeta(slotId) { this._slotMeta.delete(slotId); }
 
+  /** Pre-mark a slot as background (suppresses spinner above prompt). */
+  markSlotBackground(slotId) { /* override in TerminalChannel */ }
+
   // ── UI Zones ────────────────────────────────────────────────────────────
 
   /** Set info text in a named slot or footer. */

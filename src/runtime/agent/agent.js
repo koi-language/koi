@@ -870,6 +870,46 @@ export class Agent {
     }
 
     while (!session.isTerminated) {
+      // ── Check for completed background delegates ──────────────────────
+      // Non-blocking: check if any background promises have settled.
+      if (session._backgroundDelegates?.length > 0) {
+        const _stillRunning = [];
+        for (const bg of session._backgroundDelegates) {
+          // Race with an immediately-resolved promise to check without blocking
+          const _settled = await Promise.race([
+            bg.promise.then(r => ({ done: true, ...r })),
+            Promise.resolve({ done: false }),
+          ]);
+          if (_settled.done) {
+            const _bgAgent = bg.intent.split('::')[0];
+            if (_settled.error) {
+              channel.log('agent', `${this.name}: Background delegate failed: ${bg.intent} — ${_settled.error.message}`);
+              session.recordAction(bg.action, { _background: true, success: false, error: _settled.error.message });
+              contextMemory.add('user',
+                `Background task completed with ERROR: ${bg.intent} failed — ${_settled.error.message}`,
+                `Background ${_bgAgent} failed`, null);
+            } else {
+              channel.log('agent', `${this.name}: Background delegate completed: ${bg.intent}`);
+              session.recordAction(bg.action, _settled.result);
+              const _resultPreview = _settled.result ? JSON.stringify(_settled.result).substring(0, 300) : 'null';
+              contextMemory.add('user',
+                `Background task completed: ${bg.intent} returned: ${_resultPreview}\nHandle this result — inform the user or act on it as appropriate.`,
+                `Background ${_bgAgent} done`, null);
+              channel.printCompact(`\x1b[2m  ↙ ${_bgAgent} finished (background)\x1b[0m`);
+            }
+          } else {
+            _stillRunning.push(bg);
+          }
+        }
+        session._backgroundDelegates = _stillRunning;
+        // Update UI with background task count
+        if (_stillRunning.length > 0) {
+          channel.setInfo('background', `↗ ${_stillRunning.length} background`);
+        } else {
+          channel.setInfo('background', null);
+        }
+      }
+
       // Detect shell command loop: same shell command repeated and failing = stuck
       if (session.actionHistory.length >= 2) {
         const _prev = session.actionHistory.at(-1);
@@ -951,7 +991,9 @@ export class Agent {
         if (totalCtx > 0) {
           const latentTk = (contextMemory._latentCount || 0) * 300;
           const latentLabel = `${fmt(latentTk)} latent`;
-          channel.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${latentLabel}`);
+          if (process.env.KOI_SHOW_TOKEN_STATS === '1') {
+            channel.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${latentLabel}`);
+          }
         }
       }
 
@@ -1425,6 +1467,58 @@ export class Agent {
             session._lastConsumedImages = null;
           }
 
+          // ── BACKGROUND DELEGATION ─────────────────────────────────────────
+          // Handlers declared with 'async' in .koi run in background automatically.
+          // The caller can override with "await": true to wait synchronously.
+          let _isAsyncHandler = false;
+          if (action.actionType === 'delegate' && !action.await) {
+            try {
+              const _tm = await this.findTeamMemberForIntent(intent);
+              if (_tm) {
+                const _handler = _tm.agent.handlers?.[_tm.event];
+                if (_handler?.__async__) _isAsyncHandler = true;
+              }
+            } catch { /* non-fatal */ }
+          }
+          if (_isAsyncHandler && action.actionType === 'delegate') {
+            if (!session._backgroundDelegates) session._backgroundDelegates = [];
+            action._background = true;
+            // Pre-mark agent name as background so spinner is suppressed immediately
+            const _bgAgentName = intent.split('::')[0];
+            channel.markSlotBackground?.(_bgAgentName);
+            const _bgAction = { ...action };
+            if (!session._bgRunningCount) session._bgRunningCount = 0;
+            session._bgRunningCount++;
+            const _bgPromise = this._executeAction(_bgAction, _bgAction, session.actionContext)
+              .then(({ result: bgResult }) => ({ action: _bgAction, result: bgResult, error: null }))
+              .catch(err => ({ action: _bgAction, result: null, error: err }))
+              .finally(() => {
+                // Update background count in footer immediately when delegate finishes
+                session._bgRunningCount = Math.max(0, (session._bgRunningCount || 1) - 1);
+                if (session._bgRunningCount > 0) {
+                  channel.setInfo('background', `↗ ${session._bgRunningCount} background`);
+                } else {
+                  channel.setInfo('background', null);
+                }
+              });
+            session._backgroundDelegates.push({
+              promise: _bgPromise,
+              action: _bgAction,
+              intent,
+              startedAt: Date.now(),
+            });
+            const _bgAgent = intent.split('::')[0];
+            channel.log('agent', `${this.name}: Background delegate started: ${intent}`);
+            channel.printCompact(`\x1b[2m  ↗ ${_bgAgent} running in background — I'll notify you when it's done.\x1b[0m`);
+            // Record as "started" — the real result comes later
+            session.recordAction(action, { _background: true, status: 'running', message: `${intent} running in background` });
+            // Tell the LLM to wait for user input instead of spinning
+            contextMemory.add('user',
+              `${_bgAgent} is now running in background. Do NOT print any "waiting" or status messages. Call prompt_user immediately to wait for the user's next request. The background task will deliver its result automatically when done.`,
+              `${_bgAgent} dispatched to background`, null);
+            continue;
+          }
+
           let { result } = await this._executeAction(action, action, session.actionContext);
 
           channel.clear();
@@ -1441,6 +1535,12 @@ export class Agent {
           while (intent === 'prompt_user' && typeof result?.answer === 'string' && result.answer.startsWith('/')) {
             const slashResult = await this._handleSlashCommand(result.answer, action, session);
             if (!slashResult.handled) break;
+            // If the slash command returned an answer, use it as the user's response
+            // (e.g. /init injects a prompt for the agent to process)
+            if (slashResult.result?.answer) {
+              result = { answer: slashResult.result.answer };
+              break;
+            }
             channel.planning(channel.buildActionDisplay(this.name, action));
             const { result: newResult } = await this._executeAction(action, action, session.actionContext);
             channel.clear();
@@ -2128,7 +2228,7 @@ export class Agent {
       else if (e.tier === 'short-term') shortTk += est(e.immediate);
     }
     const totalCtx = sysTk + longTk + midTk + shortTk;
-    if (totalCtx > 0) {
+    if (totalCtx > 0 && process.env.KOI_SHOW_TOKEN_STATS === '1') {
       const latentTk = (contextMemory._latentCount || 0) * 300;
       const latentLabel = `${fmt(latentTk)} latent`;
       channel.setInfo('context', `\u{1F9E0} ${fmt(sysTk)} sys / ${fmt(longTk)} long / ${fmt(midTk)} mid / ${fmt(shortTk)} short / ${latentLabel}`);
@@ -2771,7 +2871,7 @@ Many commands are inherently slow and produce little or no output for extended p
         args: _composeArgs || {},
         state: this.state || {},
         agentName: this.name,
-        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1',
+        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1', // backward compat
         // User object — accessible as user.message, user.language, user.email, etc.
         user: {
           message: this._lastUserMessage ?? _composeArgs?.goal ?? null,
@@ -2779,6 +2879,7 @@ Many commands are inherently slow and produce little or no output for extended p
           email: process.env.KOI_LOGIN_EMAIL || null,
           name: process.env.KOI_LOGIN_NAME || null,
           plan: process.env.KOI_PLAN_NAME || null,
+          interactive: process.env.KOI_EXIT_ON_COMPLETE !== '1',
         },
       };
 
@@ -2971,6 +3072,7 @@ Many commands are inherently slow and produce little or no output for extended p
           channel.registerSlotMeta(_delegateSlot, {
             agentName: displayName,
             subject: currentData?.subject || null,
+            background: !!action._background,
           });
 
           // Delegate gets a callback to answer ask_parent questions inline —

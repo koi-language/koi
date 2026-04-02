@@ -275,6 +275,24 @@ export class SessionTracker {
   }
 
   /**
+   * Get compact stat for a commit (files changed + insertions/deletions).
+   * Returns array of { file, insertions, deletions } or empty array.
+   */
+  getCommitStat(commitHash) {
+    this._ensureInit();
+    try {
+      const raw = this._git(`diff --numstat ${commitHash}~1 ${commitHash}`);
+      if (!raw) return [];
+      return raw.split('\n').filter(Boolean).map(line => {
+        const [ins, del, file] = line.split('\t');
+        return { file, insertions: parseInt(ins, 10) || 0, deletions: parseInt(del, 10) || 0 };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Checkout a specific commit — sync working tree files to that point in history.
    * Does NOT create a new commit. Only restores tracked files in the working tree.
    * New commits are only created when the user makes actual new changes.

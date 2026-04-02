@@ -112,10 +112,25 @@ export class FilePermissions {
     if (process.env.KOI_YES === '1') return true;
 
     const resolved = path.resolve(filePath);
-
-    // Files inside .koi/ never need permission — it's Koi's own config/data directory
     const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
-    if (resolved.startsWith(path.join(projectRoot, '.koi') + path.sep) || resolved === path.join(projectRoot, '.koi')) return true;
+    const koiDir = path.join(projectRoot, '.koi');
+    const isInProject = isSubdirOf(resolved, projectRoot);
+    const isInKoi = resolved.startsWith(koiDir + path.sep) || resolved === koiDir;
+
+    // .koi/ directory: always free — it's Koi's own config/data
+    if (isInKoi) return true;
+
+    // BRAXIL.md / KOI.md at project root: always free — Braxil's own documentation
+    const basename = path.basename(resolved).toLowerCase();
+    if (isInProject && path.dirname(resolved) === path.resolve(projectRoot)
+        && (basename === 'braxil.md' || basename === 'koi.md')) return true;
+
+    // READ inside the project: always free — agents need to read code freely
+    if (level === 'read' && isInProject) return true;
+
+    // WRITE inside the project: free if "accept edits" mode is on
+    if (level === 'write' && isInProject && this._acceptEditsOn) return true;
+
     const dir = path.dirname(resolved);
 
     if (level === 'write') {
@@ -127,6 +142,14 @@ export class FilePermissions {
 
     // Read: directory-level only
     return this.readDirs.some(allowed => isSubdirOf(dir, allowed) || isSubdirOf(resolved, allowed));
+  }
+
+  /**
+   * Enable "accept edits" mode — auto-approve all writes within the project.
+   * Only applies to files inside KOI_PROJECT_ROOT. External files still need explicit permission.
+   */
+  enableAcceptEdits() {
+    this._acceptEditsOn = true;
   }
 
   /**

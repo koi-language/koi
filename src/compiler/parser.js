@@ -583,8 +583,8 @@ function peg$parse(input, options) {
   function peg$f34(config) {
     return { type: 'LLMConfig', config, location: location() };
   }
-  function peg$f35(isPrivate, event, params, body) {
-    return { type: 'EventHandler', event, params: params || [], body, isPrivate: !!isPrivate, location: location() };
+  function peg$f35(isPrivate, event, params, isAsync, body) {
+    return { type: 'EventHandler', event, params: params || [], body, isPrivate: !!isPrivate, isAsync: !!isAsync, location: location() };
   }
   function peg$f36(name) {
     const reserved = ['run', 'import', 'skill', 'role', 'can', 'team', 'agent',
@@ -3227,6 +3227,16 @@ function peg$parse(input, options) {
           }
           if (s10 !== peg$FAILED) {
             s11 = peg$parse_();
+            // Optional 'async' keyword before '{'
+            var s_async = peg$currPos;
+            if (input.substr(peg$currPos, 5) === 'async') {
+              var s_asyncKw = 'async';
+              peg$currPos += 5;
+              var s_asyncWs = peg$parse_();
+              s_async = s_asyncKw;
+            } else {
+              s_async = null;
+            }
             if (input.charCodeAt(peg$currPos) === 123) {
               s12 = peg$c4;
               peg$currPos++;
@@ -3253,7 +3263,7 @@ function peg$parse(input, options) {
               if (s16 !== peg$FAILED) {
                 s17 = peg$parse_();
                 peg$savedPos = s0;
-                s0 = peg$f35(s1, s4, s8, s14);
+                s0 = peg$f35(s1, s4, s8, s_async, s14);
               } else {
                 peg$currPos = s0;
                 s0 = peg$FAILED;
