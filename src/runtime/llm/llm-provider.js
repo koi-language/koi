@@ -44,6 +44,12 @@ function formatPromptForDebug(text) {
  * Matches runs of ≥60 base64 chars (A-Z a-z 0-9 + / =) and replaces with
  * first 20 chars … last 10 chars so the output stays readable.
  */
+/** Compare two reasoning efforts, return the higher one. */
+const _effortRank = { none: 0, low: 1, medium: 2, high: 3 };
+function _compareEffort(a, b) {
+  return (_effortRank[a] || 0) >= (_effortRank[b] || 0) ? (a || 'medium') : (b || 'medium');
+}
+
 function _truncB64Debug(str) {
   return str.replace(/[A-Za-z0-9+/]{60,}={0,2}/g, m => `${m.slice(0, 20)}\u2026${m.slice(-10)}`);
 }
@@ -357,6 +363,8 @@ export class LLMProvider {
       temperature: this.temperature,
       maxTokens: this.maxTokens,
       useThinking: this._useThinking,
+      reasoningScore: this._reasoningScore ?? 50,
+      reasoningEffort: this._reasoningEffort ?? 'medium',
       ...opts,
     });
   }
@@ -581,6 +589,8 @@ export class LLMProvider {
     }
   }
 
+  // (see module-level _compareEffort function below)
+
   /**
    * Classify a task using the fastest/cheapest available model.
    * Returns { taskType: 'code'|'reasoning', difficulty: 1-10 }.
@@ -605,11 +615,11 @@ export class LLMProvider {
 CATEGORIES:
 
 A: Greeting, hello, goodbye, casual chat, small talk
-B: Simple factual question (no code involved) — "what time is it?", "what's the capital of France?"
+B: Simple factual question (no code involved, no media generation) — "what time is it?", "what's the capital of France?"
 C: Summarize, explain, or compare something non-technical — "summarize this article", "compare these plans"
 D: Ask the user for information, gather requirements, onboarding conversation
 E: Simple text/config change — rename a variable, fix a typo, change a string, update a version number
-F: Write a simple script or query — small Python script, single SQL query, bash one-liner
+F: Write a simple script or query, OR generate media (image/video/audio) — small Python script, single SQL query, bash one-liner, generate an image, create a picture, draw an illustration, make a logo, generate a video, create audio
 G: Look up / find something in the codebase — "where is auth implemented?", "find the email config"
 H: Explain how something works in the codebase — "how does the login flow work?", "what does this function do?"
 I: Read and understand code to answer a question — "what system does the frontend use for email?"
@@ -636,11 +646,11 @@ If NONE of the above categories fit, pick the closest one. Never return a catego
 EXAMPLES (3+ per category):
 
 A: "hello", "hola qué tal", "good morning", "bye", "thanks!", "hey there"
-B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles", "generate an image of a cat", "create a picture of a sunset", "make me a logo", "generate a video of a dog running", "create audio narration for this text", "draw a kitten", "make an illustration of a mountain"
+B: "what's the weather?", "how many days until Christmas?", "convert 5km to miles", "what's the capital of France?"
 C: "summarize this article", "compare React vs Vue", "explain what Kubernetes is", "pros and cons of microservices"
 D: "what kind of project do you want?", "gather requirements from the user", "ask what stack they prefer", "onboarding: collect project details"
 E: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0"
-F: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB", "Python script to parse CSV"
+F: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB", "Python script to parse CSV", "generate an image of a cat", "create a picture of a sunset", "make me a logo", "draw a kitten playing on the beach", "generate a video of a dog running", "create audio narration for this text", "make an illustration of a mountain", "hazme un dibujo realista", "portrait alargado de un gato"
 G: "where is the auth middleware?", "find where password reset is handled", "locate the email sending code", "find all API routes"
 H: "how does the login flow work?", "explain the billing system", "what happens when a user signs up?", "walk me through the deployment pipeline"
 I: "what email provider does the backend use?", "what ORM is this project using?", "what authentication strategy is implemented?", "what database engine are we using?"
@@ -667,33 +677,34 @@ Task:
 ${taskDescription}`;
 
     // Category → profile mapping
+    // reasoningEffort: none=no thinking, low=fast/shallow, medium=balanced, high=deep analysis
     const CATEGORY_PROFILES = {
-      A: { code: 0,   reasoning: 10,  thinking: false, risk: 0 },
-      B: { code: 0,   reasoning: 10,  thinking: false, risk: 0 },
-      C: { code: 0,   reasoning: 30,  thinking: false, risk: 0 },
-      D: { code: 0,   reasoning: 40,  thinking: false, risk: 0 },
-      E: { code: 40,  reasoning: 10,  thinking: false, risk: 10 },
-      F: { code: 40,  reasoning: 30,  thinking: false, risk: 10 },
-      G: { code: 50,  reasoning: 50,  thinking: true,  risk: 10 },
-      H: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
-      I: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
-      J: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
-      K: { code: 80,  reasoning: 70,  thinking: true,  risk: 10 },
-      L: { code: 50,  reasoning: 40,  thinking: true,  risk: 10 },
-      M: { code: 60,  reasoning: 50,  thinking: true,  risk: 20 },
-      N: { code: 60,  reasoning: 60,  thinking: true,  risk: 10 },
-      O: { code: 50,  reasoning: 70,  thinking: true,  risk: 70 },
-      P: { code: 60,  reasoning: 75,  thinking: true,  risk: 60 },
-      Q: { code: 70,  reasoning: 60,  thinking: true,  risk: 30 },
-      R: { code: 70,  reasoning: 70,  thinking: true,  risk: 40 },
-      S: { code: 70,  reasoning: 70,  thinking: true,  risk: 30 },
-      T: { code: 60,  reasoning: 70,  thinking: true,  risk: 10 },
-      U: { code: 60,  reasoning: 70,  thinking: true,  risk: 20 },
-      V: { code: 70,  reasoning: 60,  thinking: true,  risk: 20 },
-      W: { code: 75,  reasoning: 70,  thinking: true,  risk: 20 },
-      X: { code: 80,  reasoning: 80,  thinking: true,  risk: 30 },
-      Y: { code: 60,  reasoning: 85,  thinking: true,  risk: 10 },
-      Z: { code: 90,  reasoning: 85,  thinking: true,  risk: 20 },
+      A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
+      B: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
+      C: { code: 0,   reasoning: 30,  risk: 0,  reasoningEffort: 'none' },
+      D: { code: 0,   reasoning: 40,  risk: 0,  reasoningEffort: 'none' },
+      E: { code: 40,  reasoning: 10,  risk: 10, reasoningEffort: 'low' },
+      F: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
+      G: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
+      H: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
+      I: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
+      J: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
+      K: { code: 80,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
+      L: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: 'low' },
+      M: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
+      N: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
+      O: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: 'medium' },
+      P: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'medium' },
+      Q: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'medium' },
+      R: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'medium' },
+      S: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'high' },
+      T: { code: 60,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
+      U: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
+      V: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'medium' },
+      W: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
+      X: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'high' },
+      Y: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
+      Z: { code: 90,  reasoning: 85,  risk: 20, reasoningEffort: 'high' },
     };
 
     const _debug = !!process.env.KOI_DEBUG_LLM;
@@ -719,7 +730,6 @@ ${taskDescription}`;
     }
     channel.log('llm', `[classify] ${_candidates.length} candidate models: ${_candidates.map(c => c.model).join(', ')}`);
 
-    const _timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms));
     channel.log('llm', `[classify] Using ${_candidates[0].model} for classification`);
 
     // Skip classification for startup (empty args) — no task to classify yet
@@ -737,8 +747,7 @@ ${taskDescription}`;
         const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
         const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
         const llm = createLLM(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens: 800, useThinking: false });
-        const apiCall = llm.complete([{ role: 'user', content: prompt }]).then(r => r);
-        const { text: content, usage: _u } = await Promise.race([apiCall, _timeout(15000)]);
+        const { text: content, usage: _u } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 15000, responseFormat: 'json_object' });
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
         costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
         channel.log('llm', `[classify] Raw response: ${content.substring(0, 200)}`);
@@ -749,11 +758,12 @@ ${taskDescription}`;
           const cat = String(json.cat).toUpperCase().charAt(0);
           const catProfile = CATEGORY_PROFILES[cat];
           if (catProfile) {
-            const { code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel = 0 } = catProfile;
+            const { code: codeScore, reasoning: reasoningScore, risk: riskLevel = 0, reasoningEffort: effort = 'medium' } = catProfile;
+            const needsThinking = effort !== 'none';
             const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
             const difficulty = Math.max(codeScore, reasoningScore);
-            const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel };
-            channel.log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} thinking=${needsThinking} risk=${riskLevel}`);
+            const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel, reasoningEffort: effort };
+            channel.log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} effort=${effort} risk=${riskLevel}`);
             return profile;
           }
           channel.log('llm', `[classify] Unknown category "${cat}" from ${candidate.model}`);
@@ -1080,11 +1090,14 @@ CRITICAL RULES:
               commitContext = await this._searchRelevantCommits(_answerText);
               await contextMemory.hydrate(_answerText);
             }
-            // Capture image attachments so we can inject them into the next LLM message
+            // Capture attachments from the user prompt — they'll be passed
+            // directly to contextMemory.add() and resolved when building messages
             const _atts = Array.isArray(entry.result.attachments)
-              ? entry.result.attachments.filter(a => a.type === 'image' && fs.existsSync(a.path))
+              ? entry.result.attachments.filter(a => a.path && fs.existsSync(a.path))
               : [];
-            if (_atts.length > 0) session._pendingImages = _atts;
+            if (_atts.length > 0) {
+              session._promptAttachments = _atts;
+            }
           }
         }
 
@@ -1100,16 +1113,26 @@ CRITICAL RULES:
         const classified = classifyFeedback(lastEntry.action, lastEntry.result, lastEntry.error);
 
         // Build the immediate content (full detail + commit context + continue)
-        // Include image paths in context memory so agents can re-reference them later
-        const _imgPaths = session._pendingImages?.map(a => a.path).filter(Boolean) || [];
+        // Include attachment references in context memory so agents can re-reference them
+        // Build text references for attached files
+        const _promptAtts = session._promptAttachments || [];
+        const _imgPaths = _promptAtts.filter(a => a.type === 'image').map(a => a.path);
         const _imgRef = _imgPaths.length > 0
           ? `\n[Attached images: ${_imgPaths.map(p => `"${p}"`).join(', ')}]`
           : '';
+        const _imgShort = _imgPaths.length > 0
+          ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
+          : '';
         const immediate = `${classified.immediate}${_imgRef}${commitContext}\nContinue.`;
-        const _shortWithImg = _imgPaths.length > 0
-          ? `${classified.shortTerm || ''} [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
+        const _shortWithImg = _imgShort
+          ? `${classified.shortTerm || ''}${_imgShort}`
           : classified.shortTerm;
-        contextMemory.add('user', immediate, _shortWithImg, classified.permanent, classified);
+        // Pass attachments as part of the message — they are resolved when building LLM request
+        contextMemory.add('user', immediate, _shortWithImg, classified.permanent, {
+          ...classified,
+          attachments: _promptAtts,
+        });
+        session._promptAttachments = null;
 
         // Queue MCP image results for multimodal injection into the next LLM call.
         // Skip if the compose resolver already injected images (e.g. frame_server_state
@@ -1228,6 +1251,39 @@ CRITICAL RULES:
       }
       let profile = session._autoProfile;
 
+      // ── Apply declared phase profile overrides ───────────────────────
+      // The agent's .koi file may declare per-phase model requirements:
+      //   phases { understanding { reasoning: high } implementing { code: high } }
+      // Values other than "auto" override the classifier's decision.
+      const _phaseProfile = session._phaseProfile;
+      if (_phaseProfile && Object.keys(_phaseProfile).length > 0) {
+        const _levelToScore = { none: 0, low: 30, medium: 60, high: 90 };
+        const _levelToEffort = { none: 'none', low: 'low', medium: 'medium', high: 'high' };
+        let _changed = false;
+        const _newProfile = { ...profile };
+
+        if (_phaseProfile.reasoning && _phaseProfile.reasoning !== 'auto') {
+          const score = _levelToScore[_phaseProfile.reasoning];
+          if (score !== undefined) {
+            _newProfile.reasoning = Math.max(_newProfile.reasoning || 0, score);
+            _newProfile.reasoningEffort = _compareEffort(_newProfile.reasoningEffort, _levelToEffort[_phaseProfile.reasoning]);
+            _changed = true;
+          }
+        }
+        if (_phaseProfile.code && _phaseProfile.code !== 'auto') {
+          const score = _levelToScore[_phaseProfile.code];
+          if (score !== undefined) {
+            _newProfile.code = Math.max(_newProfile.code || 0, score);
+            _changed = true;
+          }
+        }
+        if (_changed) {
+          _newProfile.difficulty = Math.max(_newProfile.code || 0, _newProfile.reasoning || 0);
+          channel.log('llm', `[classify] Phase profile override: code=${_newProfile.code} reasoning=${_newProfile.reasoning} effort=${_newProfile.reasoningEffort}`);
+          profile = _newProfile;
+        }
+      }
+
       // Escalate model on repeated LLM errors (truncated JSON, parse failures, etc.)
       // The classifier may keep returning the same category, so we force-bump scores
       // to break out of the "weak model → truncated → reclassify → same model" loop.
@@ -1244,7 +1300,7 @@ CRITICAL RULES:
       }
 
       // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
-      const _requiresImage = !!(session._pendingImages?.length > 0) ||
+      const _requiresImage = !!(session._promptAttachments?.some(a => a.type === 'image')) ||
         !!(session._pendingMcpImages?.length > 0) ||
         session.actionHistory.some(
           e => e.action?.intent === 'prompt_user' &&
@@ -1276,6 +1332,8 @@ CRITICAL RULES:
       this.provider     = resolved.provider;  // original provider for tracking
       this.model        = resolved.model;
       this._useThinking = resolved.useThinking;
+      this._reasoningScore = resolved.profile?.reasoning ?? 50;
+      this._reasoningEffort = resolved.profile?.reasoningEffort ?? 'medium';
       if (this._effectiveLLMProvider === 'openai')        this.openai    = this._oa;
       else if (this._effectiveLLMProvider === 'gemini')    this.openai    = this._gc;
       else if (this._effectiveLLMProvider === 'anthropic') this.anthropic = this._ac;
@@ -1287,104 +1345,73 @@ CRITICAL RULES:
     // Track attachments for debug logging
     const _debugAttachPaths = [];
 
-    // Inject image attachments into the last user message when the user sent images
-    if (session._pendingImages?.length > 0) {
-      const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
-      if (lastUserIdx >= 0) {
-        const textContent = typeof messages[lastUserIdx].content === 'string'
-          ? messages[lastUserIdx].content : '';
-
-        // Optimize images before sending to LLM:
-        // - PNG: pngquant (60-80% reduction, near-lossless) + sharp resize
-        // - JPEG: sharp resize + quality 80
-        const _MAX_IMG_DIM = 1568;
-        const _optimizeImage = async (imgPath) => {
-          try {
-            const raw = fs.readFileSync(imgPath);
-            const ext = path.extname(imgPath).toLowerCase().slice(1);
-            const isJpeg = ext === 'jpg' || ext === 'jpeg';
-            const isPng = ext === 'png';
-
-            // If already small enough (<200KB), use as-is
-            if (raw.length < 200_000) {
-              return { mime: isJpeg ? 'image/jpeg' : `image/${ext}`, b64: raw.toString('base64') };
-            }
-
-            let optimized = raw;
-            let mime = isJpeg ? 'image/jpeg' : `image/${ext}`;
-
-            // Step 1: Resize with sharp (all formats)
-            try {
-              const sharp = (await import('sharp')).default;
-              if (isJpeg) {
-                optimized = await sharp(raw).resize(_MAX_IMG_DIM, _MAX_IMG_DIM, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
-                mime = 'image/jpeg';
-              } else {
-                optimized = await sharp(raw).resize(_MAX_IMG_DIM, _MAX_IMG_DIM, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
-                mime = 'image/png';
-              }
-            } catch (sharpErr) {
-              channel.log('llm', `[image] sharp resize failed: ${sharpErr.message}`);
-            }
-
-            // Step 2: For PNGs, run pngquant for aggressive palette-based compression
-            if (isPng || mime === 'image/png') {
-              try {
-                const { execFileSync } = require('child_process');
-                const pngquantBin = require('pngquant-bin');
-                const tmpIn = path.join(os.tmpdir(), `koi-pq-in-${Date.now()}.png`);
-                const tmpOut = path.join(os.tmpdir(), `koi-pq-out-${Date.now()}.png`);
-                fs.writeFileSync(tmpIn, optimized);
-                execFileSync(typeof pngquantBin === 'object' ? pngquantBin.default : pngquantBin,
-                  ['--quality=65-80', '--speed=3', '--force', '--output', tmpOut, tmpIn],
-                  { timeout: 10000 });
-                const pqResult = fs.readFileSync(tmpOut);
-                channel.log('llm', `[image] pngquant ${path.basename(imgPath)}: ${(optimized.length/1024).toFixed(0)}KB → ${(pqResult.length/1024).toFixed(0)}KB`);
-                optimized = pqResult;
-                try { fs.unlinkSync(tmpIn); } catch {}
-                try { fs.unlinkSync(tmpOut); } catch {}
-              } catch (pqErr) {
-                channel.log('llm', `[image] pngquant failed: ${pqErr.message}, using sharp output`);
-              }
-            }
-
-            channel.log('llm', `[image] Optimized ${path.basename(imgPath)}: ${(raw.length/1024).toFixed(0)}KB → ${(optimized.length/1024).toFixed(0)}KB (${mime})`);
-            return { mime, b64: optimized.toString('base64') };
-          } catch {
-            return null;
+    // ── Resolve message attachments ─────────────────────────────────────────
+    // Each message may have `attachments: [{type:'image', path:'/...'}]`.
+    // Optimize images and inject as multimodal content via the provider's API format.
+    {
+      const _MAX_IMG_DIM = 1568;
+      const _optimizeImage = async (imgPath) => {
+        try {
+          const raw = fs.readFileSync(imgPath);
+          const ext = path.extname(imgPath).toLowerCase().slice(1);
+          const isJpeg = ext === 'jpg' || ext === 'jpeg';
+          if (raw.length < 200_000) {
+            return { mime: isJpeg ? 'image/jpeg' : `image/${ext}`, b64: raw.toString('base64') };
           }
-        };
+          let optimized = raw;
+          let mime = isJpeg ? 'image/jpeg' : `image/${ext}`;
+          try {
+            const sharp = (await import('sharp')).default;
+            optimized = await sharp(raw).resize(_MAX_IMG_DIM, _MAX_IMG_DIM, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
+            mime = 'image/jpeg';
+          } catch {}
+          channel.log('llm', `[image] Optimized ${path.basename(imgPath)}: ${(raw.length/1024).toFixed(0)}KB → ${(optimized.length/1024).toFixed(0)}KB (${mime})`);
+          return { mime, b64: optimized.toString('base64') };
+        } catch { return null; }
+      };
 
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (!msg.attachments?.length) continue;
+
+        const imageAtts = msg.attachments.filter(a =>
+          a.type === 'image' && a.path && fs.existsSync(a.path)
+        );
+
+        // Remove attachments field (LLM API doesn't understand it)
+        delete msg.attachments;
+
+        if (imageAtts.length === 0) continue;
+
+        const textContent = typeof msg.content === 'string' ? msg.content : '';
         const imageParts = (await Promise.all(
-          session._pendingImages.map(async att => {
-            const opt = await _optimizeImage(att.path);
-            return opt ? { ...opt, path: att.path } : null;
+          imageAtts.map(async a => {
+            const opt = await _optimizeImage(a.path);
+            return opt ? { ...opt, path: a.path } : null;
           })
         )).filter(Boolean);
+
+        if (imageParts.length === 0) continue;
+
         if (this.provider === 'anthropic') {
-          messages[lastUserIdx] = {
-            role: 'user',
+          messages[i] = {
+            role: msg.role,
             content: [
               ...imageParts.map(p => ({ type: 'image', source: { type: 'base64', media_type: p.mime, data: p.b64 } })),
               { type: 'text', text: textContent }
             ]
           };
         } else {
-          // OpenAI / Gemini (OpenAI-compatible)
-          messages[lastUserIdx] = {
-            role: 'user',
+          messages[i] = {
+            role: msg.role,
             content: [
               { type: 'text', text: textContent },
               ...imageParts.map(p => ({ type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.b64}` } }))
             ]
           };
         }
-        if (process.env.KOI_DEBUG_LLM) {
-          _debugAttachPaths.push(...imageParts.map(p => p.path));
-        }
+        _debugAttachPaths.push(...imageParts.map(p => p.path));
       }
-      session._lastConsumedImages = [...session._pendingImages]; // preserve for delegate propagation
-      session._pendingImages = null; // consume — don't re-send in subsequent calls
     }
 
     // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks
@@ -1516,7 +1543,8 @@ CRITICAL RULES:
 
     // Update status line with estimated input tokens before sending
     const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-    channel.setInfo('tokens', `↑${_fmtTk(_estInputTokens)} tokens · ${this.provider}/${this.model}`);
+    const _effortLabel = this._reasoningEffort && this._reasoningEffort !== 'none' ? ` · effort:${this._reasoningEffort}` : '';
+    channel.setInfo('tokens', `↑${_fmtTk(_estInputTokens)} tokens · ${this.provider}/${this.model}${_effortLabel}`);
 
     channel.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, ~${_estInputTokens} tokens, last user msg: ${lastUserMsgText.length} chars)`);
     channel.log('llm', `Last user msg preview: ${lastUserMsgText.substring(0, 300)}${lastUserMsgText.length > 300 ? '...' : ''}`);
@@ -1820,9 +1848,9 @@ CRITICAL RULES:
           throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
         }
         // 413 = payload too large — drop pending images and retry (don't exclude provider)
-        if (_status === 413 && session?._pendingImages?.length > 0) {
-          channel.log('llm', `[auto] 413 Payload Too Large — dropping ${session._pendingImages.length} pending image(s) and retrying`);
-          session._pendingImages = null;
+        if (_status === 413 && session?._promptAttachments?.length > 0) {
+          channel.log('llm', `[auto] 413 Payload Too Large — dropping ${session._promptAttachments.length} attachment(s) and retrying`);
+          session._promptAttachments = null;
         }
         // Other 4xx (401, 403, 404) = invalid key or model — exclude provider entirely.
         // 413 = payload too large — NOT the provider's fault, don't exclude it.

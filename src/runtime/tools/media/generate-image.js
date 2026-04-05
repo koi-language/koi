@@ -20,7 +20,7 @@ import { channel } from '../../io/channel.js';
 export default {
   type: 'generate_image',
   intent: 'generate_image',
-  description: 'Generate an image from a text prompt. Supports reference images for style guidance (provider-dependent). Fields: "prompt" (required), optional "aspectRatio" (1:1|16:9|9:16|4:3|3:4|3:2|2:3), optional "resolution" (low|medium|high|ultra), optional "quality" (auto|low|medium|high), optional "n" (number of images, default 1), optional "referenceImages" (array of file paths for style reference), optional "saveTo" (directory to save images). Returns: { success, provider, model, capabilities, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }',
+  description: 'Generate an image from a text prompt. Supports reference images for style guidance (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution" (low|medium|high|ultra), optional "quality" (auto|low|medium|high), optional "n" (number of images, default 1), optional "referenceImages" (array of file paths for style reference), optional "saveTo" (directory to save images). Returns: { success, provider, model, capabilities, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -28,7 +28,7 @@ export default {
     type: 'object',
     properties: {
       prompt:          { type: 'string', description: 'Text description of the desired image' },
-      aspectRatio:     { type: 'string', description: 'Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9 (default: 1:1)' },
+      aspectRatio:     { type: 'string', description: 'Aspect ratio (REQUIRED — choose based on user intent): 1:1 (square), 16:9 (landscape wide), 9:16 (portrait tall/vertical), 4:3 (landscape standard), 3:4 (portrait standard), 3:2 (landscape photo), 2:3 (portrait photo), 21:9 (ultrawide). For portrait/vertical/tall requests use 9:16 or 2:3. For landscape/wide use 16:9 or 3:2. Default: 1:1' },
       resolution:      { type: 'string', description: 'Resolution: low (~512px), medium (~1024px), high (~2048px), ultra (~4096px) (default: medium)' },
       quality:         { type: 'string', description: 'Quality: auto, low, medium, high (default: auto)' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
@@ -85,7 +85,21 @@ export default {
       }
     }
 
-    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 60)}..."`);
+    // Log capabilities so the agent can see supported aspect ratios
+    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, caps=${JSON.stringify(caps)}, prompt="${prompt.substring(0, 60)}..."`);
+
+    // Validate aspectRatio against model capabilities
+    const requestedRatio = action.aspectRatio || '1:1';
+    if (caps.aspectRatios && !caps.aspectRatios.includes(requestedRatio)) {
+      return {
+        success: false,
+        error: `Aspect ratio "${requestedRatio}" is not supported by ${resolved.model}. Supported ratios: ${caps.aspectRatios.join(', ')}. Please retry with a supported ratio.`,
+        provider: resolved.provider,
+        model: resolved.model,
+        supportedAspectRatios: caps.aspectRatios,
+        capabilities: caps,
+      };
+    }
 
     // Call provider with normalized parameters
     let result;
@@ -178,6 +192,7 @@ export default {
       success: true,
       provider: resolved.provider,
       model: resolved.model,
+      supportedAspectRatios: caps.aspectRatios,
       imageCount: savedImages.length,
       images: savedImages,
       usage: result.usage,

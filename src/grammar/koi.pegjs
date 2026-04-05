@@ -223,9 +223,38 @@ AgentBodyItem
   / AmnesiaDecl
   / EventHandler
   / StateDecl
+  / PhasesDecl
   / PlaybookDecl
   / ResilienceDecl
   / ExportFunction
+
+PhasesDecl
+  = "phases" _ "{" _ phases:PhaseEntry* _ "}" _ {
+      return { type: 'PhasesDecl', phases, location: location() };
+    }
+
+PhaseEntry
+  = name:Identifier _ "{" _ props:PhaseProps? _ "}" _ {
+      return { name: name.name || name, props: props || [], location: location() };
+    }
+
+PhaseProps
+  = head:PhaseProp tail:(_ ","? _ PhaseProp)* _ ","? {
+      return [head, ...tail.map(t => t[3])];
+    }
+
+PhaseProp
+  = key:Identifier _ ":" _ value:PhaseValue _ {
+      return { key: key.name || key, value };
+    }
+
+PhaseValue
+  = "auto" { return 'auto'; }
+  / "none" { return 'none'; }
+  / "low" { return 'low'; }
+  / "medium" { return 'medium'; }
+  / "high" { return 'high'; }
+  / n:Integer { return n; }
 
 AmnesiaDecl
   = "amnesia" _ "=" _ value:BooleanLiteral _ {
@@ -264,8 +293,8 @@ LLMConfig
     }
 
 EventHandler
-  = isPrivate:("private" _)? "on" _ event:HandlerName _ "(" _ params:Parameters? _ ")" _ "{" _ body:Statement* _ "}" _ {
-      return { type: 'EventHandler', event, params: params || [], body, isPrivate: !!isPrivate, location: location() };
+  = isPrivate:("private" _)? "on" _ event:HandlerName _ "(" _ params:Parameters? _ ")" _ isAsync:("async" _)? "{" _ body:Statement* _ "}" _ {
+      return { type: 'EventHandler', event, params: params || [], body, isPrivate: !!isPrivate, isAsync: !!isAsync, location: location() };
     }
 
 HandlerName

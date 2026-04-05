@@ -388,6 +388,169 @@ export function renderContentDiff(oldContent, newContent, filePath) {
   return output.join('\n');
 }
 
+// ─── Structured Diff Payload (for GUI/WS protocol) ────────────────────
+//
+// A DiffPayload is a JSON-serializable representation of a diff that any
+// frontend (terminal, Flutter GUI, web) can render natively. The CLI sends
+// this structure over the WS protocol; the GUI renders it with DiffBlock.
+//
+// Shape:
+//   {
+//     filePath: string,
+//     label: 'Update' | 'Create' | 'Delete',
+//     added: number,
+//     removed: number,
+//     lines: Array<{
+//       type: 'context' | 'add' | 'remove' | 'gap',
+//       num?: number,   // 1-based line number (absent for 'gap')
+//       text?: string,  // line content (absent for 'gap')
+//     }>
+//   }
+
+/**
+ * Build a DiffPayload from parsed unified-diff hunks.
+ * @param {Array} hunks - from parseUnifiedDiff()
+ * @param {string} filePath
+ * @param {string} [label='Update']
+ */
+export function buildDiffPayloadFromHunks(hunks, filePath, label = 'Update') {
+  const lines = [];
+  let added = 0, removed = 0;
+  for (let h = 0; h < hunks.length; h++) {
+    const hunk = hunks[h];
+    let oldLine = hunk.oldStart;
+    let newLine = hunk.newStart;
+    for (const line of hunk.lines) {
+      if (line.type === 'context') {
+        lines.push({ type: 'context', num: oldLine, text: line.text });
+        oldLine++; newLine++;
+      } else if (line.type === 'remove') {
+        lines.push({ type: 'remove', num: oldLine, text: line.text });
+        oldLine++;
+        removed++;
+      } else if (line.type === 'add') {
+        lines.push({ type: 'add', num: newLine, text: line.text });
+        newLine++;
+        added++;
+      }
+    }
+    if (h < hunks.length - 1) lines.push({ type: 'gap' });
+  }
+  return { filePath, label, added, removed, lines };
+}
+
+/**
+ * Build a DiffPayload from old/new file content (LCS-based).
+ * Returns null if contents are identical.
+ */
+export function buildDiffPayloadFromContent(oldContent, newContent, filePath, label = 'Update') {
+  const oldLines = oldContent.split('\n');
+  const newLines = newContent.split('\n');
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  // Huge files: fall back to full remove+add
+  if (m * n > 5000 * 5000) {
+    const lines = [];
+    for (let i = 0; i < m; i++) lines.push({ type: 'remove', num: i + 1, text: oldLines[i] });
+    for (let i = 0; i < n; i++) lines.push({ type: 'add', num: i + 1, text: newLines[i] });
+    return { filePath, label, added: n, removed: m, lines };
+  }
+
+  // LCS DP (trimEnd-tolerant)
+  const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1].trimEnd() === newLines[j - 1].trimEnd()) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack
+  const rawChanges = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1].trimEnd() === newLines[j - 1].trimEnd()) {
+      rawChanges.unshift({ type: 'equal', line: newLines[j - 1] });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      rawChanges.unshift({ type: 'add', line: newLines[j - 1] });
+      j--;
+    } else {
+      rawChanges.unshift({ type: 'remove', line: oldLines[i - 1] });
+      i--;
+    }
+  }
+
+  // Assign line numbers
+  const allChanges = [];
+  let oldLineNum = 1, newLineNum = 1;
+  for (const change of rawChanges) {
+    if (change.type === 'equal') {
+      allChanges.push({ ...change, oldLineNum, newLineNum });
+      oldLineNum++; newLineNum++;
+    } else if (change.type === 'remove') {
+      allChanges.push({ ...change, oldLineNum });
+      oldLineNum++;
+    } else if (change.type === 'add') {
+      allChanges.push({ ...change, newLineNum });
+      newLineNum++;
+    }
+  }
+
+  // ±3 context filter
+  const CTX = 3;
+  const show = new Array(allChanges.length).fill(false);
+  for (let k = 0; k < allChanges.length; k++) {
+    if (allChanges[k].type !== 'equal') {
+      for (let c = Math.max(0, k - CTX); c <= Math.min(allChanges.length - 1, k + CTX); c++) show[c] = true;
+    }
+  }
+  if (!show.some(Boolean)) return null;
+
+  const lines = [];
+  let added = 0, removed = 0;
+  let skipped = false;
+  for (let k = 0; k < allChanges.length; k++) {
+    if (show[k]) {
+      if (skipped) { lines.push({ type: 'gap' }); skipped = false; }
+      const ch = allChanges[k];
+      if (ch.type === 'equal') lines.push({ type: 'context', num: ch.oldLineNum, text: ch.line });
+      else if (ch.type === 'remove') { lines.push({ type: 'remove', num: ch.oldLineNum, text: ch.line }); removed++; }
+      else if (ch.type === 'add') { lines.push({ type: 'add', num: ch.newLineNum, text: ch.line }); added++; }
+    } else {
+      skipped = true;
+    }
+  }
+  return { filePath, label, added, removed, lines };
+}
+
+/**
+ * Build a DiffPayload for a brand-new file (all lines as context).
+ */
+export function buildDiffPayloadFromNewFile(content, filePath) {
+  const fileLines = content.split('\n');
+  const lines = fileLines.map((text, i) => ({ type: 'context', num: i + 1, text }));
+  return { filePath, label: 'Create', added: 0, removed: 0, lines };
+}
+
+/**
+ * Render a DiffPayload to an ANSI-colored terminal string.
+ * Used by the default/terminal Channel implementation.
+ */
+export function renderPayloadToTerminal(payload) {
+  if (!payload) return '';
+  const output = [diffHeader(payload.filePath, payload.added, payload.removed, payload.label)];
+  for (const line of payload.lines) {
+    if (line.type === 'gap') { output.push(`\x1b[2m      ...\x1b[0m`); continue; }
+    output.push(renderDiffLine(line.type, line.num, line.text, payload.filePath));
+  }
+  return output.join('\n');
+}
+
 /**
  * Render a new file diff (all lines are additions).
  */

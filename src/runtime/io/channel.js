@@ -92,6 +92,14 @@ class Channel {
   clear() { process.stderr.write('\r\x1b[K'); }
   clearProgress() { this.clear(); }
 
+  /**
+   * Present a resource to the user (open/preview it). No-op in plain CLI.
+   * @param {Object} spec - { type: 'file'|'url'|'image', path?, url?, title? }
+   */
+  presentResource(spec) { /* no-op in non-UI channels */ }
+  /** Whether this channel can present resources (open files/URLs visually). */
+  canPresentResources() { return false; }
+
   // ── Action Grouping ────────────────────────────────────────────────────
   // Default no-op stubs. TerminalChannel overrides with visual grouping.
 
@@ -311,6 +319,43 @@ class Channel {
 
   /** Render a new file as all-additions diff. */
   renderNewFileDiff(content, filePath) { return content; }
+
+  // ── Structured UI Blocks (for GUI frontends) ────────────────────────────
+  //
+  // These methods emit structured payloads instead of pre-rendered text.
+  // The base/terminal implementation formats them to ANSI and prints via
+  // `print()`. GUI channels (e.g. WsChannel) override these to send JSON
+  // messages that the client renders natively (DiffBlock, CommandBlock…).
+  //
+  // By sending structured data the transport layer — not regex on the
+  // client — determines how content is rendered.
+
+  /**
+   * Show a diff block.
+   * @param {{filePath:string,label:string,added:number,removed:number,lines:Array}} payload
+   */
+  async showDiff(payload) {
+    if (!payload) return;
+    const { renderPayloadToTerminal } = await import('../util/diff-render.js');
+    const text = renderPayloadToTerminal(payload);
+    if (text) this.print(`\n${text}\n`);
+  }
+
+  /**
+   * Show a shell command + its output as a terminal-style block.
+   * @param {{command:string,output?:string,exitCode?:number}} payload
+   */
+  showCommand(payload) {
+    if (!payload || !payload.command) return;
+    const dim = '\x1b[2m', reset = '\x1b[0m', bold = '\x1b[1m';
+    const out = [`${bold}$ ${payload.command}${reset}`];
+    if (payload.output) {
+      for (const line of String(payload.output).split('\n')) {
+        out.push(`${dim}  ${line}${reset}`);
+      }
+    }
+    this.print(out.join('\n'));
+  }
 }
 
 // ─── Singleton ──────────────────────────────────────────────────────────────

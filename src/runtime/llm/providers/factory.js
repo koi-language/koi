@@ -172,7 +172,7 @@ function _resolveLLM(req) {
 
   // provider = original (for tracking, exclusion, cost)
   // effectiveProvider = 'openai' in gateway mode (for SDK wrapper selection)
-  return { instance, provider, effectiveProvider, model, useThinking, effectiveDifficulty };
+  return { instance, provider, effectiveProvider, model, useThinking, effectiveDifficulty, profile: req.profile };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

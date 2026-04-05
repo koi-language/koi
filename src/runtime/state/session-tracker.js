@@ -531,7 +531,7 @@ export class SessionTracker {
    * Append a print event to the display log.
    * Called every time the LLM prints text so we can replay it on resume.
    */
-  saveDisplayEntry(type, text) {
+  saveDisplayEntry(type, data) {
     try {
       // Only create directory if the .koi parent already exists (onboarding creates it).
       // This prevents premature .koi creation before the user confirms the project.
@@ -539,7 +539,11 @@ export class SessionTracker {
       if (!fs.existsSync(koiDir)) return;
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, 'display-log.jsonl');
-      fs.appendFileSync(filePath, JSON.stringify({ ts: Date.now(), type, text }) + '\n', 'utf8');
+      // Strings go in `text`; structured payloads (diff/command) go in `payload`.
+      const entry = typeof data === 'string'
+        ? { ts: Date.now(), type, text: data }
+        : { ts: Date.now(), type, payload: data };
+      fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf8');
     } catch { /* non-fatal */ }
   }
 

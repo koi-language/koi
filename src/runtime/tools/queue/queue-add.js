@@ -20,11 +20,11 @@ export default {
     properties: {
       subject: {
         type: 'string',
-        description: 'Short title of the user request (e.g. "Add dark mode", "Fix login bug")',
+        description: 'Short title of the user request — ALWAYS in English regardless of user language (e.g. "Add dark mode", "Fix login bug")',
       },
       description: {
         type: 'string',
-        description: 'Detailed description of the request. Include all known context: what the user asked, relevant constraints, tech details, file paths mentioned, etc. This can be updated later as more info is discovered.',
+        description: 'Detailed description of the request — ALWAYS in English regardless of user language. Include all known context: what the user asked (translated to English), relevant constraints, tech details, file paths mentioned, etc.',
       },
     },
     required: ['subject'],

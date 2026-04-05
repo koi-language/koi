@@ -718,6 +718,7 @@ export class ContextMemory {
       replaceTag: opts.replaceTag || null,
     };
     if (opts.ephemeral) entry.ephemeral = true;
+    if (opts.attachments?.length > 0) entry.attachments = opts.attachments;
 
     if (opts.directLongTerm) {
       channel.log('memory', `↑ direct long-term: "${(permanent || shortTerm || immediate).substring(0, 60)}"`);
@@ -871,8 +872,12 @@ export class ContextMemory {
 
       // Inject full text from matched entries (not just summary)
       const recallText = matches.map(m => `- ${m.text || m.summary}`).join('\n');
+      // Collect all attachments from matched entries (preserved across tiers)
+      const recalledAttachments = matches.flatMap(m => m.attachments || []).filter(Boolean);
       // Inject as volatile short-term entry (will age and fade normally)
-      this.add('user', `RECALLED:\n${recallText}`, null, null);
+      this.add('user', `RECALLED:\n${recallText}`, null, null, {
+        attachments: recalledAttachments.length > 0 ? recalledAttachments : undefined,
+      });
     } catch (err) {
       channel.log('memory', `Hydration failed: ${err.message}`);
     }
@@ -908,7 +913,15 @@ export class ContextMemory {
           break;
       }
       if (content) {
-        messages.push({ role: entry.role, content });
+        const msg = { role: entry.role, content };
+        // Attachments are injected ONCE: on the first turn after they're added.
+        // After being consumed, the entry keeps the attachments for historical
+        // reference (the path is mentioned in text), but they're not re-sent to the LLM.
+        if (entry.attachments?.length > 0 && !entry._attachmentsConsumed) {
+          msg.attachments = entry.attachments;
+          entry._attachmentsConsumed = true; // mark as consumed
+        }
+        messages.push(msg);
       }
     }
 
@@ -1115,6 +1128,7 @@ export class ContextMemory {
           embedding,
           role: entry.role,
           ts: Date.now(),
+          attachments: entry.attachments || [],
         });
       } else {
         // Fallback in-memory pool (tests, no latentDbPath)
@@ -1124,6 +1138,7 @@ export class ContextMemory {
           embedding,
           ts: Date.now(),
           role: entry.role,
+          attachments: entry.attachments || [],
         });
         if (this._fallbackLatentPool.length > this._fallbackMaxLatent) {
           this._fallbackLatentPool = this._fallbackLatentPool.slice(-this._fallbackMaxLatent);

@@ -16,6 +16,7 @@ import { t } from '../../i18n.js';
 import { getFilePermissions, runFilePermDialog } from '../../code/file-permissions.js';
 import { sessionTracker } from '../../state/session-tracker.js';
 import { channel } from '../../io/channel.js';
+import { buildDiffPayloadFromContent, buildDiffPayloadFromNewFile } from '../../util/diff-render.js';
 
 export default {
   type: 'write_file',
@@ -46,19 +47,19 @@ export default {
     const exists = fs.existsSync(resolvedPath);
     const oldContent = exists ? fs.readFileSync(resolvedPath, 'utf8') : '';
 
-    // Generate diff preview (single shared function)
-    const diff = exists
-      ? channel.renderContentDiff(oldContent, newContent, filePath)
-      : channel.renderNewFileDiff(newContent, filePath);
+    // Build structured diff payload (GUI renders natively, terminal → ANSI)
+    const diffPayload = exists
+      ? buildDiffPayloadFromContent(oldContent, newContent, resolvedPath, 'Update')
+      : buildDiffPayloadFromNewFile(newContent, resolvedPath);
 
     // No real changes (only trailing whitespace differences)
-    if (exists && !diff) {
+    if (exists && !diffPayload) {
       channel.print(`\x1b[2m${t('noChanges')}\x1b[0m`);
       return { success: true, path: filePath, noChanges: true };
     }
 
     channel.clearProgress();
-    channel.print(`\n${diff}\n`);
+    await channel.showDiff(diffPayload);
 
     // Check permissions (shared across all file actions)
     const permissions = getFilePermissions(agent);

@@ -32,7 +32,9 @@ export class OpenAIChatLLM extends BaseLLM {
         max_completion_tokens: this.maxTokens,
         response_format: { type: 'json_object' },
         stream: true,
-        stream_options: { include_usage: true }
+        stream_options: { include_usage: true },
+        ...(this.caps.thinking && !this.useThinking && { reasoning_effort: 'low' }),
+        ...(this.caps.thinking && this.useThinking && { reasoning_effort: this.reasoningEffort === 'none' ? 'low' : this.reasoningEffort ?? 'medium' }),
       });
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.chat.completions.create(params, options);
@@ -131,7 +133,9 @@ export class OpenAIChatLLM extends BaseLLM {
         messages,
         temperature,
         max_completion_tokens: maxTokens,
-        ...(responseFormat && { response_format: responseFormat })
+        ...(responseFormat && { response_format: responseFormat }),
+        ...(this.caps.thinking && !this.useThinking && { reasoning_effort: 'low' }),
+        ...(this.caps.thinking && this.useThinking && { reasoning_effort: this.reasoningEffort === 'none' ? 'low' : this.reasoningEffort ?? 'medium' }),
       });
       const options = controller ? { signal: controller.signal } : {};
       const completion = await this.client.chat.completions.create(params, options);

@@ -111,6 +111,16 @@ export class FilePermissions {
     // --yes flag: auto-accept all file permissions
     if (process.env.KOI_YES === '1') return true;
 
+    // GUI: auto-approve paths explicitly attached by user
+    if (level === 'read' && globalThis.__guiApprovedPaths?.size > 0) {
+      const resolved_ = path.resolve(filePath);
+      for (const approvedDir of globalThis.__guiApprovedPaths) {
+        if (resolved_.startsWith(approvedDir + path.sep) || resolved_ === approvedDir || path.dirname(resolved_) === approvedDir) {
+          return true;
+        }
+      }
+    }
+
     const resolved = path.resolve(filePath);
     const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
     const koiDir = path.join(projectRoot, '.koi');

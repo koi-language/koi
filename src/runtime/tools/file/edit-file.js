@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { t } from '../../i18n.js';
-import { parseUnifiedDiff, renderColoredDiff } from '../../util/diff-render.js';
+import { parseUnifiedDiff, buildDiffPayloadFromHunks } from '../../util/diff-render.js';
 import { getFilePermissions, runFilePermDialog } from '../../code/file-permissions.js';
 
 /**
@@ -382,11 +382,9 @@ export default {
       };
     }
 
-    // Render colored diff preview
-    const coloredOutput = renderColoredDiff(hunks, filePath);
-
+    // Emit structured diff preview (GUI renders natively, terminal formats to ANSI)
     channel.clearProgress();
-    channel.print(`\n${coloredOutput}\n`);
+    await channel.showDiff(buildDiffPayloadFromHunks(hunks, resolvedPath, 'Update'));
 
     // Check permissions (shared across all file actions)
     const permissions = getFilePermissions(agent);

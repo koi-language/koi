@@ -1119,6 +1119,7 @@ export class KoiTranspiler {
     const amnesia = node.body.find(b => b.type === 'AmnesiaDecl');
     const exposesMCP = node.body.find(b => b.type === 'ExposesMCP');
     const peers = node.body.find(b => b.type === 'PeersDecl');
+    const phasesDecl = node.body.find(b => b.type === 'PhasesDecl');
 
     // Track if agent has handlers for auto-registration
     this.agentHasHandlers = eventHandlers.length > 0;
@@ -1166,6 +1167,26 @@ export class KoiTranspiler {
         const init = field.init ? this.generateExpression(field.init) : 'null';
         code += this.emit(`${this.getIndent()}${field.name.name}: ${init},\n`);
       }
+      this.indent--;
+      code += this.emit(`${this.getIndent()}},\n`);
+    }
+
+    // Emit phases declaration (per-phase model profiles)
+    if (phasesDecl) {
+      code += this.emit(`${this.getIndent()}phases: {\n`);
+      this.indent++;
+      const phaseNames = [];
+      for (const phase of phasesDecl.phases) {
+        const name = phase.name;
+        phaseNames.push(name);
+        const props = {};
+        for (const p of (phase.props || [])) {
+          props[p.key] = p.value;
+        }
+        code += this.emit(`${this.getIndent()}${JSON.stringify(name)}: ${JSON.stringify(props)},\n`);
+      }
+      // _validPhases: list of declared phase names for validation
+      code += this.emit(`${this.getIndent()}_validPhases: ${JSON.stringify(phaseNames)},\n`);
       this.indent--;
       code += this.emit(`${this.getIndent()}},\n`);
     }

@@ -43,10 +43,11 @@ export class AnthropicLLM extends BaseLLM {
       stream: true
     };
     if (this.caps.thinking && this.useThinking) {
-      // Extended thinking: remove temperature (unsupported) and add thinking config
+      const budgetMap = { none: 0, low: 1024, medium: 3072, high: 8000 };
+      const budget = budgetMap[this.reasoningEffort] ?? 3072;
       delete createParams.temperature;
-      createParams.thinking = { type: 'enabled', budget_tokens: 5000 };
-      createParams.max_tokens = 16000; // thinking tokens count toward max_tokens
+      createParams.thinking = { type: 'enabled', budget_tokens: budget };
+      createParams.max_tokens = budget + 8000;
     }
 
     let buffer = '';

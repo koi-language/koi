@@ -33,12 +33,34 @@ export default {
       agent.state[key] = updates[key];
     });
 
-    // Log phase transitions and trigger reclassification
+    // Log phase transitions, validate against declared phases, and apply phase profile
     if (updates.statusPhase && updates.statusPhase !== oldPhase) {
       const { channel } = await import('../../io/channel.js'); const cliLogger = channel;
+      const declaredPhases = agent.phases;
+
+      // Validate: if agent declared phases, only allow those
+      if (declaredPhases?._validPhases?.length > 0) {
+        if (!declaredPhases._validPhases.includes(updates.statusPhase)) {
+          return {
+            success: false,
+            error: `Invalid phase "${updates.statusPhase}". Valid phases: ${declaredPhases._validPhases.join(', ')}`,
+          };
+        }
+      }
+
       cliLogger.log('state', `[phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase}`);
+
+      // Apply phase profile to the session for model selection
+      const phaseProfile = declaredPhases?.[updates.statusPhase];
+      if (phaseProfile) {
+        const session = agent._activeSession;
+        if (session) {
+          session._phaseProfile = phaseProfile;
+          cliLogger.log('state', `[phase] Profile: ${JSON.stringify(phaseProfile)}`);
+        }
+      }
+
       // Phase change = agent now has more context → reclassify to pick the right model.
-      // E.g. understanding→implementing: agent read the requirements, complexity may differ.
       const session = agent._activeSession;
       if (session) session._needsReclassify = true;
     }

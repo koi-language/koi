@@ -1168,25 +1168,105 @@ export class Agent {
         // ── PARALLEL GROUP ──────────────────────────────────────────────────
         if (action.parallel && Array.isArray(action.parallel)) {
           const group = action.parallel;
-          channel.log('action', `${this.name}: Executing ${group.length} actions in parallel`);
+
+          // ── Extract async delegates from the parallel group ──────────────
+          // Handlers declared with 'async' in .koi should run in background,
+          // even when the LLM placed them inside a parallel batch.
+          const parallelResults = [];
+          const _syncGroup = [];
+          for (const pa of group) {
+            const paIntent = pa.intent || pa.type || 'unknown';
+            let _isAsync = false;
+            if (pa.actionType === 'delegate' && !pa.await) {
+              try {
+                const _tm = await this.findTeamMemberForIntent(paIntent);
+                if (_tm) {
+                  const _handler = _tm.agent.handlers?.[_tm.event];
+                  if (_handler?.__async__) _isAsync = true;
+                }
+              } catch { /* non-fatal */ }
+            }
+            if (_isAsync) {
+              // Launch as background delegate (same logic as sequential path)
+              if (!session._backgroundDelegates) session._backgroundDelegates = [];
+
+              // Prevent duplicate background delegates for the same intent
+              const _bgAlreadyRunning = session._backgroundDelegates.some(bg => bg.intent === paIntent);
+              if (_bgAlreadyRunning) {
+                channel.log('agent', `${this.name}: Skipping duplicate background delegate for ${paIntent} (already running)`);
+                parallelResults.push({ action: pa, result: { success: true, message: `Already running in background` } });
+                continue;
+              }
+
+              pa._background = true;
+              const _bgAgentName = paIntent.split('::')[0];
+              channel.markSlotBackground?.(_bgAgentName);
+              const _bgAction = { ...pa };
+              const _bgEntry = { promise: null, action: _bgAction, intent: paIntent, startedAt: Date.now() };
+              const _bgContextMemory = contextMemory;
+              const _bgChannel = channel;
+              const _bgSession = session;
+              const _bgPromise = this._executeAction(_bgAction, _bgAction, session.actionContext)
+                .then(({ result: bgResult }) => {
+                  const _agent = paIntent.split('::')[0];
+                  const _preview = bgResult ? JSON.stringify(bgResult).substring(0, 300) : 'null';
+                  _bgContextMemory.add('user',
+                    `Background task completed: ${paIntent} returned: ${_preview}\nInform the user about the result.`,
+                    `Background ${_agent} done`, null);
+                  _bgSession.recordAction(_bgAction, bgResult);
+                  _bgChannel.log('agent', `Background delegate completed: ${paIntent}`);
+                  return { result: bgResult };
+                })
+                .catch(err => {
+                  _bgChannel.log('agent', `${this.name}: Background delegate failed: ${paIntent} — ${err.message}`);
+                  _bgSession.recordAction(_bgAction, { _background: true, success: false, error: err.message });
+                  _bgContextMemory.add('user',
+                    `Background task completed with ERROR: ${paIntent} failed — ${err.message}`,
+                    `Background ${_bgAgentName} failed`, null);
+                  // Revert task to pending so System doesn't spawn a duplicate delegate
+                  if (_bgAction._taskId) {
+                    try {
+                      const wq = session._workQueue || globalThis.__koiWorkQueue;
+                      if (wq) {
+                        const task = wq.get(_bgAction._taskId);
+                        if (task && task.status === 'in_progress') {
+                          wq.update(_bgAction._taskId, { status: 'pending' });
+                          _bgChannel.log('agent', `Reverted task ${_bgAction._taskId} to pending after background failure`);
+                        }
+                      }
+                    } catch {}
+                  }
+                  return { error: err };
+                });
+              _bgEntry.promise = _bgPromise;
+              session._backgroundDelegates.push(_bgEntry);
+              channel.log('agent', `${this.name}: Background delegate started: ${paIntent}`);
+              // Add a synthetic result so the parallel summary doesn't miss it
+              session.actionContext[`_bg_${paIntent}`] = { output: { _background: true, message: `${_bgAgentName} is now running in background` } };
+            } else {
+              _syncGroup.push(pa);
+            }
+          }
+
+          channel.log('action', `${this.name}: Executing ${_syncGroup.length} actions in parallel${group.length !== _syncGroup.length ? ` (${group.length - _syncGroup.length} sent to background)` : ''}`);
           if (process.env.KOI_DEBUG_LLM) {
-            console.error(`[Agent:${this.name}] ⚡ Parallel group (${group.length}): ${group.map(a => a.intent || a.type).join(', ')}`);
+            console.error(`[Agent:${this.name}] ⚡ Parallel group (${_syncGroup.length}): ${_syncGroup.map(a => a.intent || a.type).join(', ')}`);
           }
 
           // Pre-flight: collect all required permissions BEFORE launching parallel.
           // Without this, each concurrent action would ask the user separately for
           // the same directory — pre-granting here ensures they only ask once.
-          await this._preflightParallelPermissions(group);
+          await this._preflightParallelPermissions(_syncGroup);
 
           // If all parallel actions are shell commands, group them under a single ⏺ Shell scope
-          const _allShells = group.every(pa => pa.intent === 'shell');
-          if (_allShells && group.length > 1) {
-            channel.beginScope('Shell', `${group.length} commands`);
+          const _allShells = _syncGroup.every(pa => pa.intent === 'shell');
+          if (_allShells && _syncGroup.length > 1) {
+            channel.beginScope('Shell', `${_syncGroup.length} commands`);
           }
 
           // Per-delegate timeout: if a delegate hangs (no LLM response, stuck permission, etc.)
           // it should not block the entire parallel group forever.
-          const parallelResults = await Promise.all(group.map(async (pa) => {
+          const _syncResults = await Promise.all(_syncGroup.map(async (pa) => {
             const paIntent = pa.intent || pa.type || 'unknown';
             channel.log('action', `${this.name}: Starting parallel delegate: ${paIntent}`);
             try {
@@ -1207,8 +1287,10 @@ export class Agent {
             }
           }));
 
+          parallelResults.push(..._syncResults);
+
           // Close shell scope if opened
-          if (_allShells && group.length > 1) {
+          if (_allShells && _syncGroup.length > 1) {
             channel.endScope(true);
           }
 
@@ -1216,7 +1298,7 @@ export class Agent {
           {
             const _ok = parallelResults.filter(r => !r.error).length;
             const _fail = parallelResults.filter(r => r.error).length;
-            channel.log('action', `${this.name}: All ${group.length} parallel delegates done (${_ok} ok, ${_fail} failed)`);
+            channel.log('action', `${this.name}: All ${_syncGroup.length} parallel delegates done (${_ok} ok, ${_fail} failed)`);
           }
 
           // Build a combined result so the LLM sees ALL parallel results at once.
@@ -1458,7 +1540,7 @@ export class Agent {
           // emit beginAction so consecutive reads/writes/edits are visually grouped.
           const _GROUPED_TOOLS = new Set(['read_file', 'edit_file', 'write_file', 'search', 'search_replace', 'grep', 'semantic_code_search', 'web_search', 'web_fetch']);
           const _isGroupedTool = _GROUPED_TOOLS.has(intent);
-          if (_isGroupedTool) channel.beginAction(intent, action.path || action.pattern || action.query || '');
+          if (_isGroupedTool) channel.beginAction(intent, action.url || action.path || action.pattern || action.query || '');
 
           // Propagate user-attached images to delegate agent so it sees them too.
           // session._lastConsumedImages is set by llm-provider after injecting images.
@@ -1482,6 +1564,16 @@ export class Agent {
           }
           if (_isAsyncHandler && action.actionType === 'delegate') {
             if (!session._backgroundDelegates) session._backgroundDelegates = [];
+
+            // Prevent duplicate: if a background delegate for the same intent is already running, skip
+            const _alreadyRunning = session._backgroundDelegates.some(bg => bg.intent === intent);
+            if (_alreadyRunning) {
+              channel.log('agent', `${this.name}: Skipping duplicate background delegate for ${intent} (already running)`);
+              contextMemory.add('user',
+                `Background task for ${intent} is already running. Waiting for it to complete.`,
+                `Duplicate delegate skipped`, null);
+              continue;
+            }
             action._background = true;
             // Pre-mark agent name as background so spinner is suppressed immediately
             const _bgAgentName = intent.split('::')[0];
@@ -1511,6 +1603,19 @@ export class Agent {
                   `Background ${_agent} failed`, null);
                 _bgSession.recordAction(_bgAction, { _background: true, success: false, error: err.message });
                 _bgChannel.log('agent', `Background delegate failed: ${_bgIntent} — ${err.message}`);
+                // Revert task to pending so System doesn't spawn a duplicate delegate
+                if (_bgAction._taskId) {
+                  try {
+                    const wq = _bgSession._workQueue || globalThis.__koiWorkQueue;
+                    if (wq) {
+                      const task = wq.get(_bgAction._taskId);
+                      if (task && task.status === 'in_progress') {
+                        wq.update(_bgAction._taskId, { status: 'pending' });
+                        _bgChannel.log('agent', `Reverted task ${_bgAction._taskId} to pending after background failure`);
+                      }
+                    }
+                  } catch {}
+                }
                 return { action: _bgAction, result: null, error: err };
               })
               .finally(() => {
@@ -1549,11 +1654,22 @@ export class Agent {
 
           channel.clear();
 
-          // Emit endAction for tool actions — only show on failure
+          // Emit endAction for every grouped tool — channels decide what to render.
+          // GUI needs the signal to clear the ephemeral activity shimmer; terminal
+          // skips empty-detail success lines to stay uncluttered.
           if (_isGroupedTool) {
             const _ok = result?.success !== false && !result?.denied;
             if (!_ok) {
-              channel.endAction(false, result?.error ? result.error.substring(0, 60) : 'failed');
+              const _errMsg = intent === 'web_fetch' && result?.error
+                ? `Error: ${result.error.substring(0, 80)}`
+                : (result?.error ? result.error.substring(0, 60) : 'failed');
+              channel.endAction(false, _errMsg);
+            } else if (intent === 'web_fetch') {
+              const _chars = result?.chars || result?.fileSize || 0;
+              const _size = _chars >= 1024 ? `${(_chars / 1024).toFixed(1)}KB` : `${_chars}B`;
+              channel.endAction(true, `Received ${_size} (200 OK)`);
+            } else {
+              channel.endAction(true, '');
             }
           }
 
@@ -1945,7 +2061,6 @@ export class Agent {
 
           if (feedbackText) {
             channel.log('agent', `${this.name}: Injecting user feedback: ${feedbackText.substring(0, 100)}`);
-            channel.print(`\x1b[2m↳ Feedback noted — adjusting...\x1b[0m`);
 
             // Merge feedback into the active task's description using an LLM.
             // This ensures the delegate sees an updated, coherent task spec
@@ -2026,7 +2141,15 @@ export class Agent {
         // Add user's new message to context and restart the reactive loop.
         // Re-evaluate the playbook via playbookResolver so compose blocks pick up
         // any runtime state changes (e.g. tasks created since the session started).
-        contextMemory.add('user', promptResult.answer, promptResult.answer, null);
+        const _promptAtts = Array.isArray(promptResult.attachments)
+          ? promptResult.attachments.filter(a => a.path)
+          : [];
+        // Annotate text with attachment info so the LLM knows what was attached
+        const _attNote = _promptAtts.length > 0
+          ? `\n[Attached: ${_promptAtts.map(a => a.path.split('/').pop()).join(', ')}]`
+          : '';
+        contextMemory.add('user', promptResult.answer + _attNote, promptResult.answer + _attNote, null,
+          _promptAtts.length > 0 ? { attachments: _promptAtts } : {});
         this.contextMemoryState = contextMemory.serialize();
         // Persist immediately so the user entry survives even if process.exit() is
         // called (e.g. two quick Ctrl+C presses) before the next save at line 973.
@@ -2387,7 +2510,10 @@ export class Agent {
           return { targetPath: rawPath || process.cwd(), level: 'read' };
         case 'edit_file':
         case 'write_file':
-          return rawPath ? { targetPath: rawPath, level: 'write' } : null;
+          // Writes are NEVER preflighted at directory level: the user must see
+          // the diff per file before granting. Each write_file/edit_file action
+          // handles its own per-file permission dialog with diff preview.
+          return null;
         default:
           return null; // no file permission needed
       }
