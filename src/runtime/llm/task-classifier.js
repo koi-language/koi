@@ -81,14 +81,16 @@ export class TaskClassifier {
   async classifyUserRequest(userMessage, agentName) {
     const taskDescription = `User request: ${userMessage.substring(0, 1000)}`;
 
-    const prompt = `Pick the ONE category (A-G) that best describes this user request. Return ONLY: {"cat":"X"}
+    const prompt = `Pick the ONE category (A-G) that best describes this user request. Return ONLY json: {"cat":"X"}
+
+IMPORTANT: When in doubt between two categories, ALWAYS pick the HIGHER one. Underestimating complexity causes bad results; overestimating is cheap.
 
 CATEGORIES:
 
 A: Greeting, chitchat, thanks, goodbye, casual conversation — no real task
 B: Simple question — factual, explanation, comparison, non-technical — no code needed
-C: Quick task — a single direct action: rename, fix typo, small script, generate image, find something in codebase, explain code, run a command
-D: Moderate task — a focused feature, bug fix, review, or investigation that touches 1-3 files
+C: Quick task — a single direct action: rename, fix typo, small script, find something in codebase, explain code, run a command
+D: Moderate task — a focused feature, bug fix, creative/media production (image, poster, video, infographic), review, or investigation
 E: Complex task — needs planning, decomposition, multi-file changes, integration, or architecture decisions
 F: Review or audit — code review, security audit, quality check, performance analysis
 G: Ops / infrastructure — deploy, run services, check logs, manage environments, CI/CD
@@ -97,9 +99,9 @@ EXAMPLES:
 
 A: "hello", "hola qué tal", "thanks!", "bye", "good morning", "hey", "gracias", "ok"
 B: "what's the capital of France?", "explain what Kubernetes is", "compare React vs Vue", "what time is it?", "summarize this article"
-C: "rename userId to user_id", "fix the typo", "write a bash script to backup the DB", "where is the auth middleware?", "how does the login flow work?", "generate an image of a cat", "add a loading spinner", "change the port to 8080", "run flutter run", "npm start"
-D: "add a GET /health endpoint with tests", "fix the checkout bug", "implement email verification", "add Stripe integration", "the button doesn't work on mobile", "add an index to speed up lookups", "migrate from SQL to Drizzle"
-E: "build a notification system", "refactor auth into a shared module", "create a multi-tenant architecture", "implement real-time collaboration", "build a custom template engine", "haz una app de gestión tributaria"
+C: "rename userId to user_id", "fix the typo", "write a bash script to backup the DB", "where is the auth middleware?", "how does the login flow work?", "add a loading spinner", "change the port to 8080", "run flutter run", "npm start"
+D: "add a GET /health endpoint with tests", "fix the checkout bug", "implement email verification", "add Stripe integration", "the button doesn't work on mobile", "generate an image of a cat", "make me a poster about X", "create an infographic", "design a logo", "hazme un dibujo realista"
+E: "build a notification system", "refactor auth into a shared module", "create a multi-tenant architecture", "implement real-time collaboration", "build a custom template engine", "haz una app de gestión tributaria", "create an infographic researching a topic from the web with high quality prompts"
 F: "review this PR", "check for security issues", "audit the API for OWASP top 10", "review queries for N+1 problems"
 G: "deploy to production", "check the Railway logs", "docker compose up", "why aren't emails sending?", "the CI pipeline broke", "restart the backend service", "check if SSL cert is valid"
 
@@ -137,18 +139,21 @@ ${taskDescription}`;
     // Injected on reclassification so the classifier sees real complexity, not just the task description.
     const discoveryContext = args?.recentDiscovery || null;
 
-    const prompt = `Pick the ONE category (A-V) that best matches this task. Return ONLY: {"cat":"X"}
+    const prompt = `Pick the ONE category (A-V) that best matches this task. Return ONLY json: {"cat":"X"}
+
+IMPORTANT: When in doubt between two categories, ALWAYS pick the HIGHER (more complex) one. Underestimating costs quality; overestimating costs pennies.
 ${projectContext ? `\nPROJECT CONTEXT (use this to gauge complexity — a rename in a 500-file project is harder than in a 5-file project):\n${projectContext}\n` : ''}${discoveryContext ? `\nDISCOVERY CONTEXT (what the agent found while exploring — use this to refine your estimate):\n${discoveryContext}\n` : ''}
 
 CATEGORIES:
 
 A: Simple text/config change — rename a variable, fix a typo, change a string, update a version number
-B: Write a simple script or query, OR generate media (image/video/audio) — small Python script, single SQL query, bash one-liner, generate an image
+B: Write a simple script or query — small Python script, single SQL query, bash one-liner
 C: Look up / find something in the codebase — "where is auth implemented?", "find the email config"
 D: Explain how something works in the codebase — "how does the login flow work?", "what does this function do?"
 E: Read and understand code to answer a question — "what system does the frontend use for email?"
 F: Simple bug fix in one file — off-by-one, null check, wrong condition, missing import
 G: UI design / visual adaptation — adapt colors from a reference image, redesign a page's look and feel, match a mockup/screenshot. Requires vision and strong code output.
+G2: Creative media production — generate an image, poster, infographic, logo, video, audio. Requires understanding the subject, crafting a detailed prompt, and producing high-quality output.
 H: Add form validation, input handling, basic interactivity, add a simple UI element (button, toggle, spinner)
 I: Implement a small feature (one file, straightforward) — add an endpoint, add a column, add a filter
 J: Review or audit code — PR review, security review, code quality check
@@ -165,12 +170,13 @@ T: Design architecture — system design, API design, multi-service coordination
 U: Expert-level engineering — compiler, distributed systems, CRDT, custom protocol, AST manipulation
 V: Coordinate / delegate — route tasks to agents, manage execution, orchestrate multi-step workflows
 
-If NONE of the above categories fit, pick the closest one.
+If NONE of the above categories fit, pick the closest one. When torn between two options, ALWAYS pick the harder/more complex one — it is much better to overestimate than underestimate.
 
 EXAMPLES:
 
 A: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0"
-B: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB", "generate an image of a cat", "make me a logo", "hazme un dibujo realista"
+B: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB"
+G2: "generate an image of a cat", "make me a logo", "hazme un dibujo realista", "create a poster about climate change", "design an infographic about Artemis 2", "make me a high-quality illustration"
 C: "where is the auth middleware?", "find where password reset is handled", "locate the email sending code", "find all API routes"
 D: "how does the login flow work?", "explain the billing system", "what happens when a user signs up?"
 E: "what email provider does the backend use?", "what ORM is this project using?", "what database engine are we using?"
@@ -204,6 +210,7 @@ ${taskDescription}`;
       E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
       F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
       G: { code: 80,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
+      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
       H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: 'low' },
       I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
       J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
@@ -254,7 +261,17 @@ ${taskDescription}`;
 
     this._log('llm', `[classify] Using ${_candidates[0].model} for classification`);
 
+    // Circuit breaker: if 3 consecutive models fail (timeout/error), the gateway
+    // is likely down. Stop trying and use the default profile immediately instead
+    // of wasting 15s × N_remaining models.
+    let consecutiveFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 3;
+
     for (const candidate of _candidates) {
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        this._log('llm', `[classify] Circuit breaker: ${consecutiveFailures} consecutive failures — gateway likely down, using default`);
+        break;
+      }
       this._log('llm', `[classify] Trying ${candidate.model}...`);
       try {
         // Use the correct adapter for each provider (OpenAI Chat/Responses, Anthropic, Gemini).
@@ -263,6 +280,7 @@ ${taskDescription}`;
         const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
         const llm = this._createLLMFn(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens: 800, useThinking: false });
         const { text: content, usage: _u } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 15000, responseFormat: 'json_object' });
+        consecutiveFailures = 0; // reset on success
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
         this._costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
         this._log('llm', `[classify] Raw response: ${content.substring(0, 200)}`);
@@ -270,7 +288,7 @@ ${taskDescription}`;
         const json = JSON.parse(_stripped);
         // Category format: { cat: "A"-"Z" }
         if (json.cat) {
-          const cat = String(json.cat).toUpperCase().charAt(0);
+          const cat = String(json.cat).toUpperCase();
           const catProfile = CATEGORY_PROFILES[cat];
           if (catProfile) {
             const { code: codeScore, reasoning: reasoningScore, risk: riskLevel = 0, reasoningEffort: effort = 'medium' } = catProfile;
@@ -296,7 +314,8 @@ ${taskDescription}`;
         }
         this._log('llm', `[classify] Invalid shape from ${candidate.model}: ${JSON.stringify(json)}`);
       } catch (e) {
-        this._log('llm', `[classify] ${candidate.model} failed: ${e.message}`);
+        consecutiveFailures++;
+        this._log('llm', `[classify] ${candidate.model} failed: ${e.message} (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive)`);
       }
     }
     this._log('llm', `[classify] All candidates failed — default profile ${DEFAULT_TASK_PROFILE.taskType}:${DEFAULT_TASK_PROFILE.difficulty}`);

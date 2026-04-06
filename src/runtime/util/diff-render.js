@@ -422,10 +422,12 @@ export function buildDiffPayloadFromHunks(hunks, filePath, label = 'Update') {
     let newLine = hunk.newStart;
     for (const line of hunk.lines) {
       if (line.type === 'context') {
-        lines.push({ type: 'context', num: oldLine, text: line.text });
+        // Use new (post-edit) line numbers so they match the editor view
+        lines.push({ type: 'context', num: newLine, text: line.text });
         oldLine++; newLine++;
       } else if (line.type === 'remove') {
-        lines.push({ type: 'remove', num: oldLine, text: line.text });
+        // Removed lines don't exist in the new file — show no line number
+        lines.push({ type: 'remove', num: null, text: line.text });
         oldLine++;
         removed++;
       } else if (line.type === 'add') {
@@ -518,8 +520,8 @@ export function buildDiffPayloadFromContent(oldContent, newContent, filePath, la
     if (show[k]) {
       if (skipped) { lines.push({ type: 'gap' }); skipped = false; }
       const ch = allChanges[k];
-      if (ch.type === 'equal') lines.push({ type: 'context', num: ch.oldLineNum, text: ch.line });
-      else if (ch.type === 'remove') { lines.push({ type: 'remove', num: ch.oldLineNum, text: ch.line }); removed++; }
+      if (ch.type === 'equal') lines.push({ type: 'context', num: ch.newLineNum, text: ch.line });
+      else if (ch.type === 'remove') { lines.push({ type: 'remove', num: null, text: ch.line }); removed++; }
       else if (ch.type === 'add') { lines.push({ type: 'add', num: ch.newLineNum, text: ch.line }); added++; }
     } else {
       skipped = true;

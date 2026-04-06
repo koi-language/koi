@@ -1538,9 +1538,11 @@ export class Agent {
 
           // For tool actions that don't manage their own display (shell does its own),
           // emit beginAction so consecutive reads/writes/edits are visually grouped.
-          const _GROUPED_TOOLS = new Set(['read_file', 'edit_file', 'write_file', 'search', 'search_replace', 'grep', 'semantic_code_search', 'web_search', 'web_fetch']);
-          const _isGroupedTool = _GROUPED_TOOLS.has(intent);
-          if (_isGroupedTool) channel.beginAction(intent, action.url || action.path || action.pattern || action.query || '');
+          // Emit beginAction for all tool actions that don't manage their own
+          // display (shell does its own). This lets the GUI show activity shimmer.
+          const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return']);
+          const _isGroupedTool = !_SELF_MANAGED.has(intent) && action.actionType !== 'delegate';
+          if (_isGroupedTool) channel.beginAction(intent, action.url || action.path || action.pattern || action.query || action.subject || '');
 
           // Propagate user-attached images to delegate agent so it sees them too.
           // session._lastConsumedImages is set by llm-provider after injecting images.
@@ -1643,9 +1645,11 @@ export class Agent {
             channel.log('agent', `${this.name}: Background delegate started: ${intent}`);
             // Record as "started" — the real result comes later
             session.recordAction(action, { _background: true, status: 'running', message: `${intent} running in background` });
-            // Tell the LLM to wait for user input instead of spinning
+            // Inform the user that the task is running in the background.
+            // Then tell the LLM to wait for user input.
+            const _taskSubject = action.task?.subject || action.subject || intent.split('::').pop();
             contextMemory.add('user',
-              `${_bgAgent} is now running in background. Do NOT print any "waiting" or status messages. Call prompt_user immediately to wait for the user's next request. The background task will deliver its result automatically when done.`,
+              `${_bgAgent} is now working on "${_taskSubject}" in the background. You MUST print a brief message to the user telling them what is being done and that you'll notify them when it's ready. Example: "I'm working on your infographic in the background — I'll let you know when it's done. In the meantime, feel free to ask me anything else." Then call prompt_user to wait for the user's next request. The background task will deliver its result automatically when done.`,
               `${_bgAgent} dispatched to background`, null);
             continue;
           }
@@ -2145,10 +2149,20 @@ export class Agent {
         const _promptAtts = Array.isArray(promptResult.attachments)
           ? promptResult.attachments.filter(a => a.path)
           : [];
-        // Annotate text with attachment info so the LLM knows what was attached
-        const _attNote = _promptAtts.length > 0
-          ? `\n[Attached: ${_promptAtts.map(a => a.path.split('/').pop()).join(', ')}]`
-          : '';
+        // Register attachments and annotate with IDs so delegates can resolve them
+        let _attNote = '';
+        if (_promptAtts.length > 0) {
+          try {
+            const { attachmentRegistry } = await import('../state/attachment-registry.js');
+            const _attParts = _promptAtts.map(a => {
+              const id = attachmentRegistry.register(a.path);
+              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
+            });
+            _attNote = `\n[Attached ${_attParts.join(', ')}]`;
+          } catch {
+            _attNote = `\n[Attached: ${_promptAtts.map(a => a.path.split('/').pop()).join(', ')}]`;
+          }
+        }
         contextMemory.add('user', promptResult.answer + _attNote, promptResult.answer + _attNote, null,
           _promptAtts.length > 0 ? { attachments: _promptAtts } : {});
         this.contextMemoryState = contextMemory.serialize();

@@ -64,8 +64,11 @@ export default {
     const instance = resolved.instance;
     const caps = instance.capabilities;
 
-    // Load reference images from file paths
+    // Load reference images from file paths.
+    // Each reference image used for generation is saved to the media library
+    // (deduplicated by content hash — won't store duplicates).
     let referenceImages;
+    const _savedRefIds = {}; // filePath → media library ID
     if (action.referenceImages?.length) {
       if (!caps.referenceImages) {
         channel.log('image', `Provider ${resolved.provider}/${resolved.model} does not support reference images — ignoring`);
@@ -81,6 +84,21 @@ export default {
           const ext = path.extname(resolvedPath).toLowerCase();
           const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
           referenceImages.push({ data, mimeType: mimeMap[ext] || 'image/png' });
+
+          // Save reference image to media library (dedup by hash, non-blocking)
+          try {
+            const { MediaLibrary } = await import('../../state/media-library.js');
+            const lib = MediaLibrary.global();
+            const result = await lib.save({
+              filePath: resolvedPath,
+              metadata: { source: 'reference', usedForGeneration: true },
+              description: `Reference image: ${path.basename(resolvedPath)}`,
+            });
+            _savedRefIds[resolvedPath] = result.id;
+            channel.log('image', `Reference image ${result.isNew ? 'saved to' : 'already in'} media library: ${result.id}`);
+          } catch (mlErr) {
+            channel.log('image', `Media library ref save failed (non-fatal): ${mlErr.message}`);
+          }
         }
       }
     }
@@ -129,9 +147,9 @@ export default {
       };
     }
 
-    // Always save images to disk — use saveTo if specified, otherwise temp dir
+    // Always save images to disk — persistent dir so they survive across sessions
     if (result.images?.length) {
-      const saveDir = path.join(os.tmpdir(), 'braxil-images');
+      const saveDir = path.join(os.homedir(), '.koi', 'images');
       if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
       for (let i = 0; i < result.images.length; i++) {
@@ -187,6 +205,35 @@ export default {
         ...(img.width ? { width: img.width } : {}),
         ...(img.height ? { height: img.height } : {}),
       }));
+
+    // Auto-save generated images to media library (non-blocking)
+    try {
+      const { saveGeneratedImage } = await import('../../state/media-library.js');
+      for (const img of savedImages) {
+        if (img.savedTo) {
+          await saveGeneratedImage(img.savedTo, {
+            prompt: action.prompt,
+            negativePrompt: action.negativePrompt || null,
+            model: resolved.model,
+            provider: resolved.provider,
+            aspectRatio: action.aspectRatio || null,
+            outputFormat: action.outputFormat || 'png',
+            stylePreset: action.stylePreset || null,
+            // Store media library IDs of reference images (not file paths)
+            referenceImageIds: Object.values(_savedRefIds),
+            referenceImagePaths: (action.referenceImages || []).map(r => typeof r === 'string' ? r : r.filePath).filter(Boolean),
+            seed: action.seed || null,
+            steps: action.steps || null,
+            guidanceScale: action.guidanceScale || null,
+            width: img.width || null,
+            height: img.height || null,
+          }, agent?.llmProvider || null);
+          channel.log('image', `Saved to media library: ${img.savedTo}`);
+        }
+      }
+    } catch (mlErr) {
+      channel.log('image', `Media library save failed (non-fatal): ${mlErr.message}`);
+    }
 
     return {
       success: true,

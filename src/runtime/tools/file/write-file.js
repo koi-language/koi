@@ -58,6 +58,7 @@ export default {
       return { success: true, path: filePath, noChanges: true };
     }
 
+    if (diffPayload) diffPayload.beforeContent = oldContent; // for GUI revert
     channel.clearProgress();
     await channel.showDiff(diffPayload);
 
@@ -106,8 +107,6 @@ export default {
 
     fs.writeFileSync(resolvedPath, newContent, 'utf8');
     if (sessionTracker) sessionTracker.trackFile(resolvedPath, oldContent);
-    channel.print(`\x1b[2m${t('done')}\x1b[0m`);
-
     // Schedule background re-indexing after file changes
     try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}
 

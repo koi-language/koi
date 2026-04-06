@@ -25,11 +25,11 @@ import { lookupModel } from '../cost-center.js';
 
 // ── Gateway base URL ─────────────────────────────────────────────────────────
 
-function getGatewayBase() {
+export function getGatewayBase() {
   return (process.env.KOI_API_URL || 'http://localhost:3000') + '/gateway';
 }
 
-function getAuthHeaders() {
+export function getAuthHeaders() {
   return {
     'Authorization': `Bearer ${process.env.KOI_AUTH_TOKEN}`,
     'Content-Type': 'application/json',

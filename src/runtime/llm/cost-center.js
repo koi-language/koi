@@ -64,12 +64,13 @@ export function getModelCaps(model) {
   // so this works even when models come from the backend without explicit flags.
   const isOpenAiThinking = info?.thinking && info?.provider === 'openai';
   return {
-    noTemperature:   info?.noTemperature   ?? false,
-    noMaxTokens:     info?.noMaxTokens     ?? isOpenAiThinking ?? false,
-    api:             info?.api             ?? 'chat',
-    thinking:        info?.thinking        ?? false,
-    maxOutputTokens: info?.maxOutputTokens ?? (isOpenAiThinking ? 65536 : 0),
-    supportsCaching: info?.cachedInputPer1M != null,
+    noTemperature:          info?.noTemperature          ?? false,
+    noMaxTokens:            info?.noMaxTokens            ?? isOpenAiThinking ?? false,
+    api:                    info?.api                    ?? 'chat',
+    thinking:               info?.thinking               ?? false,
+    maxOutputTokens:        info?.maxOutputTokens        ?? (isOpenAiThinking ? 65536 : 0),
+    supportsCaching:        info?.cachedInputPer1M != null,
+    supportsThinkingBudget: info?.supportsThinkingBudget ?? false,
   };
 }
 

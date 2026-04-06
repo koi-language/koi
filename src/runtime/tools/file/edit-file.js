@@ -384,7 +384,9 @@ export default {
 
     // Emit structured diff preview (GUI renders natively, terminal formats to ANSI)
     channel.clearProgress();
-    await channel.showDiff(buildDiffPayloadFromHunks(hunks, resolvedPath, 'Update'));
+    const _diffPayload = buildDiffPayloadFromHunks(hunks, resolvedPath, 'Update');
+    _diffPayload.beforeContent = content; // for GUI revert
+    await channel.showDiff(_diffPayload);
 
     // Check permissions (shared across all file actions)
     const permissions = getFilePermissions(agent);
@@ -425,8 +427,6 @@ export default {
 
     fs.writeFileSync(resolvedPath, newContent, 'utf8');
     if (sessionTracker) sessionTracker.trackFile(resolvedPath, content);
-    channel.print(`\x1b[2m${t('done')}\x1b[0m`);
-
     // Schedule background re-indexing after file changes
     try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}
 
