@@ -1701,6 +1701,7 @@ export class Agent {
             Agent._cliHooks?.onBusy?.(true);
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             this._lastUserMessage = _isBgWakeup ? null : (result?.answer || null);
+            channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
 
             // Share with session tracker so delegate commits can also use the user's request
             if (sessionTracker && this._lastUserMessage) {

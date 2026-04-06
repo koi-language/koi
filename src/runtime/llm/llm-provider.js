@@ -631,6 +631,9 @@ export class LLMProvider {
     // - A playbookResolver exists — meaning the playbook contains dynamic compose blocks
     //   that depend on runtime state (task list, registry, etc.) and must be re-evaluated
     //   on every LLM call so the system prompt is never stale.
+    // Capture the user message for classification BEFORE the reset inside the if block.
+    const _savedUserMessage = agent?._lastUserMessage || null;
+
     if (isFirstCall || !contextMemory.hasHistory() || playbookResolver) {
       const freshPlaybook = playbookResolver ? await playbookResolver() : playbook;
       const systemPromptResult = await this._buildReactiveSystemPrompt(agent, freshPlaybook);
@@ -905,15 +908,13 @@ CRITICAL RULES:
         let _classifyArgs = context?.args && Object.keys(context.args).length > 0 ? context.args : null;
         let _isInteraction = false;
 
-        // When the user just sent a message, use the interaction classifier with the clean message
-        if (_isNewUserMessage) {
-          const _userMsg = agent?._lastUserMessage;
-          channel.log('llm', `[classify] New user message detected: agent=${!!agent}, _lastUserMessage=${_userMsg ? `"${_userMsg.substring(0, 50)}"` : 'null'}`);
-          if (_userMsg) {
-            _classifyArgs = { userRequest: _userMsg };
-            _isInteraction = true;
-            channel.log('llm', `[classify] Using interaction classifier for user message`);
-          }
+        // When the user just sent a message, use the interaction classifier with the clean message.
+        // Use _savedUserMessage (captured before the reset at line ~680) since agent._lastUserMessage
+        // is already null at this point.
+        if (_isNewUserMessage && _savedUserMessage) {
+          _classifyArgs = { userRequest: _savedUserMessage };
+          _isInteraction = true;
+          channel.log('llm', `[classify] Using interaction classifier for user message: "${_savedUserMessage.substring(0, 50)}"`);
         }
 
         // Loop/agent-reclassify force task classifier — but NOT when the user just sent
@@ -939,9 +940,9 @@ CRITICAL RULES:
         }
 
         // ── Dispatch to the appropriate classifier ───────────────────────
-        if (_isInteraction && agent?._lastUserMessage) {
+        if (_isInteraction && _savedUserMessage) {
           // User just sent a message → interaction classifier (clean message, speed-oriented)
-          session._autoProfile = await this.classifyUserRequest(agent._lastUserMessage, agentName);
+          session._autoProfile = await this.classifyUserRequest(_savedUserMessage, agentName);
         } else {
           // Task/delegation path — build args for the task classifier.
           // Enrich with recent discovery context (files read, errors found) so the
@@ -957,8 +958,8 @@ CRITICAL RULES:
               _classifyArgs = { ..._classifyArgs, recentDiscovery: _recentResults };
             }
           }
-          if (!_classifyArgs && agent?._lastUserMessage) {
-            _classifyArgs = { userRequest: agent._lastUserMessage };
+          if (!_classifyArgs && _savedUserMessage) {
+            _classifyArgs = { userRequest: _savedUserMessage };
           }
           if (!_classifyArgs) {
             try {
