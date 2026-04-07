@@ -111,10 +111,10 @@ ${taskDescription}`;
       A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
       B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: 'none' },
       C: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'medium' },
-      E: { code: 65,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
-      F: { code: 60,  reasoning: 65,  risk: 10, reasoningEffort: 'medium' },
-      G: { code: 50,  reasoning: 60,  risk: 60, reasoningEffort: 'medium' },
+      D: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'low' },
+      E: { code: 65,  reasoning: 70,  risk: 20, reasoningEffort: 'low' },
+      F: { code: 60,  reasoning: 65,  risk: 10, reasoningEffort: 'low' },
+      G: { code: 50,  reasoning: 60,  risk: 60, reasoningEffort: 'low' },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);
@@ -208,24 +208,24 @@ ${taskDescription}`;
       C: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
       D: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
       E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
-      F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
-      G: { code: 80,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
-      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
+      F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'low' },
+      G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
+      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
       H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: 'low' },
-      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
-      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
-      K: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: 'medium' },
-      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'medium' },
-      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'medium' },
-      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'medium' },
-      O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'high' },
-      P: { code: 60,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
-      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'medium' },
+      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'low' },
+      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
+      K: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: 'low' },
+      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'low' },
+      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'low' },
+      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'low' },
+      O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'medium' },
+      P: { code: 60,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
+      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'low' },
       R: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
-      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'high' },
-      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
+      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'medium' },
+      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'medium' },
       U: { code: 90,  reasoning: 85,  risk: 20, reasoningEffort: 'high' },
-      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
+      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'low' },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName);
@@ -279,7 +279,7 @@ ${taskDescription}`;
         const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
         const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
         const llm = this._createLLMFn(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens: 800, useThinking: false });
-        const { text: content, usage: _u } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 15000, responseFormat: 'json_object' });
+        const { text: content, usage: _u } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 5000, responseFormat: 'json_object' });
         consecutiveFailures = 0; // reset on success
         const inputTokens = _u.input || 0, outputTokens = _u.output || 0;
         this._costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);

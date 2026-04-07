@@ -124,7 +124,8 @@ export default {
     }
 
     const duration = action.duration || 5;
-    channel.log('video', `generate_video: ${resolved.provider}/${resolved.model}, duration=${duration}s, prompt="${prompt.substring(0, 60)}..."`);
+    const refFrame = action.startFrame || action.referenceImage || null;
+    channel.log('video', `generate_video: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", duration=${duration}s, aspectRatio=${action.aspectRatio || '16:9'}, resolution=${action.resolution || '720p'}, quality=${action.quality || 'auto'}${refFrame ? ', startFrame=' + refFrame : ''}, saveTo=${action.saveTo || 'default'}`);
 
     const result = await instance.generate(prompt, {
       duration,

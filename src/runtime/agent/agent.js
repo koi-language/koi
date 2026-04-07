@@ -748,6 +748,18 @@ export class Agent {
     }
     channel.log('agent', `${this.name}: Starting reactive loop${isDelegate ? ' [delegate]' : ''}`);
 
+    // ── AUTO-ACTIVATE SKILLS ────────────────────────────────────────────────
+    // At the start of a delegate's lifecycle, check available skills and use
+    // the cheap classifier model to decide which (if any) to activate.
+    // This is deterministic and doesn't depend on the LLM choosing to call tools.
+    if (isDelegate && !this.state?.skills?.length) {
+      try {
+        await this._autoActivateSkills(args);
+      } catch (e) {
+        channel.log('skills', `${this.name}: Auto-activate skills failed: ${e.message}`);
+      }
+    }
+
     let isFirstCall = true;
     // Helper for i18n in agent hints
     const _h = (key, fallback) => globalThis.__koiStrings?.[key] ?? fallback ?? key;
@@ -1268,7 +1280,8 @@ export class Agent {
           // it should not block the entire parallel group forever.
           const _syncResults = await Promise.all(_syncGroup.map(async (pa) => {
             const paIntent = pa.intent || pa.type || 'unknown';
-            channel.log('action', `${this.name}: Starting parallel delegate: ${paIntent}`);
+            const paDetail = pa.url ? ` url=${pa.url.substring(0, 100)}` : pa.query ? ` q="${pa.query.substring(0, 60)}"` : pa.path ? ` path=${pa.path}` : '';
+            channel.log('action', `${this.name}: Starting parallel delegate: ${paIntent}${paDetail}`);
             try {
               const { result } = await this._executeAction(pa, pa, session.actionContext);
               if (pa.id) {
@@ -2693,8 +2706,15 @@ export class Agent {
         }
       }
 
+      // Emit beginAction for tool actions so the GUI shows activity shimmer.
+      const _intent = action.intent || action.type || '';
+      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_facts', 'learn_fact', 'list_skills', 'activate_skill', 'deactivate_skill', 'queue_add', 'queue_update']);
+      if (_intent && !_SELF_MANAGED.has(_intent)) {
+        channel.beginAction(_intent, action.url || action.path || action.pattern || action.query || action.subject || '');
+      }
+
       // Check if this is a registered action with an executor
-      const actionDef = actionRegistry.get(action.intent || action.type);
+      const actionDef = actionRegistry.get(_intent);
 
       if (actionDef && actionDef.execute) {
         // Fast path: execute registered action.
@@ -3004,6 +3024,64 @@ Many commands are inherently slow and produce little or no output for extended p
     } catch (err) {
       channel.log('shell', `[${this.name}] _resolveProcessInput error: ${err.message}`);
       return null;
+    }
+  }
+
+  /**
+   * Auto-activate relevant skills at the start of a delegate's lifecycle.
+   * Uses the cheap classifier model to decide which skills match the task.
+   */
+  async _autoActivateSkills(args) {
+    const result = await this.callAction('list_skills', {});
+    const skills = result?._fullSkills || result?.skills;
+    if (!skills || skills.length === 0) return;
+
+    const taskText = args?.subject || args?.description || args?.userRequest || args?.instruction || '';
+    if (!taskText) return;
+
+    const skillList = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
+
+    const prompt = `You are a skill selector. An AI agent is about to start a task. Your job is to decide which specialized skills (if any) should be activated to help it.
+
+Each skill provides a domain-specific workflow with detailed instructions, reference materials, and best practices. Activating a relevant skill significantly improves the quality of the output.
+
+TASK THE AGENT WILL PERFORM:
+${taskText.substring(0, 500)}
+
+AVAILABLE SKILLS:
+${skillList}
+
+Which skills should be activated for this task? Consider whether the task's domain, subject matter, or required techniques overlap with any skill's area of expertise.
+
+Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["api-development", "database-development"]. Return [] if no skill is relevant.`;
+
+    try {
+      const { getAllCandidates } = await import('../llm/providers/factory.js');
+      const { createLLM, getAvailableProviders } = await import('../llm/providers/factory.js');
+
+      const providers = this.llmProvider?._availableProviders || getAvailableProviders();
+      const candidates = getAllCandidates('reasoning', 40, providers);
+      if (candidates.length === 0) return;
+
+      const c = candidates[0];
+      const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : c.provider;
+      const client = this.llmProvider._getClient(effectiveProvider);
+      const llm = createLLM(effectiveProvider, client, c.model, { temperature: 0, maxTokens: 200, useThinking: false });
+      const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 5000 });
+
+      const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const names = JSON.parse(stripped);
+
+      if (Array.isArray(names)) {
+        for (const name of names) {
+          if (typeof name === 'string' && skills.some(s => s.name === name)) {
+            channel.log('skills', `${this.name}: Auto-activating skill: ${name}`);
+            await this.callAction('activate_skill', { name });
+          }
+        }
+      }
+    } catch (e) {
+      channel.log('skills', `${this.name}: Skill classifier failed: ${e.message}`);
     }
   }
 

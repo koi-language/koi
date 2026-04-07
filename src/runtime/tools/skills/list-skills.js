@@ -1,13 +1,12 @@
 /**
- * List Skills Action — Discover and list available Agent Skills (agentskills.io standard).
+ * List Skills Action — Discover and list available Agent Skills.
  *
  * Scans predefined directories for SKILL.md files, parses YAML frontmatter,
  * and returns a catalog of available skills with name, description, and location.
  *
- * Discovery paths (per agentskills.io convention):
- *   - Project-level: <projectRoot>/.agents/skills/
- *   - User-level: ~/.agents/skills/
- *   - Built-in: skills bundled with the agent (via agent.builtinSkillsDir)
+ * Discovery paths:
+ *   - Global: ~/.koi/skills/
+ *   - Project-level: <projectRoot>/.koi/skills/  (overrides global)
  */
 
 import fs from 'fs';
@@ -100,6 +99,7 @@ export default {
   description: 'Discover available Agent Skills by scanning skill directories. → Returns: { skills: [{ name, description, location, resources }], catalog }',
   thinkingHint: 'Examining available skills',
   permission: null,
+  hidden: true,
 
   schema: {
     type: 'object',
@@ -111,72 +111,41 @@ export default {
   ],
 
   async execute(action, agent) {
-    const allSkills = new Map(); // keyed by name, project-level overrides user-level
+    const allSkills = new Map(); // keyed by name, project-level overrides global
 
-    // Determine project root
     const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
 
-    // 1. User-level skills: ~/.agents/skills/
-    const userSkillsDir = path.join(os.homedir(), '.agents', 'skills');
-    for (const skill of scanSkillsDirectory(userSkillsDir)) {
-      allSkills.set(skill.name, { ...skill, scope: 'user' });
+    // 1. Global skills: ~/.koi/skills/
+    const globalDir = path.join(os.homedir(), '.koi', 'skills');
+    const globalSkills = scanSkillsDirectory(globalDir);
+    for (const skill of globalSkills) {
+      allSkills.set(skill.name, { ...skill, scope: 'global' });
     }
 
-    // 2. User-level client-specific: ~/.koi/skills/
-    const koiUserSkillsDir = path.join(os.homedir(), '.koi', 'skills');
-    for (const skill of scanSkillsDirectory(koiUserSkillsDir)) {
-      allSkills.set(skill.name, { ...skill, scope: 'user' });
-    }
-
-    // 3. Project-level skills: <projectRoot>/.agents/skills/
-    const projectSkillsDir = path.join(projectRoot, '.agents', 'skills');
-    for (const skill of scanSkillsDirectory(projectSkillsDir)) {
-      allSkills.set(skill.name, { ...skill, scope: 'project' }); // project overrides user
-    }
-
-    // 4. Project-level client-specific: <projectRoot>/.koi/skills/
-    const koiProjectSkillsDir = path.join(projectRoot, '.koi', 'skills');
-    for (const skill of scanSkillsDirectory(koiProjectSkillsDir)) {
+    // 2. Project-level skills: <projectRoot>/.koi/skills/  (overrides global)
+    const projectDir = path.join(projectRoot, '.koi', 'skills');
+    const projectSkills = scanSkillsDirectory(projectDir);
+    for (const skill of projectSkills) {
       allSkills.set(skill.name, { ...skill, scope: 'project' });
     }
 
-    // 5. Built-in skills (from agent config or env var)
-    const builtinDir = process.env.KOI_BUILTIN_SKILLS_DIR
-      || agent?.builtinSkillsDir
-      || null;
-    if (builtinDir) {
-      for (const skill of scanSkillsDirectory(builtinDir)) {
-        // Built-in skills don't override project/user skills
-        if (!allSkills.has(skill.name)) {
-          allSkills.set(skill.name, { ...skill, scope: 'builtin' });
-        }
-      }
-    }
-
-    // 6. Additional directories from action params
-    if (Array.isArray(action.directories)) {
-      for (const dir of action.directories) {
-        const resolvedDir = path.isAbsolute(dir) ? dir : path.join(projectRoot, dir);
-        for (const skill of scanSkillsDirectory(resolvedDir)) {
-          if (!allSkills.has(skill.name)) {
-            allSkills.set(skill.name, { ...skill, scope: 'custom' });
-          }
-        }
-      }
+    if (allSkills.size === 0) {
+      const { channel: ch } = await import('../../io/channel.js');
+      ch.log('skills', `list_skills: no skills found. Searched: global=${globalDir} (${globalSkills.length}), project=${projectDir} (${projectSkills.length}), KOI_PROJECT_ROOT=${projectRoot}`);
     }
 
     const skills = Array.from(allSkills.values());
 
-    // Build pre-formatted catalog (XML per agentskills.io convention)
+    // Public output: only name + description (no file paths)
+    const publicSkills = skills.map(({ name, description }) => ({ name, description }));
+
     let catalog = '';
     if (skills.length > 0) {
-      const entries = skills.map(s => {
-        const resources = s.resources ? ` resources="${s.resources.join(', ')}"` : '';
-        return `  <skill name="${s.name}" location="${s.location}"${resources}>${s.description}</skill>`;
-      });
+      const entries = skills.map(s => `  <skill name="${s.name}">${s.description}</skill>`);
       catalog = '<available_skills>\n' + entries.join('\n') + '\n</available_skills>';
     }
 
-    return { skills, catalog };
+    // _fullSkills includes location/directory for internal use by activate_skill
+    return { skills: publicSkills, _fullSkills: skills, catalog };
   },
 };

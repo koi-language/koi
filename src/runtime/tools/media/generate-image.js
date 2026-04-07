@@ -103,8 +103,9 @@ export default {
       }
     }
 
-    // Log capabilities so the agent can see supported aspect ratios
-    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, caps=${JSON.stringify(caps)}, prompt="${prompt.substring(0, 60)}..."`);
+    // Log full generation request details
+    const refPaths = action.referenceImages?.length ? action.referenceImages : [];
+    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", aspectRatio=${action.aspectRatio || 'default'}, resolution=${action.resolution || 'default'}, quality=${action.quality || 'auto'}, n=${action.n || 1}, refs=${refPaths.length}${refPaths.length ? ' [' + refPaths.map(p => path.basename(p)).join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
 
     // Validate aspectRatio against model capabilities
     const requestedRatio = action.aspectRatio || '1:1';

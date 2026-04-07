@@ -532,7 +532,7 @@ async function runFile(sourcePath, options = {}) {
   }
 
   // Session management: check for previous session or create new one
-  const projectRoot = process.cwd();
+  const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
   let sessionId;
 
   if (options.resume) {

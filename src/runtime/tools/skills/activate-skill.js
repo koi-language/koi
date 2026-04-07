@@ -39,7 +39,9 @@ export default {
     }
 
     // Use agent.callAction to call list_skills (avoids circular import of action-registry)
-    const { skills } = await agent.callAction('list_skills', {});
+    const result = await agent.callAction('list_skills', {});
+    // Use _fullSkills (includes location) for internal resolution
+    const skills = result?._fullSkills || result?.skills;
     if (!skills) {
       return { activated: false, error: 'Could not discover skills' };
     }
@@ -92,7 +94,7 @@ export default {
       }
     }
 
-    channel.print(`\x1b[32m✓\x1b[0m \x1b[2mSkill activated: \x1b[1m${skillName}\x1b[0m`);
+    channel.log('skill', `Skill activated: ${skillName}`);
 
     return {
       activated: true,

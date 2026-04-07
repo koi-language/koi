@@ -72,7 +72,7 @@ export default {
       const outputFormat = action.outputFormat || 'mp3';
       const speed = action.speed || 1.0;
 
-      channel.log('audio', `generate_audio (speech): ${resolved.provider}/${resolved.model}, voice=${voice}, format=${outputFormat}, chars=${text.length}`);
+      channel.log('audio', `generate_audio (speech): ${resolved.provider}/${resolved.model}, voice=${voice}, format=${outputFormat}, speed=${speed}, chars=${text.length}, text="${(action.text || '').substring(0, 100)}...", saveTo=${action.saveTo || 'default'}`);
 
       const result = await instance.speech(text, {
         voice,

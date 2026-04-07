@@ -130,11 +130,12 @@ export default {
     if (isBinary || saveTo) {
       const buffer = Buffer.from(await res.arrayBuffer());
 
-      // Sanity check: if we expected binary based on URL extension but got HTML
-      // (e.g. a login page or redirect), warn the user instead of saving garbage.
-      if (!_isBinaryContentType(contentType) && _isBinaryUrl(url) && !saveTo) {
+      // Sanity check: if we expected binary (by URL or saveTo extension) but got HTML
+      // (e.g. a login page, Wikimedia file page, or redirect), warn instead of saving garbage.
+      const saveToLooksImage = saveTo && /\.(png|jpe?g|gif|webp|svg|bmp|ico|tiff?)$/i.test(saveTo);
+      if (!_isBinaryContentType(contentType) && (_isBinaryUrl(url) || saveToLooksImage)) {
         const head = buffer.slice(0, 20).toString('utf8').trim().toLowerCase();
-        if (head.startsWith('<!doc') || head.startsWith('<html') || head.startsWith('<head')) {
+        if (head.startsWith('<!doc') || head.startsWith('<html') || head.startsWith('<head') || head.startsWith('<?xml') || head.startsWith('<svg')) {
           // It's actually an HTML page, not the expected binary file
           const raw = buffer.toString('utf8');
           const text = _extractReadable(raw, url);

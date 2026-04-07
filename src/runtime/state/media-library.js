@@ -109,6 +109,8 @@ export class MediaLibrary {
       const names = await this._db.tableNames();
       if (names.includes('media')) {
         this._table = await this._db.openTable('media');
+        // Clean up duplicates on first open
+        this.deduplicate().catch(() => {});
       } else {
         // Create with a seed row that we immediately delete
         this._table = await this._db.createTable('media', [{
@@ -121,10 +123,10 @@ export class MediaLibrary {
           width: 0,
           height: 0,
           created_at: new Date().toISOString(),
-          favorite: false,
+          favorite: 0,
           description: '',
           metadata_json: '{}',
-          sam2_masks_json: null,
+          sam2_masks_json: '',
           embedding: new Array(EMBEDDING_DIM).fill(0),
         }]);
         // Delete seed
@@ -181,10 +183,10 @@ export class MediaLibrary {
       width: dims.width,
       height: dims.height,
       created_at: new Date().toISOString(),
-      favorite,
+      favorite: favorite ? 1 : 0,
       description: description || '',
       metadata_json: JSON.stringify(metadata),
-      sam2_masks_json: null,
+      sam2_masks_json: '',
       embedding: embedding || new Array(EMBEDDING_DIM).fill(0),
     };
 
@@ -205,6 +207,30 @@ export class MediaLibrary {
       return rows.length > 0 ? this._deserialize(rows[0]) : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Get a media item by file path (no vector search required).
+   */
+  async getByPath(filePath) {
+    const table = await this._ensureTable();
+    try {
+      const escaped = filePath.replace(/'/g, "''");
+      // Use filter instead of search to avoid vector dimension issues
+      const rows = await table.filter(`file_path = '${escaped}'`).limit(1).toArray();
+      return rows.length > 0 ? this._deserialize(rows[0]) : null;
+    } catch (e) {
+      // Fallback: try with vector search
+      try {
+        const rows = await table.search(new Array(EMBEDDING_DIM).fill(0))
+          .where(`file_path = '${escaped}'`)
+          .limit(1)
+          .toArray();
+        return rows.length > 0 ? this._deserialize(rows[0]) : null;
+      } catch {
+        return null;
+      }
     }
   }
 
@@ -233,58 +259,70 @@ export class MediaLibrary {
    * @param {number} [opts.offset=0]
    */
   async list({ favorite, mediaType, limit = 100, offset = 0 } = {}) {
-    // Try LanceDB first
-    try {
-      const table = await this._ensureTable();
-      let query = table.search(new Array(EMBEDDING_DIM).fill(0));
+    // LanceDB is the single source of truth — no fallbacks, no disk scanning.
+    const table = await this._ensureTable();
 
-      const conditions = [];
-      if (favorite !== undefined) conditions.push(`favorite = ${favorite}`);
-      if (mediaType) conditions.push(`media_type = '${mediaType}'`);
-      if (conditions.length > 0) {
-        query = query.where(conditions.join(' AND '));
-      }
+    const conditions = [];
+    if (favorite !== undefined) conditions.push(`favorite = ${favorite}`);
+    if (mediaType) conditions.push(`media_type = '${mediaType}'`);
 
-      const rows = await query.limit(limit + offset).toArray();
-      if (rows.length > 0) {
-        return rows.slice(offset).map(r => this._deserialize(r));
-      }
-    } catch {
-      // LanceDB unavailable or empty — fall through to filesystem scan
+    let rows;
+    if (conditions.length > 0) {
+      rows = await table.query().where(conditions.join(' AND ')).limit(10000).toArray();
+    } else {
+      rows = await table.query().limit(10000).toArray();
     }
 
-    // Fallback: scan ~/.koi/images/ directory for image files
-    const imagesDir = path.join(os.homedir(), '.koi', 'images');
-    if (!fs.existsSync(imagesDir)) return [];
-    try {
-      const files = fs.readdirSync(imagesDir)
-        .filter(f => /\.(png|jpg|jpeg|webp|gif)$/i.test(f))
-        .map(f => {
-          const fp = path.join(imagesDir, f);
-          const stat = fs.statSync(fp);
-          return {
-            id: f,
-            filePath: fp,
-            file_path: fp,
-            filename: f,
-            media_type: 'image',
-            mime_type: detectMimeType(fp),
-            created_at: stat.birthtime.toISOString(),
-            favorite: false,
-            description: '',
-            metadata: {},
-            width: 0,
-            height: 0,
-          };
-        })
-        .sort((a, b) => b.created_at.localeCompare(a.created_at));
-
-      if (mediaType && mediaType !== 'image') return [];
-      return files.slice(offset, offset + limit);
-    } catch {
-      return [];
+    // Deduplicate by content_hash — keep the newest entry per hash
+    const seen = new Map();
+    for (const r of rows) {
+      const hash = r.content_hash;
+      if (!hash || hash === '') { seen.set(r.id, r); continue; }
+      const existing = seen.get(hash);
+      if (!existing || r.created_at > existing.created_at) {
+        seen.set(hash, r);
+      }
     }
+    const unique = Array.from(seen.values())
+      .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+    return unique.slice(offset, offset + limit).map(r => this._deserialize(r));
   }
+
+  /**
+   * Remove duplicate entries from LanceDB (keeps newest per content_hash).
+   * Called on startup or manually.
+   */
+  async deduplicate() {
+    const table = await this._ensureTable();
+    const rows = await table.query().limit(100000).toArray();
+
+    const byHash = new Map();
+    for (const r of rows) {
+      const hash = r.content_hash;
+      if (!hash || hash === '') continue;
+      if (!byHash.has(hash)) byHash.set(hash, []);
+      byHash.get(hash).push(r);
+    }
+
+    let removed = 0;
+    for (const [, dupes] of byHash) {
+      if (dupes.length <= 1) continue;
+      // Sort newest first, delete the rest
+      dupes.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      for (let i = 1; i < dupes.length; i++) {
+        try {
+          await table.delete(`id = '${dupes[i].id}'`);
+          removed++;
+        } catch {}
+      }
+    }
+    if (removed > 0) {
+      console.warn(`[MediaLibrary] Deduplicated: removed ${removed} duplicate entries`);
+    }
+    return removed;
+  }
+
 
   /**
    * Semantic search by embedding vector.
@@ -305,11 +343,11 @@ export class MediaLibrary {
   async setFavorite(id, favorite) {
     const table = await this._ensureTable();
     try {
-      await table.update({ favorite }, `id = '${id}'`);
-      return true;
+      await table.update({ favorite: !!favorite }).where(`id = '${id}'`).execute();
     } catch {
-      return false;
+      await table.update({ favorite: !!favorite }, `id = '${id}'`);
     }
+    return true;
   }
 
   /**
@@ -317,30 +355,16 @@ export class MediaLibrary {
    */
   async setSam2Masks(id, masks) {
     const table = await this._ensureTable();
-    try {
-      await table.update({ sam2_masks_json: JSON.stringify(masks) }, `id = '${id}'`);
-      return true;
-    } catch {
-      return false;
-    }
+    await table.update({ sam2_masks_json: JSON.stringify(masks) }, `id = '${id}'`);
+    return true;
   }
 
-  /**
-   * Update the embedding for a media item.
-   */
   async setEmbedding(id, embedding) {
     const table = await this._ensureTable();
-    try {
-      await table.update({ embedding }, `id = '${id}'`);
-      return true;
-    } catch {
-      return false;
-    }
+    await table.update({ embedding }, `id = '${id}'`);
+    return true;
   }
 
-  /**
-   * Delete a media item by ID.
-   */
   async remove(id) {
     const table = await this._ensureTable();
     try {
