@@ -75,7 +75,18 @@ export default {
       } else {
         referenceImages = [];
         const maxRef = caps.maxReferenceImages || 1;
-        for (const filePath of action.referenceImages.slice(0, maxRef)) {
+        // Filter out annotation images — they contain user markup (arrows, circles,
+        // colored shapes) that would contaminate the generated image if used as
+        // a visual reference. Only the original image should be a reference.
+        const _filteredRefs = action.referenceImages.filter(p => {
+          const name = typeof p === 'string' ? path.basename(p) : '';
+          if (name.startsWith('braxil-annotation-')) {
+            channel.log('image', `Skipping annotation image as reference: ${name}`);
+            return false;
+          }
+          return true;
+        });
+        for (const filePath of _filteredRefs.slice(0, maxRef)) {
           const resolvedPath = path.resolve(filePath);
           if (!fs.existsSync(resolvedPath)) {
             return { success: false, error: `Reference image not found: ${filePath}` };

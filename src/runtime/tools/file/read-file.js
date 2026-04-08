@@ -212,7 +212,7 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'File path to read' },
+      path: { type: 'string', description: 'File path to read, or an attachment ID (e.g. att-1) to read an attached file' },
       offset: { type: 'number', description: 'Start reading from this line number (1-based, optional)' },
       limit: { type: 'number', description: 'Maximum number of lines to read (optional)' },
       pages: { type: 'string', description: 'Page range for PDF files (e.g. "1-5", "3", "10-20"). Only for .pdf files. Max 20 pages per request.' }
@@ -228,8 +228,23 @@ export default {
   ],
 
   async execute(action, agent) {
-    const filePath = action.path;
+    let filePath = action.path;
     if (!filePath) throw new Error('read_file: "path" field is required');
+
+    // Resolve attachment IDs (att-N) transparently via the attachment registry.
+    // Agents reference attachments by ID; read_file resolves them to actual paths.
+    if (/^att-\d+$/.test(filePath)) {
+      try {
+        const { attachmentRegistry } = await import('../../state/attachment-registry.js');
+        const resolved = attachmentRegistry.resolve(filePath);
+        if (!resolved) {
+          return { success: false, error: `Attachment not found: ${filePath}. Use a valid attachment ID (e.g. att-1).` };
+        }
+        filePath = resolved;
+      } catch {
+        return { success: false, error: `Could not resolve attachment ID: ${filePath}` };
+      }
+    }
 
     const resolvedPath = path.resolve(filePath);
 
@@ -276,25 +291,56 @@ export default {
     // --- Image support (vision) ---
     const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'];
     if (IMAGE_EXTS.includes(path.extname(resolvedPath).toLowerCase())) {
+      // Read image and convert to base64 for the vision pipeline.
+      const b64 = fs.readFileSync(resolvedPath).toString('base64');
+      const ext = path.extname(resolvedPath).toLowerCase().slice(1);
+      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+
       // Queue the image for the next LLM turn as a vision input.
-      // Uses session._pendingImages which llm-provider.js injects into the
-      // next LLM message as multimodal content (base64 image blocks).
       const session = agent?._activeSession;
       if (session) {
-        if (!session._pendingImages) session._pendingImages = [];
-        session._pendingImages.push({ path: resolvedPath });
+        const fileName = path.basename(resolvedPath);
+        const isAnnotation = fileName.startsWith('braxil-annotation-');
+
+        // Annotation images must NEVER be shown to the LLM as visual input.
+        // LLMs confuse annotation overlays (colored shapes, arrows) with actual
+        // design elements and copy their colors/shapes into the output.
+        // Instead, return the sidecar JSON description (if available) as text.
+        if (isAnnotation) {
+          channel.log('read_file', `Annotation image — returning text description only (not queued for vision): ${filePath}`);
+          const sidecarPath = resolvedPath + '.annotations.json';
+          let annotationDesc = 'This is an annotation image showing the user\'s markup on a screenshot. The drawn shapes (rectangles, circles, arrows) indicate which areas the user wants changed. Their colors are meaningless — only their position matters.';
+          if (fs.existsSync(sidecarPath)) {
+            try {
+              const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'));
+              const annList = (sidecar.annotations || []).map((a, i) => {
+                const shape = a.type || 'shape';
+                const text = a.text ? ` with text "${a.text}"` : '';
+                return `  ${i + 1}. ${shape}${text} at position (${Math.round(a.points?.[0]?.x || 0)}, ${Math.round(a.points?.[0]?.y || 0)})`;
+              }).join('\n');
+              if (annList) annotationDesc += `\n\nAnnotations found:\n${annList}`;
+              if (sidecar.source) annotationDesc += `\n\nSource image: ${sidecar.source}`;
+            } catch {}
+          }
+          return {
+            success: true,
+            path: filePath,
+            type: 'annotation',
+            message: annotationDesc,
+          };
+        }
+
+        if (!session._pendingMcpImages) session._pendingMcpImages = [];
+        session._pendingMcpImages.push({ mimeType: mime, data: b64, _debugPath: filePath });
         channel.log('read_file', `Image queued for vision: ${filePath}`);
         return {
           success: true,
           path: filePath,
           type: 'image',
-          message: `Image loaded and attached for visual analysis. You will see the image on your next response — describe what you see or answer questions about it.`
+          message: `Image loaded and attached for visual analysis. You will see the image on your next response.`
         };
       }
       // Fallback: no agent available, return base64 directly
-      const b64 = fs.readFileSync(resolvedPath).toString('base64');
-      const ext = path.extname(resolvedPath).toLowerCase().slice(1);
-      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
       return {
         success: true,
         path: filePath,
@@ -438,10 +484,15 @@ export default {
         if (_pdfImages.length > 0) {
           const autoAttach = _pdfImages.length <= _AUTO_ATTACH_MAX;
           if (autoAttach && session) {
-            if (!session._pendingImages) session._pendingImages = [];
+            if (!session._pendingMcpImages) session._pendingMcpImages = [];
             for (const img of _pdfImages) {
-              session._pendingImages.push({ path: img.path, type: 'image' });
-              channel.log('read_file', `PDF p${img.page} image auto-attached: ${img.path}`);
+              try {
+                const imgB64 = fs.readFileSync(img.path).toString('base64');
+                const imgExt = path.extname(img.path).toLowerCase().slice(1) || 'png';
+                const imgMime = imgExt === 'jpg' ? 'image/jpeg' : `image/${imgExt}`;
+                session._pendingMcpImages.push({ mimeType: imgMime, data: imgB64, _debugPath: img.path });
+                channel.log('read_file', `PDF p${img.page} image auto-attached: ${img.path}`);
+              } catch { /* skip unreadable images */ }
             }
           }
           const _imgLines = _pdfImages.map(i =>

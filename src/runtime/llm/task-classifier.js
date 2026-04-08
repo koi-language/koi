@@ -146,12 +146,12 @@ ${projectContext ? `\nPROJECT CONTEXT (use this to gauge complexity — a rename
 
 CATEGORIES:
 
-A: Simple text/config change — rename a variable, fix a typo, change a string, update a version number
+A: Simple text/config change — rename a variable, fix a typo in a string literal, update a version number. NOT code logic, NOT CSS/style changes, NOT anything requiring reading code structure.
 B: Write a simple script or query — small Python script, single SQL query, bash one-liner
 C: Look up / find something in the codebase — "where is auth implemented?", "find the email config"
 D: Explain how something works in the codebase — "how does the login flow work?", "what does this function do?"
 E: Read and understand code to answer a question — "what system does the frontend use for email?"
-F: Simple bug fix in one file — off-by-one, null check, wrong condition, missing import
+F: Simple bug fix or CSS/style change in one file — off-by-one, null check, wrong condition, missing import, change colors, add gradient, modify padding/margin, change font
 G: UI design / visual adaptation — adapt colors from a reference image, redesign a page's look and feel, match a mockup/screenshot. Requires vision and strong code output.
 G2: Creative media production — generate an image, poster, infographic, logo, video, audio. Requires understanding the subject, crafting a detailed prompt, and producing high-quality output.
 H: Add form validation, input handling, basic interactivity, add a simple UI element (button, toggle, spinner)
@@ -174,13 +174,13 @@ If NONE of the above categories fit, pick the closest one. When torn between two
 
 EXAMPLES:
 
-A: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0"
+A: "rename userId to user_id", "fix the typo in the error message", "change the port from 3000 to 8080", "update the version to 2.1.0" — NOTE: CSS changes, style modifications, adding gradients, changing layouts are NOT A — they are F or higher
 B: "write a script to rename all .txt files", "SQL query to count active users", "bash script to backup the DB"
 G2: "generate an image of a cat", "make me a logo", "hazme un dibujo realista", "create a poster about climate change", "design an infographic about Artemis 2", "make me a high-quality illustration"
 C: "where is the auth middleware?", "find where password reset is handled", "locate the email sending code", "find all API routes"
 D: "how does the login flow work?", "explain the billing system", "what happens when a user signs up?"
 E: "what email provider does the backend use?", "what ORM is this project using?", "what database engine are we using?"
-F: "fix the null pointer on line 42", "the button doesn't disable after click", "off-by-one error in pagination", "missing await on async call"
+F: "fix the null pointer on line 42", "the button doesn't disable after click", "off-by-one error in pagination", "missing await on async call", "add a rainbow gradient to the title", "change the background color", "make the text bigger", "add a CSS animation", "change the font"
 G: "adapt the colors to match this screenshot", "redesign the page to look like the mockup", "change the CSS to match the reference image", "create a landing page design from scratch"
 H: "add email validation to the signup form", "add a character counter to the textarea", "add a logout button to the navbar", "add a loading spinner"
 I: "add a GET /health endpoint", "add a 'role' column to the users table", "add a search filter to the user list", "create a simple CRUD for tags"

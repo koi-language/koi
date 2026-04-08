@@ -691,6 +691,7 @@ export class LLMProvider {
       }
     }
 
+
     // Decide what message to add based on how many actions have been executed.
     // Use session.iteration (action count) rather than contextMemory.hasHistory() so
     // that the fast-greeting path (which skips the first LLM call but executes
@@ -767,7 +768,23 @@ CRITICAL RULES:
             .filter(([, v]) => v != null && v !== '')
             .map(([k, v]) => `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
             .join('\n');
-          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
+          // If images were propagated from parent, tell the delegate to examine them.
+          // List available attachment IDs so the agent can re-read them via read_file("att-N").
+          const _imgCount = session._pendingMcpImages?.length || 0;
+          let _imageNote = '';
+          if (_imgCount > 0) {
+            // Collect registered attachment IDs for images currently attached
+            let _attIds = '';
+            try {
+              const { attachmentRegistry: _ar } = await import('../state/attachment-registry.js');
+              const _allAtts = _ar.all().filter(a => a.mimeType?.startsWith('image/'));
+              if (_allAtts.length > 0) {
+                _attIds = `\nAvailable attachment IDs: ${_allAtts.map(a => `${a.id} (${a.fileName})`).join(', ')}. Use read_file("att-N") to re-read any of them.`;
+              }
+            } catch { /* ignore */ }
+            _imageNote = `\n\n🖼️ ${_imgCount === 1 ? 'IMAGE' : _imgCount + ' IMAGES'} ATTACHED: The user included ${_imgCount === 1 ? 'an image' : _imgCount + ' images'} with their request. Examine ${_imgCount === 1 ? 'it' : 'them'} carefully — ${_imgCount === 1 ? 'it' : 'they'} may contain visual context, annotations, or hints relevant to the task.${_attIds}`;
+          }
+          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
         } else if (Object.keys(context).length > 0) {
           contextStr = `\nContext: ${JSON.stringify(context)}`;
         }
@@ -845,6 +862,12 @@ CRITICAL RULES:
           ...classified,
           attachments: _promptAtts,
         });
+        // Remember that this call had image attachments — used later by model selector
+        // to ensure a vision-capable model is chosen. Must be set BEFORE clearing
+        // _promptAttachments, since the classifier runs after this block.
+        if (_promptAtts.some(a => a.type === 'image')) {
+          session._hasImageAttachments = true;
+        }
         session._promptAttachments = null;
 
         // Queue MCP image results for multimodal injection into the next LLM call.
@@ -1034,7 +1057,8 @@ CRITICAL RULES:
       }
 
       // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
-      const _requiresImage = !!(session._promptAttachments?.some(a => a.type === 'image')) ||
+      const _requiresImage = !!(session._hasImageAttachments) ||
+        !!(session._promptAttachments?.some(a => a.type === 'image')) ||
         !!(session._pendingMcpImages?.length > 0) ||
         session.actionHistory.some(
           e => e.action?.intent === 'prompt_user' &&
@@ -1042,18 +1066,46 @@ CRITICAL RULES:
                e.result.attachments.some(a => a.type === 'image')
         );
 
+      // Coordinator agents skip image injection (images go to delegate), so they
+      // don't need a vision model or the difficulty boost.
+      const _canDelegate = agent?.hasPermission?.('delegate');
+      if (_canDelegate && _requiresImage) {
+        channel.log('llm', `[auto] Coordinator agent — images will go to delegate, no vision model needed`);
+      }
+
+      // When images are attached AND will be seen by this agent, enforce minimum
+      // difficulty so we get a model that can actually understand images.
+      if (_requiresImage && !_canDelegate) {
+        const _minVisionDifficulty = 55;
+        if (profile.difficulty < _minVisionDifficulty || profile.code < _minVisionDifficulty) {
+          profile = {
+            ...profile,
+            code: Math.max(profile.code || 0, _minVisionDifficulty),
+            reasoning: Math.max(profile.reasoning || 0, _minVisionDifficulty),
+            difficulty: Math.max(profile.difficulty || 0, _minVisionDifficulty),
+          };
+          channel.log('llm', `[auto] Images detected — boosted to min difficulty ${_minVisionDifficulty} for vision quality`);
+        } else {
+          channel.log('llm', `[auto] Images detected — requiring vision-capable model (inputImage:true)`);
+        }
+      }
+
       // Delegate all model selection + difficulty boost logic to the provider factory
       const resolved = resolveModel({
         type: 'llm',
         taskType: profile.taskType,
         difficulty: profile.difficulty,
         profile,
-        requiresImage: _requiresImage,
+        requiresImage: _requiresImage && !_canDelegate,
         session,
         agentName,
         availableProviders: this._availableProviders,
         clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
       });
+
+      // Clear the image flag now that model selection has consumed it.
+      // It will be re-set on the next iteration if new images arrive.
+      if (session._hasImageAttachments) session._hasImageAttachments = false;
 
       // Store for cost tracking after the finally block restores this.model → 'auto'
       session._autoProvider = resolved.provider;
@@ -1118,8 +1170,18 @@ CRITICAL RULES:
         if (imageAtts.length === 0) continue;
 
         const textContent = typeof msg.content === 'string' ? msg.content : '';
+
+        // Filter out annotation images — they contain user markup (colored shapes,
+        // arrows) that LLMs confuse with actual design elements. The annotation's
+        // meaning is already captured in the text; showing the image only causes
+        // the LLM to copy annotation colors/shapes into its output.
+        const _nonAnnotationAtts = imageAtts.filter(a => a.role !== 'annotation');
+        if (_nonAnnotationAtts.length < imageAtts.length) {
+          channel.log('llm', `[auto] Filtered ${imageAtts.length - _nonAnnotationAtts.length} annotation image(s) from inline attachments`);
+        }
+
         const imageParts = (await Promise.all(
-          imageAtts.map(async a => {
+          _nonAnnotationAtts.map(async a => {
             const opt = await _optimizeImage(a.path);
             return opt ? { ...opt, path: a.path } : null;
           })
@@ -1131,7 +1193,9 @@ CRITICAL RULES:
           messages[i] = {
             role: msg.role,
             content: [
-              ...imageParts.map(p => ({ type: 'image', source: { type: 'base64', media_type: p.mime, data: p.b64 } })),
+              ...imageParts.map(p => ({
+                type: 'image', source: { type: 'base64', media_type: p.mime, data: p.b64 }
+              })),
               { type: 'text', text: textContent }
             ]
           };
@@ -1140,7 +1204,9 @@ CRITICAL RULES:
             role: msg.role,
             content: [
               { type: 'text', text: textContent },
-              ...imageParts.map(p => ({ type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.b64}` } }))
+              ...imageParts.map(p => ({
+                type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.b64}` }
+              }))
             ]
           };
         }
@@ -1148,40 +1214,67 @@ CRITICAL RULES:
       }
     }
 
-    // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks
+    // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks.
+    // OPTIMIZATION: Coordinator agents (with delegate permission) don't need to SEE images
+    // for routing — they only need the text metadata (attachment IDs). Images are propagated
+    // to the delegate via _pendingImagesToPropagate. Skipping injection here avoids sending
+    // megabytes of base64 to the LLM just for a routing decision.
     if (session._pendingMcpImages?.length > 0) {
-      const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
-      if (lastUserIdx >= 0) {
-        const existing = messages[lastUserIdx].content;
-        const textContent = typeof existing === 'string' ? existing
-          : Array.isArray(existing) ? existing.find(p => p.type === 'text')?.text ?? '' : '';
-        if (this.provider === 'anthropic') {
-          messages[lastUserIdx] = {
-            role: 'user',
-            content: [
-              ...session._pendingMcpImages.map(p => ({
-                type: 'image', source: { type: 'base64', media_type: p.mimeType, data: p.data }
-              })),
-              { type: 'text', text: textContent },
-            ]
-          };
-        } else {
-          // OpenAI / Gemini (OpenAI-compatible)
-          messages[lastUserIdx] = {
-            role: 'user',
-            content: [
-              { type: 'text', text: textContent },
-              ...session._pendingMcpImages.map(p => ({
-                type: 'image_url', image_url: { url: `data:${p.mimeType};base64,${p.data}` }
-              })),
-            ]
-          };
+      const _canDelegate = agent?.hasPermission?.('delegate');
+      if (_canDelegate) {
+        // Preserve images for propagation but don't inject into LLM call.
+        // agent.js line 1562 reads _lastConsumedImages to propagate to delegates.
+        session._lastConsumedImages = [...session._pendingMcpImages];
+        channel.log('llm', `[auto] Coordinator agent — skipping ${session._pendingMcpImages.length} image(s) injection (will propagate to delegate)`);
+        session._pendingMcpImages = null;
+      } else {
+        // Filter out annotation images — they contain user markup (colored shapes,
+        // arrows) that LLMs confuse with actual design elements. The annotation's
+        // meaning is already captured in the text description; showing the image
+        // to the LLM only causes it to copy annotation colors/shapes into its output.
+        const _visualImages = session._pendingMcpImages.filter(p => p.role !== 'annotation');
+        const _skippedAnnotations = session._pendingMcpImages.length - _visualImages.length;
+        if (_skippedAnnotations > 0) {
+          channel.log('llm', `[auto] Filtered ${_skippedAnnotations} annotation image(s) from LLM context (text description preserved)`);
         }
-        if (process.env.KOI_DEBUG_LLM) {
-          _debugAttachPaths.push(...session._pendingMcpImages.map(p => p._debugPath || `[${p.mimeType || 'image'}]`));
+
+        if (_visualImages.length > 0) {
+          const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+          if (lastUserIdx >= 0) {
+            const existing = messages[lastUserIdx].content;
+            const textContent = typeof existing === 'string' ? existing
+              : Array.isArray(existing) ? existing.find(p => p.type === 'text')?.text ?? '' : '';
+            if (this.provider === 'anthropic') {
+              messages[lastUserIdx] = {
+                role: 'user',
+                content: [
+                  ..._visualImages.map(p => ({
+                    type: 'image', source: { type: 'base64', media_type: p.mimeType, data: p.data }
+                  })),
+                  { type: 'text', text: textContent },
+                ]
+              };
+            } else {
+              messages[lastUserIdx] = {
+                role: 'user',
+                content: [
+                  { type: 'text', text: textContent },
+                  ..._visualImages.map(p => ({
+                    type: 'image_url', image_url: { url: `data:${p.mimeType};base64,${p.data}` }
+                  })),
+                ]
+              };
+            }
+            if (process.env.KOI_DEBUG_LLM) {
+              _debugAttachPaths.push(..._visualImages.map(p => p._debugPath || `[${p.mimeType || 'image'}]`));
+            }
+          }
         }
+        // Save ALL images (including annotations) for propagation to delegates —
+        // they may need to read annotations via read_file for their own analysis.
+        session._lastConsumedImages = [...session._pendingMcpImages];
+        session._pendingMcpImages = null;
       }
-      session._pendingMcpImages = null; // consume — don't re-send in subsequent calls
     }
 
     // Prune image blocks from all messages EXCEPT the last user message.

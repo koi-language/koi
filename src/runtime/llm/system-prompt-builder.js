@@ -33,13 +33,13 @@ export async function buildSystemPrompt(agent) {
   const agentDisplayName = agent?.name || 'unknown';
   const statusPhase = agent?.state?.statusPhase || null;
   const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
-  // User language — set by System agent via update_state, propagated via globalThis.
-  // Falls back to KOI_LANG (detected from system locale at startup).
+  // User language — set explicitly by agents via set_language action.
+  // Only show in the context table if it was explicitly set (not OS fallback),
+  // to avoid the LLM blindly copying a stale/wrong value instead of detecting
+  // the language from the user's actual message.
   const stateLanguage = agent?.state?.userLanguage;
   if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
-  const _langCodeMap = { en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian', pt: 'Portuguese', ja: 'Japanese', ko: 'Korean', zh: 'Chinese', ru: 'Russian', ar: 'Arabic', nl: 'Dutch', sv: 'Swedish', pl: 'Polish', tr: 'Turkish' };
-  const _koiLangFallback = process.env.KOI_LANG ? (_langCodeMap[process.env.KOI_LANG] || process.env.KOI_LANG) : '';
-  const userLanguage = globalThis.__koiUserLanguage || _koiLangFallback;
+  const userLanguage = globalThis.__koiUserLanguage || null;
   const langField = userLanguage ? `\n| User language | ${userLanguage} |` : '';
 
   // Timezone (IANA)
@@ -88,9 +88,16 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 - If a task requires domain expertise you lack (chess, math, science, music, etc.), search the web for APIs, libraries, or tools that can help. Install them with shell and use them programmatically.
 - Example: for chess analysis, install stockfish or python-chess. For math proofs, use sympy. For image processing, use python libraries. Never try to solve domain-specific problems from memory alone.
 
+**ANNOTATION IMAGES — user instructions drawn on screen:**
+- Attachments marked as ANNOTATION are screenshots where the user has drawn arrows, circles, crosses, or text directly on the screen to indicate changes they want.
+- Annotations are INSTRUCTIONS, not decorations. Examine them carefully to understand what the user wants changed: circled elements mean "change this", crossed-out elements mean "remove this", arrows mean "move this", text annotations are literal instructions.
+- IGNORE annotation colors (red, blue, green, etc.) — they are just visual markers to make annotations visible. The color of an annotation does NOT mean "make it this color". A red circle around text means "change this text", not "make this text red".
+- When the user says "haz ese cambio" / "make that change" with annotations attached, the annotations ARE the change description. Do NOT ask what to change — look at the annotations.
+- If both an original image and an annotated version are attached, compare them to understand the differences the user wants.
+
 **VERIFY DATA EXTRACTED FROM IMAGES:**
 - When you extract spacial data from an image (positions, coordinates, ...), ALWAYS verify it programmatically before using it.
-- If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, include the image file path so the delegate can re-read it if the extracted data is wrong.' : ''}
+- If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, reference attachments by their ID (e.g. att-1). The delegate can call read_file("att-1") to access the image. NEVER include raw file paths — always use attachment IDs.' : ''}
 ` : '';
 
   // BRAXIL.md / CLAUDE.md is already injected via koiMd (_loadKoiMd) above.
@@ -253,7 +260,7 @@ ${phaseSystemBlock}
 | Working directory | \`${cwd}\` |${langField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
-**LANGUAGE:** Respond in the user's language. If \`userLanguage\` is set in state, use that. Otherwise detect from the user's latest message and set it via \`update_state\` with \`{ "updates": { "userLanguage": "<detected language>" } }\` (e.g. "Spanish", "English", "French"). All agents must use the same language for explanations, questions, status messages, and print content. Code and technical identifiers stay in English. If the user switches language, update \`userLanguage\` accordingly.
+**LANGUAGE:** Detect the language from the user's latest MESSAGE TEXT (ignore the "User language" field above — it may be stale). Call \`set_language\` with the detected language. "cambia esa palabra" = Spanish, "fix the bug" = English. All user-facing output must match this language. Code stays in English.
 ${nonInteractiveBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 

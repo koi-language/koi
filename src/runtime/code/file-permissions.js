@@ -130,6 +130,10 @@ export class FilePermissions {
     // .koi/ directory: always free — it's Koi's own config/data
     if (isInKoi) return true;
 
+    // ~/.koi/ directory: always free — global Koi data (images, sessions, etc.)
+    const homeKoi = path.join(process.env.HOME || process.env.USERPROFILE || '', '.koi');
+    if (homeKoi && (resolved.startsWith(homeKoi + path.sep) || resolved === homeKoi)) return true;
+
     // BRAXIL.md / KOI.md at project root: always free — Braxil's own documentation
     const basename = path.basename(resolved).toLowerCase();
     if (isInProject && path.dirname(resolved) === path.resolve(projectRoot)

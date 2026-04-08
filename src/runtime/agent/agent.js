@@ -628,7 +628,7 @@ export class Agent {
     // Inject images propagated from parent agent (e.g. user attached a screenshot,
     // System consumed it, then delegated to developer — developer should see the image too)
     if (this._pendingImagesToPropagate?.length > 0) {
-      session._pendingImages = this._pendingImagesToPropagate;
+      session._pendingMcpImages = this._pendingImagesToPropagate;
       this._pendingImagesToPropagate = null;
     }
 
@@ -2169,7 +2169,8 @@ export class Agent {
             const { attachmentRegistry } = await import('../state/attachment-registry.js');
             const _attParts = _promptAtts.map(a => {
               const id = attachmentRegistry.register(a.path);
-              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
+              const roleTag = a.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
+              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'}${roleTag})`;
             });
             _attNote = `\n[Attached ${_attParts.join(', ')}]`;
           } catch {
@@ -3116,6 +3117,63 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
       const callAction = async (intent, data = {}) => {
         return await this.callAction(intent, data);
       };
+
+      // ── Interpolate fragment strings ──────────────────────────────────
+      // .md fragments are plain text but may contain {{expr}}, @if, @let
+      // constructs. Resolve them here so .md files support the same template
+      // syntax as .koi templates. Escaped \{{expr}} is left as literal {{expr}}.
+      const _interpolateFragments = (fragments, ctx) => {
+        const _resolve = (expr, ctx) => {
+          try {
+            const parts = expr.split('.');
+            let val = ctx;
+            for (const p of parts) {
+              if (val == null) return undefined;
+              val = val[p];
+            }
+            return val;
+          } catch { return undefined; }
+        };
+
+        const _processText = (text) => {
+          if (typeof text !== 'string') return text;
+
+          // 1. Process @let declarations
+          const letRegex = /^@let\s+(\w+)\s*=\s*(.+)$/gm;
+          const localVars = {};
+          text = text.replace(letRegex, (_, name, expr) => {
+            const val = _resolve(expr.trim(), { ...ctx, ...localVars });
+            localVars[name] = val;
+            return '';
+          });
+          const fullCtx = { ...ctx, ...localVars };
+
+          // 2. Process @if (condition) { ... } blocks
+          // Simple single-level @if — no nesting support in .md
+          text = text.replace(/@if\s*\(([^)]+)\)\s*\{([\s\S]*?)\n\}/g, (_, cond, body) => {
+            const val = _resolve(cond.trim(), fullCtx);
+            return val ? body : '';
+          });
+
+          // 3. Replace escaped \{{ → placeholder, then interpolate {{expr}}, then restore
+          const ESCAPE_PLACEHOLDER = '\x00ESC_OPEN\x00';
+          text = text.replace(/\\\{\{/g, ESCAPE_PLACEHOLDER);
+          text = text.replace(/\{\{([^}]+)\}\}/g, (match, expr) => {
+            const val = _resolve(expr.trim(), fullCtx);
+            return val !== undefined && val !== null ? String(val) : match;
+          });
+          text = text.replace(new RegExp(ESCAPE_PLACEHOLDER, 'g'), '{{');
+
+          return text;
+        };
+
+        for (const [key, value] of Object.entries(fragments)) {
+          if (typeof value === 'string') {
+            fragments[key] = _processText(value);
+          }
+        }
+      };
+
       // Build context object with built-in template variables
       const context = {
         args: _composeArgs || {},
@@ -3125,7 +3183,7 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
         // User object — accessible as user.message, user.language, user.email, etc.
         user: {
           message: this._lastUserMessage ?? _composeArgs?.goal ?? null,
-          language: this.state?.userLanguage || null,
+          language: this.state?.userLanguage || globalThis.__koiUserLanguage || null,
           email: process.env.KOI_LOGIN_EMAIL || null,
           name: process.env.KOI_LOGIN_NAME || null,
           plan: process.env.KOI_PLAN_NAME || null,
@@ -3154,6 +3212,10 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
       }
       // Clear ephemeral delegate after injecting — it's one-shot.
       if (this._ephemeralDelegate) this._ephemeralDelegate = null;
+
+      // Interpolate {{expr}}, @if, @let in .md fragment strings using the context
+      _interpolateFragments(resolvedFragments, context);
+
       try {
         const result = await composeDef.resolve(resolvedFragments, callAction, context);
         return this._normalizeComposeResult(result);
