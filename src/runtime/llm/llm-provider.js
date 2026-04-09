@@ -1102,7 +1102,7 @@ CRITICAL RULES:
         taskType: profile.taskType,
         difficulty: profile.difficulty,
         profile,
-        requiresImage: _requiresImage && !_canDelegate,
+        requiresImage: _requiresImage,
         session,
         agentName,
         availableProviders: this._availableProviders,
