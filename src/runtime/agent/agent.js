@@ -780,9 +780,21 @@ export class Agent {
       "What are we working on?",
     ];
     const _fastGreetMsg = _greetingsI18n[Math.floor(Math.random() * _greetingsI18n.length)];
+    // Check if a project instructions file exists — if not, skip fast-greeting
+    // so the LLM can suggest creating one on first startup.
+    const _hasProjectMd = (() => {
+      try {
+        const _fs = require('fs');
+        const _cwd = process.env.KOI_PROJECT_ROOT || process.cwd();
+        return ['BRAXIL.md', 'braxil.md', 'CLAUDE.md', 'claude.md', 'KOI.md', 'koi.md']
+          .some(f => _fs.existsSync(require('path').join(_cwd, f)));
+      } catch { return true; } // assume exists on error — don't block startup
+    })();
+
     const isFastGreeting = !isDelegate
       && !contextMemory.hasHistory()
       && !session.mcpErrors
+      && _hasProjectMd
       && (typeof interpolatedPlaybook === 'string' ? interpolatedPlaybook : JSON.stringify(interpolatedPlaybook)).includes('__FAST_GREETING__');
 
     // Track the active agent so CLI hooks can access its LLM provider
@@ -881,6 +893,46 @@ export class Agent {
       }
     }
 
+    // ── PROJECT INIT CHECK: propose BRAXIL.md creation if missing ───────
+    // Algorithmic check (no LLM) — runs once on first startup, non-delegate only.
+    if (!isDelegate && !contextMemory.hasHistory() && !_hasProjectMd) {
+      try {
+        Agent._cliHooks?.onBusy?.(false);
+        const _initChannel = (await import('../io/channel.js')).channel;
+        _initChannel.print(_initChannel.renderMarkdown(
+          'No project instructions file found (`BRAXIL.md`). This file helps me understand your codebase, conventions, and preferences.'
+        ));
+        const _initChoice = await _initChannel.select(
+          'Want me to explore the project and create one?',
+          [
+            { title: 'Yes, create BRAXIL.md', value: 'yes' },
+            { title: 'No, skip for now', value: 'no' },
+          ],
+          0,
+        );
+        if (!isDelegate) Agent._cliHooks?.onBusy?.(true);
+        if (_initChoice === 'yes') {
+          // Inject the /init prompt — the agent will process it as user input
+          const _initPrompt = (await import('../io/channel.js')).channel;
+          try {
+            const { default: initCmd } = await import(process.env.KOI_CLI_COMMAND_REGISTRY_PATH || '../../cli/commands/init.js');
+            if (initCmd?.execute) {
+              const result = await initCmd.execute(this, '');
+              if (result?.answer) {
+                // Inject as user message so the agent processes it
+                contextMemory.add('user', result.answer, 'User request', null);
+              }
+            }
+          } catch {
+            // Fallback: inject a simple prompt for BRAXIL.md creation
+            contextMemory.add('user', 'Explore this project and create a BRAXIL.md file with project documentation: tech stack, directory structure, how to run/build/test, key files, and coding conventions.', 'User request', null);
+          }
+        }
+      } catch (e) {
+        channel.log('agent', `Project init check failed: ${e.message}`);
+      }
+    }
+
     while (!session.isTerminated) {
       // ── Check for completed background delegates ──────────────────────
       // Non-blocking: check if any background promises have settled.
@@ -975,7 +1027,7 @@ export class Agent {
         channel.log('agent', `${this.name}: Fast-greeting (skipping LLM on iteration 0)`);
         response = [
           { actionType: 'direct', intent: 'prompt_user', question: _fastGreetMsg },
-          { actionType: 'direct', intent: 'update_state', updates: { statusPhase: 'routing' } }
+          { actionType: 'direct', intent: 'update_state', updates: { statusPhase: 'understanding' } }
         ];
         isFirstCall = false;
       } else {
@@ -1025,6 +1077,7 @@ export class Agent {
         });
         isFirstCall = false;
         this._llmErrorShown = false; // Reset warning flag on successful call
+        globalThis.__koiSetLanguageAllowed = false; // set_language only on first call after user input
         channel.log('agent', `${this.name}: LLM responded`);
         // Persist conversation after every LLM response so that /exit, Ctrl+C,
         // or any crash can't lose the last exchange. At this point contextMemory
@@ -1087,6 +1140,22 @@ export class Agent {
         const _backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveErrors - 1), 15000);
         channel.log('agent', `${this.name}: Backoff ${_backoffMs}ms before retry`);
         await new Promise(r => setTimeout(r, _backoffMs));
+
+        // After 2+ consecutive LLM failures, force reclassification so the
+        // auto-selector picks a different model/provider instead of retrying
+        // the same failing one indefinitely.
+        if (session.consecutiveErrors >= 2) {
+          session._needsReclassify = true;
+          // Mark the failing provider on cooldown so the selector avoids it
+          const _failedProvider = this.llmProvider?.provider;
+          if (_failedProvider) {
+            try {
+              const { markProviderTimeout } = await import('../llm/providers/factory.js');
+              markProviderTimeout(_failedProvider);
+            } catch {}
+          }
+          channel.log('agent', `${this.name}: Forcing model reclassification after ${session.consecutiveErrors} consecutive failures`);
+        }
         continue;
       }
 
@@ -1257,6 +1326,21 @@ export class Agent {
               session.actionContext[`_bg_${paIntent}`] = { output: { _background: true, message: `${_bgAgentName} is now running in background` } };
             } else {
               _syncGroup.push(pa);
+            }
+          }
+
+          // Guard: only one prompt_user/prompt_form/select per parallel group.
+          // Multiple user prompts in parallel deadlock the UI (only one can be shown).
+          let _seenPrompt = false;
+          for (let _pi = _syncGroup.length - 1; _pi >= 0; _pi--) {
+            const _pIntent = _syncGroup[_pi].intent || _syncGroup[_pi].type;
+            if (_pIntent === 'prompt_user' || _pIntent === 'prompt_form') {
+              if (_seenPrompt) {
+                channel.log('action', `${this.name}: Dropped duplicate ${_pIntent} from parallel group (only one prompt allowed)`);
+                _syncGroup.splice(_pi, 1);
+              } else {
+                _seenPrompt = true;
+              }
             }
           }
 
@@ -1718,6 +1802,8 @@ export class Agent {
             Agent._cliHooks?.onBusy?.(true);
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             this._lastUserMessage = _isBgWakeup ? null : (result?.answer || null);
+            // Allow set_language only on the very next LLM call after user input
+            globalThis.__koiSetLanguageAllowed = !!this._lastUserMessage;
             channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
 
             // Share with session tracker so delegate commits can also use the user's request
@@ -2168,8 +2254,9 @@ export class Agent {
           try {
             const { attachmentRegistry } = await import('../state/attachment-registry.js');
             const _attParts = _promptAtts.map(a => {
-              const id = attachmentRegistry.register(a.path);
-              const roleTag = a.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
+              const id = attachmentRegistry.register(a.path, { role: a.role });
+              const entry = attachmentRegistry.get(id);
+              const roleTag = entry?.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
               return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'}${roleTag})`;
             });
             _attNote = `\n[Attached ${_attParts.join(', ')}]`;
@@ -3866,7 +3953,8 @@ Execute this task and return the result as JSON.
    * Uses this agent's LLM to generate an answer, then re-delegates with the answer.
    */
   async _answerDelegateQuestion(question, delegateData, delegateName = 'Delegate') {
-    channel.print(`💬 ${delegateName} asks: \x1b[2m${question}\x1b[0m`);
+    // Internal inter-agent communication — log only, don't show to user.
+    channel.log('agent', `${delegateName} asks parent: ${question.substring(0, 200)}`);
 
     if (!this.llmProvider) {
       this.llmProvider = new LLMProvider(this.llm);

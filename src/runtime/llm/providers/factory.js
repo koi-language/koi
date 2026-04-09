@@ -166,8 +166,9 @@ function _resolveLLM(req) {
   const client = process.env.KOI_AUTH_TOKEN ? clients.openai : clients[provider];
   if (!client) throw new Error(`No SDK client for provider: ${provider}`);
 
+  const reasoningEffort = req.profile?.reasoningEffort ?? (useThinking ? 'medium' : 'none');
   const instance = createLLM(effectiveProvider, client, model, {
-    temperature, maxTokens, useThinking
+    temperature, maxTokens, useThinking, reasoningEffort
   });
 
   // provider = original (for tracking, exclusion, cost)

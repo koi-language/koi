@@ -5,9 +5,25 @@
  * Tasks are deduplicated by name. Status auto-clears after completion.
  */
 
+import fs from 'fs';
 import path from 'path';
 import { channel } from '../io/channel.js';
 import { t } from '../i18n.js';
+
+// ── Cross-process indexing lock ────────────────────────────────────────────
+// Prevents multiple engine processes (one per session) from indexing the same
+// project simultaneously.  Uses a JSON lockfile with the owning PID.
+
+function _readLock(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function _isProcessAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
 
 function progressBar(done, total, width = 10) {
   const pct = Math.round((done / total) * 100);
@@ -124,38 +140,66 @@ class BackgroundTaskManager {
       const { getSemanticIndex } = await import('../state/semantic-index.js');
       channel.log('background', 'semantic-index module loaded OK');
 
-      // Detect local dependencies — their files will be indexed into the SAME DB.
-      let depDirs = [];
-      try {
-        const { detectAllLocalDependencies, seedDependenciesFile } = await import('../code/local-dependency-detector.js');
-        seedDependenciesFile(projectDir);
-        depDirs = detectAllLocalDependencies(projectDir);
-        if (depDirs.length > 0) {
-          channel.log('background', `Local dependencies found: ${depDirs.map(d => path.basename(d)).join(', ')}`);
-        }
-      } catch (depErr) {
-        channel.log('background', `Dependency detection failed: ${depErr.message}`);
-      }
-
       const cacheDir = path.join(projectDir, '.koi', 'cache', 'semantic-index');
-      const index = getSemanticIndex(cacheDir, llmProvider);
+      fs.mkdirSync(cacheDir, { recursive: true });
+      const lockPath = path.join(cacheDir, 'indexing.lock');
 
-      channel.log('background', 'Checking if index is up-to-date...');
-      const upToDate = await index.isUpToDate(projectDir, { depDirs });
-      channel.log('background', `isUpToDate: ${upToDate}`);
+      // Cross-process lock: only one process indexes per project at a time.
+      // If another process is already indexing, just load the cache and return.
+      try {
+        const lockInfo = _readLock(lockPath);
+        if (lockInfo && _isProcessAlive(lockInfo.pid) && lockInfo.pid !== process.pid) {
+          channel.log('background', `Another process (pid=${lockInfo.pid}) is already indexing — loading cache instead`);
+          const index = getSemanticIndex(cacheDir, llmProvider);
+          await index.ensureCacheLoaded();
+          return;
+        }
+      } catch { /* stale or unreadable lock — proceed */ }
 
-      if (upToDate) {
-        channel.log('background', 'Semantic index up-to-date — pre-loading cache');
-        await index.ensureCacheLoaded();
-        return;
+      // Write our lock
+      try {
+        fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started: Date.now() }));
+      } catch { /* non-critical */ }
+
+      try {
+        // Detect local dependencies — their files will be indexed into the SAME DB.
+        let depDirs = [];
+        try {
+          const { detectAllLocalDependencies, seedDependenciesFile } = await import('../code/local-dependency-detector.js');
+          seedDependenciesFile(projectDir);
+          depDirs = detectAllLocalDependencies(projectDir);
+          if (depDirs.length > 0) {
+            channel.log('background', `Local dependencies found: ${depDirs.map(d => path.basename(d)).join(', ')}`);
+          }
+        } catch (depErr) {
+          channel.log('background', `Dependency detection failed: ${depErr.message}`);
+        }
+
+        const index = getSemanticIndex(cacheDir, llmProvider);
+
+        channel.log('background', 'Checking if index is up-to-date...');
+        const upToDate = await index.isUpToDate(projectDir, { depDirs });
+        channel.log('background', `isUpToDate: ${upToDate}`);
+
+        if (upToDate) {
+          channel.log('background', 'Semantic index up-to-date — pre-loading cache');
+          await index.ensureCacheLoaded();
+          return;
+        }
+
+        channel.log('background', 'Starting index.build()...');
+        await index.build(projectDir, (done, total) => {
+          report(progressBar(done, total));
+          if (channel.sendIndexStatus) {
+            channel.sendIndexStatus({ progress: done, total, isBuilding: true });
+          }
+        }, { depDirs });
+
+        channel.log('background', 'Semantic indexing complete');
+      } finally {
+        // Release lock
+        try { fs.unlinkSync(lockPath); } catch { /* */ }
       }
-
-      channel.log('background', 'Starting index.build()...');
-      await index.build(projectDir, (done, total) => {
-        report(progressBar(done, total));
-      }, { depDirs });
-
-      channel.log('background', 'Semantic indexing complete');
     };
   }
 

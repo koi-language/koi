@@ -78,16 +78,17 @@ export class GatewayEmbedding extends BaseEmbedding {
   }
 
   /**
-   * Batch embed multiple texts in chunks to avoid rate limits.
+   * Batch embed multiple texts in chunks to respect rate limits.
+   * Sends chunks of CHUNK_SIZE with pauses between them.
+   * On 429, respects the server's Retry-After header (or waits 60s).
    */
   async embedBatch(texts, opts = {}) {
     if (!texts.length) return [];
     if (texts.length === 1) return [await this.embed(texts[0], opts)];
 
-    const CHUNK_SIZE = 10;
-    const CHUNK_PAUSE = 500;
-    const RETRY_WAIT = 15_000;
-    const MAX_RETRIES = 2;
+    const CHUNK_SIZE = 20;
+    const CHUNK_PAUSE = 1000;
+    const MAX_RETRIES = 4;
 
     const allVectors = [];
     for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
@@ -111,7 +112,10 @@ export class GatewayEmbedding extends BaseEmbedding {
         }
 
         if (res.status === 429 && attempt < MAX_RETRIES) {
-          await new Promise(r => setTimeout(r, RETRY_WAIT));
+          // Respect Retry-After header; default to 60s (gateway says "retry in 1 minute")
+          const retryAfter = parseInt(res.headers.get('retry-after'), 10);
+          const wait = (retryAfter > 0 ? retryAfter : 60) * 1000;
+          await new Promise(r => setTimeout(r, wait));
           continue;
         }
 

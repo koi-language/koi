@@ -20,7 +20,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { parseFile, getSupportedExtensions } from '../code/code-parser.js';
-import { IGNORE_DIRS, SOURCE_EXTS } from '../code/file-discovery.js';
+import { IGNORE_DIRS, discoverFiles } from '../code/file-discovery.js';
 import { channel } from '../io/channel.js';
 
 const EMBEDDING_DIM = 1536; // text-embedding-3-small dimension
@@ -73,18 +73,16 @@ export class SemanticIndex {
       await this._ensureDb();
       this._loadManifest();
 
-      // Use SOURCE_EXTS (broad set: .java, .go, .rs, etc.) for file discovery,
-      // not just extensions with tree-sitter plugins. Files without a parser
-      // still get file-level indexing (description + embedding from content).
-      const discoverExts = SOURCE_EXTS;
+      // File discovery uses .koi/index-extensions.json (all configured extensions).
+      // Files without a tree-sitter parser still get file-level indexing.
       const parserExts = getSupportedExtensions();
-      channel.log('semantic-index', `Discovery extensions: ${[...discoverExts].join(', ')} (parser: ${[...parserExts].join(', ')})`);
+      channel.log('semantic-index', `Discovery: index-extensions.json (parser: ${[...parserExts].join(', ')})`);
 
       // Discover files from main project + dependency directories (all in one index)
       // manifestKey = key for incremental hash check (dep:name/... for deps, relPath for main)
       // indexPath = path stored in LanceDB file_path column — ALWAYS absolute so agents can read_file directly
       const fileEntries = []; // { absPath, manifestKey, indexPath }
-      const mainFiles = this._discoverFiles(projectDir, discoverExts);
+      const mainFiles = this._discoverFiles(projectDir);
       for (const f of mainFiles) {
         const rel = path.relative(projectDir, f);
         fileEntries.push({ absPath: f, manifestKey: rel, indexPath: f });
@@ -94,7 +92,7 @@ export class SemanticIndex {
       const depDirs = opts.depDirs || [];
       for (const depDir of depDirs) {
         const depName = path.basename(depDir);
-        const depFiles = this._discoverFiles(depDir, discoverExts);
+        const depFiles = this._discoverFiles(depDir);
         channel.log('semantic-index', `Dependency ${depName}: ${depFiles.length} files`);
         for (const f of depFiles) {
           fileEntries.push({
@@ -322,7 +320,7 @@ export class SemanticIndex {
     if (!this._manifest || Object.keys(this._manifest).length === 0) return false;
 
     // Check main project files
-    const files = this._discoverFiles(projectDir, SOURCE_EXTS);
+    const files = this._discoverFiles(projectDir);
     for (const filePath of files) {
       const relPath = path.relative(projectDir, filePath);
       let content;
@@ -334,7 +332,7 @@ export class SemanticIndex {
     // Check dependency files
     for (const depDir of (opts.depDirs || [])) {
       const depName = path.basename(depDir);
-      const depFiles = this._discoverFiles(depDir, SOURCE_EXTS);
+      const depFiles = this._discoverFiles(depDir);
       for (const filePath of depFiles) {
         const relPath = `dep:${depName}/${path.relative(depDir, filePath)}`;
         let content;
@@ -352,6 +350,32 @@ export class SemanticIndex {
     this._saveManifest();
     this._cache = null;
     this._cachePromise = null;
+  }
+
+  /**
+   * Get structured index stats for the GUI.
+   * @returns {{ totalFiles: number, indexedFiles: number, directories: string[], cacheSize: { files: number, classes: number, functions: number } }}
+   */
+  getStats() {
+    this._loadManifest();
+    const manifestKeys = Object.keys(this._manifest || {});
+    const dirs = new Set();
+    for (const key of manifestKeys) {
+      // key is either a relative path or dep:name/rel/path
+      const parts = key.replace(/^dep:[^/]+\//, '').split('/');
+      if (parts.length > 1) dirs.add(parts.slice(0, -1).join('/'));
+    }
+    return {
+      totalFiles: manifestKeys.length,
+      indexedFiles: manifestKeys.length,
+      directories: [...dirs].sort(),
+      isBuilding: this._building,
+      cacheSize: {
+        files: this._cache?.files?.length || 0,
+        classes: this._cache?.classes?.length || 0,
+        functions: this._cache?.functions?.length || 0,
+      },
+    };
   }
 
   // ─── Cache Management ──────────────────────────────────────────────
@@ -463,26 +487,9 @@ export class SemanticIndex {
 
   // ─── Private: File Discovery ────────────────────────────────────────
 
-  _discoverFiles(baseDir, supportedExts, maxFiles = 5000) {
-    const files = [];
-    const walk = (dir, depth) => {
-      if (depth > 15 || files.length >= maxFiles) return;
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-      for (const entry of entries) {
-        if (files.length >= maxFiles) return;
-        if (entry.name.startsWith('.') && entry.name !== '.') continue;
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!IGNORE_DIRS.has(entry.name)) walk(full, depth + 1);
-        } else if (entry.isFile()) {
-          const ext = path.extname(entry.name).toLowerCase();
-          if (supportedExts.has(ext)) files.push(full);
-        }
-      }
-    };
-    walk(baseDir, 0);
-    return files;
+  _discoverFiles(baseDir, _supportedExts, maxFiles = 5000) {
+    // Delegates to the shared discoverFiles (accepts all text files, skips binaries)
+    return discoverFiles(baseDir, maxFiles);
   }
 
   // ─── Private: DB & Tables ───────────────────────────────────────────

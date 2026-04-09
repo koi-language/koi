@@ -34,6 +34,7 @@ export class BaseLLM {
     this.maxTokens = opts.maxTokens || _perModel || 8192;
     this.caps = opts.caps || {};
     this.useThinking = opts.useThinking ?? false;
+    this.reasoningEffort = opts.reasoningEffort ?? (this.useThinking ? 'medium' : 'none');
   }
 
   /** Provider name for logging. Override in subclass. */

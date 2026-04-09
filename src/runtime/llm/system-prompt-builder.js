@@ -175,8 +175,8 @@ BATCH
 "batch" is a TOP-LEVEL-ONLY key. It cannot coexist with "actionType", "intent", or any other action field. If you need to do multiple things in one turn (e.g. prompt_user + update_state), use a batch:
 
 { "batch": [
-  { "actionType": "direct", "intent": "prompt_user", "question": "Hello! How can I help?" },
-  { "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "routing" } }
+  { "actionType": "direct", "intent": "print", "message": "Here is the result." },
+  { "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "<valid_phase>" } }
 ]}
 
 ========================================

@@ -33,9 +33,9 @@ export class OpenAIChatLLM extends BaseLLM {
         response_format: { type: 'json_object' },
         stream: true,
         stream_options: { include_usage: true },
-        ...(this.caps.thinking && !this.useThinking && { reasoning_effort: 'low' }),
-        ...(this.caps.thinking && this.useThinking && { reasoning_effort: this.reasoningEffort === 'none' ? 'low' : this.reasoningEffort ?? 'medium' }),
+        ...(this.caps.thinking && { reasoning_effort: (!this.reasoningEffort || this.reasoningEffort === 'none') ? 'low' : this.reasoningEffort }),
       });
+      channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature}`);
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.chat.completions.create(params, options);
 
@@ -81,8 +81,21 @@ export class OpenAIChatLLM extends BaseLLM {
       if (race) await Promise.race([_iterate(), race]);
       else await _iterate();
     } catch (err) {
-      this._logFail(err.message);
-      throw err;
+      // If we already accumulated content before the stream broke (e.g.
+      // "JSON error injected into SSE stream" from Gemini proxies),
+      // try to use what we have instead of failing the whole call.
+      if (buffer.trim().length > 10) {
+        try {
+          JSON.parse(buffer.trim());
+          this._log(`Stream error recovered (${buffer.length} chars buffered): ${err.message}`);
+        } catch {
+          this._logFail(err.message);
+          throw err;
+        }
+      } else {
+        this._logFail(err.message);
+        throw err;
+      }
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
@@ -134,9 +147,9 @@ export class OpenAIChatLLM extends BaseLLM {
         temperature,
         max_completion_tokens: maxTokens,
         ...(responseFormat && { response_format: responseFormat }),
-        ...(this.caps.thinking && !this.useThinking && { reasoning_effort: 'low' }),
-        ...(this.caps.thinking && this.useThinking && { reasoning_effort: this.reasoningEffort === 'none' ? 'low' : this.reasoningEffort ?? 'medium' }),
+        ...(this.caps.thinking && { reasoning_effort: (!this.reasoningEffort || this.reasoningEffort === 'none') ? 'low' : this.reasoningEffort }),
       });
+      channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens || maxTokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature ?? temperature}`);
       const options = controller ? { signal: controller.signal } : {};
       const completion = await this.client.chat.completions.create(params, options);
       const text = completion.choices[0].message.content?.trim() || '';

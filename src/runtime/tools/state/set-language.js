@@ -11,9 +11,11 @@
 export default {
   type: 'set_language',
   intent: 'set_language',
-  description: 'Set the language for all user-facing communication',
+  description: 'Set the language for all user-facing communication. ONLY available immediately after the user sends a message — do NOT call this on subsequent iterations.',
   thinkingHint: 'Setting language',
   permission: null,
+  // Only visible on the first LLM call after a user message — never on subsequent iterations.
+  hidden: () => !globalThis.__koiSetLanguageAllowed,
 
   schema: {
     type: 'object',

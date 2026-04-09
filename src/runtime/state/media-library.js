@@ -342,10 +342,13 @@ export class MediaLibrary {
    */
   async setFavorite(id, favorite) {
     const table = await this._ensureTable();
+    const val = favorite ? '1' : '0';
+    const filter = `id = '${id}'`;
     try {
-      await table.update({ favorite: !!favorite }).where(`id = '${id}'`).execute();
-    } catch {
-      await table.update({ favorite: !!favorite }, `id = '${id}'`);
+      // LanceDB update() expects SQL expression strings as values, not JS numbers.
+      await table.update({ favorite: val }).where(filter).execute();
+    } catch (e) {
+      process.stderr.write(`[MediaLibrary] setFavorite failed for ${id}: ${e.message}\n`);
     }
     return true;
   }

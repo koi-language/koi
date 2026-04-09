@@ -20,7 +20,7 @@ Never ask the user something you can verify yourself with:
 - grep
 - semantic_code_search
 
-One prompt_user = one question.
+One prompt_user = one question. NEVER put multiple prompt_user calls in a parallel block — only one can be shown at a time. Ask questions one at a time, sequentially.
 Do not ask multiple questions in a single prompt_user.
 
 When you need to explain something and ask a follow-up:
@@ -49,7 +49,7 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
       },
       options: {
         type: 'array',
-        description: 'Optional array of choices for interactive menu (e.g., ["Yes", "No"]). User navigates with arrows and selects with Enter.'
+        description: 'Optional array of choices for interactive menu. Each item is either a string (e.g. "Yes") or an object { title, value?, description?, freeText? }. Set freeText:true on a choice to show an inline text input when selected (e.g. { title: "Other", freeText: true }).'
       },
       prompt: {
         type: 'string',
@@ -70,7 +70,7 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
   examples: [
     { intent: 'prompt_user', message: 'Here is the answer to your question:\n\n1. First point\n2. Second point', question: 'Do you need more details?' },
     { intent: 'prompt_user', question: 'What is your name?' },
-    { intent: 'prompt_user', question: 'Do you want to proceed?', options: ['Yes', 'No'], meta: { allowFreeText: true } },
+    { intent: 'prompt_user', question: 'Do you want to proceed?', options: ['Yes', 'No', { title: 'Other (explain)', freeText: true }] },
     { intent: 'prompt_user', question: 'Which features for the MVP?', options: ['Auth', 'Dashboard', 'API', 'Admin panel'], meta: { allowFreeText: true, multiSelect: true } },
     { intent: 'prompt_user', prompt: '(~/project) $ ' }
   ],
@@ -169,10 +169,10 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
       const cleanQuestion = question
         .split('\n').filter(l => !/^\s*[\d\-\*]+[\.\)]\s/.test(l)).join('\n').trim();
       const _multiSelect = action.meta?.multiSelect === true;
-      const value = await channel.select(cleanQuestion || question, options.map((opt) => ({
-        title: opt,
-        value: opt
-      })), 0, { meta: { allowFreeText: true, multiSelect: _multiSelect } });
+      const value = await channel.select(cleanQuestion || question, options.map((opt) => {
+        if (typeof opt === 'string') return { title: opt, value: opt };
+        return { title: opt.title || opt.value || '', value: opt.value || opt.title || '', description: opt.description || null, freeText: opt.freeText || false };
+      }), 0, { meta: { allowFreeText: true, multiSelect: _multiSelect } });
       return { answer: value || options[0] };
     }
 
@@ -184,8 +184,13 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
       return answerAtts.length > 0 ? { answer: answerText, attachments: answerAtts } : { answer: answerText };
     }
 
-    // QUESTION mode: print question to scrollback (above separator), then wait for input
-    channel.print(channel.renderMarkdown(question));
+    // QUESTION mode: print question as a chat bubble, then wait for input.
+    // If a print() just happened with the same text (LLM sent print + prompt_user),
+    // skip to avoid duplicate messages.
+    const alreadyPrinted = message && message.includes(question.trim());
+    if (!alreadyPrinted) {
+      channel.print(channel.renderMarkdown(question));
+    }
     const raw = await channel.prompt(promptText);
     const answerText = String(typeof raw === 'string' ? raw : (raw?.text ?? ''));
     const answerAtts = Array.isArray(raw?.attachments) ? raw.attachments : [];

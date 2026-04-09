@@ -292,7 +292,7 @@ ${taskDescription}`;
           const catProfile = CATEGORY_PROFILES[cat];
           if (catProfile) {
             const { code: codeScore, reasoning: reasoningScore, risk: riskLevel = 0, reasoningEffort: effort = 'medium' } = catProfile;
-            const needsThinking = effort !== 'none';
+            const needsThinking = effort !== 'none' && effort !== 'low';
             const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
             const difficulty = Math.max(codeScore, reasoningScore);
             const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel, reasoningEffort: effort };

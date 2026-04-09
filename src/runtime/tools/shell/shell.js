@@ -985,7 +985,10 @@ When a command requires sudo, just use sudo normally in the command. The system 
       } else if (closeCode !== 0) {
         _shellOutputCallback?.(false);
         reportDone?.();
-        if (!isSilent) { _showOutputPreview(stderrStr || combinedStr, true); _showTimeout(); }
+        if (!isSilent) {
+          _showOutputPreview(stderrStr || combinedStr, true); _showTimeout();
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,stderrStr || combinedStr);
+        }
         yield {
           success: false,
           exitCode: closeCode || 1,
@@ -996,7 +999,10 @@ When a command requires sudo, just use sudo normally in the command. The system 
       } else {
         _shellOutputCallback?.(false);
         reportDone?.();
-        if (!isSilent) { _showOutputPreview(combinedStr); _showTimeout(); }
+        if (!isSilent) {
+          _showOutputPreview(combinedStr); _showTimeout();
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,combinedStr);
+        }
         yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrStr };
       }
       // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.

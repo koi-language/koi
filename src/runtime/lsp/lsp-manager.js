@@ -80,6 +80,270 @@ const LANGUAGE_CONFIGS = {
       });
     },
     binPath: (dir) => path.join(dir, 'bin', 'gopls')
+  },
+  dart: {
+    markers: ['pubspec.yaml'],
+    extensions: ['.dart'],
+    serverBin: 'dart',
+    serverArgs: ['language-server', '--protocol=lsp'],
+    installDir: 'dart',
+    // Dart LSP ships with the Dart/Flutter SDK — no separate install needed.
+    // If `dart` is not on PATH, the user needs to install the SDK.
+    install: () => { throw new Error('Dart SDK not found on PATH. Install Flutter/Dart SDK: https://flutter.dev/docs/get-started/install'); },
+    binPath: () => 'dart' // always expect it on PATH
+  },
+  java: {
+    markers: ['pom.xml', 'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts', '.classpath'],
+    extensions: ['.java'],
+    serverBin: 'jdtls',
+    serverArgs: [],
+    installDir: 'java',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const url = 'https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/1.43.0/jdt-language-server-1.43.0-202501152348.tar.gz&r=1';
+      const tarPath = path.join(dir, 'jdtls.tar.gz');
+      execSync(`curl -sL "${url}" -o "${tarPath}" && tar xzf "${tarPath}" -C "${dir}" && rm "${tarPath}"`, {
+        cwd: dir, stdio: 'pipe'
+      });
+      // Create a wrapper script
+      const wrapper = path.join(dir, 'bin', 'jdtls');
+      fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+      const dataDir = path.join(dir, 'data');
+      const configDir = path.join(dir, process.platform === 'darwin' ? 'config_mac' : process.platform === 'win32' ? 'config_win' : 'config_linux');
+      fs.writeFileSync(wrapper, `#!/bin/sh\nexec java -Declipse.application=org.eclipse.jdt.ls.core.id1 -Dosgi.bundles.defaultStartLevel=4 -Declipse.product=org.eclipse.jdt.ls.core.product -Dlog.level=ALL -noverify -Xmx1G --add-modules=ALL-SYSTEM --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED -jar "${dir}"/plugins/org.eclipse.equinox.launcher_*.jar -configuration "${configDir}" -data "${dataDir}" "$@"\n`);
+      execSync(`chmod +x "${wrapper}"`, { stdio: 'pipe' });
+    },
+    binPath: (dir) => path.join(dir, 'bin', 'jdtls')
+  },
+  csharp: {
+    markers: ['*.csproj', '*.sln', '*.fsproj', 'global.json'],
+    extensions: ['.cs', '.fs', '.fsx'],
+    serverBin: 'csharp-ls',
+    serverArgs: [],
+    installDir: 'csharp',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      // csharp-ls is a .NET tool — requires .NET SDK on PATH
+      execSync('dotnet tool install --tool-path . csharp-ls', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'csharp-ls')
+  },
+  cpp: {
+    markers: ['CMakeLists.txt', 'Makefile', 'compile_commands.json', 'meson.build', '.clangd'],
+    extensions: ['.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'],
+    serverBin: 'clangd',
+    serverArgs: ['--background-index'],
+    installDir: 'cpp',
+    // clangd ships with LLVM/Xcode — no separate install on macOS.
+    // On Linux: apt install clangd or similar.
+    install: () => { throw new Error('clangd not found on PATH. Install LLVM/clangd: https://clangd.llvm.org/installation'); },
+    binPath: () => 'clangd'
+  },
+  ruby: {
+    markers: ['Gemfile', 'Rakefile', '.ruby-version'],
+    extensions: ['.rb', '.rake', '.gemspec'],
+    serverBin: 'solargraph',
+    serverArgs: ['stdio'],
+    installDir: 'ruby',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      execSync('gem install solargraph --install-dir .', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => {
+      // gem install puts the binary in a bin/ subdir
+      const localBin = path.join(dir, 'bin', 'solargraph');
+      if (fs.existsSync(localBin)) return localBin;
+      return 'solargraph'; // fallback to PATH
+    }
+  },
+  php: {
+    markers: ['composer.json', 'artisan', 'index.php'],
+    extensions: ['.php'],
+    serverBin: 'intelephense',
+    serverArgs: ['--stdio'],
+    installDir: 'php',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      execSync('npm init -y && npm install intelephense', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'node_modules', '.bin', 'intelephense')
+  },
+  swift: {
+    markers: ['Package.swift', '*.xcodeproj', '*.xcworkspace'],
+    extensions: ['.swift'],
+    serverBin: 'sourcekit-lsp',
+    serverArgs: [],
+    installDir: 'swift',
+    // sourcekit-lsp ships with the Swift toolchain / Xcode.
+    install: () => { throw new Error('sourcekit-lsp not found on PATH. Install Xcode or Swift toolchain: https://swift.org/download/'); },
+    binPath: () => 'sourcekit-lsp'
+  },
+  kotlin: {
+    markers: ['build.gradle.kts', 'build.gradle', 'settings.gradle.kts'],
+    extensions: ['.kt', '.kts'],
+    serverBin: 'kotlin-language-server',
+    serverArgs: [],
+    installDir: 'kotlin',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const url = 'https://github.com/fwcd/kotlin-language-server/releases/latest/download/server.zip';
+      const zipPath = path.join(dir, 'server.zip');
+      execSync(`curl -sL "${url}" -o "${zipPath}" && unzip -qo "${zipPath}" -d "${dir}" && rm "${zipPath}"`, {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'server', 'bin', 'kotlin-language-server')
+  },
+  scala: {
+    markers: ['build.sbt', 'build.sc', '.bsp'],
+    extensions: ['.scala', '.sc'],
+    serverBin: 'metals',
+    serverArgs: [],
+    installDir: 'scala',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      // Metals is distributed via coursier
+      execSync('curl -fL https://github.com/coursier/coursier/releases/latest/download/cs-x86_64-apple-darwin.gz | gzip -d > cs && chmod +x cs && ./cs install metals --install-dir .', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => {
+      const localBin = path.join(dir, 'metals');
+      if (fs.existsSync(localBin)) return localBin;
+      return 'metals';
+    }
+  },
+  elixir: {
+    markers: ['mix.exs'],
+    extensions: ['.ex', '.exs'],
+    serverBin: 'elixir-ls',
+    serverArgs: [],
+    installDir: 'elixir',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const url = 'https://github.com/elixir-lsp/elixir-ls/releases/latest/download/elixir-ls.zip';
+      const zipPath = path.join(dir, 'elixir-ls.zip');
+      execSync(`curl -sL "${url}" -o "${zipPath}" && unzip -qo "${zipPath}" -d "${dir}" && rm "${zipPath}" && chmod +x "${dir}"/language_server.sh`, {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'language_server.sh')
+  },
+  lua: {
+    markers: ['.luarc.json', '.luarc.jsonc', '.luacheckrc'],
+    extensions: ['.lua'],
+    serverBin: 'lua-language-server',
+    serverArgs: [],
+    installDir: 'lua',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const platform = process.platform;
+      const arch = process.arch;
+      let target;
+      if (platform === 'darwin' && arch === 'arm64') target = 'darwin-arm64';
+      else if (platform === 'darwin') target = 'darwin-x64';
+      else if (platform === 'linux' && arch === 'x64') target = 'linux-x64';
+      else if (platform === 'win32') target = 'win32-x64';
+      else throw new Error(`Unsupported platform for lua-language-server: ${platform}-${arch}`);
+
+      const url = `https://github.com/LuaLS/lua-language-server/releases/latest/download/lua-language-server-3.13.5-${target}.tar.gz`;
+      const tarPath = path.join(dir, 'luals.tar.gz');
+      execSync(`curl -sL "${url}" -o "${tarPath}" && tar xzf "${tarPath}" -C "${dir}" && rm "${tarPath}"`, {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'bin', 'lua-language-server')
+  },
+  zig: {
+    markers: ['build.zig', 'build.zig.zon'],
+    extensions: ['.zig'],
+    serverBin: 'zls',
+    serverArgs: [],
+    installDir: 'zig',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const platform = process.platform;
+      const arch = process.arch;
+      let target;
+      if (platform === 'darwin' && arch === 'arm64') target = 'aarch64-macos';
+      else if (platform === 'darwin') target = 'x86_64-macos';
+      else if (platform === 'linux' && arch === 'x64') target = 'x86_64-linux';
+      else if (platform === 'win32') target = 'x86_64-windows';
+      else throw new Error(`Unsupported platform for zls: ${platform}-${arch}`);
+
+      const url = `https://github.com/zigtools/zls/releases/latest/download/zls-${target}.tar.xz`;
+      const tarPath = path.join(dir, 'zls.tar.xz');
+      execSync(`curl -sL "${url}" -o "${tarPath}" && tar xJf "${tarPath}" -C "${dir}" && rm "${tarPath}"`, {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'zls')
+  },
+  clojure: {
+    markers: ['project.clj', 'deps.edn', 'shadow-cljs.edn'],
+    extensions: ['.clj', '.cljs', '.cljc', '.edn'],
+    serverBin: 'clojure-lsp',
+    serverArgs: [],
+    installDir: 'clojure',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const platform = process.platform;
+      let target;
+      if (platform === 'darwin') target = 'macos-amd64';
+      else if (platform === 'linux') target = 'linux-amd64';
+      else throw new Error(`Unsupported platform for clojure-lsp: ${platform}`);
+
+      const url = `https://github.com/clojure-lsp/clojure-lsp/releases/latest/download/clojure-lsp-native-${target}.zip`;
+      const zipPath = path.join(dir, 'clojure-lsp.zip');
+      execSync(`curl -sL "${url}" -o "${zipPath}" && unzip -qo "${zipPath}" -d "${dir}" && rm "${zipPath}" && chmod +x "${dir}"/clojure-lsp`, {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'clojure-lsp')
+  },
+  haskell: {
+    markers: ['stack.yaml', 'cabal.project', '*.cabal', 'hie.yaml'],
+    extensions: ['.hs', '.lhs'],
+    serverBin: 'haskell-language-server-wrapper',
+    serverArgs: ['--lsp'],
+    installDir: 'haskell',
+    // HLS is best installed via ghcup — too complex to auto-install.
+    install: () => { throw new Error('haskell-language-server not found on PATH. Install via ghcup: https://www.haskell.org/ghcup/'); },
+    binPath: () => 'haskell-language-server-wrapper'
+  },
+  svelte: {
+    markers: ['svelte.config.js', 'svelte.config.ts'],
+    extensions: ['.svelte'],
+    serverBin: 'svelteserver',
+    serverArgs: ['--stdio'],
+    installDir: 'svelte',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      execSync('npm init -y && npm install svelte-language-server', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'node_modules', '.bin', 'svelteserver')
+  },
+  vue: {
+    markers: ['nuxt.config.ts', 'nuxt.config.js', 'vite.config.ts'],
+    extensions: ['.vue'],
+    serverBin: 'vue-language-server',
+    serverArgs: ['--stdio'],
+    installDir: 'vue',
+    install: (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      execSync('npm init -y && npm install @vue/language-server', {
+        cwd: dir, stdio: 'pipe'
+      });
+    },
+    binPath: (dir) => path.join(dir, 'node_modules', '.bin', 'vue-language-server')
   }
 };
 

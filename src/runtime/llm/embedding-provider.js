@@ -128,20 +128,19 @@ export class EmbeddingProvider {
   }
 
   /**
-   * Batch embed multiple texts in a single API call (gateway mode only).
-   * Falls back to individual getEmbedding() calls for non-gateway providers.
-   * Returns an array of embedding vectors (same order as input texts).
-   * Failed embeddings return null.
+   * Batch embed multiple texts via the gateway batch API.
+   * Non-gateway mode falls back to sequential individual calls.
    *
-   * Batches are serialized: only one batch request runs at a time, even if
-   * multiple files are being indexed in parallel. This prevents flooding the
-   * gateway/provider with concurrent batch requests.
+   * Batches are serialized: only one batch runs at a time.
+   * Uses a while-loop lock to prevent the race condition where multiple
+   * waiters wake up simultaneously when the previous batch completes.
    */
   async getEmbeddingBatch(texts) {
     if (!texts.length) return [];
 
-    // Serialize batch requests — wait for any in-flight batch to finish first
-    if (this._embeddingBatchLock) {
+    // Serialize batch requests — re-check lock after waking up to prevent
+    // multiple waiters from proceeding concurrently.
+    while (this._embeddingBatchLock) {
       await this._embeddingBatchLock;
     }
 
@@ -157,7 +156,7 @@ export class EmbeddingProvider {
   }
 
   async _doEmbeddingBatch(texts) {
-    // Gateway mode: use batch API (single HTTP request)
+    // Gateway mode: always use batch API — never fall back to individual calls.
     if (process.env.KOI_AUTH_TOKEN) {
       if (!this._gatewayEmbeddingInstance) {
         const { GatewayEmbedding } = await import('./providers/gateway.js');
@@ -165,17 +164,12 @@ export class EmbeddingProvider {
       }
       const _t0 = Date.now();
       this._log('memory', `Embedding batch: ${texts.length} texts via gateway`);
-      try {
-        const results = await this._gatewayEmbeddingInstance.embedBatch(texts);
-        this._log('memory', `Embedding batch OK: ${Date.now() - _t0}ms, count=${results.length}`);
-        return results;
-      } catch (err) {
-        this._log('memory', `Embedding batch FAILED: ${err.message}, falling back to individual`);
-        // Fall through to individual calls
-      }
+      const results = await this._gatewayEmbeddingInstance.embedBatch(texts);
+      this._log('memory', `Embedding batch OK: ${Date.now() - _t0}ms, count=${results.length}`);
+      return results;
     }
 
-    // Fallback: sequential individual calls
+    // Non-gateway: sequential individual calls (direct API keys)
     const results = [];
     for (const text of texts) {
       try {

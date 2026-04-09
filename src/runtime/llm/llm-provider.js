@@ -123,11 +123,12 @@ export class LLMProvider {
       this.model = 'auto';
       this.openai = null;
       this.anthropic = null;
-      // Start with common providers as fallback — syncGatewayProviders() will
-      // replace this with the actual list from the backend (fully dynamic).
-      this._availableProviders = ['openai', 'anthropic', 'gemini'];
-      // Fire async sync (non-blocking — updates _availableProviders from backend)
-      this.syncGatewayProviders();
+      // Models MUST be loaded before any LLM/embedding call can proceed.
+      // _modelsReady is awaited in _ensureClients() — nothing runs until models are available.
+      this._availableProviders = [];
+      this._modelsReady = this.syncGatewayProviders().then(() => {
+        this._modelsReady = null; // resolved — no need to await again
+      });
       return;
     }
 
@@ -197,13 +198,18 @@ export class LLMProvider {
     // Load models from backend — this populates the auto-model-selector with
     // the actual active models. getAvailableProviders() then returns providers
     // dynamically from whatever the backend sent (no hardcoded list needed).
+    // loadRemoteModels() falls back to local models.json if the backend is
+    // unreachable or returns an HTTP error.
     await loadRemoteModels();
     const providers = getAvailableProviders();
     if (providers.length > 0) {
       this._availableProviders = providers;
       channel.log('llm', `[gateway] Available providers: ${providers.join(', ')}`);
     } else {
-      channel.log('llm', '[gateway] No providers found — using fallback list');
+      // Should not happen (loadRemoteModels always falls back to models.json),
+      // but use a hardcoded safety net just in case.
+      this._availableProviders = ['openai', 'anthropic', 'gemini'];
+      channel.log('llm', '[gateway] No providers found — using hardcoded fallback list');
     }
   }
 
@@ -216,6 +222,12 @@ export class LLMProvider {
    * Prompts the user for missing API keys, saves them to .env, and creates clients.
    */
   async _ensureClients(agent) {
+    // Block until models are loaded from backend (or local fallback).
+    // This is the gate that prevents any LLM/embedding call from proceeding
+    // before the model catalog is available.
+    if (this._modelsReady) {
+      await this._modelsReady;
+    }
     if (this._autoMode) {
       if (this._lockedProvider) {
         await this._ensureLockedProviderClient(agent);
@@ -1066,16 +1078,10 @@ CRITICAL RULES:
                e.result.attachments.some(a => a.type === 'image')
         );
 
-      // Coordinator agents skip image injection (images go to delegate), so they
-      // don't need a vision model or the difficulty boost.
-      const _canDelegate = agent?.hasPermission?.('delegate');
-      if (_canDelegate && _requiresImage) {
-        channel.log('llm', `[auto] Coordinator agent — images will go to delegate, no vision model needed`);
-      }
-
-      // When images are attached AND will be seen by this agent, enforce minimum
-      // difficulty so we get a model that can actually understand images.
-      if (_requiresImage && !_canDelegate) {
+      // When images are attached, enforce minimum difficulty so we get a model
+      // that can actually understand images. Coordinators also need vision to
+      // look at images before deciding who to delegate to.
+      if (_requiresImage) {
         const _minVisionDifficulty = 55;
         if (profile.difficulty < _minVisionDifficulty || profile.code < _minVisionDifficulty) {
           profile = {
@@ -1119,7 +1125,7 @@ CRITICAL RULES:
       this.model        = resolved.model;
       this._useThinking = resolved.useThinking;
       this._reasoningScore = resolved.profile?.reasoning ?? 50;
-      this._reasoningEffort = resolved.profile?.reasoningEffort ?? 'medium';
+      this._reasoningEffort = resolved.profile?.reasoningEffort ?? 'low';
       if (this._effectiveLLMProvider === 'openai')        this.openai    = this._oa;
       else if (this._effectiveLLMProvider === 'gemini')    this.openai    = this._gc;
       else if (this._effectiveLLMProvider === 'anthropic') this.anthropic = this._ac;
@@ -1215,19 +1221,16 @@ CRITICAL RULES:
     }
 
     // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks.
-    // OPTIMIZATION: Coordinator agents (with delegate permission) don't need to SEE images
-    // for routing — they only need the text metadata (attachment IDs). Images are propagated
-    // to the delegate via _pendingImagesToPropagate. Skipping injection here avoids sending
-    // megabytes of base64 to the LLM just for a routing decision.
+    // Inject images into the LLM call so the agent can see them.
+    // Coordinators also need vision to look at images before deciding who to delegate to.
+    // Images are ALSO preserved for propagation to delegates.
     if (session._pendingMcpImages?.length > 0) {
       const _canDelegate = agent?.hasPermission?.('delegate');
       if (_canDelegate) {
-        // Preserve images for propagation but don't inject into LLM call.
-        // agent.js line 1562 reads _lastConsumedImages to propagate to delegates.
+        // Preserve images for propagation to delegates as well.
         session._lastConsumedImages = [...session._pendingMcpImages];
-        channel.log('llm', `[auto] Coordinator agent — skipping ${session._pendingMcpImages.length} image(s) injection (will propagate to delegate)`);
-        session._pendingMcpImages = null;
-      } else {
+      }
+      {
         // Filter out annotation images — they contain user markup (colored shapes,
         // arrows) that LLMs confuse with actual design elements. The annotation's
         // meaning is already captured in the text description; showing the image

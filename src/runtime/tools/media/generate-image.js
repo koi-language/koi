@@ -32,7 +32,7 @@ export default {
       resolution:      { type: 'string', description: 'Resolution: low (~512px), medium (~1024px), high (~2048px), ultra (~4096px) (default: medium)' },
       quality:         { type: 'string', description: 'Quality: auto, low, medium, high (default: auto)' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
-      referenceImages: { type: 'array',  description: 'Array of file paths to reference images for style/subject guidance', items: { type: 'string' } },
+      referenceImages: { type: 'array',  description: 'Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.', items: { type: 'string' } },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
       model:           { type: 'string', description: 'Specific model to use (optional — auto-selects if omitted)' }
@@ -75,17 +75,38 @@ export default {
       } else {
         referenceImages = [];
         const maxRef = caps.maxReferenceImages || 1;
-        // Filter out annotation images — they contain user markup (arrows, circles,
-        // colored shapes) that would contaminate the generated image if used as
-        // a visual reference. Only the original image should be a reference.
-        const _filteredRefs = action.referenceImages.filter(p => {
-          const name = typeof p === 'string' ? path.basename(p) : '';
-          if (name.startsWith('braxil-annotation-')) {
-            channel.log('image', `Skipping annotation image as reference: ${name}`);
-            return false;
+        // Resolve attachment IDs (att-N) to real paths, filtering out annotations.
+        // Annotations contain user markup that would contaminate the generated image.
+        const _filteredRefs = [];
+        try {
+          const { attachmentRegistry: _ar } = await import('../../state/attachment-registry.js');
+          for (const p of action.referenceImages) {
+            if (typeof p === 'string' && /^att-\d+$/.test(p)) {
+              const entry = _ar.get(p);
+              if (entry?.role === 'annotation') {
+                channel.log('image', `Skipping annotation attachment as reference: ${p} (${entry.fileName})`);
+                continue;
+              }
+              if (entry?.path) {
+                _filteredRefs.push(entry.path);
+                continue;
+              }
+            }
+            // Raw path fallback — also check filename
+            const name = typeof p === 'string' ? path.basename(p) : '';
+            if (name.startsWith('braxil-annotation-')) {
+              channel.log('image', `Skipping annotation image as reference: ${name}`);
+              continue;
+            }
+            _filteredRefs.push(p);
           }
-          return true;
-        });
+        } catch {
+          // Fallback: filter by filename only
+          for (const p of action.referenceImages) {
+            const name = typeof p === 'string' ? path.basename(p) : '';
+            if (!name.startsWith('braxil-annotation-')) _filteredRefs.push(p);
+          }
+        }
         for (const filePath of _filteredRefs.slice(0, maxRef)) {
           const resolvedPath = path.resolve(filePath);
           if (!fs.existsSync(resolvedPath)) {

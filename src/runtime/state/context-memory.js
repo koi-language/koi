@@ -1051,12 +1051,16 @@ export class ContextMemory {
       // Code-aware summarization: read_file entries need structural summaries, not action descriptions
       const isCodeRead = textToSummarize.includes('read_file ') && (textToSummarize.startsWith('✅') || textToSummarize.includes('lines '));
       const user = isCodeRead
-        ? `Summarize the CODE CONTENT shown below (NOT the action that produced it). List: key functions/classes/components defined, their names and signatures, important state variables, and notable logic. Preserve all identifiers exactly as written. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`
+        ? `Summarize the CODE CONTENT below in 1-3 sentences as a flat string. Mention the most important function/class names and their purpose. Do NOT return arrays or nested objects. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`
         : `Summarize in 1-3 sentences. Preserve file paths, names, numbers, and errors. Return JSON: {"summary": "..."}\n\nText:\n${textToSummarize}`;
       // callSummary uses the cheapest/fastest model and records cost in costCenter.
       const raw = await this.llmProvider.callSummary(system, user);
       const _elapsed = Date.now() - _t0;
       channel.log('memory', `callSummary returned in ${_elapsed}ms, rawLen=${raw.length}, preview="${raw.substring(0, 100).replace(/\n/g, ' ')}"`);
+      if (!raw || !raw.trim()) {
+        channel.log('memory', `Summary empty response (${_elapsed}ms)`);
+        return false;
+      }
       let cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       let parsed;
       try {
@@ -1070,9 +1074,21 @@ export class ContextMemory {
           return '';
         });
         try { parsed = JSON.parse(cleaned); } catch {
-          // Last resort: extract summary from raw text
-          const m = raw.match(/["']summary["']\s*:\s*["'](.+?)["']\s*[,}]/s);
-          parsed = m ? { summary: m[1] } : null;
+          // Last resort: extract summary value from raw text (handles both string and truncated object values)
+          const mStr = raw.match(/["']summary["']\s*:\s*["'](.+?)["']\s*[,}]/s);
+          if (mStr) {
+            parsed = { summary: mStr[1] };
+          } else {
+            // Flash-lite may return truncated JSON with summary as an object — salvage what we can
+            const mObj = raw.match(/["']summary["']\s*:\s*(\{[\s\S]*)/);
+            if (mObj) {
+              // Strip the truncated object content and use the raw text up to ~300 chars as summary
+              const salvaged = mObj[1].replace(/[\n\r]+/g, ' ').substring(0, 300).trim();
+              parsed = { summary: `[partial] ${salvaged}` };
+            } else {
+              parsed = null;
+            }
+          }
         }
       }
       let summary = parsed?.summary;

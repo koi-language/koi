@@ -81,6 +81,9 @@ export default {
         const filled = Math.round((done / total) * 10);
         const bar = '▰'.repeat(filled) + '▱'.repeat(10 - filled);
         channel.progress(`indexing ${bar} ${pct}%`);
+        if (channel.sendIndexStatus) {
+          channel.sendIndexStatus({ progress: done, total, isBuilding: true });
+        }
       }, { depDirs });
 
       channel.clear();

@@ -48,7 +48,7 @@ export default {
         }
       }
 
-      cliLogger.log('state', `[phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase}`);
+      cliLogger.log('state', `\x1b[1m\x1b[36m*** [phase] ${agent.name}: ${oldPhase || '(none)'} → ${updates.statusPhase} ***\x1b[0m`);
 
       // Apply phase profile to the session for model selection
       const phaseProfile = declaredPhases?.[updates.statusPhase];

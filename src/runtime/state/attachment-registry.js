@@ -25,7 +25,13 @@ class AttachmentRegistry {
    * Register a file and return its attachment ID.
    * If the file is already registered, returns the existing ID.
    */
-  register(filePath) {
+  /**
+   * Register a file and return its attachment ID.
+   * If the file is already registered, returns the existing ID.
+   * @param {string} filePath
+   * @param {Object} [meta] - Optional metadata (e.g. { role: 'annotation' })
+   */
+  register(filePath, meta = {}) {
     const resolved = path.resolve(filePath);
 
     // Check if already registered
@@ -45,11 +51,16 @@ class AttachmentRegistry {
       '.py': 'text/x-python', '.html': 'text/html', '.css': 'text/css',
     };
     const mimeType = mimeMap[ext] || 'application/octet-stream';
+    const fileName = path.basename(resolved);
+
+    // Auto-detect annotation role from filename
+    const role = meta.role || (fileName.startsWith('braxil-annotation-') ? 'annotation' : null);
 
     this._map.set(id, {
       path: resolved,
       mimeType,
-      fileName: path.basename(resolved),
+      fileName,
+      role,
       registeredAt: Date.now(),
     });
 

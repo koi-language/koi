@@ -36,6 +36,17 @@ const _REMOTE_RETRY_MS = 30_000; // retry every 30s on failure
 const _REMOTE_POLL_MS = 60_000;  // poll for changes every 60s
 let _pollTimer = null;
 
+/** Load local models.json as fallback when backend is unavailable. */
+function _useLocalFallback(reason) {
+  const fallback = _getLocalFallback();
+  if (Object.keys(fallback).length > 0) {
+    modelsData = fallback;
+    if (process.env.KOI_LOG_FILE) {
+      try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend ${reason}, using local models.json fallback\n`); } catch {}
+    }
+  }
+}
+
 /**
  * Fetch active models from the backend API.
  * Uses ETag/If-None-Match to avoid downloading unchanged data.
@@ -80,17 +91,14 @@ export async function loadRemoteModels() {
           try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Loaded ${count} models from backend\n`); } catch {}
         }
       }
+    } else if (!_remoteLoaded) {
+      // HTTP error (401, 500, etc.) — fall back to local models.json
+      _useLocalFallback('HTTP ' + res.status);
     }
   } catch {
     // Backend unreachable — fall back to local models.json so the agent can still work
     if (!_remoteLoaded) {
-      const fallback = _getLocalFallback();
-      if (Object.keys(fallback).length > 0) {
-        modelsData = fallback;
-        if (process.env.KOI_LOG_FILE) {
-          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend unreachable, using local models.json fallback\n`); } catch {}
-        }
-      }
+      _useLocalFallback('unreachable');
     }
   }
 
