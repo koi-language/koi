@@ -142,6 +142,8 @@ export class SemanticIndex {
       // Phase 3: Embed everything in one batch request.
       // Phase 4: Store results.
       for (let i = 0; i < toIndex.length; i += FILE_PARALLEL_BATCH) {
+        // Yield between batches to avoid starving agent LLM calls
+        if (i > 0) await new Promise(r => setTimeout(r, 500));
         const batch = toIndex.slice(i, i + FILE_PARALLEL_BATCH);
 
         // Phase 1+2: Prepare files in parallel — returns pending embed jobs + store callbacks
