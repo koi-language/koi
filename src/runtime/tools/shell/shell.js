@@ -208,6 +208,26 @@ export function setPasswordPromptCallback(fn) {
   _passwordPromptCallback = fn;
 }
 
+// ── Per-action shell registry ────────────────────────────────────────────────
+// Lets the GUI "Stop" button kill a single running shell by its actionId
+// without triggering a global agent abort. Each entry is a kill function that
+// terminates only that shell; the agent then receives a { userKilled: true }
+// result and can decide what to do next.
+const _runningShellsByAction = new Map();
+
+/**
+ * Kill a running shell identified by its GUI actionId.
+ * Returns true if a matching shell was found and stopped.
+ */
+export function killShellByActionId(actionId) {
+  if (!actionId) return false;
+  const entry = _runningShellsByAction.get(actionId);
+  if (!entry) return false;
+  try { entry.kill(); } catch { /* non-fatal */ }
+  entry.userKilled = true;
+  return true;
+}
+
 /**
  * Detect potentially dangerous command patterns and return a warning string,
  * or null if no concerns are found.
@@ -446,11 +466,22 @@ When a command requires sudo, just use sudo normally in the command. The system 
   ],
 
   async * execute(action, agent) {
-    const { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, silent_timeout: silentTimeoutMs = 10000, stream_interval = 10000 } = action;
+    let { command, description: _desc, cwd, background = false, timeout: timeoutMs = 120000, silent_timeout: silentTimeoutMs = 10000, stream_interval = 10000 } = action;
 
     if (!command) {
       throw new Error('shell: "command" field is required');
     }
+
+    // Auto-detect trailing "&" as background launch.
+    // This catches LLMs that add "&" to the command string instead of passing
+    // background: true. Without this, the shell waits forever for a server
+    // process that never exits.
+    const _trimmed = command.trimEnd();
+    if (_trimmed.endsWith('&') && !_trimmed.endsWith('&&')) {
+      background = true;
+      command = _trimmed.slice(0, -1).trimEnd();
+    }
+
     const description = _desc || command;
 
     const _cmdFull = command.split('\n')[0];
@@ -521,12 +552,25 @@ When a command requires sudo, just use sudo normally in the command. The system 
     // Background launch: spawn detached, don't wait for completion.
     // Never use background when inside a parallel scope — the scope needs to wait for all results.
     if (background && !channel.hasScope()) {
+      // Open a proper action so the GUI renders a CommandBlock (same as a
+      // foreground shell), instead of a stray "⏺ Shell(...)" printCompact.
+      if (!isSilent) {
+        channel.resetActionGroup();
+        channel.beginAction('shell', cmdPreview);
+        descriptionShown = true;
+      }
+
       const bgChild = spawn(USER_SHELL, _shellArgs(effectiveCommand), {
         cwd: cwd || process.cwd(),
         env: effectiveEnv,
         stdio: ['ignore', 'ignore', 'pipe'],  // pipe stderr to catch startup errors
         detached: true
       });
+
+      // Capture the action ID at launch time so the later exit notification
+      // can be routed back to the original shell bubble in the GUI, even
+      // after endAction has cleared channel._currentActionId.
+      const _bgActionId = channel._currentActionId || null;
 
       // Collect stderr for error reporting (capped at 4KB)
       const bgStderr = [];
@@ -548,19 +592,20 @@ When a command requires sudo, just use sudo normally in the command. The system 
         channel.clearProgress();
 
         if (code !== 0) {
-          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground crashed · exit ${code}\x1b[0m`);
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground crashed · exit ${code}\x1b[0m`, { actionId: _bgActionId });
           _bgNotify?.(`[System notification] Background process crashed: "${cmdPreview}" exited with code ${code}.${stderrStr ? ` Error output:\n${stderrStr}` : ''} Please handle this.`);
         } else {
-          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground finished\x1b[0m`);
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120mbackground finished\x1b[0m`, { actionId: _bgActionId });
         }
       });
 
       bgChild.unref();
       reportDone?.();
       if (!isSilent) {
-        channel.resetActionGroup();
-        channel.printCompact(`\x1b[1m⏺\x1b[0m \x1b[1mShell\x1b[0m\x1b[2m(${cmdPreview})\x1b[0m`);
-        channel.progress(`\x1b[2m↗  background · PID ${bgChild.pid}\x1b[0m`);
+        // Emit a single in-bubble status line so the CommandBlock shows
+        // "↗ running in background · PID N" instead of a blank body.
+        channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m↗ running in background · PID ${bgChild.pid}\x1b[0m`);
+        channel.endAction(true, `background · PID ${bgChild.pid}`);
       }
       yield { success: true, background: true, pid: bgChild.pid };
       return;
@@ -776,7 +821,28 @@ When a command requires sudo, just use sudo normally in the command. The system 
       });
 
       proc = {
-        kill: () => ptyProc.kill(),
+        kill: () => {
+          // Kill the entire process group so child processes (e.g. npx serve spawning node)
+          // are also terminated, not just the shell that launched them.
+          try {
+            const pid = ptyProc.pid;
+            if (pid) {
+              try { process.kill(-pid, 'SIGTERM'); } catch { /* group kill may fail */ }
+              try { process.kill(pid, 'SIGTERM'); } catch { /* */ }
+            }
+          } catch { /* */ }
+          try { ptyProc.kill(); } catch { /* */ }
+          // Escalate to SIGKILL after 2s if still alive
+          setTimeout(() => {
+            try {
+              const pid = ptyProc.pid;
+              if (pid) {
+                try { process.kill(-pid, 'SIGKILL'); } catch { /* */ }
+                try { process.kill(pid, 'SIGKILL'); } catch { /* */ }
+              }
+            } catch { /* */ }
+          }, 2000);
+        },
         writeStdin: (data) => ptyProc.write(data),
       };
 
@@ -804,10 +870,29 @@ When a command requires sudo, just use sudo normally in the command. The system 
         cwd: cwd || process.cwd(),
         env: effectiveEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: true, // own process group so we can kill children via process.kill(-pid)
       });
 
       proc = {
-        kill: () => child.kill('SIGTERM'),
+        kill: () => {
+          // Kill the entire process group so child processes are also terminated.
+          try {
+            const pid = child.pid;
+            if (pid) {
+              try { process.kill(-pid, 'SIGTERM'); } catch { /* */ }
+            }
+          } catch { /* */ }
+          try { child.kill('SIGTERM'); } catch { /* */ }
+          setTimeout(() => {
+            try {
+              const pid = child.pid;
+              if (pid) {
+                try { process.kill(-pid, 'SIGKILL'); } catch { /* */ }
+              }
+            } catch { /* */ }
+            try { child.kill('SIGKILL'); } catch { /* */ }
+          }, 2000);
+        },
         writeStdin: (data) => { if (!child.stdin.destroyed) child.stdin.write(data); },
       };
 
@@ -849,6 +934,16 @@ When a command requires sudo, just use sudo normally in the command. The system 
     timeout = setTimeout(() => proc.kill(), timeoutMs);
     const onAbort = () => proc.kill();
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+
+    // Register this shell in the per-action registry so the GUI Stop button
+    // can target THIS command specifically (without a global abort). The
+    // entry object is shared with killShellByActionId, which mutates its
+    // `userKilled` flag before calling kill() — we read it back on close.
+    const _shellActionId = channel._currentActionId || null;
+    const _registryEntry = { kill: () => proc.kill(), userKilled: false };
+    if (_shellActionId) {
+      _runningShellsByAction.set(_shellActionId, _registryEntry);
+    }
 
     try {
       // Yield progress snapshots at stream_interval while process runs.
@@ -989,10 +1084,30 @@ When a command requires sudo, just use sudo normally in the command. The system 
         channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(timeout ${tStr})\x1b[0m`);
       };
 
-      if (closeError) {
+      // User pressed the Stop button in the GUI — surface this as data
+      // (not an abort) so the agent can continue with a different approach.
+      if (_registryEntry.userKilled) {
+        _shellOutputCallback?.(false);
+        reportDone?.();
+        if (!isSilent) {
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;200;140;80mstopped by user\x1b[0m`);
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command, combinedStr);
+        }
+        if (!isSilent && !_inScope) channel.endAction(false, 'stopped by user');
+        yield {
+          success: false,
+          userKilled: true,
+          exitCode: 130, // conventional "terminated by user" exit
+          stdout: stdoutStr,
+          stderr: stderrStr,
+          message: 'The user stopped this command. The agent was NOT aborted — continue with a different approach or investigate a different angle. Do NOT retry the exact same command; instead, reason about why the user stopped it and try something else.'
+        };
+      } else if (closeError) {
         _shellOutputCallback?.(false);
         reportDone?.();
         if (!isSilent) { _showOutputPreview(closeError.message, true); _showTimeout(); }
+        // Signal action finished so the GUI clears the Running/Stop widget
+        if (!isSilent && !_inScope) channel.endAction(false, closeError.message);
         yield { success: false, exitCode: 1, stdout: '', stderr: '', error: closeError.message };
       } else if (closeCode !== 0) {
         _shellOutputCallback?.(false);
@@ -1001,6 +1116,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           _showOutputPreview(stderrStr || combinedStr, true); _showTimeout();
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,stderrStr || combinedStr);
         }
+        if (!isSilent && !_inScope) channel.endAction(false, `exit ${closeCode}`);
         yield {
           success: false,
           exitCode: closeCode || 1,
@@ -1015,10 +1131,13 @@ When a command requires sudo, just use sudo normally in the command. The system 
           _showOutputPreview(combinedStr); _showTimeout();
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,combinedStr);
         }
+        if (!isSilent && !_inScope) channel.endAction(true, '');
         yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrStr };
       }
       // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.
     } finally {
+      // Always drop the per-action registry entry.
+      if (_shellActionId) _runningShellsByAction.delete(_shellActionId);
       // Clean up if the generator was aborted early (consumer broke out of for await).
       if (!isClosed) {
         if (usePty) _releasePty();

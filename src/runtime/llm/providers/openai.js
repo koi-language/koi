@@ -116,7 +116,27 @@ export class OpenAIChatLLM extends BaseLLM {
     this._logEnd(outChars);
 
     const text = buffer.trim();
-    if (!text) throw new Error('OpenAI returned no content');
+    if (!text) {
+      // Build an informative error message to aid debugging and retry logic.
+      // Common causes:
+      //   1. finish_reason === 'length' — model exhausted all output tokens
+      //      on thinking and never emitted a content delta.
+      //   2. Gateway timeout / connection reset — finish_reason null.
+      //   3. Model errored silently after reasoning.
+      const parts = [];
+      if (_finishReason === 'length') {
+        parts.push(`exhausted max_tokens budget (${this.maxTokens}) on reasoning`);
+      } else if (_finishReason) {
+        parts.push(`finish_reason=${_finishReason}`);
+      } else {
+        parts.push('stream ended without content');
+      }
+      if (_thinkChars > 0) {
+        parts.push(`${_thinkChars} reasoning chars consumed`);
+      }
+      parts.push(`effort=${this.reasoningEffort || 'default'}`);
+      throw new Error(`OpenAI returned no content (${parts.join(', ')})`);
+    }
     // Validate that the response is complete JSON — if the stream was cut short
     // (connection drop, timeout, or max_tokens hit), the buffer will be truncated.
     // Throwing here lets the agent retry the LLM call instead of failing at parse.

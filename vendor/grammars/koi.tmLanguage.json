@@ -10,6 +10,10 @@
     { "include": "#agent-declaration" },
     { "include": "#team-declaration" },
     { "include": "#skill-declaration" },
+    { "include": "#mcp-declaration" },
+    { "include": "#prompt-declaration" },
+    { "include": "#uses-mcp" },
+    { "include": "#expose-mcp" },
     { "include": "#run-statement" },
     { "include": "#keywords" },
     { "include": "#strings" },
@@ -61,7 +65,7 @@
       ]
     },
     "agent-declaration": {
-      "begin": "\\b(Agent)\\s+(\\w+)\\s*:\\s*(\\w+)\\s*\\{",
+      "begin": "\\b([Aa]gent)\\s+(\\w+)\\s*:\\s*(\\w+)\\s*\\{",
       "beginCaptures": {
         "1": { "name": "keyword.control.agent.koi" },
         "2": { "name": "entity.name.class.agent.koi" },
@@ -69,6 +73,7 @@
       },
       "end": "\\}",
       "patterns": [
+        { "include": "#expose-mcp" },
         { "include": "#llm-config" },
         { "include": "#state-declaration" },
         { "include": "#event-handler" },
@@ -79,7 +84,7 @@
       ]
     },
     "team-declaration": {
-      "begin": "\\b(Team)\\s+(\\w+)\\s*\\{",
+      "begin": "\\b([Tt]eam)\\s+(\\w+)\\s*\\{",
       "beginCaptures": {
         "1": { "name": "keyword.control.team.koi" },
         "2": { "name": "entity.name.class.team.koi" }
@@ -87,7 +92,7 @@
       "end": "\\}",
       "patterns": [
         {
-          "match": "(\\w+)\\s*=\\s*(\\w+)",
+          "match": "(\\w+)\\s*[:=]\\s*(\\w+)",
           "captures": {
             "1": { "name": "variable.other.property.koi" },
             "2": { "name": "entity.name.class.agent.koi" }
@@ -97,7 +102,7 @@
       ]
     },
     "skill-declaration": {
-      "begin": "\\b(Skill)\\s+(\\w+)\\s*\\{",
+      "begin": "\\b([Ss]kill)\\s+(\\w+)\\s*\\{",
       "beginCaptures": {
         "1": { "name": "keyword.control.skill.koi" },
         "2": { "name": "entity.name.class.skill.koi" }
@@ -110,6 +115,161 @@
         { "include": "#export-function" },
         { "include": "#comments" }
       ]
+    },
+    "mcp-declaration": {
+      "begin": "\\b(mcp)\\s+(\\w+)\\s*=\\s*\\{",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.mcp.koi" },
+        "2": { "name": "entity.name.class.mcp.koi" }
+      },
+      "end": "\\}",
+      "patterns": [
+        {
+          "match": "(\\w+)\\s*:",
+          "captures": {
+            "1": { "name": "variable.other.property.koi" }
+          }
+        },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#comments" }
+      ]
+    },
+    "prompt-declaration": {
+      "patterns": [
+        {
+          "comment": "Compose prompt: export? prompt Name = compose(params)? { ... }",
+          "begin": "(?:\\b(export)\\s+)?\\b(prompt)\\s+(\\w+)\\s*=\\s*(compose)\\s*(?:(\\([^)]*\\))\\s*)?\\{",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.export.koi" },
+            "2": { "name": "keyword.control.prompt.koi" },
+            "3": { "name": "entity.name.function.prompt.koi" },
+            "4": { "name": "keyword.control.compose.koi" },
+            "5": { "patterns": [{ "include": "#compose-params" }] }
+          },
+          "end": "\\}",
+          "patterns": [
+            { "include": "#compose-body" }
+          ]
+        },
+        {
+          "comment": "Parameterized prompt: export? prompt Name(params) = \"\"\"...\"\"\"",
+          "begin": "(?:\\b(export)\\s+)?\\b(prompt)\\s+(\\w+)\\s*(\\([^)]*\\))\\s*=\\s*(\"\"\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.export.koi" },
+            "2": { "name": "keyword.control.prompt.koi" },
+            "3": { "name": "entity.name.function.prompt.koi" },
+            "4": { "patterns": [{ "include": "#prompt-params" }] },
+            "5": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "end": "\"\"\"",
+          "endCaptures": {
+            "0": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "contentName": "string.quoted.triple.prompt.koi",
+          "patterns": [
+            { "include": "#prompt-directives" },
+            { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
+            { "include": "#template-variable" }
+          ]
+        },
+        {
+          "comment": "Simple prompt: export? prompt Name = \"\"\"...\"\"\"",
+          "begin": "(?:\\b(export)\\s+)?\\b(prompt)\\s+(\\w+)\\s*=\\s*(\"\"\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.export.koi" },
+            "2": { "name": "keyword.control.prompt.koi" },
+            "3": { "name": "entity.name.function.prompt.koi" },
+            "4": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "end": "\"\"\"",
+          "endCaptures": {
+            "0": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "contentName": "string.quoted.triple.prompt.koi",
+          "patterns": [
+            { "include": "#prompt-directives" },
+            { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
+            { "include": "#template-variable" }
+          ]
+        }
+      ]
+    },
+    "compose-body": {
+      "patterns": [
+        { "include": "#compose-fragments" },
+        {
+          "comment": "compose keys: model, template",
+          "match": "\\b(model|template)\\s*(?=:)",
+          "captures": {
+            "1": { "name": "keyword.other.compose.koi" }
+          }
+        },
+        { "include": "#strings" },
+        { "include": "#comments" }
+      ]
+    },
+    "compose-fragments": {
+      "begin": "\\b(fragments)\\s*:\\s*\\{",
+      "beginCaptures": {
+        "1": { "name": "keyword.other.compose.koi" }
+      },
+      "end": "\\}",
+      "patterns": [
+        {
+          "comment": "fragment pair: alias: PromptRef",
+          "match": "(\\w+)\\s*:\\s*(\\w+)",
+          "captures": {
+            "1": { "name": "variable.other.property.koi" },
+            "2": { "name": "entity.name.function.prompt-ref.koi" }
+          }
+        },
+        { "include": "#comments" }
+      ]
+    },
+    "prompt-params": {
+      "patterns": [
+        {
+          "match": "(\\w+)\\s*:\\s*(\\w+)",
+          "captures": {
+            "1": { "name": "variable.parameter.koi" },
+            "2": { "name": "entity.name.type.koi" }
+          }
+        },
+        {
+          "name": "punctuation.separator.koi",
+          "match": ","
+        }
+      ]
+    },
+    "compose-params": {
+      "patterns": [
+        {
+          "name": "variable.parameter.compose.koi",
+          "match": "\\w+"
+        },
+        {
+          "name": "punctuation.separator.koi",
+          "match": ","
+        }
+      ]
+    },
+    "uses-mcp": {
+      "match": "\\b(uses)\\s+(mcp)\\s+(\\w+(?:\\s*,\\s*\\w+)*)",
+      "captures": {
+        "1": { "name": "keyword.control.uses.koi" },
+        "2": { "name": "keyword.control.mcp.koi" },
+        "3": { "name": "entity.name.class.mcp.koi" }
+      }
+    },
+    "expose-mcp": {
+      "match": "\\b(expose)\\s+(mcp)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.expose.koi" },
+        "2": { "name": "keyword.control.mcp.koi" }
+      }
     },
     "llm-config": {
       "begin": "\\b(llm)\\s+(default)\\s*=\\s*\\{",
@@ -149,11 +309,12 @@
       ]
     },
     "event-handler": {
-      "begin": "\\b(on)\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{",
+      "begin": "(?:\\b(private)\\s+)?\\b(on)\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{",
       "beginCaptures": {
-        "1": { "name": "keyword.control.on.koi" },
-        "2": { "name": "entity.name.function.event.koi" },
-        "3": { "patterns": [{ "include": "#function-params" }] }
+        "1": { "name": "keyword.control.private.koi" },
+        "2": { "name": "keyword.control.on.koi" },
+        "3": { "name": "entity.name.function.event.koi" },
+        "4": { "patterns": [{ "include": "#function-params" }] }
       },
       "end": "\\}",
       "patterns": [
@@ -178,16 +339,262 @@
       "name": "string.quoted.triple.affordance.koi"
     },
     "playbook": {
-      "begin": "\\b(playbook)\\s+(\"\"\")",
+      "patterns": [
+        {
+          "comment": "Composed playbook: playbook Parts + ... + \"\"\"...\"\"\"",
+          "begin": "\\b(playbook)\\s+((?:[A-Za-z_]\\w*(?:\\([^)]*\\))?\\s*\\+\\s*)+)(\"\"\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.playbook.koi" },
+            "2": { "patterns": [{ "include": "#playbook-composition-parts" }] },
+            "3": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "end": "\"\"\"",
+          "endCaptures": {
+            "0": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "contentName": "string.quoted.triple.playbook.koi",
+          "patterns": [
+            { "include": "#template-variable" }
+          ]
+        },
+        {
+          "comment": "Simple playbook: playbook \"\"\"...\"\"\"",
+          "begin": "\\b(playbook)\\s+(\"\"\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.playbook.koi" },
+            "2": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "end": "\"\"\"",
+          "endCaptures": {
+            "0": { "name": "string.quoted.triple.delimiter.koi" }
+          },
+          "contentName": "string.quoted.triple.playbook.koi",
+          "patterns": [
+            { "include": "#template-variable" }
+          ]
+        },
+        {
+          "comment": "Playbook with only refs/calls (no string)",
+          "match": "\\b(playbook)\\s+([A-Za-z_]\\w*(?:\\([^)]*\\))?(?:\\s*\\+\\s*[A-Za-z_]\\w*(?:\\([^)]*\\))?)*)",
+          "captures": {
+            "1": { "name": "keyword.control.playbook.koi" },
+            "2": { "patterns": [{ "include": "#playbook-composition-parts" }] }
+          }
+        }
+      ]
+    },
+    "playbook-composition-parts": {
+      "patterns": [
+        {
+          "comment": "Prompt call: Name(args)",
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.prompt-ref.koi" }
+          }
+        },
+        {
+          "comment": "Prompt reference: PascalCase identifier",
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "entity.name.function.prompt-ref.koi" }
+          }
+        },
+        {
+          "name": "keyword.operator.composition.koi",
+          "match": "\\+"
+        },
+        { "include": "#strings" }
+      ]
+    },
+    "prompt-directives": {
+      "patterns": [
+        {
+          "comment": "@if/@else if (condition) { — end only matches ) followed by { or end-of-line",
+          "begin": "(\\B@)(if|else\\s+if)\\s*(\\()",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.directive.koi" },
+            "2": { "name": "keyword.control.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" }
+          },
+          "end": "(\\))\\s*(\\{)\\s*$|(\\))\\s*$",
+          "endCaptures": {
+            "1": { "name": "keyword.control.directive.koi" },
+            "2": { "name": "keyword.control.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" }
+          },
+          "contentName": "meta.directive.condition.koi",
+          "patterns": [
+            { "include": "#directive-expression" }
+          ]
+        },
+        {
+          "comment": "@else with optional opening brace",
+          "match": "(\\B@)(else)\\s*(\\{)?",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.koi" },
+            "2": { "name": "keyword.control.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" }
+          }
+        },
+        {
+          "comment": "@let name = expression",
+          "match": "(\\B@)(let)\\s+(\\w+)\\s*(=)\\s*(.+?)(?=$|\\n)",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.koi" },
+            "2": { "name": "keyword.control.directive.koi" },
+            "3": { "name": "variable.other.directive.koi" },
+            "4": { "name": "keyword.operator.assignment.koi" },
+            "5": { "name": "meta.directive.expression.koi", "patterns": [{ "include": "#directive-expression" }] }
+          }
+        },
+        {
+          "comment": "} @else if (condition) { — end only matches ) followed by { or end-of-line",
+          "begin": "(\\})\\s*(\\B@)(else\\s*if)\\s*(\\()",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.koi" },
+            "2": { "name": "punctuation.definition.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" },
+            "4": { "name": "keyword.control.directive.koi" }
+          },
+          "end": "(\\))\\s*(\\{)\\s*$|(\\))\\s*$",
+          "endCaptures": {
+            "1": { "name": "keyword.control.directive.koi" },
+            "2": { "name": "keyword.control.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" }
+          },
+          "contentName": "meta.directive.condition.koi",
+          "patterns": [
+            { "include": "#directive-expression" }
+          ]
+        },
+        {
+          "comment": "} @else { — without condition",
+          "match": "(\\})\\s*(\\B@)(else)\\s*(\\{)?",
+          "captures": {
+            "1": { "name": "keyword.control.directive.koi" },
+            "2": { "name": "punctuation.definition.directive.koi" },
+            "3": { "name": "keyword.control.directive.koi" },
+            "4": { "name": "keyword.control.directive.koi" }
+          }
+        },
+        {
+          "comment": "Closing brace } alone on a line",
+          "match": "^\\s*(\\})\\s*$",
+          "captures": {
+            "1": { "name": "keyword.control.directive.koi" }
+          }
+        }
+      ]
+    },
+    "directive-expression": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.koi",
+          "match": "'[^']*'"
+        },
+        {
+          "name": "string.quoted.double.koi",
+          "match": "\"[^\"]*\""
+        },
+        {
+          "name": "constant.numeric.koi",
+          "match": "\\b\\d+\\b"
+        },
+        {
+          "name": "constant.language.koi",
+          "match": "\\b(true|false|null|undefined)\\b"
+        },
+        {
+          "comment": "Tool accessor: tool('name').call({...}) — the 'name' arg is highlighted as a tool-name constant",
+          "match": "\\b(tool)\\s*\\(\\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)(\\2)\\s*\\)",
+          "captures": {
+            "1": { "name": "support.function.builtin.tool.koi" },
+            "2": { "name": "punctuation.definition.string.koi" },
+            "3": { "name": "constant.other.tool-name.koi" },
+            "4": { "name": "punctuation.definition.string.koi" }
+          }
+        },
+        {
+          "comment": "Phase accessor properties in templates: phase.name, phase.valid",
+          "match": "\\b(phase)\\.(name|valid)\\b",
+          "captures": {
+            "1": { "name": "support.function.builtin.phase-accessor.koi" },
+            "2": { "name": "variable.other.property.phase-accessor.koi" }
+          }
+        },
+        {
+          "comment": "Phase reference in templates: phase('name') or phase(name)",
+          "match": "\\b(phase)\\s*\\(\\s*(?:'([A-Za-z_]\\w*)'|\"([A-Za-z_]\\w*)\"|([A-Za-z_]\\w*))\\s*\\)",
+          "captures": {
+            "1": { "name": "support.function.builtin.phase-accessor.koi" },
+            "2": { "name": "constant.other.phase-name.koi" },
+            "3": { "name": "constant.other.phase-name.koi" },
+            "4": { "name": "constant.other.phase-name.koi" }
+          }
+        },
+        {
+          "comment": "Operators: comparison, logical, ternary, optional chaining, arrow",
+          "name": "keyword.operator.expression.koi",
+          "match": "===|!==|==|!=|>=|<=|=>|&&|\\|\\||\\?\\.|[?:><!=]"
+        },
+        {
+          "comment": "Parentheses, brackets, braces, and commas",
+          "name": "keyword.operator.expression.koi",
+          "match": "[()\\[\\]{},]"
+        },
+        {
+          "comment": "Method calls: obj.method( — variable + dot + function",
+          "match": "([a-zA-Z_][a-zA-Z0-9_]*)(\\.)(\\??\\.?)([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "variable.other.expression.koi" },
+            "2": { "name": "keyword.operator.expression.koi" },
+            "3": { "name": "keyword.operator.expression.koi" },
+            "4": { "name": "entity.name.function.expression.koi" }
+          }
+        },
+        {
+          "comment": "Standalone function calls: func(",
+          "match": "([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.expression.koi" }
+          }
+        },
+        {
+          "name": "variable.other.expression.koi",
+          "match": "[a-zA-Z_][a-zA-Z0-9_.]*"
+        }
+      ]
+    },
+    "prompt-interpolation": {
+      "begin": "\\{\\{",
       "beginCaptures": {
-        "1": { "name": "keyword.control.playbook.koi" },
-        "2": { "name": "string.quoted.triple.delimiter.koi" }
+        "0": { "name": "punctuation.section.embedded.begin.koi" }
       },
-      "end": "\"\"\"",
+      "end": "\\}\\}",
       "endCaptures": {
-        "0": { "name": "string.quoted.triple.delimiter.koi" }
+        "0": { "name": "punctuation.section.embedded.end.koi" }
       },
-      "name": "string.quoted.triple.playbook.koi"
+      "contentName": "meta.interpolation.koi",
+      "patterns": [
+        { "match": "\\b\\w+\\b", "name": "variable.other.koi" },
+        { "include": "#numbers" },
+        { "include": "#operators" },
+        { "include": "#constants" },
+        { "include": "#types" },
+        { "include": "#strings" }
+      ]
+    },
+    "prompt-fragment-reference": {
+      "match": "(\\{\\{)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(\\}\\})",
+      "captures": {
+        "1": { "name": "punctuation.section.embedded.begin.koi" },
+        "2": { "name": "entity.name.function.fragment.koi" },
+        "3": { "name": "punctuation.section.embedded.end.koi" }
+      }
+    },
+    "template-variable": {
+      "name": "variable.other.template.koi",
+      "match": "\\$\\{[^}]+\\}"
     },
     "export-function": {
       "begin": "\\b(export)\\s+(async)?\\s*(function)\\s+(\\w+)",
@@ -216,7 +623,31 @@
       "patterns": [
         {
           "name": "keyword.control.koi",
-          "match": "\\b(package|import|role|Agent|Team|Skill|on|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all)\\b"
+          "match": "\\b(package|import|role|agent|team|skill|mcp|prompt|compose|on|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all|amnesia|expose|private|reactions|phases)\\b"
+        },
+        {
+          "comment": "Reaction body constructors: phase(X).start(), effort(X), score(dim, N), bump(dim, N, max: N, min: N)",
+          "name": "support.function.builtin.reaction.koi",
+          "match": "\\b(effort|score|bump)(?=\\s*\\()"
+        },
+        {
+          "comment": "Reaction accessor: phase('exploring').start() or phase(exploring).start()",
+          "match": "(\\bphase)\\s*\\(\\s*(?:'([A-Za-z_]\\w*)'|\"([A-Za-z_]\\w*)\"|([A-Za-z_]\\w*))\\s*\\)\\s*(?:\\.([A-Za-z_]\\w*))?",
+          "captures": {
+            "1": { "name": "support.function.builtin.reaction.koi" },
+            "2": { "name": "constant.other.phase-name.koi" },
+            "3": { "name": "constant.other.phase-name.koi" },
+            "4": { "name": "constant.other.phase-name.koi" },
+            "5": { "name": "entity.name.function.method.reaction.koi" }
+          }
+        },
+        {
+          "comment": "Reaction lifecycle event path after `on`: invoked, session.start/resumed, user.message/attachments, error.llm/tool/timeout/network, tasks.pending/completed, phase.done",
+          "match": "(\\bon)\\s+((?:invoked|session\\.(?:start|resumed)|user\\.(?:message|attachments)|error\\.(?:llm|tool|timeout|network)|tasks\\.(?:pending|completed)|phase\\.done)(?:\\s*,\\s*(?:invoked|session\\.(?:start|resumed)|user\\.(?:message|attachments)|error\\.(?:llm|tool|timeout|network)|tasks\\.(?:pending|completed)|phase\\.done))*)",
+          "captures": {
+            "1": { "name": "keyword.control.koi" },
+            "2": { "name": "support.constant.event.reaction.koi" }
+          }
         },
         {
           "name": "keyword.control.flow.koi",
@@ -233,7 +664,13 @@
         {
           "name": "string.quoted.triple.koi",
           "begin": "\"\"\"",
-          "end": "\"\"\""
+          "end": "\"\"\"",
+          "patterns": [
+            { "include": "#prompt-directives" },
+            { "include": "#prompt-fragment-reference" },
+            { "include": "#prompt-interpolation" },
+            { "include": "#template-variable" }
+          ]
         },
         {
           "name": "string.quoted.double.koi",

@@ -5,6 +5,9 @@ import { LLMProvider } from '../llm/llm-provider.js';
 
 import { actionRegistry } from './action-registry.js';
 import { PlaybookSession } from './playbook-session.js';
+import { fireReaction } from './reactions.js';
+import { MessageInbox } from './message-inbox.js';
+import { createPhaseAccessor } from './phase-accessor.js';
 
 import { initSessionTracker, sessionTracker } from '../state/session-tracker.js';
 import { ContextMemory, classifyFeedback } from '../state/context-memory.js';
@@ -163,6 +166,36 @@ export class Agent {
     return null;
   }
 
+  /**
+   * Per-agent inbox registry — maps agentName (lowercase) → Agent instance.
+   * Used by Agent.pushInboxMessage() to route inbound messages from the CLI,
+   * from other agents, or from broadcast classifications.
+   *
+   * Registration happens lazily in the Agent constructor.
+   */
+  static _inboxRegistry = new Map();
+
+  /**
+   * Push a message into an agent's inbox by name. Returns the message id
+   * on success, or null if no agent with that name is registered.
+   *
+   * The push is non-blocking — classification runs in the background and
+   * the agent's main loop drains the result between iterations.
+   *
+   * @param {string} agentName
+   * @param {Object} msg — { from, text, attachments?, parentTaskId?, correlationId? }
+   * @returns {string|null}
+   */
+  static pushInboxMessage(agentName, msg) {
+    const key = String(agentName || '').toLowerCase();
+    const agent = Agent._inboxRegistry.get(key);
+    if (!agent || !agent._inbox) {
+      channel.log('inbox', `pushInboxMessage: no agent registered for "${agentName}"`);
+      return null;
+    }
+    return agent._inbox.push(msg);
+  }
+
   /** Set CLI hooks from the bootstrap layer. */
   static setCliHooks(hooks) {
     Agent._cliHooks = hooks;
@@ -214,8 +247,40 @@ export class Agent {
 
     this.handlers = config.handlers || {};
 
+    // Declared phases (per-phase model profile) and reactions (event-driven
+    // phase/profile transitions). Both come from the transpiled .koi output.
+    this.phases = config.phases || null;
+    this.reactions = config.reactions || null;
+
     // Per-agent work queue — each agent has its own task backlog
     this._workQueue = null; // lazy init to avoid import at module load
+
+    // Per-agent message inbox ("oreja") — async message classifier.
+    // See runtime/agent/message-inbox.js. The inbox runs its classifier
+    // in the background; results are drained by the main loop between
+    // iterations and applied to this.workQueue.
+    //
+    // _wakeupPromise / _wakeupResolve let a sleeping main loop be woken
+    // up when a new message arrives or a classification finishes.
+    this._inbox = new MessageInbox(this);
+    this._wakeupPromise = null;
+    this._wakeupResolve = null;
+    // Task keys used by the inbox broadcast system. Keys are globally
+    // unique strings of the form "wq:<agentName>:<id>" (WorkQueue item)
+    // or "tm:<id>" (TaskManager task).
+    //
+    //   _ownTaskKey    — the task this invocation is doing (what my
+    //                    parent asked me to do). Set at invocation time.
+    //   _parentTaskKey — the task the PARENT was doing when it delegated
+    //                    to me. If the parent modifies that task, I get
+    //                    a broadcast notification via the inbox.
+    this._ownTaskKey = null;
+    this._parentTaskKey = null;
+
+    // Register in the global inbox registry so external callers can
+    // push messages by agent name. Last-write-wins if the same name is
+    // registered twice; in practice each Agent name is unique per process.
+    Agent._inboxRegistry.set(String(this.name || '').toLowerCase(), this);
 
     // Initialize LLM provider if needed
     this.llmProvider = null;
@@ -353,6 +418,176 @@ export class Agent {
     return false;
   }
 
+  /**
+   * Apply a classified inbox message to this agent's state.
+   *
+   * Called by the main loop when draining the inbox. For each message +
+   * classifier result, we:
+   *   - new_task     → add to WorkQueue
+   *   - modify_task  → update the existing WorkQueue item and, if the
+   *                    task is in_progress, broadcast the user's message
+   *                    to any active delegate that is working on a
+   *                    subtask derived from it.
+   *   - noop         → inject as a plain user note in context memory
+   *
+   * Every case also injects a short note into context memory so the
+   * agent's next LLM iteration knows the message arrived.
+   *
+   * @param {import('./message-inbox.js').InboxMessage} msg
+   * @param {import('./message-inbox.js').ClassifierResult} result
+   * @param {ContextMemory} contextMemory
+   */
+  async _applyInboxResult(msg, result, contextMemory) {
+    const queue = this.workQueue || (await this.ensureWorkQueue?.());
+    const kind = result?.kind || 'noop';
+
+    // ── Language detection (ONLY for messages from the user) ─────────
+    // The inbox classifier detects the natural language of each user
+    // message and writes it to `agent.state.userLanguage`. There is no
+    // LLM-facing tool for changing language — the ear handles it.
+    //
+    // Strict check: only `from === 'user'` triggers a language change.
+    // Agent-to-agent broadcasts (where `from` is an agent name) MUST
+    // NEVER modify the active language.
+    if (msg.from === 'user' && result?.language && this.state) {
+      const prev = this.state.userLanguage || null;
+      if (result.language !== prev) {
+        this.state.userLanguage = result.language;
+        // Keep the global mirror in sync for legacy readers.
+        globalThis.__koiUserLanguage = result.language;
+        channel.log('inbox', `${this.name}: userLanguage ${prev || '(none)'} → ${result.language}`);
+      }
+    }
+
+    if (kind === 'new_task' && result.rewrittenTask && queue) {
+      const added = queue.add({
+        subject: result.rewrittenTask.subject,
+        description: result.rewrittenTask.description || msg.text,
+        owner: this.name,
+      });
+      channel.log('inbox', `${this.name}: queued new task #${added.id} "${added.subject}"`);
+      contextMemory.add(
+        'user',
+        `[INBOX] New message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
+        `Inbox → task #${added.id}`,
+        null
+      );
+      return;
+    }
+
+    if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask && queue) {
+      const existing = queue.get(result.targetTaskId);
+      if (!existing) {
+        // Fallback: classifier thought the id existed but it was completed/deleted
+        // between classification and drain. Treat as new_task.
+        channel.log('inbox', `${this.name}: modify_task target #${result.targetTaskId} vanished — falling back to new_task`);
+        if (queue) {
+          const added = queue.add({
+            subject: result.rewrittenTask.subject,
+            description: result.rewrittenTask.description || msg.text,
+            owner: this.name,
+          });
+          contextMemory.add('user',
+            `[INBOX] Message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
+            `Inbox → task #${added.id}`, null);
+        }
+        return;
+      }
+
+      // Rewrite subject/description. We REPLACE description (not append)
+      // because the classifier has already produced a merged version.
+      queue.update(result.targetTaskId, {
+        subject: result.rewrittenTask.subject,
+        description: result.rewrittenTask.description || existing.description,
+        replaceDescription: true,
+      });
+
+      // If the task is in_progress and an activeForm was provided, also
+      // update the live panel so the user sees the change in the UI.
+      // The taskManager (global) tracks the panel. We look up by matching
+      // description/subject if the work queue id doesn't match a tm task.
+      if (existing.status === 'in_progress' && result.rewrittenTask.activeForm) {
+        try {
+          const { taskManager } = await import('../state/task-manager.js');
+          // The WorkQueue id and the taskManager id are separate namespaces,
+          // but when a task is created in the panel it's usually identified
+          // by subject. Try to find a matching task and update its activeForm.
+          const tmTasks = taskManager.list();
+          const match = tmTasks.find(t =>
+            t.status === 'in_progress' &&
+            (t.subject === existing.subject || t.subject === result.rewrittenTask.subject)
+          );
+          if (match) {
+            taskManager.update(match.id, {
+              subject: result.rewrittenTask.subject,
+              activeForm: result.rewrittenTask.activeForm,
+            });
+          }
+        } catch (err) {
+          channel.log('inbox', `${this.name}: panel update failed: ${err.message}`);
+        }
+      }
+
+      channel.log('inbox', `${this.name}: modified task #${result.targetTaskId} "${result.rewrittenTask.subject}"`);
+      contextMemory.add(
+        'user',
+        `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to task #${existing.id}: ${result.rewrittenTask.subject}`,
+        `Inbox → modify task #${existing.id}`,
+        null
+      );
+
+      // Broadcast to delegates working on subtasks derived from this one.
+      // Only if the task is in_progress — if it's still pending there's
+      // no running delegate to notify.
+      if (existing.status === 'in_progress') {
+        this._broadcastToDelegatesOfTask(existing.id, msg);
+      }
+      return;
+    }
+
+    // noop (or invalid kind) — just drop the message into context memory so
+    // the agent sees it on its next iteration. If the agent is idle (no
+    // pending tasks), this may still prompt it to react.
+    contextMemory.add(
+      'user',
+      `[INBOX] Message from ${msg.from}: "${msg.text}"${result?.reasoning ? ` (classifier: ${result.reasoning})` : ''}`,
+      `Inbox note`,
+      null
+    );
+  }
+
+  /**
+   * Broadcast an inbox message to every delegate agent that is currently
+   * running as a consequence of a specific parent task.
+   *
+   * A delegate is "linked" to a parent task if its `_parentTaskKey` field
+   * matches the given taskId. We find them via Agent._inboxRegistry and
+   * push the message into their inbox (where their own classifier will
+   * re-apply the same algorithm recursively).
+   *
+   * @param {string} parentTaskId
+   * @param {import('./message-inbox.js').InboxMessage} msg
+   */
+  _broadcastToDelegatesOfTask(parentTaskId, msg) {
+    let count = 0;
+    for (const [, agent] of Agent._inboxRegistry) {
+      if (agent === this) continue;
+      if (String(agent._parentTaskKey || '') === String(parentTaskId)) {
+        agent._inbox.push({
+          from: this.name,
+          text: msg.text,
+          attachments: msg.attachments,
+          correlationId: msg.correlationId,
+          parentTaskId, // marks this as a downstream broadcast — skips re-classification
+        });
+        count++;
+      }
+    }
+    if (count > 0) {
+      channel.log('inbox', `${this.name}: broadcast task #${parentTaskId} update to ${count} delegate(s)`);
+    }
+  }
+
   async handle(eventName, args, _fromDelegation = false, _parentAnswerFn = null) {
     // Bootstrap CLI layer (e.g. Ink) early — before any stdout writes.
     // When KOI_CLI_MODE is set, dynamically import the bootstrap module
@@ -432,6 +667,12 @@ export class Agent {
             if (task.status === 'pending') updates.status = 'in_progress';
             taskManager.update(String(task.id), updates);
             args = task;
+            // Record the parent task id so inbox broadcast can find this
+            // delegate when the parent modifies the same task via its
+            // inbox classifier. Best-effort — ids may collide with
+            // other agents' WorkQueue ids; the receiving classifier will
+            // no-op on mismatches.
+            this._parentTaskKey = String(task.id);
             channel.log('task', `[${this.name}] Working on task #${task.id}: ${task.subject}`);
           }
         }
@@ -449,6 +690,10 @@ export class Agent {
           this._workQueue.update(queueItem.id, { status: 'in_progress' });
           // Merge queue item fields into args so the agent sees them
           args = { ...args, ...queueItem };
+          // If the caller explicitly passed a parent task id via args,
+          // record it so inbox broadcast can find us. Used when a parent
+          // agent wants to establish the link explicitly.
+          if (args._parentTaskKey) this._parentTaskKey = String(args._parentTaskKey);
           channel.log('task', `[${this.name}] Enqueued in own queue: #${queueItem.id}: ${queueItem.subject}`);
         }
       }
@@ -483,7 +728,37 @@ export class Agent {
       }
 
       throw error;
+    } finally {
+      // Clear the parent-task link — the invocation is over so inbox
+      // broadcasts should no longer target this agent.
+      this._parentTaskKey = null;
     }
+  }
+
+  /**
+   * Sleep until a new inbox message arrives (or until `timeoutMs` expires).
+   * Resolves with `true` if woken by an inbox event, `false` on timeout.
+   *
+   * Used by an idle main loop that has no work to do and wants to avoid
+   * burning LLM calls while waiting for the user. Safe to call from any
+   * iteration — the wake-up promise is recreated after each resolution.
+   *
+   * @param {number} [timeoutMs=0]  — 0 = no timeout (wait forever)
+   * @returns {Promise<boolean>}
+   */
+  _waitForWakeup(timeoutMs = 0) {
+    if (!this._wakeupPromise) {
+      this._wakeupPromise = new Promise((resolve) => {
+        this._wakeupResolve = resolve;
+      });
+    }
+    if (timeoutMs > 0) {
+      return Promise.race([
+        this._wakeupPromise.then(() => true),
+        new Promise((r) => setTimeout(() => r(false), timeoutMs)),
+      ]);
+    }
+    return this._wakeupPromise.then(() => true);
   }
 
   async executePlaybookHandler(eventName, playbook, args, _fromDelegation = false, playbookFn = null, _parentAnswerFn = null) {
@@ -748,6 +1023,21 @@ export class Agent {
     }
     channel.log('agent', `${this.name}: Starting reactive loop${isDelegate ? ' [delegate]' : ''}`);
 
+    // Fire `invoked` on every handler entry — this is the right event for
+    // delegate agents that want to set their initial phase whenever their
+    // parent invokes them. The root agent ALSO receives `invoked`, so it
+    // can use it interchangeably with `session.start` if it prefers.
+    //
+    // For the root agent (not a delegate), also fire `session.start` (or
+    // `session.resumed` on a recovered session) so its reactions can
+    // distinguish "fresh program start" from "subsequent invocation".
+    const _reactionCtx = { state: this.state, session: { isDelegate } };
+    fireReaction(this, 'invoked', null, _reactionCtx);
+    if (!isDelegate) {
+      const _isResume = !!_isRecovery;
+      fireReaction(this, _isResume ? 'session.resumed' : 'session.start', null, _reactionCtx);
+    }
+
     // ── AUTO-ACTIVATE SKILLS ────────────────────────────────────────────────
     // At the start of a delegate's lifecycle, check available skills and use
     // the cheap classifier model to decide which (if any) to activate.
@@ -934,6 +1224,21 @@ export class Agent {
     }
 
     while (!session.isTerminated) {
+      // ── Drain the inbox: apply classified messages to this agent's
+      // work queue / context memory. Non-blocking: the classifier runs
+      // in the background, we only consume whatever finished. See
+      // runtime/agent/message-inbox.js and llm/message-classifier.js.
+      if (this._inbox && this._inbox.hasWork()) {
+        try {
+          const processed = this._inbox.drainProcessed();
+          for (const entry of processed) {
+            await this._applyInboxResult(entry.message, entry.result, contextMemory);
+          }
+        } catch (err) {
+          channel.log('inbox', `${this.name}: drain error: ${err?.message || err}`);
+        }
+      }
+
       // ── Check for completed background delegates ──────────────────────
       // Non-blocking: check if any background promises have settled.
       if (session._backgroundDelegates?.length > 0) {
@@ -1025,9 +1330,11 @@ export class Agent {
       if (isFastGreeting && session.iteration === 0) {
         // Skip LLM call — show greeting + transition to routing instantly (zero tokens)
         channel.log('agent', `${this.name}: Fast-greeting (skipping LLM on iteration 0)`);
+        // Phase transitions are now driven by reactions (session.start /
+        // invoked fires at handler entry), so we no longer inject an
+        // update_state action here.
         response = [
-          { actionType: 'direct', intent: 'prompt_user', question: _fastGreetMsg },
-          { actionType: 'direct', intent: 'update_state', updates: { statusPhase: 'understanding' } }
+          { actionType: 'direct', intent: 'prompt_user', question: _fastGreetMsg }
         ];
         isFirstCall = false;
       } else {
@@ -1077,7 +1384,6 @@ export class Agent {
         });
         isFirstCall = false;
         this._llmErrorShown = false; // Reset warning flag on successful call
-        globalThis.__koiSetLanguageAllowed = false; // set_language only on first call after user input
         channel.log('agent', `${this.name}: LLM responded`);
         // Persist conversation after every LLM response so that /exit, Ctrl+C,
         // or any crash can't lose the last exchange. At this point contextMemory
@@ -1135,6 +1441,33 @@ export class Agent {
           console.error(`[Agent:${this.name}] ❌ LLM call failed (${modelId}): ${error.message}`);
         }
         session.recordAction({ intent: '_llm_error', actionType: 'direct' }, null, error);
+
+        // Fire error.llm reaction so agents can bump profile / change phase
+        fireReaction(this, 'error.llm', null, {
+          error: {
+            count: session.consecutiveErrors,
+            message: error.message,
+            kind: 'llm',
+          },
+          state: this.state,
+        });
+
+        // Detect "exhausted thinking budget" style errors (model spent all
+        // max_tokens on reasoning and emitted no content). For these, bump
+        // down the effort so the retry has budget for actual content.
+        const _isThinkingExhaustion = /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(error.message || '');
+        if (_isThinkingExhaustion && this.llmProvider?._activeSession) {
+          const _sess = this.llmProvider._activeSession;
+          if (!_sess._phaseProfile) _sess._phaseProfile = {};
+          const _prev = _sess._phaseProfile.reasoningEffort || 'medium';
+          const _levels = ['high', 'medium', 'low', 'none'];
+          const _idx = _levels.indexOf(_prev);
+          if (_idx >= 0 && _idx < _levels.length - 1) {
+            _sess._phaseProfile.reasoningEffort = _levels[_idx + 1];
+            channel.log('llm', `${this.name}: Thinking exhaustion detected — lowered effort ${_prev} → ${_levels[_idx + 1]} for retry`);
+          }
+        }
+
         // Exponential backoff on consecutive LLM failures to avoid tight retry loops.
         // 1st fail: 1s, 2nd: 2s, 3rd: 4s, cap at 15s.
         const _backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveErrors - 1), 15000);
@@ -1802,9 +2135,15 @@ export class Agent {
             Agent._cliHooks?.onBusy?.(true);
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             this._lastUserMessage = _isBgWakeup ? null : (result?.answer || null);
-            // Allow set_language only on the very next LLM call after user input
-            globalThis.__koiSetLanguageAllowed = !!this._lastUserMessage;
             channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
+
+            // Fire user.message reaction
+            if (!_isBgWakeup && this._lastUserMessage) {
+              fireReaction(this, 'user.message', null, {
+                user: { message: this._lastUserMessage, attachments: result?.attachments || [] },
+                state: this.state,
+              });
+            }
 
             // Share with session tracker so delegate commits can also use the user's request
             if (sessionTracker && this._lastUserMessage) {
@@ -1872,6 +2211,21 @@ export class Agent {
               success: result?.success !== false && !result?.error,
               data: result || null,
             };
+
+            // Fire <delegateAgent>.result reaction
+            const _reactionCtx = {
+              [_delegateAgent]: {
+                result: {
+                  success: result?.success !== false && !result?.error,
+                  data: result?.data ?? result ?? null,
+                  error: result?.error ?? null,
+                  taskCount: result?.taskCount ?? result?.data?.taskCount ?? 0,
+                  cancelled: result?.cancelled ?? false,
+                },
+              },
+              state: this.state,
+            };
+            fireReaction(this, `${_delegateAgent}.result`, null, _reactionCtx);
           }
 
           // ── Auto-register external project dependencies ──────────────────
@@ -3120,8 +3474,18 @@ Many commands are inherently slow and produce little or no output for extended p
    * Uses the cheap classifier model to decide which skills match the task.
    */
   async _autoActivateSkills(args) {
-    const result = await this.callAction('list_skills', {});
-    const skills = result?._fullSkills || result?.skills;
+    // Everything in this method must be best-effort: a failure here
+    // (slow model, missing skill registry, JSON parse error) must NEVER
+    // prevent the delegate from starting its main loop. Wrap the whole
+    // body so even unexpected throws are swallowed.
+    let skills;
+    try {
+      const result = await this.callAction('list_skills', {});
+      skills = result?._fullSkills || result?.skills;
+    } catch (e) {
+      channel.log('skills', `${this.name}: list_skills failed: ${e.message} — skipping auto-activate`);
+      return;
+    }
     if (!skills || skills.length === 0) return;
 
     const taskText = args?.subject || args?.description || args?.userRequest || args?.instruction || '';
@@ -3151,14 +3515,32 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
       const candidates = getAllCandidates('reasoning', 40, providers);
       if (candidates.length === 0) return;
 
-      const c = candidates[0];
+      // Prefer a non-thinking model for this fast classification task.
+      // Thinking models with a small token budget starve and return empty,
+      // which then blows up JSON.parse. Fall back to candidates[0] if none.
+      const nonThinking = candidates.find(c => !c.thinking) || candidates[0];
+      const c = nonThinking;
       const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : c.provider;
       const client = this.llmProvider._getClient(effectiveProvider);
-      const llm = createLLM(effectiveProvider, client, c.model, { temperature: 0, maxTokens: 200, useThinking: false });
-      const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 5000 });
+      // Bump maxTokens to 1000: thinking-capable models reserve part of the
+      // budget for internal reasoning tokens even when useThinking=false, so
+      // 200 is too tight and causes empty responses.
+      const llm = createLLM(effectiveProvider, client, c.model, { temperature: 0, maxTokens: 1000, useThinking: false });
+      // 30s timeout — the cheapest classifier models on the gateway are
+      // sometimes slow (cold starts, queue depth). 8s was too tight and
+      // aborted valid requests, leaving delegates with no skills before
+      // they even started their main loop.
+      const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 30000 });
 
-      const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      const names = JSON.parse(stripped);
+      const stripped = (text || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      if (!stripped) {
+        channel.log('skills', `${this.name}: Skill classifier returned empty response — skipping`);
+        return;
+      }
+      // Extract the first JSON array from the response (some models add prose).
+      const arrayMatch = stripped.match(/\[[\s\S]*?\]/);
+      const jsonToParse = arrayMatch ? arrayMatch[0] : stripped;
+      const names = JSON.parse(jsonToParse);
 
       if (Array.isArray(names)) {
         for (const name of names) {
@@ -3180,6 +3562,11 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
     const actionDef = actionRegistry.get(intent);
     if (!actionDef) return null;
     return await actionDef.execute({ intent, ...data }, this);
+  }
+
+  /** Call syntax: `this.tool('name').call({ data })` — equivalent to callAction. */
+  tool(intent) {
+    return { call: (data = {}) => this.callAction(intent, data) };
   }
 
   async _executeComposePrompt(composeDef, _composeArgs) {
@@ -3266,6 +3653,11 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
         args: _composeArgs || {},
         state: this.state || {},
         agentName: this.name,
+        // Phase accessor — lets templates write `phase.is(exploring)`,
+        // `phase.in(a, b)`, `{{phase.name}}` instead of reading
+        // `state.statusPhase` directly. Validates bare idents at runtime
+        // against the agent's declared `phases { }` block.
+        phase: createPhaseAccessor(this),
         nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1', // backward compat
         // User object — accessible as user.message, user.language, user.email, etc.
         user: {
@@ -4047,7 +4439,8 @@ Be specific and concise. Never ask the user for things you or the delegate can d
       return typeof userAnswer === 'string' ? userAnswer : (userAnswer?.text ?? String(userAnswer ?? ''));
     }
 
-    channel.print(`💬 ${this.name} responds to ${delegateName}: \x1b[2m${answer}\x1b[0m`);
+    // Internal inter-agent communication — log only, never show to user.
+    channel.log('agent', `${this.name} responds to ${delegateName}: ${answer.substring(0, 200)}`);
     return answer;
   }
 

@@ -6,7 +6,7 @@
       "contextK": 1000,
       "outputType": "text",
       "inputImage": true,
-      "speed": 47,
+      "speed": 43,
       "code": 82,
       "reasoning": 85,
       "codeThinking": 83,
@@ -21,7 +21,7 @@
       "contextK": 1000,
       "outputType": "text",
       "inputImage": true,
-      "speed": 50,
+      "speed": 45,
       "code": 80,
       "reasoning": 79,
       "codeThinking": 88,
@@ -31,22 +31,6 @@
       "cachedInputPer1M": 0.3
     }
   },
-  "kimi": {
-    "kimi-k2.5": {
-      "inputPer1M": 0.42,
-      "outputPer1M": 2.2,
-      "contextK": 262,
-      "outputType": "text",
-      "inputImage": true,
-      "speed": 34,
-      "code": 41,
-      "reasoning": 81,
-      "codeThinking": 67,
-      "reasoningThinking": 97,
-      "thinking": true,
-      "cachedInputPer1M": 0.21
-    }
-  },
   "gemini": {
     "gemini-3-flash-preview": {
       "inputPer1M": 0.5,
@@ -54,10 +38,10 @@
       "contextK": 1049,
       "outputType": "text",
       "inputImage": true,
-      "speed": 143,
-      "code": 64,
+      "speed": 119,
+      "code": 63,
       "reasoning": 40,
-      "codeThinking": 64,
+      "codeThinking": 63,
       "reasoningThinking": 40,
       "thinking": true,
       "cachedInputPer1M": 0.05
@@ -68,7 +52,7 @@
       "contextK": 1049,
       "outputType": "text",
       "inputImage": true,
-      "speed": 205,
+      "speed": 201,
       "code": 26,
       "reasoning": 10,
       "codeThinking": 26,
@@ -76,20 +60,6 @@
       "thinking": true,
       "supportsThinkingBudget": true,
       "cachedInputPer1M": 0.03
-    },
-    "gemini-3.1-pro-preview": {
-      "inputPer1M": 2,
-      "outputPer1M": 12,
-      "contextK": 1049,
-      "outputType": "text",
-      "inputImage": true,
-      "speed": 24,
-      "code": 97,
-      "reasoning": 97,
-      "codeThinking": 97,
-      "reasoningThinking": 97,
-      "thinking": true,
-      "cachedInputPer1M": 0.2
     }
   },
   "openai": {
@@ -107,22 +77,6 @@
       "thinking": true,
       "noTemperature": true,
       "cachedInputPer1M": 0.175
-    }
-  },
-  "z-ai": {
-    "glm-5-turbo": {
-      "inputPer1M": 1.2,
-      "outputPer1M": 4,
-      "contextK": 203,
-      "outputType": "text",
-      "inputImage": false,
-      "speed": 5,
-      "code": 62,
-      "reasoning": 100,
-      "codeThinking": 62,
-      "reasoningThinking": 100,
-      "thinking": true,
-      "cachedInputPer1M": 0.24
     }
   }
 }

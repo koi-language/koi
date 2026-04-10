@@ -33,10 +33,9 @@ export async function buildSystemPrompt(agent) {
   const agentDisplayName = agent?.name || 'unknown';
   const statusPhase = agent?.state?.statusPhase || null;
   const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
-  // User language — set explicitly by agents via set_language action.
-  // Only show in the context table if it was explicitly set (not OS fallback),
-  // to avoid the LLM blindly copying a stale/wrong value instead of detecting
-  // the language from the user's actual message.
+  // User language — set automatically by the inbox classifier ("ear")
+  // when a user message arrives. Agents never set it themselves; it is
+  // always authoritative for the language of the user's latest message.
   const stateLanguage = agent?.state?.userLanguage;
   if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
   const userLanguage = globalThis.__koiUserLanguage || null;
@@ -47,6 +46,7 @@ export async function buildSystemPrompt(agent) {
   try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
 
   // ── Phase system explanation (only when agent uses phases) ──
+  const hasPhaseDone = agent?.hasPermission?.('phase_done') ?? (agent?._availableActions?.has?.('phase_done') ?? true);
   const phaseSystemBlock = statusPhase ? `
 ========================================
 PHASE SYSTEM
@@ -56,13 +56,9 @@ You operate in phases. Each phase controls which actions, agents, and rules are 
 
 Your current phase is \`${statusPhase}\`. Only the actions and agents relevant to this phase are shown below.
 
-To transition phase, emit update_state either alone or as the LAST action in a batch:
+**You do NOT choose your phase.** Phase transitions are handled by the runtime based on events declared in the agent's reactions block (user messages, delegate returns, errors, phase completion). The \`statusPhase\` field is read-only from your point of view — any attempt to change it via \`update_state\` will be silently ignored.
 
-{ "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "implementing" } }
-
-**Phase transitions MUST be the LAST action — NEVER place any action AFTER a phase change.** Phase transitions change which actions are available, but the new actions only appear on the NEXT turn. Any action placed after the transition in the same batch will execute with the OLD phase's permissions and may fail or bypass safety checks.
-
-Always set the phase that matches what you expect to do NEXT turn.
+When you finish all the work that belongs to the current phase, call \`phase_done\` to signal completion. The runtime will then fire the \`phase.done\` event and transition to the next phase based on the agent's reactions. Do not try to pick the next phase yourself.
 ` : '';
 
   // prompt_user requires 'prompt_user' permission — only System and ProjectOnBoarding have it
@@ -172,11 +168,11 @@ Valid:
 BATCH
 ========================================
 
-"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with "actionType", "intent", or any other action field. If you need to do multiple things in one turn (e.g. prompt_user + update_state), use a batch:
+"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with "actionType", "intent", or any other action field. If you need to do multiple things in one turn (e.g. print + phase_done), use a batch:
 
 { "batch": [
   { "actionType": "direct", "intent": "print", "message": "Here is the result." },
-  { "actionType": "direct", "intent": "update_state", "updates": { "statusPhase": "<valid_phase>" } }
+  { "actionType": "direct", "intent": "phase_done" }
 ]}
 
 ========================================
@@ -248,6 +244,36 @@ ${resourceSection}${intentNesting}
 
 CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 
+  // ── Working area: documents the user has open in the GUI ──
+  // Pulled from the in-memory store (open-documents-store), populated by the
+  // CLI layer when the GUI reports tab changes.
+  let openDocumentsBlock = '';
+  try {
+    const { openDocumentsStore } = await import('../state/open-documents-store.js');
+    if (openDocumentsStore.hasAny()) {
+      const docs = openDocumentsStore.getAll();
+      const active = openDocumentsStore.getActive();
+      const lines = ['', '# WORKING AREA', '', `The user has ${docs.length} document(s) open next to the chat:`];
+      for (const d of docs) {
+        const loc = d.path || d.url || '';
+        const isActive = active && d.id === active.id;
+        lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${isActive ? ' **(ACTIVE — what the user is currently looking at)**' : ''}`);
+      }
+      lines.push('');
+      lines.push('**The active document is what the user is currently looking at on their screen.** When the user says "this", "esto", "ves esto?", "the document", "the pdf", "the image", or refers to something visible without naming it — they mean the ACTIVE document.');
+      lines.push('');
+      lines.push('To read any of these documents, use `read_file` with the exact path shown above. Do NOT invent paths — only use paths from this list.');
+      if (active && (active.path || active.url)) {
+        lines.push('');
+        lines.push('Example — read the active document:');
+        lines.push('```json');
+        lines.push(`{ "intent": "read_file", "path": "${active.path || active.url}" }`);
+        lines.push('```');
+      }
+      openDocumentsBlock = lines.join('\n') + '\n';
+    }
+  } catch { /* store not available — skip */ }
+
   // ── Dynamic section: runtime context, project map, language, non-interactive ──
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
@@ -260,8 +286,8 @@ ${phaseSystemBlock}
 | Working directory | \`${cwd}\` |${langField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
-**LANGUAGE:** Detect the language from the user's latest MESSAGE TEXT (ignore the "User language" field above — it may be stale). Call \`set_language\` with the detected language. "cambia esa palabra" = Spanish, "fix the bug" = English. All user-facing output must match this language. Code stays in English.
-${nonInteractiveBlock}
+**LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
+${openDocumentsBlock}${nonInteractiveBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 
   return { static: staticPart, dynamic };

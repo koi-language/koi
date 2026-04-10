@@ -580,11 +580,17 @@ export class SessionTracker {
   saveConversation(agentName, messages) {
     try {
       const koiDir = path.join(this.projectRoot, '.koi');
-      if (!fs.existsSync(koiDir)) return;
+      if (!fs.existsSync(koiDir)) {
+        process.stderr.write(`[session-tracker] saveConversation skipped: ${koiDir} does not exist\n`);
+        return;
+      }
       fs.mkdirSync(this.gitDir, { recursive: true });
       const filePath = path.join(this.gitDir, `conversation-${agentName}.json`);
-      fs.writeFileSync(filePath, JSON.stringify(messages), 'utf8');
-    } catch { /* non-fatal */ }
+      const payload = JSON.stringify(messages);
+      fs.writeFileSync(filePath, payload, 'utf8');
+    } catch (err) {
+      process.stderr.write(`[session-tracker] saveConversation(${agentName}) failed: ${err.message}\n`);
+    }
   }
 
   /** Save shared session knowledge to disk. */

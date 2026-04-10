@@ -523,7 +523,7 @@ export class KoiTranspiler {
           .split('\n')
           .map(line => `    ${line}`)
           .join('\n');
-        const composeObj = `{ __isCompose__: true, fragments: {\n${fragmentsStr}\n  }, resolve: async (fragments, callAction, context) => {\n${indentedResolver}\n  } }`;
+        const composeObj = `{ __isCompose__: true, fragments: {\n${fragmentsStr}\n  }, resolve: async (fragments, callAction, context) => {\n    const tool = (__name) => ({ call: (__data = {}) => callAction(__name, __data) });\n${indentedResolver}\n  } }`;
         return this.emit(
           `const ${name} = ${wrapWithParams(composeObj)};\n\n`,
           node
@@ -538,7 +538,7 @@ export class KoiTranspiler {
           .split('\n')
           .map(line => `    ${line}`)
           .join('\n');
-        const composeObj = `{ __isCompose__: true, fragments: {\n${fragmentsStr}\n  }, resolve: async (fragments, callAction, context) => {\n${indentedResolver}\n  } }`;
+        const composeObj = `{ __isCompose__: true, fragments: {\n${fragmentsStr}\n  }, resolve: async (fragments, callAction, context) => {\n    const tool = (__name) => ({ call: (__data = {}) => callAction(__name, __data) });\n${indentedResolver}\n  } }`;
         return this.emit(
           `const ${name} = ${wrapWithParams(composeObj)};\n\n`,
           node
@@ -588,6 +588,34 @@ export class KoiTranspiler {
   // ============================================================
 
   /**
+   * Rewrite `phase(ident)` inside template expressions so bare identifiers
+   * become string literals. This lets template authors write:
+   *
+   *     @if (phase == phase(exploring))              { ... }
+   *     @if (phase != phase(returning))              { ... }
+   *     Current phase: {{phase.name}}
+   *
+   * and the compiled JS gets `phase("exploring")` which in turn returns
+   * the string `"exploring"` (validated against the agent's declared
+   * phases at runtime via `phase-accessor.js`).
+   *
+   * String literals already inside the call (e.g. `phase('x')`) are left
+   * untouched. Any call whose argument is not a single bare identifier
+   * (e.g. contains punctuation, nested calls, string literals) is also
+   * left untouched.
+   */
+  _rewritePhaseIdents(expr) {
+    if (typeof expr !== 'string' || !expr.includes('phase')) return expr;
+    // Match phase(ident) where ident is a plain identifier. Avoid matching
+    // `phase.something(...)` (e.g. future `phase.valid`) — we anchor on a
+    // word boundary before `phase` and require `(` immediately after.
+    return expr.replace(
+      /\bphase\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/g,
+      (_, name) => `phase(${JSON.stringify(name)})`
+    );
+  }
+
+  /**
    * Check if compose template contains template directives (@let, @if).
    */
   _hasComposeDirectives(template) {
@@ -620,7 +648,7 @@ export class KoiTranspiler {
     // Detect team agent variables used in the template (e.g., projectOnboarding.result)
     // These are ephemeral — only populated when that agent just returned.
     const agentVars = new Set();
-    const _reservedVars = new Set(['state', 'args', 'user', 'agentName', 'nonInteractive', 'callAction', 'context']);
+    const _reservedVars = new Set(['state', 'args', 'user', 'agentName', 'nonInteractive', 'callAction', 'context', 'phase', 'tool']);
     for (const rawLine of lines) {
       const matches = rawLine.matchAll(/\b(\w+)\.result\b/g);
       for (const m of matches) {
@@ -638,8 +666,8 @@ export class KoiTranspiler {
       const letMatch = trimmed.match(/^@let\s+(\w+)\s*=\s*(.+)$/);
       if (!letMatch) continue;
       const [, varName, expr] = letMatch;
-      // callAction is always tainted
-      if (expr.includes('callAction')) {
+      // tool('x').call() is always tainted
+      if (/\btool\s*\(/.test(expr)) {
         taintedVars.add(varName);
         continue;
       }
@@ -750,7 +778,7 @@ export class KoiTranspiler {
     const cacheAware = true;
 
     // Build destructuring with all known variables + any agent variables found in template
-    const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user'];
+    const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user', 'phase'];
     const _allVars = [..._baseVars, ...agentVars];
     const jsLines = [
       `const { ${_allVars.join(', ')} } = context || {};`,
@@ -783,15 +811,44 @@ export class KoiTranspiler {
     let ifDepth = 0;
     // Whether we're inside a discriminator variant branch
     let inDiscriminatorBranch = false;
+    // Track whether we're inside a fenced markdown code block (``` or ~~~).
+    // Lines inside fences are treated as literal content even if they match
+    // template syntax (so `}` on its own inside a JSON example isn't mistaken
+    // for a template block close).
+    let inFence = false;
+    let fenceMarker = '';
 
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
+
+      // Fence toggling: ``` or ~~~ (with optional language after, e.g. ```json)
+      const fenceMatch = trimmed.match(/^(```+|~~~+)(.*)$/);
+      if (fenceMatch) {
+        if (!inFence) {
+          inFence = true;
+          fenceMarker = fenceMatch[1][0]; // ` or ~
+        } else if (trimmed.startsWith(fenceMarker.repeat(3))) {
+          inFence = false;
+          fenceMarker = '';
+        }
+        // Emit the fence line as literal text.
+        textBuffer.push(rawLine);
+        continue;
+      }
+
+      // Inside a code fence: everything is literal text. Do not interpret
+      // @let / @if / @else / } as template directives.
+      if (inFence) {
+        textBuffer.push(rawLine);
+        continue;
+      }
 
       // @let varName = expr
       const letMatch = trimmed.match(/^@let\s+(\w+)\s*=\s*(.+)$/);
       if (letMatch) {
         flushText();
-        const [, varName, expr] = letMatch;
+        const [, varName, rawExpr] = letMatch;
+        const expr = this._rewritePhaseIdents(rawExpr);
         jsLines.push(`const ${varName} = await ${expr};`);
         // Auto-collect images for frame_server_state and browser_observe
         if (expr.includes('frame_server_state') || expr.includes('browser_observe')) {
@@ -810,7 +867,7 @@ export class KoiTranspiler {
       const ifMatch = trimmed.match(/^@if\s*\((.+)\)\s*\{$/);
       if (ifMatch) {
         flushText();
-        const cond = ifMatch[1];
+        const cond = this._rewritePhaseIdents(ifMatch[1]);
 
         // Detect discriminator branch: top-level @if on the discriminator variable
         if (cacheAware && ifDepth === 0 && discriminator) {
@@ -837,33 +894,55 @@ export class KoiTranspiler {
       }
 
       // @else if (expr) {  — replaces the preceding }
+      // Works when the } is on its own line, same line, or separated by whitespace/text.
       const elseIfMatch = trimmed.match(/^@else\s+if\s*\((.+)\)\s*\{$/);
       if (elseIfMatch) {
         flushText();
-        // Remove any dynStack pop that was inserted after the preceding } (it's not a final close)
-        if (cacheAware && jsLines.length > 0 && jsLines[jsLines.length - 1].includes('__dynStack')) {
-          jsLines.pop(); // remove the pop
+        const elseIfCond = this._rewritePhaseIdents(elseIfMatch[1]);
+        // Walk back through jsLines to find the most recent `}` (skipping
+        // __dynStack pop/reset bookkeeping lines and empty pushes), and
+        // replace it with `} else if (...) {`. Previously we only looked at
+        // the last element, which broke when whitespace or bookkeeping was
+        // between the `}` and the `@else if`.
+        for (let i = jsLines.length - 1; i >= 0; i--) {
+          const ln = jsLines[i];
+          if (ln === '}') {
+            jsLines[i] = `} else if (${elseIfCond}) {`;
+            break;
+          }
+          // Drop bookkeeping lines inserted between the } and the @else if.
+          if (ln.includes('__dynStack')) {
+            jsLines.splice(i, 1);
+            continue;
+          }
+          // Unexpected content — bail out and insert a synthetic `} else if`.
+          jsLines.push(`} else if (${elseIfCond}) {`);
+          break;
         }
-        if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
-          jsLines[jsLines.length - 1] = `} else if (${elseIfMatch[1]}) {`;
-        } else {
-          jsLines.push(`} else if (${elseIfMatch[1]}) {`);
-        }
+        // The preceding `}` closed the if block and decremented ifDepth; the
+        // else-if re-opens the same block, so re-increment to keep tracking
+        // correct for any nested `@if` inside the else-if body.
+        ifDepth++;
         continue;
       }
 
       // @else {  — replaces the preceding }
       if (/^@else\s*\{$/.test(trimmed)) {
         flushText();
-        // Remove any dynStack pop that was inserted after the preceding }
-        if (cacheAware && jsLines.length > 0 && jsLines[jsLines.length - 1].includes('__dynStack')) {
-          jsLines.pop();
-        }
-        if (jsLines.length > 0 && jsLines[jsLines.length - 1] === '}') {
-          jsLines[jsLines.length - 1] = `} else {`;
-        } else {
+        for (let i = jsLines.length - 1; i >= 0; i--) {
+          const ln = jsLines[i];
+          if (ln === '}') {
+            jsLines[i] = `} else {`;
+            break;
+          }
+          if (ln.includes('__dynStack')) {
+            jsLines.splice(i, 1);
+            continue;
+          }
           jsLines.push(`} else {`);
+          break;
         }
+        ifDepth++; // re-open: the } we just replaced decremented depth
         continue;
       }
 
@@ -871,6 +950,9 @@ export class KoiTranspiler {
       if (/^\}\s*@else\s*\{$/.test(trimmed)) {
         flushText();
         jsLines.push(`} else {`);
+        // Same-line form: the } was never emitted as a separate close, so
+        // we didn't decrement ifDepth. No adjustment needed here — the
+        // chain stays open at the current depth.
         continue;
       }
 
@@ -958,10 +1040,13 @@ export class KoiTranspiler {
 
       const endIdx = remaining.indexOf('}}', interpIdx + 2);
       if (endIdx >= 0) {
-        const expr = remaining.substring(interpIdx + 2, endIdx).trim();
-        if (fragmentNames.includes(expr)) {
-          segments.push({ type: 'fragment', value: expr });
+        const rawExpr = remaining.substring(interpIdx + 2, endIdx).trim();
+        if (fragmentNames.includes(rawExpr)) {
+          segments.push({ type: 'fragment', value: rawExpr });
         } else {
+          // Rewrite phase.is(ident)/in/not/notIn bare identifiers to strings
+          // before any other expression processing.
+          const expr = this._rewritePhaseIdents(rawExpr);
           const safeExpr = this._safePropertyAccess(expr);
           segments.push({ type: 'expr', value: safeExpr });
         }
@@ -1034,7 +1119,7 @@ export class KoiTranspiler {
 
   generateTeam(node) {
     // Validate team member names — 'user' is reserved for the user context object
-    const _reserved = new Set(['user', 'state', 'args', 'agentName', 'nonInteractive', 'callAction', 'context']);
+    const _reserved = new Set(['user', 'state', 'args', 'agentName', 'nonInteractive', 'callAction', 'context', 'phase', 'tool']);
     for (const member of node.members) {
       const memberName = member.key?.name || member.key;
       if (_reserved.has(memberName)) {
@@ -1120,6 +1205,7 @@ export class KoiTranspiler {
     const exposesMCP = node.body.find(b => b.type === 'ExposesMCP');
     const peers = node.body.find(b => b.type === 'PeersDecl');
     const phasesDecl = node.body.find(b => b.type === 'PhasesDecl');
+    const reactionsDecl = node.body.find(b => b.type === 'ReactionsDecl');
 
     // Track if agent has handlers for auto-registration
     this.agentHasHandlers = eventHandlers.length > 0;
@@ -1189,6 +1275,12 @@ export class KoiTranspiler {
       code += this.emit(`${this.getIndent()}_validPhases: ${JSON.stringify(phaseNames)},\n`);
       this.indent--;
       code += this.emit(`${this.getIndent()}},\n`);
+    }
+
+    // Emit reactions declaration (event-driven phase/profile transitions)
+    if (reactionsDecl) {
+      const reactionsJson = this._reactionsToPlainJson(reactionsDecl.clauses);
+      code += this.emit(`${this.getIndent()}reactions: ${JSON.stringify(reactionsJson)},\n`);
     }
 
     if (playbooks.length > 0) {
@@ -1910,7 +2002,7 @@ export class KoiTranspiler {
         return this.generateAwaitExpression(node);
       case 'Identifier':
         // Add 'this.' prefix for agent properties when inside event handler
-        if (this.inEventHandler && (node.name === 'peers' || node.name === 'state' || node.name === 'callAction')) {
+        if (this.inEventHandler && (node.name === 'peers' || node.name === 'state' || node.name === 'tool')) {
           return `this.${node.name}`;
         }
         return node.name;
@@ -2139,5 +2231,83 @@ export class KoiTranspiler {
     const left = this.generateExpression(node.left);
     const right = this.generateExpression(node.right);
     return `${left} ${node.operator} ${right}`;
+  }
+
+  // ============================================================
+  // Reactions block — convert AST to plain JSON serialisable form.
+  // The runtime (agent.js) interprets this JSON to dispatch reactions.
+  // ============================================================
+  _reactionsToPlainJson(clauses) {
+    return clauses.map(clause => ({
+      events: clause.events.map(e => ({
+        path: e.path.join('.'),
+        arg: e.arg || null,
+      })),
+      body: clause.body.map(s => this._reactionStmtToJson(s)),
+    }));
+  }
+
+  _reactionStmtToJson(stmt) {
+    if (stmt.type === 'ReactionIf') {
+      return {
+        kind: 'if',
+        cond: this._reactionExprToJson(stmt.cond),
+        then: stmt.then.map(s => this._reactionStmtToJson(s)),
+        else: stmt.else ? stmt.else.map(s => this._reactionStmtToJson(s)) : null,
+      };
+    }
+    if (stmt.type === 'ReactionMethodCall') {
+      // e.g. phase(exploring).start()
+      return {
+        kind: 'methodCall',
+        subject: stmt.subject,
+        subjectArg: stmt.subjectArg,
+        method: stmt.method,
+        args: stmt.args.map(a => ({
+          kind: a.type === 'NamedArg' ? 'named' : 'positional',
+          key: a.key || null,
+          value: this._reactionArgValueToJson(a.value),
+        })),
+      };
+    }
+    if (stmt.type === 'ReactionCall') {
+      return {
+        kind: 'call',
+        name: stmt.name,
+        args: stmt.args.map(a => ({
+          kind: a.type === 'NamedArg' ? 'named' : 'positional',
+          key: a.key || null,
+          value: this._reactionArgValueToJson(a.value),
+        })),
+      };
+    }
+    throw new KoiSemanticError(`Unknown reaction statement type: ${stmt.type}`);
+  }
+
+  _reactionArgValueToJson(val) {
+    if (val.type === 'Number') return { kind: 'number', value: val.value };
+    if (val.type === 'Ident') return { kind: 'ident', name: val.name };
+    throw new KoiSemanticError(`Unknown reaction arg value type: ${val.type}`);
+  }
+
+  _reactionExprToJson(expr) {
+    if (expr.type === 'ReactionBinary') {
+      return {
+        kind: 'binary',
+        op: expr.op,
+        left: this._reactionExprToJson(expr.left),
+        right: this._reactionExprToJson(expr.right),
+      };
+    }
+    if (expr.type === 'ReactionUnary') {
+      return { kind: 'unary', op: expr.op, expr: this._reactionExprToJson(expr.expr) };
+    }
+    if (expr.type === 'ReactionPath') {
+      return { kind: 'path', path: expr.path };
+    }
+    if (expr.type === 'ReactionLiteral') {
+      return { kind: 'literal', value: expr.value };
+    }
+    throw new KoiSemanticError(`Unknown reaction expression type: ${expr.type}`);
   }
 }

@@ -224,6 +224,7 @@ AgentBodyItem
   / EventHandler
   / StateDecl
   / PhasesDecl
+  / ReactionsDecl
   / PlaybookDecl
   / ResilienceDecl
   / ExportFunction
@@ -255,6 +256,204 @@ PhaseValue
   / "medium" { return 'medium'; }
   / "high" { return 'high'; }
   / n:Integer { return n; }
+
+// ============================================================
+// Reactions — event-driven phase/profile transitions
+// ============================================================
+
+ReactionsDecl
+  = "reactions" _ "{" _ clauses:ReactionClause* _ "}" _ {
+      return { type: 'ReactionsDecl', clauses, location: location() };
+    }
+
+ReactionClause
+  = events:ReactionEvents _ "{" _ body:ReactionStmt* _ "}" _ {
+      return { type: 'ReactionClause', events, body, location: location() };
+    }
+
+// One or more event headers, either comma-separated on one "on" line
+// or stacked across multiple "on" lines. Grammar captures both forms.
+ReactionEvents
+  = first:ReactionOnHeader rest:(_ ReactionOnHeader)* {
+      return [].concat(first, ...rest.map(r => r[1]));
+    }
+
+ReactionOnHeader
+  = "on" _ first:ReactionEvent tail:(_ "," _ ReactionEvent)* {
+      return [first, ...tail.map(t => t[3])];
+    }
+
+// Reaction event syntax:
+//   name                             → `on ready`
+//   name.prop                        → `on user.message`
+//   name.prop.prop                   → `on error.tool.shell`
+//   name(arg).prop                   → `on phase(planning).done`
+//   name(arg).prop.prop              → future: `on delegate(planner).return.success`
+//
+// `name(arg)` is an accessor with a parameter (filters the event); the
+// trailing `.prop` path selects the specific event on that subject.
+// Events use a relaxed identifier that allows reserved words (llm, error,
+// state, etc.). This way `error.llm` parses cleanly even though `llm` is a
+// reserved word in other contexts.
+ReactionEvent
+  = subject:ReactionEventSubject parts:("." ReactionEventIdent)* {
+      const tailNames = parts.map(p => p[1]);
+      return {
+        type: 'ReactionEvent',
+        path: [subject.name, ...tailNames],
+        arg: subject.arg || null,
+      };
+    }
+
+ReactionEventSubject
+  = name:ReactionEventIdent "(" _ arg:ReactionEventArg _ ")" {
+      return { name, arg };
+    }
+  / name:ReactionEventIdent {
+      return { name, arg: null };
+    }
+
+// Argument to a reaction event subject — allows either a bare identifier
+// (legacy: `phase(exploring)`) or a string literal (preferred for
+// consistency with template syntax: `phase('exploring')`). The string
+// form is also what readers expect for a phase name passed as a value.
+ReactionEventArg
+  = lit:StringLiteral { return lit.value; }
+  / id:ReactionEventIdent { return id; }
+
+// A word usable as an event token. Includes reserved words so that
+// `error.llm`, `user.state`, `session.default`, etc. all parse cleanly.
+ReactionEventIdent
+  = name:$([a-zA-Z_][a-zA-Z0-9_]*) { return name; }
+
+ReactionStmt
+  = ReactionIf
+  / ReactionMethodCall
+  / ReactionDirectCall
+
+ReactionIf
+  = "if" _ "(" _ cond:ReactionExpr _ ")" _ "{" _ then:ReactionStmt* _ "}" _ alt:ReactionElse? _ {
+      return { type: 'ReactionIf', cond, then, else: alt || null, location: location() };
+    }
+
+ReactionElse
+  = "else" _ ifs:ReactionIf {
+      return [ifs];
+    }
+  / "else" _ "{" _ body:ReactionStmt* _ "}" {
+      return body;
+    }
+
+// Accessor-method call: phase(X).start(), phase(X).skip(), ...
+// The subject (phase, delegate, etc.) takes one argument; the method is
+// invoked on the returned handle.
+ReactionMethodCall
+  = subject:ReactionAccessor "." method:Identifier _ "(" _ margs:ReactionArgList? _ ")" _ {
+      return {
+        type: 'ReactionMethodCall',
+        subject: subject.name,
+        subjectArg: subject.arg,
+        method: method.name || method,
+        args: margs || [],
+        location: location(),
+      };
+    }
+
+ReactionAccessor
+  = name:Identifier "(" _ arg:ReactionAccessorArg _ ")" {
+      return { name: name.name || name, arg };
+    }
+
+// Argument to a reaction accessor — supports either a bare identifier
+// (legacy: `phase(exploring).start()`) or a string literal (preferred:
+// `phase('exploring').start()`), mirroring the template syntax.
+ReactionAccessorArg
+  = lit:StringLiteral { return lit.value; }
+  / id:Identifier { return id.name || id; }
+
+// Direct call: effort(X), score(code, 80), bump(reasoning, +20, max: 85)
+ReactionDirectCall
+  = name:ReactionDirectCallName _ "(" _ args:ReactionArgList? _ ")" _ {
+      return { type: 'ReactionCall', name, args: args || [], location: location() };
+    }
+
+ReactionDirectCallName
+  = "effort"  { return 'effort'; }
+  / "score"   { return 'score'; }
+  / "bump"    { return 'bump'; }
+
+ReactionArgList
+  = first:ReactionArg rest:(_ "," _ ReactionArg)* {
+      return [first, ...rest.map(r => r[3])];
+    }
+
+ReactionArg
+  = key:Identifier _ ":" _ val:ReactionArgValue {
+      return { type: 'NamedArg', key: key.name || key, value: val };
+    }
+  / val:ReactionArgValue {
+      return { type: 'PositionalArg', value: val };
+    }
+
+ReactionArgValue
+  = ReactionSignedInt
+  / id:Identifier { return { type: 'Ident', name: id.name || id }; }
+
+ReactionSignedInt
+  = sign:("+" / "-")? _ n:Integer {
+      const signed = sign === '-' ? -n : n;
+      return { type: 'Number', value: signed };
+    }
+
+// Small expression grammar for reaction conditions:
+//   requirementsGatherer.result
+//   requirementsGatherer.result.success === true
+//   error.count < 3
+//   !planner.result
+ReactionExpr
+  = ReactionOrExpr
+
+ReactionOrExpr
+  = left:ReactionAndExpr rest:(_ "||" _ ReactionAndExpr)* {
+      return rest.reduce((l, r) => ({ type: 'ReactionBinary', op: '||', left: l, right: r[3] }), left);
+    }
+
+ReactionAndExpr
+  = left:ReactionCmpExpr rest:(_ "&&" _ ReactionCmpExpr)* {
+      return rest.reduce((l, r) => ({ type: 'ReactionBinary', op: '&&', left: l, right: r[3] }), left);
+    }
+
+ReactionCmpExpr
+  = left:ReactionUnary _ op:ReactionCmpOp _ right:ReactionUnary {
+      return { type: 'ReactionBinary', op, left, right };
+    }
+  / ReactionUnary
+
+ReactionCmpOp
+  = "===" / "!==" / "==" / "!=" / "<=" / ">=" / "<" / ">"
+
+ReactionUnary
+  = "!" _ expr:ReactionUnary { return { type: 'ReactionUnary', op: '!', expr }; }
+  / ReactionPrimary
+
+ReactionPrimary
+  = "(" _ expr:ReactionExpr _ ")" { return expr; }
+  / ReactionLiteral
+  / ReactionPathExpr
+
+ReactionPathExpr
+  = head:Identifier parts:("." Identifier)* {
+      const headName = head.name || head;
+      const tailNames = parts.map(p => p[1].name || p[1]);
+      return { type: 'ReactionPath', path: [headName, ...tailNames] };
+    }
+
+ReactionLiteral
+  = n:Integer { return { type: 'ReactionLiteral', value: n }; }
+  / "true"  !IdentifierPart { return { type: 'ReactionLiteral', value: true }; }
+  / "false" !IdentifierPart { return { type: 'ReactionLiteral', value: false }; }
+  / "null"  !IdentifierPart { return { type: 'ReactionLiteral', value: null }; }
+  / s:StringLiteral { return { type: 'ReactionLiteral', value: s.value }; }
 
 AmnesiaDecl
   = "amnesia" _ "=" _ value:BooleanLiteral _ {

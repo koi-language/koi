@@ -505,6 +505,34 @@
           "match": "\\b(true|false|null|undefined)\\b"
         },
         {
+          "comment": "Tool accessor: tool('name').call({...}) — the 'name' arg is highlighted as a tool-name constant",
+          "match": "\\b(tool)\\s*\\(\\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)(\\2)\\s*\\)",
+          "captures": {
+            "1": { "name": "support.function.builtin.tool.koi" },
+            "2": { "name": "punctuation.definition.string.koi" },
+            "3": { "name": "constant.other.tool-name.koi" },
+            "4": { "name": "punctuation.definition.string.koi" }
+          }
+        },
+        {
+          "comment": "Phase accessor properties in templates: phase.name, phase.valid",
+          "match": "\\b(phase)\\.(name|valid)\\b",
+          "captures": {
+            "1": { "name": "support.function.builtin.phase-accessor.koi" },
+            "2": { "name": "variable.other.property.phase-accessor.koi" }
+          }
+        },
+        {
+          "comment": "Phase reference in templates: phase('name') or phase(name)",
+          "match": "\\b(phase)\\s*\\(\\s*(?:'([A-Za-z_]\\w*)'|\"([A-Za-z_]\\w*)\"|([A-Za-z_]\\w*))\\s*\\)",
+          "captures": {
+            "1": { "name": "support.function.builtin.phase-accessor.koi" },
+            "2": { "name": "constant.other.phase-name.koi" },
+            "3": { "name": "constant.other.phase-name.koi" },
+            "4": { "name": "constant.other.phase-name.koi" }
+          }
+        },
+        {
           "comment": "Operators: comparison, logical, ternary, optional chaining, arrow",
           "name": "keyword.operator.expression.koi",
           "match": "===|!==|==|!=|>=|<=|=>|&&|\\|\\||\\?\\.|[?:><!=]"
@@ -595,7 +623,31 @@
       "patterns": [
         {
           "name": "keyword.control.koi",
-          "match": "\\b(package|import|role|agent|team|skill|mcp|prompt|compose|on|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all|amnesia|expose|private)\\b"
+          "match": "\\b(package|import|role|agent|team|skill|mcp|prompt|compose|on|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all|amnesia|expose|private|reactions|phases)\\b"
+        },
+        {
+          "comment": "Reaction body constructors: phase(X).start(), effort(X), score(dim, N), bump(dim, N, max: N, min: N)",
+          "name": "support.function.builtin.reaction.koi",
+          "match": "\\b(effort|score|bump)(?=\\s*\\()"
+        },
+        {
+          "comment": "Reaction accessor: phase('exploring').start() or phase(exploring).start()",
+          "match": "(\\bphase)\\s*\\(\\s*(?:'([A-Za-z_]\\w*)'|\"([A-Za-z_]\\w*)\"|([A-Za-z_]\\w*))\\s*\\)\\s*(?:\\.([A-Za-z_]\\w*))?",
+          "captures": {
+            "1": { "name": "support.function.builtin.reaction.koi" },
+            "2": { "name": "constant.other.phase-name.koi" },
+            "3": { "name": "constant.other.phase-name.koi" },
+            "4": { "name": "constant.other.phase-name.koi" },
+            "5": { "name": "entity.name.function.method.reaction.koi" }
+          }
+        },
+        {
+          "comment": "Reaction lifecycle event path after `on`: invoked, session.start/resumed, user.message/attachments, error.llm/tool/timeout/network, tasks.pending/completed, phase.done",
+          "match": "(\\bon)\\s+((?:invoked|session\\.(?:start|resumed)|user\\.(?:message|attachments)|error\\.(?:llm|tool|timeout|network)|tasks\\.(?:pending|completed)|phase\\.done)(?:\\s*,\\s*(?:invoked|session\\.(?:start|resumed)|user\\.(?:message|attachments)|error\\.(?:llm|tool|timeout|network)|tasks\\.(?:pending|completed)|phase\\.done))*)",
+          "captures": {
+            "1": { "name": "keyword.control.koi" },
+            "2": { "name": "support.constant.event.reaction.koi" }
+          }
         },
         {
           "name": "keyword.control.flow.koi",

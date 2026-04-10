@@ -58,7 +58,11 @@ export default {
       return { success: true, path: filePath, noChanges: true };
     }
 
-    if (diffPayload) diffPayload.beforeContent = oldContent; // for GUI revert
+    if (diffPayload) {
+      diffPayload.beforeContent = oldContent; // for GUI revert
+      diffPayload.afterContent = newContent; // for GUI re-apply after denial
+      diffPayload.diffId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
     channel.clearProgress();
     await channel.showDiff(diffPayload);
 
@@ -91,11 +95,13 @@ export default {
         permitted = true;
       } else if (value === 'feedback') {
         const feedback = await channel.prompt('> ');
+        if (channel.updateDiff && diffPayload?.diffId) await channel.updateDiff({ diffId: diffPayload.diffId, applied: false });
         return { success: false, denied: true, feedback, message: `User rejected the edit with feedback: ${feedback}` };
       }
     }
 
     if (!permitted) {
+      if (channel.updateDiff && diffPayload?.diffId) await channel.updateDiff({ diffId: diffPayload.diffId, applied: false });
       return { success: false, denied: true, message: 'User denied file change' };
     }
 

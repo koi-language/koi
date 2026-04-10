@@ -386,6 +386,8 @@ export default {
     channel.clearProgress();
     const _diffPayload = buildDiffPayloadFromHunks(hunks, resolvedPath, 'Update');
     _diffPayload.beforeContent = content; // for GUI revert
+    _diffPayload.afterContent = newContent; // for GUI re-apply after denial
+    _diffPayload.diffId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     await channel.showDiff(_diffPayload);
 
     // Check permissions (shared across all file actions)
@@ -416,11 +418,13 @@ export default {
         permitted = true;
       } else if (value === 'feedback') {
         const feedback = await channel.prompt('> ');
+        if (channel.updateDiff) await channel.updateDiff({ diffId: _diffPayload.diffId, applied: false });
         return { success: false, denied: true, feedback, message: `User rejected the edit with feedback: ${feedback}` };
       }
     }
 
     if (!permitted) {
+      if (channel.updateDiff) await channel.updateDiff({ diffId: _diffPayload.diffId, applied: false });
       channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
       return { success: false, denied: true, message: 'User denied file change' };
     }

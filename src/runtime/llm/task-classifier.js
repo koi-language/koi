@@ -232,6 +232,74 @@ ${taskDescription}`;
   }
 
   /**
+   * Run a JSON-returning completion on the cheapest capable model.
+   *
+   * Used by any caller that needs a fast, cheap, structured LLM call
+   * (classifiers, routers, small decisions). Returns the parsed JSON
+   * or `null` if every candidate fails.
+   *
+   * @param {string} prompt
+   * @param {Object} [opts]
+   * @param {number} [opts.timeoutMs=5000]
+   * @param {number} [opts.maxTokens=800]
+   * @param {number} [opts.minReasoning=40]  — min reasoning score required from candidate models
+   * @param {string} [opts.label='cheap-json'] — used for logs
+   * @returns {Promise<Object|null>}
+   */
+  async runCheapJsonCompletion(prompt, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? 5000;
+    const maxTokens = opts.maxTokens ?? 800;
+    const minReasoning = opts.minReasoning ?? 40;
+    const label = opts.label || 'cheap-json';
+
+    const _allModels = getAllCandidates('reasoning', minReasoning, this._getAvailableProvidersFn());
+    const _candidates = _allModels.map(c => ({
+      client: this._getClient(c.provider),
+      model: c.model,
+      provider: c.provider,
+      caps: c.caps || {},
+    }));
+
+    if (_candidates.length === 0) {
+      this._log('llm', `[${label}] No models available`);
+      return null;
+    }
+
+    let consecutiveFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 3;
+
+    for (const candidate of _candidates) {
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        this._log('llm', `[${label}] Circuit breaker: ${consecutiveFailures} consecutive failures — giving up`);
+        break;
+      }
+      try {
+        const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
+        const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
+        const llm = this._createLLMFn(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens, useThinking: false });
+        const { text: content, usage: _u } = await llm.complete(
+          [{ role: 'user', content: prompt }],
+          { timeoutMs, responseFormat: 'json_object' }
+        );
+        consecutiveFailures = 0;
+        const inputTokens = _u?.input || 0, outputTokens = _u?.output || 0;
+        this._costCenter.recordUsage(candidate.model, candidate.provider, inputTokens, outputTokens);
+        const _stripped = (content || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        try {
+          return JSON.parse(_stripped);
+        } catch (e) {
+          this._log('llm', `[${label}] Invalid JSON from ${candidate.model}: ${e.message}`);
+          // Fall through — try the next candidate
+        }
+      } catch (e) {
+        consecutiveFailures++;
+        this._log('llm', `[${label}] ${candidate.model} failed: ${e.message} (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+      }
+    }
+    return null;
+  }
+
+  /**
    * Shared classifier execution — sends prompt to cheapest capable model, parses category response.
    */
   async _runClassifier(prompt, CATEGORY_PROFILES, classifierType, agentName) {
