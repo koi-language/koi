@@ -240,13 +240,95 @@ export class LLMProvider {
   }
 
   /**
+   * Late initialization of credentials that appeared AFTER this provider
+   * was constructed. In GUI mode the user may sign in via the welcome
+   * dialog or paste API keys into Settings → Models long after the
+   * engine has started — when that happens the WsProtocolServer sets
+   * `process.env.KOI_AUTH_TOKEN` / `OPENAI_API_KEY` / etc., but the
+   * LLMProvider instance held by the running agent still has empty
+   * `_availableProviders` and no `_koiGateway`. This method upgrades
+   * the instance on the fly so the very next LLM call succeeds.
+   * Safe to call repeatedly — no-op when the state is already correct.
+   */
+  _maybeLateInitFromEnv() {
+    // (a) Gateway upgrade: token appeared → route through braxil.ai
+    if (!this._koiGateway && process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
+      const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
+      const gatewayBase = apiBase + '/gateway';
+      channel.log('llm', `[gateway] late-init: baseURL=${gatewayBase}`);
+      this._koiGatewayApiBase = apiBase;
+      this._koiGateway = new OpenAI({
+        apiKey: process.env.KOI_AUTH_TOKEN,
+        baseURL: gatewayBase,
+        maxRetries: 2,
+      });
+      this._autoMode = true;
+      this._gatewayMode = true;
+      this.provider = 'auto';
+      this.model = 'auto';
+      this.openai = null;
+      this.anthropic = null;
+      this._availableProviders = [];
+      this._modelsReady = this.syncGatewayProviders().then(() => {
+        this._modelsReady = null;
+      });
+      return;
+    }
+
+    // (b) Local API keys appeared in env → build SDK clients for them
+    if (!this._koiGateway) {
+      if (process.env.OPENAI_API_KEY && !this._oa) {
+        this._oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
+        if (!this._availableProviders.includes('openai')) this._availableProviders.push('openai');
+        channel.log('llm', `[llm] late-init: openai client built from env`);
+      }
+      if (process.env.ANTHROPIC_API_KEY && !this._ac) {
+        this._ac = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        if (!this._availableProviders.includes('anthropic')) this._availableProviders.push('anthropic');
+        channel.log('llm', `[llm] late-init: anthropic client built from env`);
+      }
+      if ((process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) && !this._gc) {
+        this._gc = new OpenAI({
+          apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+          maxRetries: 0,
+        });
+        if (!this._availableProviders.includes('gemini')) this._availableProviders.push('gemini');
+        channel.log('llm', `[llm] late-init: gemini client built from env`);
+      }
+    }
+  }
+
+  /**
    * For auto mode with no locked provider: ensure at least one provider client exists.
    * If none are configured, let the user pick a provider and enter the key.
+   *
+   * In GUI mode (`KOI_GUI_MODE=1`), this method is a no-op. The GUI has
+   * its own welcome dialog + Settings > Models tab for configuring keys;
+   * printing "No API key configured. Select a provider" and running
+   * `cliSelect` would leak terminal-era conversation bubbles into the
+   * chat. If the runtime reaches this code in GUI mode without any
+   * provider, the upstream LLM call will throw a clear "No provider
+   * available" error instead, which the caller (quota flow, etc.)
+   * can handle by redirecting the user to Settings.
    */
   async _ensureAnyProvider(agent) {
+    // ── Late auth upgrade (GUI welcome flow) ─────────────────────────
+    // The LLMProvider may have been constructed before the user signed
+    // in / added API keys. If the env now contains credentials, pick
+    // them up on the fly instead of throwing NO_PROVIDER.
+    this._maybeLateInitFromEnv();
     if (this._availableProviders.length > 0) return;
     // Gateway mode: all providers are available via the braxil.ai backend
     if (this._koiGateway) return;
+    // GUI mode: never prompt via CLI. Throw a structured error so the
+    // main loop can catch it and surface a "configure your keys" prompt
+    // instead of crashing downstream when the SDK client is null.
+    if (process.env.KOI_GUI_MODE === '1') {
+      const err = new Error('No LLM provider configured. Open Settings → Models and add an API key, or sign in with Braxil.');
+      err.code = 'NO_PROVIDER';
+      throw err;
+    }
 
     const { channel: cliLogger } = await import('../io/channel.js');
     const cliSelect = (await import('../io/channel.js')).channel.select;
@@ -278,11 +360,19 @@ export class LLMProvider {
    * For auto mode with a locked provider: ensure the client for that provider exists.
    */
   async _ensureLockedProviderClient(agent) {
+    this._maybeLateInitFromEnv();
+    if (this._koiGateway) return;
     const p = this._lockedProvider;
     const hasClient = (p === 'openai' && this._oa) ||
                       (p === 'anthropic' && this._ac) ||
                       (p === 'gemini' && this._gc);
     if (hasClient) return;
+    // GUI mode: never prompt for keys via CLI. See _ensureAnyProvider.
+    if (process.env.KOI_GUI_MODE === '1') {
+      const err = new Error(`No ${p} API key configured. Open Settings → Models and add an API key, or sign in with Braxil.`);
+      err.code = 'NO_PROVIDER';
+      throw err;
+    }
 
     const { ensureApiKey } = await import('../api/api-key-manager.js');
     const apiKey = await ensureApiKey(p, agent);
@@ -300,7 +390,15 @@ export class LLMProvider {
    * For explicit (non-auto) provider: ensure the client exists.
    */
   async _ensureExplicitClient(agent) {
+    this._maybeLateInitFromEnv();
+    if (this._koiGateway) return;
     if (this.openai || this.anthropic) return;
+    // GUI mode: never prompt for keys via CLI. See _ensureAnyProvider.
+    if (process.env.KOI_GUI_MODE === '1') {
+      const err = new Error(`No ${this.provider} API key configured. Open Settings → Models and add an API key, or sign in with Braxil.`);
+      err.code = 'NO_PROVIDER';
+      throw err;
+    }
 
     const { ensureApiKey } = await import('../api/api-key-manager.js');
     const apiKey = await ensureApiKey(this.provider, agent);
@@ -978,6 +1076,23 @@ CRITICAL RULES:
         if (_isInteraction && _savedUserMessage) {
           // User just sent a message → interaction classifier (clean message, speed-oriented)
           session._autoProfile = await this.classifyUserRequest(_savedUserMessage, agentName);
+          // ── Language detection side-effect ─────────────────────────────
+          // The interaction classifier ALSO returns `userLanguage` as part
+          // of the same LLM call (see task-classifier.js). Writing it to
+          // the agent's state here means every user message refreshes the
+          // active language — no extra LLM call needed, and it works both
+          // for the inbox classifier path AND the fast prompt_user path.
+          const _lang = session._autoProfile?.userLanguage;
+          if (_lang && agent?.state) {
+            const _prev = agent.state.userLanguage || null;
+            if (_lang !== _prev) {
+              agent.state.userLanguage = _lang;
+              // Keep the global mirror in sync for legacy readers
+              // (system-prompt-builder.js, compose templates, etc.).
+              globalThis.__koiUserLanguage = _lang;
+              channel.log('llm', `[classify] agent.userLanguage ${_prev || '(none)'} → ${_lang}`);
+            }
+          }
         } else {
           // Task/delegation path — build args for the task classifier.
           // Enrich with recent discovery context (files read, errors found) so the

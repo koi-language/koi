@@ -459,6 +459,10 @@ export class Agent {
       }
     }
 
+    // Apply the classifier decision (new_task / modify_task / noop)
+    // to the local state. Each branch writes to context memory so the
+    // LLM has visibility of what happened, but NONE of them returns
+    // early — delivery to the agent happens ONCE at the end.
     if (kind === 'new_task' && result.rewrittenTask && queue) {
       const added = queue.add({
         subject: result.rewrittenTask.subject,
@@ -472,88 +476,102 @@ export class Agent {
         `Inbox → task #${added.id}`,
         null
       );
-      return;
-    }
-
-    if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask && queue) {
+    } else if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask && queue) {
       const existing = queue.get(result.targetTaskId);
       if (!existing) {
         // Fallback: classifier thought the id existed but it was completed/deleted
         // between classification and drain. Treat as new_task.
         channel.log('inbox', `${this.name}: modify_task target #${result.targetTaskId} vanished — falling back to new_task`);
-        if (queue) {
-          const added = queue.add({
-            subject: result.rewrittenTask.subject,
-            description: result.rewrittenTask.description || msg.text,
-            owner: this.name,
-          });
-          contextMemory.add('user',
-            `[INBOX] Message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
-            `Inbox → task #${added.id}`, null);
-        }
-        return;
-      }
+        const added = queue.add({
+          subject: result.rewrittenTask.subject,
+          description: result.rewrittenTask.description || msg.text,
+          owner: this.name,
+        });
+        contextMemory.add('user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
+          `Inbox → task #${added.id}`, null);
+      } else {
+        // Rewrite subject/description. We REPLACE description (not append)
+        // because the classifier has already produced a merged version.
+        queue.update(result.targetTaskId, {
+          subject: result.rewrittenTask.subject,
+          description: result.rewrittenTask.description || existing.description,
+          replaceDescription: true,
+        });
 
-      // Rewrite subject/description. We REPLACE description (not append)
-      // because the classifier has already produced a merged version.
-      queue.update(result.targetTaskId, {
-        subject: result.rewrittenTask.subject,
-        description: result.rewrittenTask.description || existing.description,
-        replaceDescription: true,
-      });
-
-      // If the task is in_progress and an activeForm was provided, also
-      // update the live panel so the user sees the change in the UI.
-      // The taskManager (global) tracks the panel. We look up by matching
-      // description/subject if the work queue id doesn't match a tm task.
-      if (existing.status === 'in_progress' && result.rewrittenTask.activeForm) {
-        try {
-          const { taskManager } = await import('../state/task-manager.js');
-          // The WorkQueue id and the taskManager id are separate namespaces,
-          // but when a task is created in the panel it's usually identified
-          // by subject. Try to find a matching task and update its activeForm.
-          const tmTasks = taskManager.list();
-          const match = tmTasks.find(t =>
-            t.status === 'in_progress' &&
-            (t.subject === existing.subject || t.subject === result.rewrittenTask.subject)
-          );
-          if (match) {
-            taskManager.update(match.id, {
-              subject: result.rewrittenTask.subject,
-              activeForm: result.rewrittenTask.activeForm,
-            });
+        // If the task is in_progress and an activeForm was provided, also
+        // update the live panel so the user sees the change in the UI.
+        if (existing.status === 'in_progress' && result.rewrittenTask.activeForm) {
+          try {
+            const { taskManager } = await import('../state/task-manager.js');
+            const tmTasks = taskManager.list();
+            const match = tmTasks.find(t =>
+              t.status === 'in_progress' &&
+              (t.subject === existing.subject || t.subject === result.rewrittenTask.subject)
+            );
+            if (match) {
+              taskManager.update(match.id, {
+                subject: result.rewrittenTask.subject,
+                activeForm: result.rewrittenTask.activeForm,
+              });
+            }
+          } catch (err) {
+            channel.log('inbox', `${this.name}: panel update failed: ${err.message}`);
           }
-        } catch (err) {
-          channel.log('inbox', `${this.name}: panel update failed: ${err.message}`);
+        }
+
+        channel.log('inbox', `${this.name}: modified task #${result.targetTaskId} "${result.rewrittenTask.subject}"`);
+        contextMemory.add(
+          'user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to task #${existing.id}: ${result.rewrittenTask.subject}`,
+          `Inbox → modify task #${existing.id}`,
+          null
+        );
+
+        // Broadcast to delegates working on subtasks derived from this
+        // one. Only if the task is in_progress — if it's still pending
+        // there's no running delegate to notify.
+        if (existing.status === 'in_progress') {
+          this._broadcastToDelegatesOfTask(existing.id, msg);
         }
       }
-
-      channel.log('inbox', `${this.name}: modified task #${result.targetTaskId} "${result.rewrittenTask.subject}"`);
+    } else {
+      // noop (or invalid kind) — drop the message into context memory
+      // as a conversational note. The LLM will see it on its next
+      // iteration and may respond naturally.
       contextMemory.add(
         'user',
-        `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to task #${existing.id}: ${result.rewrittenTask.subject}`,
-        `Inbox → modify task #${existing.id}`,
+        `[INBOX] Message from ${msg.from}: "${msg.text}"${result?.reasoning ? ` (classifier: ${result.reasoning})` : ''}`,
+        `Inbox note`,
         null
       );
-
-      // Broadcast to delegates working on subtasks derived from this one.
-      // Only if the task is in_progress — if it's still pending there's
-      // no running delegate to notify.
-      if (existing.status === 'in_progress') {
-        this._broadcastToDelegatesOfTask(existing.id, msg);
-      }
-      return;
     }
 
-    // noop (or invalid kind) — just drop the message into context memory so
-    // the agent sees it on its next iteration. If the agent is idle (no
-    // pending tasks), this may still prompt it to react.
-    contextMemory.add(
-      'user',
-      `[INBOX] Message from ${msg.from}: "${msg.text}"${result?.reasoning ? ` (classifier: ${result.reasoning})` : ''}`,
-      `Inbox note`,
-      null
-    );
+    // ── Wake up the agent so it processes this message IMMEDIATELY ───
+    // Only for messages from the user. Agent-to-agent broadcasts are
+    // already handled via _broadcastToDelegatesOfTask and must not
+    // trigger a second delivery.
+    //
+    // The `deliverClassifiedInput` CLI hook delivers the text to any
+    // pending prompt_user waiter (fast path) or queues it for the next
+    // one (fallback). This guarantees that:
+    //   - noop      → LLM sees the user turn and responds naturally
+    //   - new_task  → LLM starts working on the freshly queued task
+    //   - modify_task → LLM continues with the updated task description
+    //
+    // Without this call, the classifier would happily mutate state
+    // in the background while the agent stayed idle forever.
+    if (msg.from === 'user') {
+      try {
+        const _deliver = Agent._cliHooks?.deliverClassifiedInput;
+        if (typeof _deliver === 'function') {
+          _deliver(msg.text);
+          channel.log('inbox', `${this.name}: delivered classified input to agent (${kind})`);
+        }
+      } catch (err) {
+        channel.log('inbox', `${this.name}: deliverClassifiedInput failed: ${err?.message || err}`);
+      }
+    }
   }
 
   /**
@@ -611,9 +629,10 @@ export class Agent {
           }
         }
       }
-      // Prompt for any missing API keys (OpenAI, Anthropic, Gemini)
-      const { promptMissingApiKeys } = await import('../api/api-key-manager.js');
-      await promptMissingApiKeys(this);
+      // Note: We no longer prompt for missing API keys here. The GUI handles
+      // all credential setup via the Welcome dialog and the Settings → Models
+      // tab. Showing a terminal-style "Enter your OpenAI API key" prompt in
+      // the chat panel was confusing and duplicated that UX.
     }
 
     // Fire-and-forget: start project indexing in background (once per process).
@@ -1437,11 +1456,57 @@ export class Agent {
           break;
         }
 
-        // No providers available = fatal, don't retry (would loop forever)
-        if (error.message?.startsWith('NO_PROVIDERS:')) {
-          const msg = error.message.replace('NO_PROVIDERS: ', '');
+        // No providers available. Two sources of this error:
+        //   - Legacy: thrown with a "NO_PROVIDERS: <msg>" prefix.
+        //   - New:    `err.code === 'NO_PROVIDER'` from the _ensure* methods
+        //             in llm-provider.js when running in GUI mode without keys.
+        //
+        // In GUI mode we MUST NOT exit the process — the WelcomeDialog /
+        // Settings → Models flow is how the user provides credentials, and
+        // killing the engine leaves the Flutter UI stuck on "Connection
+        // refused". Instead we wait at prompt_user until the user supplies
+        // a key (via welcome.saveApiKeys or welcome.startOauth), which
+        // restarts the reactive loop with working providers.
+        //
+        // In terminal / binary mode we still stop: the CLI has no way to
+        // recover without re-invoking the welcome flow.
+        if (error.code === 'NO_PROVIDER' || error.message?.startsWith('NO_PROVIDERS:')) {
+          const msg = error.code === 'NO_PROVIDER'
+            ? error.message
+            : error.message.replace('NO_PROVIDERS: ', '');
+          channel.log('agent', `${this.name}: No LLM providers`);
+          const _isGuiMode = process.env.KOI_GUI_MODE === '1';
+          if (_isGuiMode) {
+            // Wait for the user to supply credentials via the GUI. When
+            // they do, submitInput wakes us up and we retry the LLM call
+            // by continuing the outer loop.
+            Agent._cliHooks?.onBusy?.(false);
+            try {
+              const { result: _r } = await this._executeAction(
+                { intent: 'prompt_user' },
+                { intent: 'prompt_user' },
+                session.actionContext
+              );
+              // If the user typed something, track it and continue the loop
+              // so the next LLM call picks up the (hopefully now-configured)
+              // provider.
+              if (_r?.answer) {
+                this._lastUserMessage = _r.answer;
+                contextMemory.add('user', _r.answer, _r.answer, null);
+                this.contextMemoryState = contextMemory.serialize();
+              }
+              // Reset consecutive-error counter so the retry has a fresh budget.
+              session.consecutiveErrors = 0;
+              Agent._cliHooks?.onBusy?.(true);
+              continue;
+            } catch {
+              // prompt_user errored (shouldn't normally happen) — fall
+              // through and stop to avoid a tight infinite loop.
+              break;
+            }
+          }
           channel.print(`\x1b[31m${msg}\x1b[0m`);
-          channel.log('agent', `${this.name}: No LLM providers — stopping`);
+          channel.log('agent', `${this.name}: Stopping (terminal mode)`);
           break;
         }
 

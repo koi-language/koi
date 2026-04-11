@@ -139,6 +139,16 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
         } catch {}
       } else if (chosen?.action === 'print') {
         channel.print(channel.renderMarkdown(chosen.text || ''));
+      } else if (chosen?.action === 'show_api_keys_prompt') {
+        // GUI mode: trigger the Flutter welcome dialog directly in the
+        // "API keys" input view, so the user can paste keys inline.
+        // Terminal mode: fall back to printing the text instructions.
+        const isGui = process.env.KOI_GUI_MODE === '1';
+        if (isGui && typeof channel.showWelcomeApiKeysPrompt === 'function') {
+          channel.showWelcomeApiKeysPrompt();
+        } else if (chosen.text) {
+          channel.print(channel.renderMarkdown(chosen.text));
+        }
       } else if (chosen?.action === 'logout') {
         // Delete token and restart so the user can log in with a different account
         try {

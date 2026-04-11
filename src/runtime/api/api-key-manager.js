@@ -106,6 +106,15 @@ export async function promptMissingApiKeys(agent) {
   // the gateway proxies LLM calls using the auth token.
   if (process.env.KOI_AUTH_TOKEN) return;
 
+  // In GUI mode, the welcome dialog and Settings > Models tab handle
+  // API keys. The runtime must NEVER print "No API key found, please
+  // enter one" prompts into the chat — that terminal-era flow bleeds
+  // into the GUI as loose conversation bubbles and confuses the user.
+  // If no auth token AND no keys are configured, it means the welcome
+  // dialog should be up; let the LLM call fail quietly and the GUI
+  // will redirect the user to Settings via the quota / welcome flow.
+  if (process.env.KOI_GUI_MODE === '1') return;
+
   // If at least one API key is already configured, don't prompt for the missing ones.
   // The user can add more anytime via .env or /config.
   const allKeys = Object.values(PROVIDER_KEYS);
@@ -177,6 +186,21 @@ export async function ensureApiKey(provider, agent) {
   if (process.env.KOI_AUTH_TOKEN) return '__KOI_ACCOUNT__';
 
   const providerName = PROVIDER_NAMES[provider] || provider;
+
+  // In GUI mode, we NEVER prompt inline for an API key. The user configures
+  // keys via the Welcome dialog or Settings → Models tab. If we reach this
+  // point with no key and no auth token, fail with a clear error so the
+  // caller can surface it appropriately (and the GUI can re-show the welcome
+  // flow if needed).
+  const isGuiMode = process.env.KOI_GUI_MODE === '1' || !!process.env.KOI_GUI_PORT;
+  if (isGuiMode) {
+    throw new Error(
+      `${keyName} is required but not configured. ` +
+      `Open Settings → Models and add your ${providerName} API key, ` +
+      `or sign in with a Braxil account.`
+    );
+  }
+
   const key = await _promptForApiKey(agent, { provider, keyName, providerName, allowSkip: false });
 
   if (!key) {

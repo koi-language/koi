@@ -81,9 +81,13 @@ export class TaskClassifier {
   async classifyUserRequest(userMessage, agentName) {
     const taskDescription = `User request: ${userMessage.substring(0, 1000)}`;
 
-    const prompt = `Pick the ONE category (A-G) that best describes this user request. Return ONLY json: {"cat":"X"}
+    const prompt = `You are classifying a user request.
+
+Pick the ONE category (A-G) that best describes this user request AND detect the natural language the user wrote it in (English name, e.g. "Spanish", "English", "French"). Return ONLY json: {"cat":"X","lang":"Language"}
 
 IMPORTANT: When in doubt between two categories, ALWAYS pick the HIGHER one. Underestimating complexity causes bad results; overestimating is cheap.
+
+For "lang": return the English name of the natural language used in the request (e.g. "Spanish", "English", "French", "German", "Portuguese", "Italian", "Japanese", "Chinese", "Arabic", "Russian", "Dutch", "Polish"). If the message is too short or language-neutral (single emoji, code-only), return "English" as default.
 
 CATEGORIES:
 
@@ -354,6 +358,9 @@ ${taskDescription}`;
         this._log('llm', `[classify] Raw response: ${content.substring(0, 200)}`);
         const _stripped = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
         const json = JSON.parse(_stripped);
+        // Optional language detection — only present when classifying
+        // an interaction (classifyUserRequest). Normalized and validated.
+        const _lang = _normalizeLanguage(json.lang || json.language || null);
         // Category format: { cat: "A"-"Z" }
         if (json.cat) {
           const cat = String(json.cat).toUpperCase();
@@ -364,7 +371,8 @@ ${taskDescription}`;
             const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
             const difficulty = Math.max(codeScore, reasoningScore);
             const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel, reasoningEffort: effort };
-            this._log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} effort=${effort} risk=${riskLevel}`);
+            if (_lang) profile.userLanguage = _lang;
+            this._log('llm', `[classify] Category ${cat} → code=${codeScore} reasoning=${reasoningScore} effort=${effort} risk=${riskLevel}${_lang ? ` lang=${_lang}` : ''}`);
             return profile;
           }
           this._log('llm', `[classify] Unknown category "${cat}" from ${candidate.model}`);
@@ -389,4 +397,16 @@ ${taskDescription}`;
     this._log('llm', `[classify] All candidates failed — default profile ${DEFAULT_TASK_PROFILE.taskType}:${DEFAULT_TASK_PROFILE.difficulty}`);
     return DEFAULT_TASK_PROFILE;
   }
+}
+
+/** Normalize a language string returned by the classifier. Returns
+ *  a trimmed English language name or null for obvious non-values. */
+function _normalizeLanguage(lang) {
+  if (!lang || typeof lang !== 'string') return null;
+  const trimmed = lang.trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+  if (lower === 'null' || lower === 'unknown' || lower === 'n/a' || lower === 'none') return null;
+  // Capitalize: "spanish" → "Spanish"
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
 }
