@@ -1391,6 +1391,9 @@ CRITICAL RULES:
         // Save ALL images (including annotations) for propagation to delegates —
         // they may need to read annotations via read_file for their own analysis.
         session._lastConsumedImages = [...session._pendingMcpImages];
+        // Keep a snapshot so the catch-retry path can re-inject them if the
+        // call fails. Cleared on successful streamReactive return.
+        session._consumedThisCall = [...session._pendingMcpImages];
         session._pendingMcpImages = null;
       }
     }
@@ -1763,7 +1766,17 @@ CRITICAL RULES:
       });
 
       this.logResponse(response.text, `Reactive ${agentInfo}`, response.usage);
+      // Successful call — drop the retry snapshot so these images don't get
+      // re-injected on a future (unrelated) error.
+      if (session) session._consumedThisCall = null;
     } catch (_callErr) {
+      // Restore pending images so the retry re-injects them. Without this,
+      // a failed call (e.g. model rejects image payload) silently drops the
+      // attachment and the next iteration hallucinates about a different image.
+      if (session?._consumedThisCall?.length && !session._pendingMcpImages?.length) {
+        session._pendingMcpImages = [...session._consumedThisCall];
+        channel.log('llm', `[auto] Restoring ${session._consumedThisCall.length} image(s) after LLM error for retry`);
+      }
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
       if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {

@@ -126,6 +126,15 @@ export class Agent {
    * }
    */
   static _cliHooks = null;
+  /**
+   * Tracks an in-flight re-auth attempt so concurrent 401s (multiple agents,
+   * delegates, or rapid retries) collapse to a SINGLE welcome-screen request
+   * instead of spamming it for every failing call. Shared across all Agent
+   * instances in the process.
+   *   - null  → no re-auth in progress; next 401 kicks one off
+   *   - Promise<string|null> → one in progress; other callers await it
+   */
+  static _reauthPromise = null;
   static _cliBootstrapped = false;
   static _cliBootstrapPromise = null;
   static _indexingStarted = false;
@@ -1446,13 +1455,55 @@ export class Agent {
           channel.progress(`\x1b[33m⚠ ${_s.serverError || 'Server error'}: ${error.message}\x1b[0m`);
         }
 
-        // Auth expired = fatal, user needs to re-login
+        // Auth expired — re-authenticate in place via the CLI host hook.
+        // Concurrent 401s (delegates, background classifiers, rapid retries)
+        // all await the SAME in-flight welcome-screen request so the user
+        // only sees it once.
         if (error.message?.startsWith('AUTH_EXPIRED:')) {
           const msg = error.message.replace('AUTH_EXPIRED: ', '');
+          const _reauth = Agent._cliHooks?.onAuthExpired;
+          if (typeof _reauth === 'function') {
+            // Only the first caller deletes the token and invokes the hook;
+            // everyone else piggybacks on the existing Promise.
+            if (!Agent._reauthPromise) {
+              try { const fs = await import('fs'); const os = await import('os'); const path = await import('path'); fs.unlinkSync(path.join(os.homedir(), '.koi', '.token')); } catch {}
+              channel.log('agent', `${this.name}: Auth expired — requesting re-login`);
+              Agent._reauthPromise = (async () => {
+                try {
+                  return await _reauth(msg);
+                } catch (_reauthErr) {
+                  channel.log('agent', `${this.name}: Re-auth failed: ${_reauthErr?.message || _reauthErr}`);
+                  return null;
+                }
+              })();
+            } else {
+              channel.log('agent', `${this.name}: Auth expired — joining in-flight re-login`);
+            }
+            const _newToken = await Agent._reauthPromise;
+            Agent._reauthPromise = null;
+            if (_newToken) {
+              process.env.KOI_AUTH_TOKEN = _newToken;
+              // Rebuild the gateway OpenAI client so subsequent requests
+              // carry the fresh Authorization header.
+              if (this.llmProvider?._koiGateway) {
+                const { default: OpenAI } = await import('openai');
+                const _apiBase = this.llmProvider._koiGatewayApiBase || (process.env.KOI_API_URL || 'http://localhost:3000');
+                this.llmProvider._koiGateway = new OpenAI({
+                  apiKey: _newToken,
+                  baseURL: _apiBase + '/gateway',
+                  maxRetries: 2,
+                });
+              }
+              session.consecutiveErrors = 0;
+              channel.log('agent', `${this.name}: Auth refreshed — retrying`);
+              continue;
+            }
+          } else {
+            // No hook registered — delete the token so the next launch shows welcome.
+            try { const fs = await import('fs'); const os = await import('os'); const path = await import('path'); fs.unlinkSync(path.join(os.homedir(), '.koi', '.token')); } catch {}
+          }
           channel.print(`\x1b[33m⚠ ${msg}\x1b[0m`);
           channel.log('agent', `${this.name}: Auth expired — stopping`);
-          // Delete the invalid token so next launch triggers login
-          try { const fs = await import('fs'); const os = await import('os'); const path = await import('path'); fs.unlinkSync(path.join(os.homedir(), '.koi', '.token')); } catch {}
           break;
         }
 

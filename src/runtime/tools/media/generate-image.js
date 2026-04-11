@@ -11,16 +11,17 @@
  */
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
+import { fetchImageCapabilities } from '../../llm/providers/gateway.js';
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 
-export default {
+const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
-  description: 'Generate an image from a text prompt. Supports reference images for style guidance (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution" (low|medium|high|ultra), optional "quality" (auto|low|medium|high), optional "n" (number of images, default 1), optional "referenceImages" (array of file paths for style reference), optional "saveTo" (directory to save images). Returns: { success, provider, model, capabilities, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }',
+  description: 'Generate an image from a text prompt. Supports reference images (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution" (low|medium|high|ultra), optional "quality" (auto|low|medium|high), optional "n" (number of images, default 1), optional "referenceImages" (array of file paths / attachment IDs), optional "saveTo" (directory to save images), optional "label" (capability label — pick the model best suited for what you want: e.g. "photorealistic", "illustration", "consistency", "text-rendering"). Returns: { success, provider, model, capabilities, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }. IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — you MUST state it explicitly in "prompt". Start the prompt with a clear directive such as "Using the reference image as a STYLE guide, ..." / "...in the exact art style of the reference image" (for style transfer), or "Edit the reference image to ..." (for img2img edits), or "Use the reference image as the subject and ..." (for subject preservation). If the user supplies a reference for style but asks for a different subject, lead the prompt with the style directive and keep your own stylistic adjectives minimal so they do not compete with the reference.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -35,7 +36,8 @@ export default {
       referenceImages: { type: 'array',  description: 'Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.', items: { type: 'string' } },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
-      model:           { type: 'string', description: 'Specific model to use (optional — auto-selects if omitted)' }
+      label:           { type: 'string', description: 'Capability label used to pick the best model for the task. Leave empty for the default fallback. Common labels (actual set comes from backend): photorealistic, illustration, consistency, text-rendering, fast, high-detail.' },
+      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should use "label" instead and let the backend pick the cheapest matching model).' }
     },
     required: ['prompt']
   },
@@ -43,7 +45,8 @@ export default {
   examples: [
     { intent: 'generate_image', prompt: 'A serene mountain lake at sunset, oil painting style' },
     { intent: 'generate_image', prompt: 'Logo for a tech startup', aspectRatio: '1:1', resolution: 'high', quality: 'high' },
-    { intent: 'generate_image', prompt: 'Product photo in this style', referenceImages: ['/tmp/style-ref.png'], aspectRatio: '4:3' }
+    { intent: 'generate_image', prompt: 'Using the reference image as a STYLE guide, create an illustration of a smartphone floating in perspective, in the exact art style of the reference image', referenceImages: ['att-1'], aspectRatio: '4:3' },
+    { intent: 'generate_image', prompt: 'Edit the reference image: change the eye color to red, keep everything else identical', referenceImages: ['/Users/me/.koi/images/kitten.png'], aspectRatio: '1:1' }
   ],
 
   async execute(action, agent) {
@@ -161,10 +164,25 @@ export default {
         quality: action.quality || 'auto',
         n: action.n || 1,
         outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
+        label: action.label,
         referenceImages,
       });
     } catch (genErr) {
       const errMsg = genErr.message || String(genErr);
+      const details = genErr.details || null;
+      // Structured router error — backend couldn't find a model matching the
+      // label + hard capabilities. Surface the available labels so the agent
+      // can retry with a different one (or omit it for the fallback).
+      if (details?.code === 'no_model_matches') {
+        return {
+          success: false,
+          errorType: 'no_model_matches',
+          error: errMsg,
+          label: details.label ?? action.label ?? null,
+          availableLabels: details.availableLabels || [],
+          hint: 'Retry with a different "label" value from availableLabels, or omit "label" to use the fallback model.',
+        };
+      }
       // Detect common error types for the agent to interpret
       const isContentPolicy = /safety|policy|nsfw|blocked|prohibited|inappropriate|harmful/i.test(errMsg);
       const isTimeout = /timeout|timed out|deadline/i.test(errMsg);
@@ -279,3 +297,20 @@ export default {
     };
   }
 };
+
+// Fire-and-forget: fetch the live label catalog from the backend and rewrite
+// the action's description so the system prompt exposes real labels instead
+// of the static hint. Runs once at import; any failure is silent and the
+// static description remains in place.
+fetchImageCapabilities().then((caps) => {
+  if (!caps?.labels?.length) return;
+  const labelList = caps.labels
+    .map((l) => `"${l.slug}" (${l.description})`)
+    .join(', ');
+  const newDesc = `Capability labels for model selection: ${labelList}. Pick the one that best matches what you want, or omit "label" to use the fallback.`;
+  generateImageAction.schema.properties.label.description = newDesc;
+  // Also append to the tool description so the system prompt picks it up.
+  generateImageAction.description += `\n\nAvailable capability labels: ${caps.labels.map((l) => l.slug).join(', ')}.`;
+}).catch(() => {});
+
+export default generateImageAction;

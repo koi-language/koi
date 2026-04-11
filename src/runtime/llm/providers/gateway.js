@@ -43,6 +43,31 @@ function _getMediaCaps(model) {
   return info?.mediaCaps || null;
 }
 
+// ── Dynamic image capabilities (labels + enums) from the backend ─────────────
+//
+// Cached for the process lifetime. The first caller kicks off a fetch; later
+// callers share the same promise. On failure we return null and the tool
+// keeps its static defaults, so missing auth / offline backend never breaks
+// image generation.
+
+let _imageCapabilitiesPromise = null;
+
+export function fetchImageCapabilities() {
+  if (_imageCapabilitiesPromise) return _imageCapabilitiesPromise;
+  _imageCapabilitiesPromise = (async () => {
+    try {
+      const res = await fetch(`${getGatewayBase()}/fal/capabilities`, {
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  })();
+  return _imageCapabilitiesPromise;
+}
+
 // ── GatewayEmbedding ─────────────────────────────────────────────────────────
 
 export class GatewayEmbedding extends BaseEmbedding {
@@ -211,6 +236,8 @@ export class GatewayImageGen extends BaseImageGen {
     if (opts.outputFormat) payload.output_format = opts.outputFormat;
     // resolution/quality are normalized params mapped by the backend, pass through if set
     if (opts.resolution) payload.resolution = opts.resolution;
+    // Capability label — backend uses this to pick the best matching model.
+    if (opts.label) payload.label = opts.label;
 
     if (opts.referenceImages?.length) {
       payload.reference_images = opts.referenceImages.map(ref => ({
@@ -227,8 +254,16 @@ export class GatewayImageGen extends BaseImageGen {
     });
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway image error (${res.status}): ${body}`);
+      // Preserve structured errors from the backend (e.g. no_model_matches with availableLabels).
+      const bodyText = await res.text().catch(() => '');
+      let structured = null;
+      try { structured = JSON.parse(bodyText); } catch {}
+      const err = new Error(
+        structured?.error || `Gateway image error (${res.status}): ${bodyText}`,
+      );
+      err.status = res.status;
+      if (structured) err.details = structured;
+      throw err;
     }
 
     const data = await res.json();

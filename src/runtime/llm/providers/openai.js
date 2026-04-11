@@ -197,6 +197,34 @@ export class OpenAIChatLLM extends BaseLLM {
 export class OpenAIResponsesLLM extends BaseLLM {
   get providerName() { return 'openai'; }
 
+  // Convert a Chat-Completions-style content part into the Responses API
+  // shape. The two APIs disagree on:
+  //   - text:  Chat uses { type: 'text', text }         → Responses wants { type: 'input_text', text }
+  //   - image: Chat uses { type: 'image_url', image_url: { url } }
+  //            → Responses wants { type: 'input_image', image_url: <string> }
+  // Without this, passing an array content through unchanged makes OpenRouter
+  // reject the call with `"expected string, received array"` on image_url.
+  _normalizeContentForResponses(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return content;
+    return content.map(p => {
+      if (!p || typeof p !== 'object') return p;
+      if (p.type === 'text') return { type: 'input_text', text: p.text };
+      if (p.type === 'input_text' || p.type === 'input_image') return p;
+      if (p.type === 'image_url') {
+        const url = typeof p.image_url === 'string' ? p.image_url : p.image_url?.url;
+        return { type: 'input_image', image_url: url };
+      }
+      if (p.type === 'image' && p.source?.type === 'base64') {
+        return {
+          type: 'input_image',
+          image_url: `data:${p.source.media_type};base64,${p.source.data}`,
+        };
+      }
+      return p;
+    });
+  }
+
   async streamReactive(messages, opts = {}) {
     const { abortSignal, onChunk, onHeartbeat } = opts;
 
@@ -204,7 +232,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
     const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
     let inputMessages = messages
       .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({ role: m.role, content: m.content }));
+      .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
 
     // Responses API requires "json" in input messages for json_object format
     const lastUserIdx = inputMessages.map(m => m.role).lastIndexOf('user');
@@ -335,7 +363,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
       const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
       let inputMessages = messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role, content: m.content }));
+        .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
 
       // Responses API requires literal "json" in the last user input when
       // format=json_object. Inject a reminder if the prompt doesn't already

@@ -116,7 +116,25 @@ function _shellArgs(cmd) {
   } else if (shellName === 'bash') {
     rcSource = '[ -f ~/.bashrc ] && source ~/.bashrc >/dev/null 2>&1; ';
   }
-  return ['-c', rcSource + cmd];
+  // -l → login shell, so .zprofile / .bash_profile (PATH, brew, etc.) are
+  // sourced. Needed when koi is launched from a GUI app bundle (Braxil.app)
+  // where the inherited env lacks the usual login-shell PATH.
+  return ['-l', '-c', rcSource + cmd];
+}
+
+// Strip npm_config_* vars inherited from whoever launched us. When koi is
+// started by `npm exec` / `npx` / an nvm-wrapped npm, those vars pin the
+// child shell to a specific npm prefix (e.g. /usr/local), which makes nvm's
+// shell integration intercept every command and error out if that prefix
+// isn't writable. Filtering them here protects both app-bundle launches and
+// npm-wrapped launches without touching the parent process env.
+function _sanitizeEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k.startsWith('npm_config_')) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 let _pty = null;
@@ -547,16 +565,21 @@ When a command requires sudo, just use sudo normally in the command. The system 
     const sudoEnv = _sudoAskpassEnv(description);
     const hasSudo = /\bsudo\b/.test(command);
     const effectiveCommand = hasSudo ? _injectSudoA(command) : command;
-    const effectiveEnv = sudoEnv ? { ...process.env, ...sudoEnv } : { ...process.env };
+    const baseEnv = _sanitizeEnv(process.env);
+    const effectiveEnv = sudoEnv ? { ...baseEnv, ...sudoEnv } : baseEnv;
 
     // Background launch: spawn detached, don't wait for completion.
     // Never use background when inside a parallel scope — the scope needs to wait for all results.
     if (background && !channel.hasScope()) {
       // Open a proper action so the GUI renders a CommandBlock (same as a
       // foreground shell), instead of a stray "⏺ Shell(...)" printCompact.
+      // Capture the action ID returned by beginAction so the later exit
+      // notification and the endAction call are both paired to the same
+      // bubble, regardless of any other action that opens in between.
+      let _bgActionId = null;
       if (!isSilent) {
         channel.resetActionGroup();
-        channel.beginAction('shell', cmdPreview);
+        _bgActionId = channel.beginAction('shell', cmdPreview) || channel._currentActionId || null;
         descriptionShown = true;
       }
 
@@ -566,11 +589,6 @@ When a command requires sudo, just use sudo normally in the command. The system 
         stdio: ['ignore', 'ignore', 'pipe'],  // pipe stderr to catch startup errors
         detached: true
       });
-
-      // Capture the action ID at launch time so the later exit notification
-      // can be routed back to the original shell bubble in the GUI, even
-      // after endAction has cleared channel._currentActionId.
-      const _bgActionId = channel._currentActionId || null;
 
       // Collect stderr for error reporting (capped at 4KB)
       const bgStderr = [];
@@ -605,7 +623,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
         // Emit a single in-bubble status line so the CommandBlock shows
         // "↗ running in background · PID N" instead of a blank body.
         channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m↗ running in background · PID ${bgChild.pid}\x1b[0m`);
-        channel.endAction(true, `background · PID ${bgChild.pid}`);
+        channel.endAction(true, `background · PID ${bgChild.pid}`, _bgActionId);
       }
       yield { success: true, background: true, pid: bgChild.pid };
       return;
@@ -627,8 +645,13 @@ When a command requires sudo, just use sudo normally in the command. The system 
     };
 
     const _inScope = !isSilent && channel.hasScope();
+    // Action ID captured at begin time so every subsequent endAction /
+    // sendShellFullOutput call is paired against the same bubble, even if
+    // another action opens in between (which would otherwise clobber the
+    // channel._currentActionId singleton).
+    let _shellActionId = null;
     if (!isSilent) {
-      channel.beginAction('shell', cmdPreview);
+      _shellActionId = channel.beginAction('shell', cmdPreview) || channel._currentActionId || null;
       descriptionShown = true;
       // Inside a scope (parallel shells), skip the progress spinner — it would clutter the grouped display
       if (!_inScope) {
@@ -939,7 +962,8 @@ When a command requires sudo, just use sudo normally in the command. The system 
     // can target THIS command specifically (without a global abort). The
     // entry object is shared with killShellByActionId, which mutates its
     // `userKilled` flag before calling kill() — we read it back on close.
-    const _shellActionId = channel._currentActionId || null;
+    // _shellActionId was captured earlier (at beginAction) so it remains
+    // stable even if another action opens in parallel.
     const _registryEntry = { kill: () => proc.kill(), userKilled: false };
     if (_shellActionId) {
       _runningShellsByAction.set(_shellActionId, _registryEntry);
@@ -1058,7 +1082,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           // Inside parallel scope: compact one-line summary
           const preview = lines.length > 0 ? lines[0].substring(0, 80) : (t('noOutput') || 'No output');
           const extra = lines.length > 1 ? ` … +${lines.length - 1} lines` : '';
-          channel.endAction(!isError, `${preview}${extra}`);
+          channel.endAction(!isError, `${preview}${extra}`, _shellActionId);
           return;
         }
         if (lines.length === 0) {
@@ -1091,9 +1115,9 @@ When a command requires sudo, just use sudo normally in the command. The system 
         reportDone?.();
         if (!isSilent) {
           channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;200;140;80mstopped by user\x1b[0m`);
-          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command, combinedStr);
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(false, 'stopped by user');
+        if (!isSilent && !_inScope) channel.endAction(false, 'stopped by user', _shellActionId);
         yield {
           success: false,
           userKilled: true,
@@ -1107,16 +1131,16 @@ When a command requires sudo, just use sudo normally in the command. The system 
         reportDone?.();
         if (!isSilent) { _showOutputPreview(closeError.message, true); _showTimeout(); }
         // Signal action finished so the GUI clears the Running/Stop widget
-        if (!isSilent && !_inScope) channel.endAction(false, closeError.message);
+        if (!isSilent && !_inScope) channel.endAction(false, closeError.message, _shellActionId);
         yield { success: false, exitCode: 1, stdout: '', stderr: '', error: closeError.message };
       } else if (closeCode !== 0) {
         _shellOutputCallback?.(false);
         reportDone?.();
         if (!isSilent) {
           _showOutputPreview(stderrStr || combinedStr, true); _showTimeout();
-          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,stderrStr || combinedStr);
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, stderrStr || combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(false, `exit ${closeCode}`);
+        if (!isSilent && !_inScope) channel.endAction(false, `exit ${closeCode}`, _shellActionId);
         yield {
           success: false,
           exitCode: closeCode || 1,
@@ -1129,9 +1153,9 @@ When a command requires sudo, just use sudo normally in the command. The system 
         reportDone?.();
         if (!isSilent) {
           _showOutputPreview(combinedStr); _showTimeout();
-          if (channel.sendShellFullOutput) channel.sendShellFullOutput(channel._currentActionId, command,combinedStr);
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(true, '');
+        if (!isSilent && !_inScope) channel.endAction(true, '', _shellActionId);
         yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrStr };
       }
       // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.
