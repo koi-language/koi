@@ -425,18 +425,20 @@ export function _calculateDifficultyBoosts(session) {
 
 /**
  * Create an LLM instance directly (no auto-selection).
+ *
+ * Routing between `OpenAIChatLLM` (POST /v1/chat/completions) and
+ * `OpenAIResponsesLLM` (POST /v1/responses) is decided purely by
+ * `caps.api`, which is populated from the model registry — either the
+ * remote gateway `models.json` (authoritative source) or the local
+ * `models.json` fallback. The client does NOT guess by model name.
+ *
+ * If a new OpenAI model is added to the gateway without an `api` value,
+ * the call will default to chat completions. Use the backoffice
+ * "Auto-detect API" button (or the /admin/model-prices/:id/probe-api
+ * endpoint) to resolve the correct value.
  */
 export function createLLM(provider, client, model, opts = {}) {
   const caps = getModelCaps(model);
-
-  // Defensive routing: codex-family OpenAI models (gpt-*-codex) are ONLY
-  // available via the Responses API — chat.completions returns 404. If
-  // the model caps don't explicitly set api=responses (e.g. because the
-  // backend-remote model list is missing the flag), force it by name.
-  if (provider === 'openai' && /(^|-)codex(-|$)/i.test(model) && caps.api !== 'responses') {
-    caps.api = 'responses';
-  }
-
   const fullOpts = { ...opts, caps };
 
   switch (provider) {
