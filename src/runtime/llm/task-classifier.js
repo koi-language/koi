@@ -219,7 +219,7 @@ ${taskDescription}`;
       M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'low' },
       N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'low' },
       O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'medium' },
-      P: { code: 60,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
+      P: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
       Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'low' },
       R: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
       S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'medium' },

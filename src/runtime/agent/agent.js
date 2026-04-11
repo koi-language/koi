@@ -616,13 +616,26 @@ export class Agent {
       await promptMissingApiKeys(this);
     }
 
-    // Fire-and-forget: start project indexing in background (once per process)
+    // Fire-and-forget: start project indexing in background (once per process).
+    // Skip when no real project is open — indexing a user's home directory
+    // takes forever, burns CPU, and sends thousands of wasted embedding
+    // requests for system headers (Homebrew, SDKs, etc.).
     if (process.env.KOI_CLI_MODE === '1' && !Agent._indexingStarted) {
-      Agent._indexingStarted = true;
-      channel.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);
-      this._startBackgroundIndexing().catch(err => {
-        channel.log('background', `Background indexing failed: ${err?.message || err}`);
-      });
+      const _root = process.env.KOI_PROJECT_ROOT || process.cwd();
+      const _home = (process.env.HOME || process.env.USERPROFILE || '').replace(/[\\/]+$/, '');
+      const _normRoot = _root.replace(/[\\/]+$/, '');
+      const _isHome = _home && _normRoot === _home;
+      const _disabled = process.env.KOI_DISABLE_AUTO_INDEX === '1';
+      if (_isHome || _disabled) {
+        Agent._indexingStarted = true; // prevent retries
+        channel.log('background', `Background indexing skipped: ${_isHome ? 'project root is $HOME' : 'KOI_DISABLE_AUTO_INDEX=1'}`);
+      } else {
+        Agent._indexingStarted = true;
+        channel.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);
+        this._startBackgroundIndexing().catch(err => {
+          channel.log('background', `Background indexing failed: ${err?.message || err}`);
+        });
+      }
     }
 
     // Delegated invocations run inside an isolated state context so parallel
@@ -1056,20 +1069,13 @@ export class Agent {
     let thinkingHint = _h('thinking', 'Thinking');
     let exitedOnAbort = false;
 
-    // Fast-greeting: skip the first LLM call for interactive CLI agents.
-    // When the playbook has __FAST_GREETING__, we directly show a hardcoded greeting
-    // + prompt_user on iteration 0 without calling the LLM at all.
-    // This eliminates the 2-5s startup delay and ensures prompt_user runs in the
-    // sequential path (so slash commands like /cost are properly intercepted).
-    // Use i18n greetings if available, otherwise fallback
-    const _greetingsI18n = (globalThis.__koiStrings?.greetings) || [
-      "What can I build for you?",
-      "Ready. What's the task?",
-      "What do you need?",
-      "Go ahead.",
-      "What are we working on?",
-    ];
-    const _fastGreetMsg = _greetingsI18n[Math.floor(Math.random() * _greetingsI18n.length)];
+    // Fast-start: skip the first LLM call for interactive CLI agents.
+    // When the playbook has __FAST_GREETING__, we skip the LLM entirely on
+    // iteration 0 and emit a silent `prompt_user` so the agent waits for
+    // the first user message without showing any greeting bubble.
+    // Historically we printed a random "Hello!"-style greeting here, but
+    // those bubbles cluttered the chat and, worse, were persisted in the
+    // display log so every session resume re-rendered them.
     // Check if a project instructions file exists — if not, skip fast-greeting
     // so the LLM can suggest creating one on first startup.
     const _hasProjectMd = (() => {
@@ -1185,7 +1191,12 @@ export class Agent {
 
     // ── PROJECT INIT CHECK: propose BRAXIL.md creation if missing ───────
     // Algorithmic check (no LLM) — runs once on first startup, non-delegate only.
-    if (!isDelegate && !contextMemory.hasHistory() && !_hasProjectMd) {
+    // Skip when KOI_DISABLE_AUTO_INDEX=1 (set by the GUI when launching the
+    // root Braxil.app with no project open). In that case the user hasn't
+    // chosen a project yet, so asking about BRAXIL.md would be meaningless
+    // and the blocking select() would freeze the agent loop.
+    if (!isDelegate && !contextMemory.hasHistory() && !_hasProjectMd
+        && process.env.KOI_DISABLE_AUTO_INDEX !== '1') {
       try {
         Agent._cliHooks?.onBusy?.(false);
         const _initChannel = (await import('../io/channel.js')).channel;
@@ -1328,13 +1339,14 @@ export class Agent {
       let response;
 
       if (isFastGreeting && session.iteration === 0) {
-        // Skip LLM call — show greeting + transition to routing instantly (zero tokens)
-        channel.log('agent', `${this.name}: Fast-greeting (skipping LLM on iteration 0)`);
-        // Phase transitions are now driven by reactions (session.start /
-        // invoked fires at handler entry), so we no longer inject an
-        // update_state action here.
+        // Skip the LLM on iteration 0 — emit a silent prompt_user (no
+        // question) so the agent just waits for the user's first message
+        // without printing anything to the chat or persisting anything
+        // to the display log. Phase transitions are already handled by
+        // reactions (session.start / invoked at handler entry).
+        channel.log('agent', `${this.name}: Fast-start (silent prompt_user, no greeting)`);
         response = [
-          { actionType: 'direct', intent: 'prompt_user', question: _fastGreetMsg }
+          { actionType: 'direct', intent: 'prompt_user' }
         ];
         isFirstCall = false;
       } else {
@@ -1875,6 +1887,64 @@ export class Agent {
               channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint}\x1b[0m`);
               // Continue the loop — LLM will be called again and should prompt_user
               continue;
+            }
+          }
+
+          // ── ANTI-HALLUCINATION GUARD for task-creating delegates ──────
+          // If the delegate has `write_tasks` permission (i.e. it is a
+          // planner-role agent whose JOB is to decompose work into
+          // task_create calls) and it claims a positive outcome, verify
+          // that the global TaskManager actually has tasks. If not, the
+          // LLM hallucinated success without doing the work: inject a
+          // correction and continue the loop so the agent is forced to
+          // actually call task_create before returning again.
+          if (isDelegate && this.hasPermission?.('write_tasks') && returnData && typeof returnData === 'object') {
+            const _claimsSuccess =
+              returnData.success === true
+              || (typeof returnData.taskCount === 'number' && returnData.taskCount > 0)
+              || (typeof returnData.summary === 'string' && returnData.summary.length > 0 && returnData.success !== false);
+            if (_claimsSuccess) {
+              try {
+                const { taskManager: _tmPlanner } = await import('../state/task-manager.js');
+                const _liveTasks = _tmPlanner.list();
+                const _realCount = _liveTasks.length;
+
+                if (_realCount === 0) {
+                  if (!session._plannerRejectCount) session._plannerRejectCount = 0;
+                  session._plannerRejectCount++;
+
+                  // After 3 rejections, give up and let the return proceed
+                  // so we don't get stuck in an infinite loop.
+                  if (session._plannerRejectCount <= 3) {
+                    channel.log('task', `${this.name}: Return REJECTED — claimed success but TaskManager is empty (attempt ${session._plannerRejectCount}/3). Forcing retry.`);
+                    session.recordAction(action, {
+                      success: false,
+                      error: 'Return rejected: no tasks created',
+                    });
+                    contextMemory.add(
+                      'user',
+                      `❌ RETURN REJECTED. You claimed to have planned work but the task list is EMPTY — you never called task_create. ` +
+                      `Do NOT print another summary and do NOT call return yet. Instead, emit a batch of task_create actions NOW, one per step in your plan, with hyper-detailed descriptions (200-500 words each, covering file paths, class names, imports, constraints, tests, gotchas). ` +
+                      `After all task_create calls succeed, wire dependencies with task_update addBlockedBy, THEN call return. ` +
+                      `This is attempt ${session._plannerRejectCount}/3 — after 3 failures the plan will be abandoned.`,
+                      `Return rejected (${session._plannerRejectCount}/3): no tasks created`,
+                      null
+                    );
+                    thinkingHint = _h('creatingTasks', 'Creating tasks');
+                    continue;
+                  }
+                  channel.log('task', `${this.name}: Return accepted after ${session._plannerRejectCount} rejections — giving up on validation.`);
+                } else {
+                  // Runtime-measured taskCount overrides whatever the LLM said.
+                  // Don't let the model hallucinate the number.
+                  if ('taskCount' in returnData || _realCount > 0) {
+                    returnData.taskCount = _realCount;
+                  }
+                  channel.log('task', `${this.name}: Return verified: ${_realCount} task(s) in TaskManager.`);
+                }
+              } catch (err) {
+                channel.log('task', `${this.name}: Return validation failed (non-fatal): ${err?.message || err}`);
+              }
             }
           }
 

@@ -428,6 +428,15 @@ export function _calculateDifficultyBoosts(session) {
  */
 export function createLLM(provider, client, model, opts = {}) {
   const caps = getModelCaps(model);
+
+  // Defensive routing: codex-family OpenAI models (gpt-*-codex) are ONLY
+  // available via the Responses API — chat.completions returns 404. If
+  // the model caps don't explicitly set api=responses (e.g. because the
+  // backend-remote model list is missing the flag), force it by name.
+  if (provider === 'openai' && /(^|-)codex(-|$)/i.test(model) && caps.api !== 'responses') {
+    caps.api = 'responses';
+  }
+
   const fullOpts = { ...opts, caps };
 
   switch (provider) {

@@ -320,14 +320,91 @@ export class OpenAIResponsesLLM extends BaseLLM {
   }
 
   async complete(messages, opts = {}) {
-    // Responses API models can also use Chat Completions for simple calls
-    // Delegate to the chat path since complete() doesn't need reasoning
-    const chatLLM = new OpenAIChatLLM(this.client, this.model, {
-      temperature: this.temperature,
-      maxTokens: this.maxTokens,
-      caps: this.caps,
-    });
-    return chatLLM.complete(messages, opts);
+    // Codex and other Responses-API-only models cannot use Chat Completions
+    // (the endpoint returns 404). Use responses.create directly and collect
+    // the output into a single text string — mirrors the chat-completions
+    // contract (returns { text, usage }) so callers don't need to branch.
+    const maxTokens = opts.maxTokens ?? this.maxTokens;
+    const responseFormat = opts.responseFormat;
+    const timeoutMs = opts.timeoutMs || 0;
+
+    const controller = timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    try {
+      const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+      let inputMessages = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role, content: m.content }));
+
+      // Responses API requires literal "json" in the last user input when
+      // format=json_object. Inject a reminder if the prompt doesn't already
+      // mention it — mirrors the streaming path.
+      if (responseFormat === 'json_object') {
+        const lastUserIdx = inputMessages.map(m => m.role).lastIndexOf('user');
+        if (lastUserIdx >= 0) {
+          const _luc = inputMessages[lastUserIdx].content;
+          const _lucText = typeof _luc === 'string' ? _luc : String(_luc || '');
+          if (!_lucText.toLowerCase().includes('json')) {
+            inputMessages[lastUserIdx] = {
+              ...inputMessages[lastUserIdx],
+              content: _lucText + '\n\nRespond with a valid JSON object only.',
+            };
+          }
+        }
+      }
+
+      const params = {
+        model: this.model,
+        instructions: systemPrompt,
+        input: inputMessages,
+        max_output_tokens: maxTokens,
+      };
+      if (responseFormat === 'json_object') {
+        params.text = { format: { type: 'json_object' } };
+      }
+      if (this.caps.thinking) {
+        // Honor the configured reasoning effort for these models; default low
+        // matches the non-thinking classifier path.
+        const effort = (!this.reasoningEffort || this.reasoningEffort === 'none')
+          ? 'low'
+          : this.reasoningEffort;
+        params.reasoning = { effort, summary: 'auto' };
+      }
+
+      channel.log('llm', `[request] model=${params.model} max_output_tokens=${params.max_output_tokens} reasoning_effort=${params.reasoning?.effort ?? '(none)'} thinking=${this.useThinking} api=responses`);
+
+      const options = controller ? { signal: controller.signal } : {};
+      const response = await this.client.responses.create(params, options);
+
+      // Extract the text output. The Responses API returns an array of
+      // output items; we only care about text content.
+      let text = '';
+      if (response.output_text) {
+        text = response.output_text;
+      } else if (Array.isArray(response.output)) {
+        for (const item of response.output) {
+          if (item.type === 'message' && Array.isArray(item.content)) {
+            for (const c of item.content) {
+              if (c.type === 'output_text' && c.text) text += c.text;
+            }
+          }
+        }
+      }
+      text = (text || '').trim();
+
+      const usage = {
+        input: response.usage?.input_tokens || 0,
+        output: response.usage?.output_tokens || 0,
+        thinking: response.usage?.reasoning_tokens
+          || response.usage?.output_tokens_details?.reasoning_tokens
+          || 0,
+        cachedInput: response.usage?.input_tokens_details?.cached_tokens || 0,
+      };
+      return { text, usage };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
 
