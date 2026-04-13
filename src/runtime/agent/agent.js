@@ -1587,15 +1587,27 @@ export class Agent {
         }
         session.recordAction({ intent: '_llm_error', actionType: 'direct' }, null, error);
 
-        // Fire error.llm reaction so agents can bump profile / change phase
-        fireReaction(this, 'error.llm', null, {
-          error: {
-            count: session.consecutiveErrors,
-            message: error.message,
-            kind: 'llm',
-          },
-          state: this.state,
-        });
+        // Classify the error: a transient network / gateway failure has
+        // NOTHING to do with model capability, so we must NOT fire the
+        // error.llm reaction (which bumps code/reasoning scores and pushes
+        // the agent toward more expensive models). Only real model failures
+        // (bad output, refusal, rate limit, exhausted thinking budget) should
+        // trigger the escalation reaction.
+        const { isNetworkError } = await import('../llm/is-network-error.js');
+        const _isNetErr = isNetworkError(error);
+        if (!_isNetErr) {
+          // Fire error.llm reaction so agents can bump profile / change phase
+          fireReaction(this, 'error.llm', null, {
+            error: {
+              count: session.consecutiveErrors,
+              message: error.message,
+              kind: 'llm',
+            },
+            state: this.state,
+          });
+        } else {
+          channel.log('agent', `${this.name}: Network/transient error — skipping error.llm reaction (no profile bump)`);
+        }
 
         // Detect "exhausted thinking budget" style errors (model spent all
         // max_tokens on reasoning and emitted no content). For these, bump

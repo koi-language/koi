@@ -62,7 +62,14 @@ export class PlaybookSession {
     const entry = {
       action,
       result: result || null,
-      error: error ? { message: error.message || String(error) } : null,
+      error: error
+        ? {
+            message: error.message || String(error),
+            name: error?.constructor?.name || error?.name || undefined,
+            code: error?.code || undefined,
+            causeCode: error?.cause?.code || undefined,
+          }
+        : null,
       timestamp: Date.now(),
       iteration: this.iteration
     };

@@ -1178,16 +1178,25 @@ CRITICAL RULES:
       // Escalate model on repeated LLM errors (truncated JSON, parse failures, etc.)
       // The classifier may keep returning the same category, so we force-bump scores
       // to break out of the "weak model → truncated → reclassify → same model" loop.
+      // BUT skip escalation when the recent errors are network/gateway failures —
+      // those have nothing to do with model capability and pushing to a bigger
+      // model just wastes credits on a request that will also fail.
       if (_isLoop && _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === '_llm_error')) {
-        const _bump = Math.min(30, _recentActions.length * 10); // 30 for 3 errors, capped
-        profile = {
-          ...profile,
-          code: Math.min(100, (profile.code || 50) + _bump),
-          reasoning: Math.min(100, (profile.reasoning || 50) + _bump),
-          difficulty: Math.min(100, (profile.difficulty || 50) + _bump),
-        };
-        session._autoProfile = profile;
-        channel.log('llm', `[classify] LLM error escalation: bumped scores by +${_bump} → code:${profile.code}, reasoning:${profile.reasoning}`);
+        const { isNetworkError } = await import('./is-network-error.js');
+        const _allNetErrs = _recentActions.every(e => isNetworkError(e.error));
+        if (_allNetErrs) {
+          channel.log('llm', `[classify] LLM error escalation skipped — all recent errors are network/transient (no model bump)`);
+        } else {
+          const _bump = Math.min(30, _recentActions.length * 10); // 30 for 3 errors, capped
+          profile = {
+            ...profile,
+            code: Math.min(100, (profile.code || 50) + _bump),
+            reasoning: Math.min(100, (profile.reasoning || 50) + _bump),
+            difficulty: Math.min(100, (profile.difficulty || 50) + _bump),
+          };
+          session._autoProfile = profile;
+          channel.log('llm', `[classify] LLM error escalation: bumped scores by +${_bump} → code:${profile.code}, reasoning:${profile.reasoning}`);
+        }
       }
 
       // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
