@@ -1448,6 +1448,23 @@ export class Agent {
           break;
         }
 
+        // Quota exceeded (HTTP 402) — the gateway says the user has no credits.
+        // Surface the upgrade dialog and pivot the turn to "wait for user
+        // input" WITHOUT entering the recovery path (which would retry the
+        // LLM and fail again). This flag is read in the CLI exit logic below
+        // to take the same path as a clean abort.
+        {
+          const { isQuotaExceededError, toQuotaExceededError } = await import('../llm/quota-exceeded-error.js');
+          if (isQuotaExceededError(error)) {
+            const quotaErr = toQuotaExceededError(error) || error;
+            const { showQuotaExceededDialog } = await import('../llm/quota-dialog.js');
+            await showQuotaExceededDialog(quotaErr);
+            channel.log('agent', `${this.name}: Quota exceeded — waiting for user input (no recovery)`);
+            session._quotaExceeded = true;
+            break;
+          }
+        }
+
         // Server errors (5xx) from the gateway — show in progress area (not persisted to history)
         const _httpStatus = error.status ?? error.statusCode;
         if (_httpStatus >= 500) {
@@ -2572,6 +2589,19 @@ export class Agent {
         } catch (error) {
           channel.clear();
           const failedIntent = action?.intent || action?.type || 'unknown';
+          // Quota exceeded thrown from inside a tool (embeddings, search, image
+          // gen, etc.) — show the upgrade dialog, mark the session so we skip
+          // the recovery LLM call, and break out of the turn. The loop does
+          // NOT die: CLI mode will then wait for the user's next prompt.
+          const { isQuotaExceededError, toQuotaExceededError } = await import('../llm/quota-exceeded-error.js');
+          if (isQuotaExceededError(error)) {
+            const quotaErr = toQuotaExceededError(error) || error;
+            const { showQuotaExceededDialog } = await import('../llm/quota-dialog.js');
+            await showQuotaExceededDialog(quotaErr);
+            channel.log('agent', `${this.name}: Action "${failedIntent}" aborted — quota exceeded, waiting for user input`);
+            session._quotaExceeded = true;
+            break;
+          }
           channel.log('error', `${this.name}: Action "${failedIntent}" failed [iter=${session.iteration}, delegate=${isDelegate}]: ${error.message}\n${error.stack}`);
           if (process.env.KOI_DEBUG_LLM) {
             console.error(`[Agent:${this.name}] ❌ Action "${failedIntent}" failed: ${error.message}\n${error.stack}`);
@@ -2685,6 +2715,89 @@ export class Agent {
         || (session._pivotCount || 0) > 3;
 
       channel.log('agent', `${this.name}: CLI mode — loop exited (errors: ${session.consecutiveErrors}, abort: ${exitedOnAbort}, recovery: ${_isRecovery})`);
+
+      // Quota exceeded: do NOT recurse into the reactive loop (that would just
+      // re-fire the same 402). Park the agent on a persistent prompt_user so
+      // the process stays alive waiting for whatever the user types next.
+      // Loop until we actually get a non-empty answer — exceptions and empty
+      // results are swallowed so a transient channel hiccup can't bring down
+      // the agent.
+      if (session._quotaExceeded) {
+        channel.log('agent', `${this.name}: Quota wait — parking on prompt_user until user types`);
+        // Disable the WS idle-shutdown safety net: in GUI mode, opening the
+        // subscription URL in the browser may steal focus from the Flutter
+        // app and briefly tear down the WS connection. That 10s timer would
+        // kill the engine right as the user is about to come back.
+        const _hasSuppress = typeof Agent._cliHooks?.suppressShutdown === 'function';
+        channel.log('agent', `${this.name}: suppressShutdown hook present=${_hasSuppress}`);
+        try {
+          Agent._cliHooks?.suppressShutdown?.(true);
+          channel.log('agent', `${this.name}: suppressShutdown(true) invoked`);
+        } catch (_e) {
+          channel.log('agent', `${this.name}: suppressShutdown threw: ${_e?.message || _e}`);
+        }
+        let _quotaAnswer = null;
+        let _quotaAttachments = [];
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          try {
+            Agent._cliHooks?.onBusy?.(false);
+            if (Agent._cliHooks?.hasPendingRequests?.()) {
+              const queuedInput = Agent._cliHooks.consumePendingRequest();
+              const queuedText = typeof queuedInput === 'string' ? queuedInput : (queuedInput?.text ?? '');
+              if (queuedText) {
+                _quotaAnswer = queuedText;
+                break;
+              }
+            }
+            const { result } = await this._executeAction(
+              { intent: 'prompt_user' },
+              { intent: 'prompt_user' },
+              session.actionContext
+            );
+            if (result?.answer) {
+              _quotaAnswer = result.answer;
+              _quotaAttachments = Array.isArray(result.attachments) ? result.attachments.filter(a => a.path) : [];
+              break;
+            }
+            // Empty answer — the GUI may have dismissed the prompt while the
+            // user opened the subscription page. Sleep briefly and ask again.
+            await new Promise(r => setTimeout(r, 500));
+          } catch (_err) {
+            // Channel error (disconnect, etc.) — keep retrying, never die.
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+
+        // Got a real answer — re-enable the idle shutdown safety net and
+        // restart the reactive loop with the user's message injected.
+        try { Agent._cliHooks?.suppressShutdown?.(false); } catch { /* */ }
+        this._lastUserMessage = _quotaAnswer;
+        let _attNote = '';
+        if (_quotaAttachments.length > 0) {
+          try {
+            const { attachmentRegistry } = await import('../state/attachment-registry.js');
+            const _attParts = _quotaAttachments.map(a => {
+              const id = attachmentRegistry.register(a.path, { role: a.role });
+              const entry = attachmentRegistry.get(id);
+              const roleTag = entry?.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
+              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'}${roleTag})`;
+            });
+            _attNote = `\n[Attached ${_attParts.join(', ')}]`;
+          } catch {
+            _attNote = `\n[Attached: ${_quotaAttachments.map(a => a.path.split('/').pop()).join(', ')}]`;
+          }
+        }
+        contextMemory.add('user', _quotaAnswer + _attNote, _quotaAnswer + _attNote, null,
+          _quotaAttachments.length > 0 ? { attachments: _quotaAttachments } : {});
+        this.contextMemoryState = contextMemory.serialize();
+        if (!this.amnesia && sessionTracker) {
+          sessionTracker.saveConversation(this.name, this.contextMemoryState);
+        }
+        const _quotaFreshPlaybook = playbookResolver ? await playbookResolver() : interpolatedPlaybook;
+        this._nextSessionIsContinuation = true;
+        return await this._executePlaybookReactive(eventName, _quotaFreshPlaybook, args, context, this.contextMemoryState, false, false, playbookResolver);
+      }
 
       // Ctrl+C abort: stop silently. No LLM call, no recovery greeting.
       // agentBusy is already false (cleared above). Directly show the input

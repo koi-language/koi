@@ -102,6 +102,14 @@ export default {
       };
     } catch (err) {
       channel.clear();
+      // Rethrow quota-exceeded so the agent's action catch handles it uniformly
+      // (shows the upgrade dialog once and parks the session). Returning a
+      // plain failure here would cause the LLM to be re-called and trigger a
+      // second dialog from the LLM catch path.
+      const { isQuotaExceededError, toQuotaExceededError } = await import('../../llm/quota-exceeded-error.js');
+      if (isQuotaExceededError(err)) {
+        throw toQuotaExceededError(err) || err;
+      }
       return { success: false, error: `Indexing failed: ${err.message}` };
     }
   },

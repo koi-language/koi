@@ -22,6 +22,18 @@
 
 import { BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen } from './base.js';
 import { lookupModel } from '../cost-center.js';
+import { parseQuotaExceededResponse } from '../quota-exceeded-error.js';
+
+/**
+ * Throw a QuotaExceededError if the response is HTTP 402. Callers should
+ * `await throwIfQuotaExceeded(res)` immediately after `fetch()` so that the
+ * no-credits case short-circuits any per-endpoint error handling below.
+ */
+async function throwIfQuotaExceeded(res) {
+  if (res.status === 402) {
+    throw await parseQuotaExceededResponse(res);
+  }
+}
 
 // ── Gateway base URL ─────────────────────────────────────────────────────────
 
@@ -92,6 +104,7 @@ export class GatewayEmbedding extends BaseEmbedding {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway embedding error (${res.status}): ${body}`);
@@ -136,6 +149,9 @@ export class GatewayEmbedding extends BaseEmbedding {
           break;
         }
 
+        // 402 = no credits — abort the whole batch loop immediately.
+        await throwIfQuotaExceeded(res);
+
         if (res.status === 429 && attempt < MAX_RETRIES) {
           // Respect Retry-After header; default to 60s (gateway says "retry in 1 minute")
           const retryAfter = parseInt(res.headers.get('retry-after'), 10);
@@ -175,6 +191,7 @@ export class GatewaySearch extends BaseSearch {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway search error (${res.status}): ${body}`);
@@ -253,6 +270,7 @@ export class GatewayImageGen extends BaseImageGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       // Preserve structured errors from the backend (e.g. no_model_matches with availableLabels).
       const bodyText = await res.text().catch(() => '');
@@ -297,6 +315,7 @@ export class GatewayImageGen extends BaseImageGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway image edit error (${res.status}): ${body}`);
@@ -337,6 +356,7 @@ export class GatewayAudioGen extends BaseAudioGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway audio error (${res.status}): ${body}`);
@@ -358,6 +378,7 @@ export class GatewayAudioGen extends BaseAudioGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway transcribe error (${res.status}): ${body}`);
@@ -455,6 +476,7 @@ export class GatewayVideoGen extends BaseVideoGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway video error (${res.status}): ${body}`);
@@ -476,6 +498,7 @@ export class GatewayVideoGen extends BaseVideoGen {
       signal: opts.abortSignal,
     });
 
+    await throwIfQuotaExceeded(res);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway video status error (${res.status}): ${body}`);

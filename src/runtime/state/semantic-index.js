@@ -22,6 +22,7 @@ import crypto from 'crypto';
 import { parseFile, getSupportedExtensions } from '../code/code-parser.js';
 import { IGNORE_DIRS, discoverFiles } from '../code/file-discovery.js';
 import { channel } from '../io/channel.js';
+import { isQuotaExceededError } from '../llm/quota-exceeded-error.js';
 
 const EMBEDDING_DIM = 1536; // text-embedding-3-small dimension
 const FUNC_BATCH_SIZE = 10;
@@ -151,6 +152,15 @@ export class SemanticIndex {
           batch.map(entry => this._prepareFile(entry.absPath, entry.indexPath, entry.content, entry.hash, entry.manifestKey))
         );
 
+        // If any file-prep task failed with a quota error (description LLM
+        // calls go through the gateway too), abort the entire build.
+        for (const r of results) {
+          if (r.status === 'rejected' && isQuotaExceededError(r.reason)) {
+            this._saveManifest();
+            throw r.reason;
+          }
+        }
+
         // Phase 3: Collect all embed jobs from all files in this batch
         const allEmbedTexts = [];
         const preparedFiles = [];
@@ -166,7 +176,16 @@ export class SemanticIndex {
         // Single batch embedding call for all files in this batch
         let allVectors = [];
         if (allEmbedTexts.length > 0) {
-          allVectors = await this.llmProvider.getEmbeddingBatch(allEmbedTexts);
+          try {
+            allVectors = await this.llmProvider.getEmbeddingBatch(allEmbedTexts);
+          } catch (err) {
+            if (isQuotaExceededError(err)) {
+              // Persist whatever progress we made so a resumed run picks up here.
+              this._saveManifest();
+              throw err;
+            }
+            throw err;
+          }
         }
 
         // Phase 4: Store results — give each file its slice of vectors

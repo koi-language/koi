@@ -93,11 +93,17 @@ function _resolveLLM(req) {
     const model = envModelOverride;
     channel.log('llm', `[forced] ${agentName || 'agent'} → ${provider}/${model} | ${taskType}`);
     channel.setInfo('model', model);
-    // Create a direct client for the forced provider — bypass gateway.
-    // In gateway mode, clients[provider] returns the gateway proxy, so we
-    // create a fresh direct client using the API key instead.
+    // Resolve client for the forced provider.
+    // If the user is signed in (KOI_AUTH_TOKEN set), ALWAYS route through
+    // the gateway — never fall back to local env API keys. Mixing gateway
+    // and direct providers in the same session bypasses credit accounting.
+    // Only when the user is NOT signed in (or explicitly offline) do we
+    // fall through to direct clients built from local env vars.
+    const _isSignedIn = !!process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE;
     let client;
-    if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
+    if (_isSignedIn) {
+      client = clients[provider];
+    } else if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
       client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     } else if (provider === 'openai' && process.env.OPENAI_API_KEY) {
       client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });

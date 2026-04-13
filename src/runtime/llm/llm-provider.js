@@ -33,6 +33,7 @@ import { buildReactiveSystemPrompt, buildSystemPrompt, loadKoiMd, buildSmartReso
 import { executeCompose as _executeCompose, callJSONWithMessages as _callJSONWithMessages, inferProviderFromModel } from './compose-executor.js';
 import { StreamingPrintParser } from './streaming-print.js';
 import { optimizeImage, resolveAttachments, injectMcpImages, pruneOldImages, injectCacheControl } from './message-builder.js';
+import { isQuotaExceededError, toQuotaExceededError } from './quota-exceeded-error.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -268,6 +269,12 @@ export class LLMProvider {
       this.model = 'auto';
       this.openai = null;
       this.anthropic = null;
+      // Clear any direct-provider clients built earlier from local env keys.
+      // Once signed in, ALL LLM traffic must go through the gateway so
+      // credits/usage are accounted for — never mix gateway and direct.
+      this._oa = null;
+      this._ac = null;
+      this._gc = null;
       this._availableProviders = [];
       this._modelsReady = this.syncGatewayProviders().then(() => {
         this._modelsReady = null;
@@ -1794,6 +1801,13 @@ CRITICAL RULES:
       // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
       // model is unavailable. Remove that provider from candidates so we don't hammer it
       // on every retry iteration — the agent would otherwise loop forever with the same error.
+      // 402 Payment Required — gateway says the user is out of credits.
+      // Convert to QuotaExceededError so upstream catches (tool loop, agent)
+      // can surface the upgrade dialog. Do this BEFORE the generic 4xx
+      // provider-exclusion logic so we don't nuke the provider list.
+      if (isQuotaExceededError(_callErr)) {
+        throw toQuotaExceededError(_callErr) || _callErr;
+      }
       if (this._autoMode) {
         const _status = _callErr.status ?? _callErr.statusCode;
         // 429 = rate limit — put provider on cooldown

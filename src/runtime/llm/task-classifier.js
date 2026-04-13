@@ -390,6 +390,15 @@ ${taskDescription}`;
         }
         this._log('llm', `[classify] Invalid shape from ${candidate.model}: ${JSON.stringify(json)}`);
       } catch (e) {
+        // Quota exceeded — don't burn through more fallback candidates, we
+        // already know none of them will succeed. Fall back to the default
+        // profile immediately so the real LLM call (which will itself 402)
+        // happens ASAP and surfaces the upgrade dialog.
+        const _s = e?.status ?? e?.statusCode;
+        if (_s === 402 || e?.name === 'QuotaExceededError' || /QUOTA_EXCEEDED/i.test(e?.message || '')) {
+          this._log('llm', `[classify] ${candidate.model} → 402 quota exceeded — skipping remaining candidates`);
+          break;
+        }
         consecutiveFailures++;
         this._log('llm', `[classify] ${candidate.model} failed: ${e.message} (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive)`);
       }

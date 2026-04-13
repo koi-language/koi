@@ -54,6 +54,12 @@ export class EmbeddingProvider {
     const MAX_RETRIES = 2;
     const TIMEOUT_MS = 15000;
     const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
+    // Fail fast when no credentials are configured — retrying the same 'none'
+    // provider with 2s+4s backoff just wastes the startup window while the
+    // agent is blocked on memory restore / semantic index warmup.
+    if (_provider === 'none') {
+      throw new Error('No embedding provider available (need KOI_AUTH_TOKEN, OPENAI_API_KEY, or GEMINI_API_KEY)');
+    }
     let lastError;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -118,7 +124,17 @@ export class EmbeddingProvider {
         const isTimeout = ac.signal.aborted;
         const msg = isTimeout ? `embedding timeout after ${elapsed}ms` : error.message;
         this._log('memory', `Embedding FAILED: ${msg} (provider=${_provider}, textLen=${text.length}, elapsed=${elapsed}ms, attempt=${attempt})`);
-        lastError = new Error(msg);
+        lastError = error; // preserve typed errors (e.g. QuotaExceededError) for upstream detection
+        // Surface 402 once so the user sees "no credits" instead of a frozen UI.
+        try {
+          const { isQuotaExceededError, surfaceQuotaIfDetected } = await import('./quota-exceeded-error.js');
+          if (isQuotaExceededError(error)) {
+            await surfaceQuotaIfDetected(error);
+            throw error;
+          }
+        } catch (_e) {
+          if (_e === error) throw error;
+        }
         // Retry on timeout or 5xx errors; don't retry auth/validation errors
         const status = error.status || 0;
         if (!isTimeout && status > 0 && status < 500) throw lastError;

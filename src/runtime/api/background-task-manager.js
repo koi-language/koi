@@ -71,7 +71,15 @@ class BackgroundTaskManager {
         entry.status = 'error';
         entry.error = err.message;
         this._updateFooter();
-        channel.log('background', `Task "${name}" FAILED: ${err.message}\n${err.stack || ''}`);
+        // Quota exceeded is expected when the user has no credits — log it
+        // without a stack trace and don't spam the logs. The foreground agent
+        // is already responsible for surfacing the upgrade dialog.
+        const _isQuota = err?.name === 'QuotaExceededError' || err?.status === 402;
+        if (_isQuota) {
+          channel.log('background', `Task "${name}" stopped — quota exceeded (no credits).`);
+        } else {
+          channel.log('background', `Task "${name}" FAILED: ${err.message}\n${err.stack || ''}`);
+        }
         // Auto-cleanup after 5s
         setTimeout(() => {
           if (this._tasks.get(name) === entry) {
@@ -196,6 +204,15 @@ class BackgroundTaskManager {
         }, { depDirs });
 
         channel.log('background', 'Semantic indexing complete');
+      } catch (err) {
+        try {
+          const { surfaceQuotaIfDetected } = await import('../llm/quota-exceeded-error.js');
+          if (await surfaceQuotaIfDetected(err)) {
+            channel.log('background', 'Semantic indexing hit 402 — quota dialog surfaced');
+            return;
+          }
+        } catch { /* best-effort */ }
+        throw err;
       } finally {
         // Release lock
         try { fs.unlinkSync(lockPath); } catch { /* */ }

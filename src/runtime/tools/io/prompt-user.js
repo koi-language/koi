@@ -126,42 +126,11 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     const isQuota = action._quota_exceeded || action.data?._quota_exceeded;
     const quotaOptions = action._quota_options || action.data?._quota_options;
     if (isQuota && quotaOptions && Array.isArray(quotaOptions)) {
-      const msg = action.message || action.data?.message || 'Choose an option:';
-      const labels = quotaOptions.map(o => o.label);
-      const selected = await channel.select(msg, labels.map((l, i) => ({ title: l, value: i })), 0);
-      const chosen = quotaOptions[selected ?? 0];
-
-      if (chosen?.action === 'open_url' && chosen.url) {
-        try {
-          const { exec } = await import('child_process');
-          const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-          exec(`${cmd} "${chosen.url}"`);
-        } catch {}
-      } else if (chosen?.action === 'print') {
-        channel.print(channel.renderMarkdown(chosen.text || ''));
-      } else if (chosen?.action === 'show_api_keys_prompt') {
-        // GUI mode: trigger the Flutter welcome dialog directly in the
-        // "API keys" input view, so the user can paste keys inline.
-        // Terminal mode: fall back to printing the text instructions.
-        const isGui = process.env.KOI_GUI_MODE === '1';
-        if (isGui && typeof channel.showWelcomeApiKeysPrompt === 'function') {
-          channel.showWelcomeApiKeysPrompt();
-        } else if (chosen.text) {
-          channel.print(channel.renderMarkdown(chosen.text));
-        }
-      } else if (chosen?.action === 'logout') {
-        // Delete token and restart so the user can log in with a different account
-        try {
-          const os = await import('os');
-          const path = await import('path');
-          const fs = await import('fs');
-          fs.unlinkSync(path.join(os.homedir(), '.koi', '.token'));
-        } catch {}
-        channel.print('Logged out. Please restart koi-cli to log in with a different account.');
-        process.exit(0);
-      } else if (chosen?.action === 'exit') {
-        process.exit(0);
-      }
+      const { showQuotaExceededDialog } = await import('../../llm/quota-dialog.js');
+      await showQuotaExceededDialog({
+        message: action.message || action.data?.message || 'Choose an option:',
+        options: quotaOptions,
+      });
       // Return empty answer so agent goes back to prompt_user (waiting for user input)
       return { answer: '' };
     }

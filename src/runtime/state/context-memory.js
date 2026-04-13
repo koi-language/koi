@@ -1109,6 +1109,10 @@ export class ContextMemory {
       return false;
     } catch (err) {
       channel.log('memory', `Summarization exception: ${err.message} (${Date.now() - _t0}ms)`);
+      try {
+        const { surfaceQuotaIfDetected } = await import('../llm/quota-exceeded-error.js');
+        await surfaceQuotaIfDetected(err);
+      } catch { /* best-effort */ }
       return false;
     }
   }
@@ -1164,6 +1168,10 @@ export class ContextMemory {
       this._latentCount++;
     } catch (err) {
       channel.log('memory', `_moveToLatent failed: ${err.message}`);
+      try {
+        const { surfaceQuotaIfDetected } = await import('../llm/quota-exceeded-error.js');
+        await surfaceQuotaIfDetected(err);
+      } catch { /* best-effort */ }
     }
   }
 
