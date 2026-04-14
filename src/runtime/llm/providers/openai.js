@@ -204,6 +204,20 @@ export class OpenAIResponsesLLM extends BaseLLM {
   //            → Responses wants { type: 'input_image', image_url: <string> }
   // Without this, passing an array content through unchanged makes OpenRouter
   // reject the call with `"expected string, received array"` on image_url.
+  // The Responses API requires `instructions` to be a plain string. Our
+  // message-builder may have split the system prompt into an array of text
+  // parts (with cache_control markers) for providers that support prompt
+  // caching. Flatten back to a single string here.
+  _flattenSystemToString(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map(p => (p && typeof p === 'object' && typeof p.text === 'string') ? p.text : '')
+        .join('');
+    }
+    return String(content || '');
+  }
+
   _normalizeContentForResponses(content) {
     if (typeof content === 'string') return content;
     if (!Array.isArray(content)) return content;
@@ -229,7 +243,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
     const { abortSignal, onChunk, onHeartbeat } = opts;
 
     // Responses API: system → instructions, user/assistant → input
-    const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+    const systemPrompt = this._flattenSystemToString(messages.find(m => m.role === 'system')?.content || '');
     let inputMessages = messages
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
@@ -360,7 +374,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
     try {
-      const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
+      const systemPrompt = this._flattenSystemToString(messages.find(m => m.role === 'system')?.content || '');
       let inputMessages = messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
