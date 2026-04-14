@@ -12,12 +12,13 @@
  */
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
+import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 
 import fs from 'fs';
 import path from 'path';
 import { channel } from '../../io/channel.js';
 
-export default {
+const generateAudioAction = {
   type: 'generate_audio',
   intent: 'generate_audio',
   description: 'Generate speech audio from text, or transcribe audio to text. Two modes: "speech" converts text to audio file (TTS), "transcribe" converts audio file to text (STT). Fields: For speech mode: "text" (required), optional "voice" (alloy|echo|fable|onyx|nova|shimmer), optional "outputFormat" (mp3|opus|aac|flac|wav), optional "speed" (0.25-4.0), "saveTo" (required, file path). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). Returns: For speech: { success, savedTo, format, fileSize }. For transcribe: { success, text, duration }',
@@ -131,3 +132,50 @@ export default {
     throw new Error(`generate_audio: unknown mode "${mode}" — use "speech" or "transcribe"`);
   }
 };
+
+// Fire-and-forget: rewrite the tool schema from the backend's active audio
+// model set so the agent only ever sees parameters the backend can serve.
+fetchMediaCapabilities('audio').then((caps) => {
+  if (!caps) return;
+  const props = generateAudioAction.schema.properties;
+
+  // mode: restrict to whichever audio kinds the backend actually serves.
+  if (Array.isArray(caps.kinds) && caps.kinds.length) {
+    props.mode = {
+      type: 'string',
+      enum: caps.kinds,
+      description: `Mode: ${caps.kinds.map((k) => `"${k}"`).join(', ')}.`,
+    };
+  } else {
+    delete props.mode;
+  }
+
+  if (!caps.anyTts) {
+    delete props.text;
+    delete props.outputFormat;
+    delete props.speed;
+    delete props.saveTo;
+    delete props.voice;
+  } else if (!caps.anyVoiceSelect) {
+    delete props.voice;
+  }
+
+  if (!caps.anyTranscribe) {
+    delete props.audioFile;
+    delete props.language;
+  }
+
+  if (caps.labels?.length) {
+    const list = caps.labels.map((l) => `"${l}"`).join(', ');
+    props.label = {
+      type: 'string',
+      enum: caps.labels,
+      description: `Optional ranking preference — the router prefers a model tagged with this label. Available: ${list}.`,
+    };
+    generateAudioAction.description += ` Optional "label" ranking hint (one of: ${list}).`;
+  } else {
+    delete props.label;
+  }
+}).catch(() => {});
+
+export default generateAudioAction;

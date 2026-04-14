@@ -55,29 +55,198 @@ function _getMediaCaps(model) {
   return info?.mediaCaps || null;
 }
 
-// ── Dynamic image capabilities (labels + enums) from the backend ─────────────
+// ── Dynamic media capabilities from the backend models list ────────────────
 //
-// Cached for the process lifetime. The first caller kicks off a fetch; later
-// callers share the same promise. On failure we return null and the tool
-// keeps its static defaults, so missing auth / offline backend never breaks
-// image generation.
+// Source of truth: GET /gateway/models/{image,video,audio}.json — the
+// authoritative list of currently active media models from the backend DB.
+// We fetch once per process per kind, take the DISTINCT union of the
+// capability columns, and expose a single blob the runtime tools use to
+// build dynamic schemas so the agent only ever sees values the backend can
+// actually serve (no phantom aspect ratios, no phantom resolutions, no
+// phantom labels).
+//
+// Design intent (important):
+//   - Labels are a RANKING preference, not a filter. A model without the
+//     label is still eligible, it just ranks lower.
+//   - Any parameter (label, resolution, aspectRatio, n, refs, withAudio…)
+//     is surfaced to the agent ONLY when at least one active model in the
+//     set supports it. Empty → omit from the schema entirely.
+//
+// Returns null on any failure (offline, unauth, 5xx). Callers treat that
+// as "unknown, fall back to static defaults".
 
-let _imageCapabilitiesPromise = null;
+const _mediaCapabilitiesPromises = { image: null, video: null, audio: null };
 
-export function fetchImageCapabilities() {
-  if (_imageCapabilitiesPromise) return _imageCapabilitiesPromise;
-  _imageCapabilitiesPromise = (async () => {
+const _splitCsv = (s) => {
+  if (typeof s !== 'string') return [];
+  return s.split(',').map((x) => x.trim()).filter(Boolean);
+};
+
+function _collectCommon(models) {
+  const labelSet = new Set();
+  const resolutionSet = new Set();
+  const aspectRatioSet = new Set();
+  for (const m of models) {
+    if (Array.isArray(m?.labels)) {
+      for (const l of m.labels) {
+        if (typeof l === 'string' && l.trim()) labelSet.add(l.trim());
+      }
+    }
+    for (const r of _splitCsv(m?.resolutions)) resolutionSet.add(r);
+    for (const a of _splitCsv(m?.aspectRatios)) aspectRatioSet.add(a);
+  }
+  return {
+    labels:       [...labelSet].sort(),
+    resolutions:  [...resolutionSet],
+    aspectRatios: [...aspectRatioSet],
+  };
+}
+
+function _aggregateImage(models) {
+  const common = _collectCommon(models);
+  let anyCanGenerate = false;
+  let anyCanEdit = false;
+  let maxImages = 0;
+  let maxRefImages = 0;
+  let hasRefImageSupport = false;
+  for (const m of models) {
+    if (m?.canGenerate) anyCanGenerate = true;
+    if (m?.canEdit) anyCanEdit = true;
+    if (typeof m?.maxImages === 'number' && m.maxImages > maxImages) {
+      maxImages = m.maxImages;
+    }
+    if (m?.maxRefImages != null) {
+      hasRefImageSupport = true;
+      if (m.maxRefImages === 0) {
+        maxRefImages = Math.max(maxRefImages, 16);
+      } else if (typeof m.maxRefImages === 'number' && m.maxRefImages > maxRefImages) {
+        maxRefImages = m.maxRefImages;
+      }
+    }
+  }
+  return {
+    models,
+    ...common,
+    anyCanGenerate,
+    anyCanEdit,
+    maxImages: maxImages || 1,
+    hasRefImageSupport,
+    maxRefImages,
+  };
+}
+
+function _aggregateVideo(models) {
+  const common = _collectCommon(models);
+  let anyTextToVideo = false;
+  let anyImageToVideo = false;
+  let anyVideoToVideo = false;
+  let anyFrameControl = false;
+  let anyAudio = false;
+  for (const m of models) {
+    if (m?.textToVideo) anyTextToVideo = true;
+    if (m?.imageToVideo) anyImageToVideo = true;
+    if (m?.videoToVideo) anyVideoToVideo = true;
+    if (m?.frameControl) anyFrameControl = true;
+    if (m?.hasAudio) anyAudio = true;
+  }
+  return {
+    models,
+    ...common,
+    anyTextToVideo,
+    anyImageToVideo,
+    anyVideoToVideo,
+    anyFrameControl,
+    anyAudio,
+    hasRefImageSupport: anyImageToVideo || anyVideoToVideo,
+  };
+}
+
+function _aggregateAudio(models) {
+  const common = _collectCommon(models);
+  let anyTts = false;
+  let anyTranscribe = false;
+  let anyMusic = false;
+  let anySfx = false;
+  let anyVoiceSelect = false;
+  for (const m of models) {
+    if (m?.tts) anyTts = true;
+    if (m?.transcribe) anyTranscribe = true;
+    if (m?.music) anyMusic = true;
+    if (m?.sfx) anySfx = true;
+    if (m?.voiceSelect) anyVoiceSelect = true;
+  }
+  const kinds = [];
+  if (anyTts) kinds.push('tts');
+  if (anyTranscribe) kinds.push('transcribe');
+  if (anyMusic) kinds.push('music');
+  if (anySfx) kinds.push('sfx');
+  return {
+    models,
+    ...common,
+    kinds,
+    anyTts,
+    anyTranscribe,
+    anyMusic,
+    anySfx,
+    anyVoiceSelect,
+  };
+}
+
+const _aggregateByKind = {
+  image: _aggregateImage,
+  video: _aggregateVideo,
+  audio: _aggregateAudio,
+};
+
+/**
+ * Fetch + cache the active media models of a given kind plus a union of the
+ * user-facing capability signals the runtime tools need to build dynamic
+ * schemas. Cached for the process lifetime. Returns null on any failure.
+ */
+export function fetchMediaCapabilities(kind) {
+  if (!_mediaCapabilitiesPromises.hasOwnProperty(kind)) {
+    return Promise.resolve(null);
+  }
+  if (_mediaCapabilitiesPromises[kind]) return _mediaCapabilitiesPromises[kind];
+  _mediaCapabilitiesPromises[kind] = (async () => {
     try {
-      const res = await fetch(`${getGatewayBase()}/fal/capabilities`, {
+      const res = await fetch(`${getGatewayBase()}/models/${kind}.json`, {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return null;
-      return await res.json();
+      const models = await res.json();
+      if (!Array.isArray(models) || models.length === 0) return null;
+      return _aggregateByKind[kind](models);
     } catch {
       return null;
     }
   })();
-  return _imageCapabilitiesPromise;
+  return _mediaCapabilitiesPromises[kind];
+}
+
+// ── Client-side media model resolver ────────────────────────────────────────
+//
+// Mirrors how text LLMs work: the backend is a dumb proxy that runs whatever
+// slug the client sends. Hard filters + soft ranking live in the runtime
+// (see media-model-router.js), fed by the live /gateway/models/{kind}.json
+// list. When the caller provides an explicit slug we trust it verbatim and
+// skip the router.
+
+function _toNoMatchError(routingErr) {
+  const err = new Error(routingErr.message);
+  err.details = { code: 'no_model_matches', ...(routingErr.details || {}) };
+  return err;
+}
+
+async function _resolveMediaModel(kind, explicit, opts, pickFn, req) {
+  if (explicit && explicit !== 'auto') return explicit;
+  const caps = await fetchMediaCapabilities(kind);
+  if (!caps || !Array.isArray(caps.models) || caps.models.length === 0) {
+    const err = new Error(`No active ${kind} models available from the backend`);
+    err.details = { code: 'no_model_matches', requirements: req };
+    throw err;
+  }
+  return await pickFn(caps.models, req);
 }
 
 // ── GatewayEmbedding ─────────────────────────────────────────────────────────
@@ -246,15 +415,31 @@ export class GatewayImageGen extends BaseImageGen {
   }
 
   async generate(prompt, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('image', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickImageModel, MediaModelRoutingError }) => {
+        try {
+          return pickImageModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      {
+        n: opts.n,
+        resolution: opts.resolution,
+        aspectRatio: opts.aspectRatio,
+        refsCount: opts.referenceImages?.length || 0,
+        label: opts.label,
+      },
+    );
+
     // Only include fields that the gateway/fal understand — omit undefined/unsupported
-    const payload = { model: this.model, prompt };
+    const payload = { model: resolvedModel, prompt };
     if (opts.n && opts.n > 1) payload.num_images = opts.n;
     if (opts.aspectRatio) payload.aspect_ratio = opts.aspectRatio;
     if (opts.outputFormat) payload.output_format = opts.outputFormat;
-    // resolution/quality are normalized params mapped by the backend, pass through if set
+    // resolution/quality are passed through to the Fal model as-is.
     if (opts.resolution) payload.resolution = opts.resolution;
-    // Capability label — backend uses this to pick the best matching model.
-    if (opts.label) payload.label = opts.label;
 
     if (opts.referenceImages?.length) {
       payload.reference_images = opts.referenceImages.map(ref => ({
@@ -343,11 +528,23 @@ export class GatewayAudioGen extends BaseAudioGen {
   get providerName() { return 'koi-gateway'; }
 
   async speech(text, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+        try {
+          return pickAudioModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'tts', label: opts.label },
+    );
+
     const res = await fetch(`${getGatewayBase()}/media/audio/speech`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({
-        model: this.model,
+        model: resolvedModel,
         input: text,
         voice: opts.voice || 'alloy',
         response_format: opts.outputFormat || 'mp3',
@@ -367,11 +564,23 @@ export class GatewayAudioGen extends BaseAudioGen {
   }
 
   async transcribe(audio, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+        try {
+          return pickAudioModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'transcribe', label: opts.label },
+    );
+
     const res = await fetch(`${getGatewayBase()}/media/audio/transcribe`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({
-        model: 'whisper-1',
+        model: resolvedModel,
         language: opts.language,
         response_format: opts.format || 'json',
       }),
@@ -440,8 +649,28 @@ export class GatewayVideoGen extends BaseVideoGen {
   }
 
   async generate(prompt, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('video', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
+        try {
+          return pickVideoModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      {
+        resolution: opts.resolution,
+        aspectRatio: opts.aspectRatio,
+        hasStartFrame: !!opts.startFrame?.data,
+        hasEndFrame: !!opts.endFrame?.data,
+        withAudio: !!opts.withAudio,
+        refsCount: opts.referenceImages?.length || 0,
+        label: opts.label,
+      },
+    );
+
     const payload = {
-      model: this.model,
+      model: resolvedModel,
       prompt,
       aspect_ratio: opts.aspectRatio || '16:9',
       resolution: opts.resolution || '720p',

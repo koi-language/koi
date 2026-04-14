@@ -1513,6 +1513,38 @@ CRITICAL RULES:
     channel.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, ~${_estInputTokens} tokens, last user msg: ${lastUserMsgText.length} chars)`);
     channel.log('llm', `Last user msg preview: ${lastUserMsgText.substring(0, 300)}${lastUserMsgText.length > 300 ? '...' : ''}`);
 
+    // Full-message dump for debugging hallucination / prompt-regression bugs.
+    // Enable with KOI_DUMP_LLM=1. Writes one JSON file per LLM call to
+    // ~/.koi/debug/ containing the entire `messages` array (system + user +
+    // assistant + tool), plus provider/model metadata. The file is written
+    // synchronously so a crash or abort right after this line still leaves
+    // the artifact on disk.
+    if (process.env.KOI_DUMP_LLM) {
+      try {
+        const _fs = await import('fs');
+        const _path = await import('path');
+        const _os = await import('os');
+        const _dir = _path.join(_os.homedir(), '.koi', 'debug');
+        _fs.mkdirSync(_dir, { recursive: true });
+        const _ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const _agent = (agent?.name || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const _file = _path.join(_dir, `llm-${_ts}-${_agent}.json`);
+        _fs.writeFileSync(_file, JSON.stringify({
+          timestamp: new Date().toISOString(),
+          agent: agent?.name || null,
+          provider: this.provider,
+          model: this.model,
+          reasoningEffort: this._reasoningEffort || null,
+          msgCount,
+          estInputTokens: _estInputTokens,
+          messages,
+        }, null, 2));
+        channel.log('llm', `[dump] Full prompt → ${_file}`);
+      } catch (e) {
+        channel.log('llm', `[dump] Failed to write debug dump: ${e.message}`);
+      }
+    }
+
     // Real-time streaming callback: updates the token footer as chunks arrive.
     // Also detects print intent and streams the message content to the UI in real-time.
     // (_fmtTk defined above for input token estimate)

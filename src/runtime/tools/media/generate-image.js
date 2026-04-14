@@ -11,17 +11,24 @@
  */
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
-import { fetchImageCapabilities } from '../../llm/providers/gateway.js';
+import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 
+// NOTE on the "label" parameter: intentionally NOT declared in the static
+// schema or description below. It is injected at import time by the
+// fetchMediaCapabilities('image') block at the bottom of this file — and ONLY when
+// the backend advertises at least one distinct label across its active image
+// models. When the label set is empty (or the fetch fails), the parameter
+// simply does not exist from the agent's point of view. Do not re-add it
+// here.
 const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
-  description: 'Generate an image from a text prompt. Supports reference images (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution" (low|medium|high|ultra), optional "quality" (auto|low|medium|high), optional "n" (number of images, default 1), optional "referenceImages" (array of file paths / attachment IDs), optional "saveTo" (directory to save images), optional "label" (capability label — pick the model best suited for what you want: e.g. "photorealistic", "illustration", "consistency", "text-rendering"). Returns: { success, provider, model, capabilities, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }. IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — you MUST state it explicitly in "prompt". Start the prompt with a clear directive such as "Using the reference image as a STYLE guide, ..." / "...in the exact art style of the reference image" (for style transfer), or "Edit the reference image to ..." (for img2img edits), or "Use the reference image as the subject and ..." (for subject preservation). If the user supplies a reference for style but asks for a different subject, lead the prompt with the style directive and keep your own stylistic adjectives minimal so they do not compete with the reference.',
+  description: 'Generate an image from a text prompt. Supports reference images (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (array of file paths / attachment IDs), optional "saveTo" (directory to save images). For "aspectRatio" and "resolution" you MUST pick one of the exact values from the enum in the schema — the allowed values come from the live backend catalog and any other value will be rejected. Omit either parameter to let the backend choose a default. Returns: { success, provider, model, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }. IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — you MUST state it explicitly in "prompt". Start the prompt with a clear directive such as "Using the reference image as a STYLE guide, ..." / "...in the exact art style of the reference image" (for style transfer), or "Edit the reference image to ..." (for img2img edits), or "Use the reference image as the subject and ..." (for subject preservation). If the user supplies a reference for style but asks for a different subject, lead the prompt with the style directive and keep your own stylistic adjectives minimal so they do not compete with the reference.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -29,24 +36,22 @@ const generateImageAction = {
     type: 'object',
     properties: {
       prompt:          { type: 'string', description: 'Text description of the desired image' },
-      aspectRatio:     { type: 'string', description: 'Aspect ratio (REQUIRED — choose based on user intent): 1:1 (square), 16:9 (landscape wide), 9:16 (portrait tall/vertical), 4:3 (landscape standard), 3:4 (portrait standard), 3:2 (landscape photo), 2:3 (portrait photo), 21:9 (ultrawide). For portrait/vertical/tall requests use 9:16 or 2:3. For landscape/wide use 16:9 or 3:2. Default: 1:1' },
-      resolution:      { type: 'string', description: 'Resolution: low (~512px), medium (~1024px), high (~2048px), ultra (~4096px) (default: medium)' },
-      quality:         { type: 'string', description: 'Quality: auto, low, medium, high (default: auto)' },
+      aspectRatio:     { type: 'string', description: 'Aspect ratio — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
+      resolution:      { type: 'string', description: 'Resolution — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
       referenceImages: { type: 'array',  description: 'Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.', items: { type: 'string' } },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
-      label:           { type: 'string', description: 'Capability label used to pick the best model for the task. Leave empty for the default fallback. Common labels (actual set comes from backend): photorealistic, illustration, consistency, text-rendering, fast, high-detail.' },
-      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should use "label" instead and let the backend pick the cheapest matching model).' }
+      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should let the backend pick the cheapest capable model).' }
     },
     required: ['prompt']
   },
 
   examples: [
     { intent: 'generate_image', prompt: 'A serene mountain lake at sunset, oil painting style' },
-    { intent: 'generate_image', prompt: 'Logo for a tech startup', aspectRatio: '1:1', resolution: 'high', quality: 'high' },
-    { intent: 'generate_image', prompt: 'Using the reference image as a STYLE guide, create an illustration of a smartphone floating in perspective, in the exact art style of the reference image', referenceImages: ['att-1'], aspectRatio: '4:3' },
-    { intent: 'generate_image', prompt: 'Edit the reference image: change the eye color to red, keep everything else identical', referenceImages: ['/Users/me/.koi/images/kitten.png'], aspectRatio: '1:1' }
+    { intent: 'generate_image', prompt: 'Logo for a tech startup' },
+    { intent: 'generate_image', prompt: 'Using the reference image as a STYLE guide, create an illustration of a smartphone floating in perspective, in the exact art style of the reference image', referenceImages: ['att-1'] },
+    { intent: 'generate_image', prompt: 'Edit the reference image: change the eye color to red, keep everything else identical', referenceImages: ['/Users/me/.koi/images/kitten.png'] }
   ],
 
   async execute(action, agent) {
@@ -140,47 +145,47 @@ const generateImageAction = {
 
     // Log full generation request details
     const refPaths = action.referenceImages?.length ? action.referenceImages : [];
-    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", aspectRatio=${action.aspectRatio || 'default'}, resolution=${action.resolution || 'default'}, quality=${action.quality || 'auto'}, n=${action.n || 1}, refs=${refPaths.length}${refPaths.length ? ' [' + refPaths.map(p => path.basename(p)).join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
+    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", aspectRatio=${action.aspectRatio || '-'}, resolution=${action.resolution || '-'}, n=${action.n || 1}, refs=${refPaths.length}${refPaths.length ? ' [' + refPaths.map(p => path.basename(p)).join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
 
-    // Validate aspectRatio against model capabilities
-    const requestedRatio = action.aspectRatio || '1:1';
-    if (caps.aspectRatios && !caps.aspectRatios.includes(requestedRatio)) {
-      return {
-        success: false,
-        error: `Aspect ratio "${requestedRatio}" is not supported by ${resolved.model}. Supported ratios: ${caps.aspectRatios.join(', ')}. Please retry with a supported ratio.`,
-        provider: resolved.provider,
-        model: resolved.model,
-        supportedAspectRatios: caps.aspectRatios,
-        capabilities: caps,
-      };
-    }
+    // Passthrough: only forward params the agent actually supplied. The
+    // client-side router (media-model-router.js) picks a model that accepts
+    // exactly those constraints — fabricating defaults here would reintroduce
+    // stale vocabulary (e.g. 'medium') that the live backend catalog does not
+    // advertise.
+    const genOpts = {
+      outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
+      referenceImages,
+    };
+    if (action.aspectRatio) genOpts.aspectRatio = action.aspectRatio;
+    if (action.resolution)  genOpts.resolution  = action.resolution;
+    if (action.n && action.n > 1) genOpts.n = action.n;
+    if (action.label) genOpts.label = action.label;
 
-    // Call provider with normalized parameters
     let result;
     try {
-      result = await instance.generate(prompt, {
-        aspectRatio: action.aspectRatio || '1:1',
-        resolution: action.resolution || 'medium',
-        quality: action.quality || 'auto',
-        n: action.n || 1,
-        outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
-        label: action.label,
-        referenceImages,
-      });
+      result = await instance.generate(prompt, genOpts);
     } catch (genErr) {
       const errMsg = genErr.message || String(genErr);
       const details = genErr.details || null;
-      // Structured router error — backend couldn't find a model matching the
-      // label + hard capabilities. Surface the available labels so the agent
-      // can retry with a different one (or omit it for the fallback).
+      // Structured router error — backend couldn't find a model whose HARD
+      // capabilities match the request (canEdit for reference images,
+      // maxImages, resolution, aspect_ratio). Labels are ranking-only and
+      // never cause this error, so we don't return availableLabels here.
+      // The agent should retry by dropping the constraint that doesn't fit
+      // (fewer images, smaller resolution, no reference images, etc.).
       if (details?.code === 'no_model_matches') {
+        // `alternatives` is a per-dimension diagnostic: for each requirement
+        // the caller supplied, the list of image models that WOULD match if
+        // that dimension had been the only constraint. The agent uses it to
+        // reconcile its request — pick a model listed under one dimension
+        // and drop/relax the other constraint.
         return {
           success: false,
           errorType: 'no_model_matches',
           error: errMsg,
-          label: details.label ?? action.label ?? null,
-          availableLabels: details.availableLabels || [],
-          hint: 'Retry with a different "label" value from availableLabels, or omit "label" to use the fallback model.',
+          requirements: details.requirements || null,
+          alternatives: details.alternatives || null,
+          hint: 'No single active model satisfies every hard constraint at once. Inspect `alternatives` — each key is one of your requested features and its list is the models that would accept it in isolation. Cross-reference the lists to find a combination that is actually supported, then retry with a compatible request (different resolution, different aspectRatio, fewer reference images, smaller n, etc.).',
         };
       }
       // Detect common error types for the agent to interpret
@@ -298,19 +303,81 @@ const generateImageAction = {
   }
 };
 
-// Fire-and-forget: fetch the live label catalog from the backend and rewrite
-// the action's description so the system prompt exposes real labels instead
-// of the static hint. Runs once at import; any failure is silent and the
-// static description remains in place.
-fetchImageCapabilities().then((caps) => {
-  if (!caps?.labels?.length) return;
-  const labelList = caps.labels
-    .map((l) => `"${l.slug}" (${l.description})`)
-    .join(', ');
-  const newDesc = `Capability labels for model selection: ${labelList}. Pick the one that best matches what you want, or omit "label" to use the fallback.`;
-  generateImageAction.schema.properties.label.description = newDesc;
-  // Also append to the tool description so the system prompt picks it up.
-  generateImageAction.description += `\n\nAvailable capability labels: ${caps.labels.map((l) => l.slug).join(', ')}.`;
+// Fire-and-forget: build the tool schema dynamically from the backend's
+// /gateway/models/image.json. The rule: the agent must only ever see values
+// the backend can actually serve. If the backend advertises no aspect ratios
+// → the aspectRatio parameter goes away. Same for resolutions, labels, and
+// reference images. The static schema above is the fallback for API-keys
+// mode (no backend reach).
+//
+// The fetchMediaCapabilities('image') helper in providers/gateway.js returns
+// the pre-computed union of all capabilities. We replace each schema property
+// in-place with an enum/limit pulled from that union.
+fetchMediaCapabilities('image').then((caps) => {
+  if (!caps) return; // backend unreachable → keep static defaults
+
+  const props = generateImageAction.schema.properties;
+
+  // Aspect ratios: replace with the exact enum from the backend, or drop.
+  if (caps.aspectRatios?.length) {
+    props.aspectRatio = {
+      type: 'string',
+      enum: caps.aspectRatios,
+      description: `Aspect ratio for the generated image. Choose one of the supported values: ${caps.aspectRatios.map((v) => `"${v}"`).join(', ')}. Pick based on user intent (portrait/vertical → tall, landscape/wide → wide).`,
+    };
+  } else {
+    delete props.aspectRatio;
+  }
+
+  // Resolutions: ditto.
+  if (caps.resolutions?.length) {
+    props.resolution = {
+      type: 'string',
+      enum: caps.resolutions,
+      description: `Resolution for the generated image. Choose one of: ${caps.resolutions.map((v) => `"${v}"`).join(', ')}.`,
+    };
+  } else {
+    delete props.resolution;
+  }
+
+  // Number of images: max bounded by the most permissive active model.
+  if (caps.maxImages > 1) {
+    props.n = {
+      type: 'number',
+      minimum: 1,
+      maximum: caps.maxImages,
+      description: `Number of images to generate (default: 1, max: ${caps.maxImages}).`,
+    };
+  } else {
+    delete props.n;
+  }
+
+  // Reference images: only expose the parameter if at least one active model
+  // can actually consume reference images. Otherwise the agent never sees it.
+  if (caps.hasRefImageSupport && caps.anyCanEdit) {
+    const capHint = caps.maxRefImages ? ` Max: ${caps.maxRefImages}.` : '';
+    props.referenceImages = {
+      type: 'array',
+      items: { type: 'string' },
+      description: `Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.${capHint} IMPORTANT: when you pass reference images, state their role explicitly in the prompt — "Using the reference image as a STYLE guide, ...", "Edit the reference image to ...", "Use the reference image as the subject and ...".`,
+    };
+  } else {
+    delete props.referenceImages;
+  }
+
+  // Labels: soft ranking preference. Only expose when at least one is
+  // advertised, and never filter — passing a label can't fail the call.
+  if (caps.labels?.length) {
+    const list = caps.labels.map((l) => `"${l}"`).join(', ');
+    props.label = {
+      type: 'string',
+      enum: caps.labels,
+      description: `Optional ranking preference — the router prefers (but does not require) a model tagged with this label when several are eligible. Never filters: if no tagged model exists the cheapest capable one is used. Available: ${list}. Omit when you have no preference.`,
+    };
+    generateImageAction.description += ` Optional "label" ranking hint (one of: ${list}).`;
+  } else {
+    delete props.label;
+  }
 }).catch(() => {});
 
 export default generateImageAction;

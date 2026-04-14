@@ -11,12 +11,13 @@
  */
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
+import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 
 import fs from 'fs';
 import path from 'path';
 import { channel } from '../../io/channel.js';
 
-export default {
+const generateVideoAction = {
   type: 'generate_video',
   intent: 'generate_video',
   description: 'Generate a video from a text prompt. Video generation is async — returns a job ID to poll with check_video_status. Supports start/end frames and reference images (provider-dependent). Fields: "prompt" (required), optional "duration" (seconds, default 5), optional "aspectRatio" (1:1|16:9|9:16|4:3|3:4), optional "resolution" (360p|480p|720p|1080p|2k|4k), optional "quality" (auto|low|medium|high), optional "startFrame" (file path to first frame image), optional "endFrame" (file path to last frame image), optional "referenceImages" (array of file paths), optional "withAudio" (boolean, generate audio track). Returns: { success, provider, model, capabilities, id, status }',
@@ -150,3 +151,56 @@ export default {
     };
   }
 };
+
+// Fire-and-forget: rewrite the tool schema from the backend's active video
+// model set so the agent only ever sees parameters the backend can serve.
+// Mirrors the pattern in generate-image.js.
+fetchMediaCapabilities('video').then((caps) => {
+  if (!caps) return;
+  const props = generateVideoAction.schema.properties;
+
+  if (caps.aspectRatios?.length) {
+    props.aspectRatio = {
+      type: 'string',
+      enum: caps.aspectRatios,
+      description: `Aspect ratio for the generated video. One of: ${caps.aspectRatios.map((v) => `"${v}"`).join(', ')}.`,
+    };
+  } else {
+    delete props.aspectRatio;
+  }
+
+  if (caps.resolutions?.length) {
+    props.resolution = {
+      type: 'string',
+      enum: caps.resolutions,
+      description: `Resolution for the generated video. One of: ${caps.resolutions.map((v) => `"${v}"`).join(', ')}.`,
+    };
+  } else {
+    delete props.resolution;
+  }
+
+  if (!caps.anyFrameControl) {
+    delete props.startFrame;
+    delete props.endFrame;
+  }
+  if (!caps.hasRefImageSupport) {
+    delete props.referenceImages;
+  }
+  if (!caps.anyAudio) {
+    delete props.withAudio;
+  }
+
+  if (caps.labels?.length) {
+    const list = caps.labels.map((l) => `"${l}"`).join(', ');
+    props.label = {
+      type: 'string',
+      enum: caps.labels,
+      description: `Optional ranking preference — the router prefers (but does not require) a model tagged with this label. Available: ${list}.`,
+    };
+    generateVideoAction.description += ` Optional "label" ranking hint (one of: ${list}).`;
+  } else {
+    delete props.label;
+  }
+}).catch(() => {});
+
+export default generateVideoAction;
