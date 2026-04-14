@@ -38,7 +38,7 @@ export default {
   intent: 'return',        // NUEVO: identificador semántico
   description: 'Return final result from action sequence. CRITICAL: Return RAW data structures (objects, arrays) NOT formatted strings or markdown tables. If playbook says "Return: { count, users: [array] }", return actual JSON array not a formatted table string.',
   thinkingHint: 'Finishing',
-  permission: null,
+  permission: 'return',
 
   schema: {
     type: 'object',

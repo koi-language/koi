@@ -227,12 +227,13 @@ export class OpenAIResponsesLLM extends BaseLLM {
       if (p.type === 'input_text' || p.type === 'input_image') return p;
       if (p.type === 'image_url') {
         const url = typeof p.image_url === 'string' ? p.image_url : p.image_url?.url;
-        return { type: 'input_image', image_url: url };
+        return { type: 'input_image', image_url: url, detail: 'auto' };
       }
       if (p.type === 'image' && p.source?.type === 'base64') {
         return {
           type: 'input_image',
           image_url: `data:${p.source.media_type};base64,${p.source.data}`,
+          detail: 'auto',
         };
       }
       return p;

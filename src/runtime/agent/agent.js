@@ -397,6 +397,13 @@ export class Agent {
    * @returns {boolean} True if agent has the permission
    */
   hasPermission(permissionName) {
+    // `return` is an implicit capability every agent has — it is how a
+    // delegate signals completion to its parent. Phases can still revoke it
+    // with `cant return` to force the agent through a proper terminal phase.
+    if (permissionName === 'return') {
+      return true;
+    }
+
     if (!this.role) {
       return false;
     }
@@ -3461,6 +3468,40 @@ export class Agent {
 
       // Emit beginAction for tool actions so the GUI shows activity shimmer.
       const _intent = action.intent || action.type || '';
+
+      // Phase-scoped enforcement: apply the current phase's permission model
+      // (can / cant) to the action about to run. Mirrors the filter in
+      // action-registry.js::generatePromptDocumentation so the LLM and the
+      // dispatcher agree on what is allowed. Rejections surface as error
+      // tool-results so the LLM retries (typically with `phase_done`).
+      if (_intent) {
+        const _phaseName = this.state?.statusPhase;
+        const _phaseConfig = this.phases?.[_phaseName];
+        const _phaseCan = Array.isArray(_phaseConfig?.permissions) ? _phaseConfig.permissions : null;
+        const _phaseCant = Array.isArray(_phaseConfig?.deniedPermissions) ? _phaseConfig.deniedPermissions : null;
+        if (_phaseCan || _phaseCant) {
+          const { actionRegistry: _ar } = await import('./action-registry.js');
+          const _actionDef = _ar.get(_intent);
+          const _required = _actionDef?.permission;
+          if (_required) {
+            let _blocked = false;
+            let _reason = '';
+            if (_phaseCant && _phaseCant.includes(_required)) {
+              _blocked = true;
+              _reason = `permission '${_required}' is denied (\`cant ${_required}\`)`;
+            } else if (_phaseCan && _required !== 'return' && !_phaseCan.includes(_required)) {
+              _blocked = true;
+              _reason = `permission '${_required}' is not in the phase's \`can\` list (${_phaseCan.join(', ') || 'empty'})`;
+            }
+            if (_blocked) {
+              const _errMsg = `Action '${_intent}' is not allowed in phase '${_phaseName}': ${_reason}. Call 'phase_done' when you are finished with this phase to advance.`;
+              channel.log('agent', `${this.name}: phase-gate rejected '${_intent}' in phase '${_phaseName}' — ${_reason}`);
+              return { result: { success: false, error: _errMsg, phaseGated: true }, shouldExitLoop: false };
+            }
+          }
+        }
+      }
+
       const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_facts', 'learn_fact', 'list_skills', 'activate_skill', 'deactivate_skill', 'queue_add', 'queue_update']);
       if (_intent && !_SELF_MANAGED.has(_intent)) {
         channel.beginAction(_intent, action.url || action.path || action.pattern || action.query || action.subject || '');

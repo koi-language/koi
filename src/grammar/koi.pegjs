@@ -235,18 +235,39 @@ PhasesDecl
     }
 
 PhaseEntry
-  = name:Identifier _ "{" _ props:PhaseProps? _ "}" _ {
-      return { name: name.name || name, props: props || [], location: location() };
+  = name:Identifier _ "{" _ items:PhaseBodyItems? _ "}" _ {
+      const all = items || [];
+      const props = all.filter(i => i.kind === 'prop').map(i => ({ key: i.key, value: i.value }));
+      const perms = all.filter(i => i.kind === 'can').map(i => i.name);
+      const denied = all.filter(i => i.kind === 'cant').map(i => i.name);
+      if (perms.length > 0) props.push({ key: 'permissions', value: perms });
+      if (denied.length > 0) props.push({ key: 'deniedPermissions', value: denied });
+      return { name: name.name || name, props, location: location() };
     }
 
-PhaseProps
-  = head:PhaseProp tail:(_ ","? _ PhaseProp)* _ ","? {
+PhaseBodyItems
+  = head:PhaseBodyItem tail:(_ ","? _ PhaseBodyItem)* _ ","? {
       return [head, ...tail.map(t => t[3])];
+    }
+
+PhaseBodyItem
+  = PhaseCant
+  / PhaseCan
+  / PhaseProp
+
+PhaseCant
+  = "cant" _ name:PhaseIdent {
+      return { kind: 'cant', name };
+    }
+
+PhaseCan
+  = "can" _ name:PhaseIdent {
+      return { kind: 'can', name };
     }
 
 PhaseProp
   = key:Identifier _ ":" _ value:PhaseValue _ {
-      return { key: key.name || key, value };
+      return { kind: 'prop', key: key.name || key, value };
     }
 
 PhaseValue
@@ -256,6 +277,11 @@ PhaseValue
   / "medium" { return 'medium'; }
   / "high" { return 'high'; }
   / n:Integer { return n; }
+
+// Permissive identifier for phase capability names — accepts reserved keywords
+// like `return` that would otherwise be rejected by the main Identifier rule.
+PhaseIdent
+  = chars:[a-zA-Z_][a-zA-Z0-9_]* { return text(); }
 
 // ============================================================
 // Reactions — event-driven phase/profile transitions

@@ -92,14 +92,36 @@ class ActionRegistry {
 
     if (agent) {
       const disabledPerms = agent.state?.disabledPermissions;
+      // Phase-scoped permission model:
+      //  - `can X` in a phase → whitelist subset of the role's permissions.
+      //  - `cant X` in a phase → deny list subtracted from the effective set.
+      //  - Neither declared → phase inherits all role permissions.
+      //  - `return` is an implicit capability every agent has (see
+      //    hasPermission), and is always allowed in a phase unless explicitly
+      //    denied via `cant return`.
+      const _phaseName = agent.state?.statusPhase;
+      const _phaseConfig = agent.phases?.[_phaseName];
+      const _phaseCan = Array.isArray(_phaseConfig?.permissions)
+        ? new Set(_phaseConfig.permissions)
+        : null;
+      const _phaseCant = Array.isArray(_phaseConfig?.deniedPermissions)
+        ? new Set(_phaseConfig.deniedPermissions)
+        : null;
+
       actions = actions.filter(action => {
         // hidden can be boolean or function(agent)
         const isHidden = typeof action.hidden === 'function' ? action.hidden(agent) : action.hidden;
         if (isHidden) return false;
-        if (!action.permission) return true;
-        if (!agent.hasPermission(action.permission)) return false;
-        // Phase-based: if permission is temporarily disabled, hide the action
-        if (Array.isArray(disabledPerms) && disabledPerms.includes(action.permission)) return false;
+        const perm = action.permission;
+        if (!perm) return true;
+        if (!agent.hasPermission(perm)) return false;
+        // Legacy: if permission is temporarily disabled, hide the action
+        if (Array.isArray(disabledPerms) && disabledPerms.includes(perm)) return false;
+        // Phase deny-list takes precedence over everything else
+        if (_phaseCant && _phaseCant.has(perm)) return false;
+        // Whitelist mode: must be in `can` list. `return` is implicit unless
+        // explicitly denied above, so it passes even without `can return`.
+        if (_phaseCan && perm !== 'return' && !_phaseCan.has(perm)) return false;
         return true;
       });
     } else {
