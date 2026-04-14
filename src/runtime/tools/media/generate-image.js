@@ -28,7 +28,13 @@ import { channel } from '../../io/channel.js';
 const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
-  description: 'Generate an image from a text prompt. Supports reference images (provider-dependent). Fields: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (array of file paths / attachment IDs), optional "saveTo" (directory to save images). For "aspectRatio" and "resolution" you MUST pick one of the exact values from the enum in the schema — the allowed values come from the live backend catalog and any other value will be rejected. Omit either parameter to let the backend choose a default. Returns: { success, provider, model, images: [{ url?, b64?, savedTo?, revisedPrompt? }] }. IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — you MUST state it explicitly in "prompt". Start the prompt with a clear directive such as "Using the reference image as a STYLE guide, ..." / "...in the exact art style of the reference image" (for style transfer), or "Edit the reference image to ..." (for img2img edits), or "Use the reference image as the subject and ..." (for subject preservation). If the user supplies a reference for style but asks for a different subject, lead the prompt with the style directive and keep your own stylistic adjectives minimal so they do not compete with the reference.',
+  // NOTE: this description is the API-keys fallback. When the backend catalog
+  // is reachable, the fetchMediaCapabilities('image') block at the bottom of
+  // this file REWRITES this string at import time with the real enums (aspect
+  // ratios, resolutions, labels, max n, ref image support) pulled from the
+  // /gateway/models/image.json catalog. Do NOT add specific values here —
+  // they would become stale the moment the catalog changes.
+  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages", optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -318,66 +324,70 @@ fetchMediaCapabilities('image').then((caps) => {
 
   const props = generateImageAction.schema.properties;
 
-  // Aspect ratios: replace with the exact enum from the backend, or drop.
+  // Sync the schema props with the catalog (used for JSON-schema validation
+  // and by any tool-introspection consumer).
   if (caps.aspectRatios?.length) {
-    props.aspectRatio = {
-      type: 'string',
-      enum: caps.aspectRatios,
-      description: `Aspect ratio for the generated image. Choose one of the supported values: ${caps.aspectRatios.map((v) => `"${v}"`).join(', ')}. Pick based on user intent (portrait/vertical → tall, landscape/wide → wide).`,
-    };
+    props.aspectRatio = { type: 'string', enum: caps.aspectRatios };
   } else {
     delete props.aspectRatio;
   }
-
-  // Resolutions: ditto.
   if (caps.resolutions?.length) {
-    props.resolution = {
-      type: 'string',
-      enum: caps.resolutions,
-      description: `Resolution for the generated image. Choose one of: ${caps.resolutions.map((v) => `"${v}"`).join(', ')}.`,
-    };
+    props.resolution = { type: 'string', enum: caps.resolutions };
   } else {
     delete props.resolution;
   }
-
-  // Number of images: max bounded by the most permissive active model.
   if (caps.maxImages > 1) {
-    props.n = {
-      type: 'number',
-      minimum: 1,
-      maximum: caps.maxImages,
-      description: `Number of images to generate (default: 1, max: ${caps.maxImages}).`,
-    };
+    props.n = { type: 'number', minimum: 1, maximum: caps.maxImages };
   } else {
     delete props.n;
   }
-
-  // Reference images: only expose the parameter if at least one active model
-  // can actually consume reference images. Otherwise the agent never sees it.
-  if (caps.hasRefImageSupport && caps.anyCanEdit) {
-    const capHint = caps.maxRefImages ? ` Max: ${caps.maxRefImages}.` : '';
-    props.referenceImages = {
-      type: 'array',
-      items: { type: 'string' },
-      description: `Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.${capHint} IMPORTANT: when you pass reference images, state their role explicitly in the prompt — "Using the reference image as a STYLE guide, ...", "Edit the reference image to ...", "Use the reference image as the subject and ...".`,
-    };
+  const refsEnabled = caps.hasRefImageSupport && caps.anyCanEdit;
+  if (refsEnabled) {
+    props.referenceImages = { type: 'array', items: { type: 'string' } };
   } else {
     delete props.referenceImages;
   }
-
-  // Labels: soft ranking preference. Only expose when at least one is
-  // advertised, and never filter — passing a label can't fail the call.
   if (caps.labels?.length) {
-    const list = caps.labels.map((l) => `"${l}"`).join(', ');
-    props.label = {
-      type: 'string',
-      enum: caps.labels,
-      description: `Optional ranking preference — the router prefers (but does not require) a model tagged with this label when several are eligible. Never filters: if no tagged model exists the cheapest capable one is used. Available: ${list}. Omit when you have no preference.`,
-    };
-    generateImageAction.description += ` Optional "label" ranking hint (one of: ${list}).`;
+    props.label = { type: 'string', enum: caps.labels };
   } else {
     delete props.label;
   }
+
+  // Rewrite the tool description IN PLACE, inlining the real values from the
+  // catalog. This is the string the agent actually sees in AVAILABLE ACTIONS
+  // — so the allowed values must live here, not in schema-property metadata
+  // that the renderer does not unfold.
+  const fields = ['"prompt" (required) — text description of the desired image'];
+
+  if (caps.aspectRatios?.length) {
+    const list = caps.aspectRatios.map((v) => `"${v}"`).join(', ');
+    fields.push(`optional "aspectRatio" — one of: ${list}. Pick based on user intent (portrait → tall, landscape → wide). Omit to let the backend pick.`);
+  }
+  if (caps.resolutions?.length) {
+    const list = caps.resolutions.map((v) => `"${v}"`).join(', ');
+    fields.push(`optional "resolution" — one of: ${list}. Omit to let the backend pick.`);
+  }
+  if (caps.maxImages > 1) {
+    fields.push(`optional "n" — integer 1..${caps.maxImages} (default 1)`);
+  }
+  if (refsEnabled) {
+    const maxRef = caps.maxRefImages ? ` Max ${caps.maxRefImages}.` : '';
+    fields.push(`optional "referenceImages" — array of attachment IDs (e.g. "att-1") or absolute file paths.${maxRef} Annotation attachments are auto-excluded.`);
+  }
+  if (caps.labels?.length) {
+    const list = caps.labels.map((l) => `"${l}"`).join(', ');
+    fields.push(`optional "label" — ranking preference, one of: ${list}. Soft hint only, never filters.`);
+  }
+  fields.push('optional "saveTo" — absolute directory path where the tool will save the generated image(s). The real path is returned in images[].savedTo — use THAT in any downstream step, never fabricate paths.');
+
+  const header = 'Generate an image from a text prompt. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const refNote = refsEnabled
+    ? ' IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — state it explicitly in "prompt". Start with a directive such as "Using the reference image as a STYLE guide, ..." (style transfer), "Edit the reference image to ..." (img2img edit), or "Use the reference image as the subject and ..." (subject preservation).'
+    : '';
+  const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
+  const returns = '\nReturns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }';
+
+  generateImageAction.description = header + fieldsBlock + returns + refNote;
 }).catch(() => {});
 
 export default generateImageAction;

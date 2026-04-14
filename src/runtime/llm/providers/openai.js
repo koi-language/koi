@@ -246,7 +246,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
     const systemPrompt = this._flattenSystemToString(messages.find(m => m.role === 'system')?.content || '');
     let inputMessages = messages
       .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
+      .map(m => ({ type: 'message', role: m.role, content: this._normalizeContentForResponses(m.content) }));
 
     // Responses API requires "json" in input messages for json_object format
     const lastUserIdx = inputMessages.map(m => m.role).lastIndexOf('user');
@@ -377,7 +377,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
       const systemPrompt = this._flattenSystemToString(messages.find(m => m.role === 'system')?.content || '');
       let inputMessages = messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role, content: this._normalizeContentForResponses(m.content) }));
+        .map(m => ({ type: 'message', role: m.role, content: this._normalizeContentForResponses(m.content) }));
 
       // Responses API requires literal "json" in the last user input when
       // format=json_object. Inject a reminder if the prompt doesn't already
