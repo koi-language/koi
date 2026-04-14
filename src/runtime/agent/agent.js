@@ -1945,6 +1945,28 @@ export class Agent {
           console.error(`[Agent:${this.name}] 🎯 Reactive step ${session.iteration + 1}: ${intent}`);
         }
 
+        // Phase-gate `return` here — the inline return handler below short-circuits
+        // before _executeAction runs, so the gate in _executeAction never sees it.
+        // `cant return` must block the delegate from bailing out of non-terminal phases.
+        if (intent === 'return') {
+          const _phaseName = this.state?.statusPhase;
+          const _phaseConfig = this.phases?.[_phaseName];
+          const _phaseCant = Array.isArray(_phaseConfig?.deniedPermissions) ? _phaseConfig.deniedPermissions : null;
+          if (_phaseCant && _phaseCant.includes('return')) {
+            const _errMsg = `Action 'return' is not allowed in phase '${_phaseName}': permission 'return' is denied (\`cant return\`). Call 'phase_done' when you are finished with this phase to advance to a terminal phase before returning.`;
+            channel.log('agent', `${this.name}: phase-gate rejected 'return' in phase '${_phaseName}' — blocked by \`cant return\``);
+            session.recordAction(action, { success: false, error: _errMsg, phaseGated: true });
+            contextMemory.add(
+              'user',
+              `❌ return REJECTED: ${_errMsg}`,
+              `❌ return blocked in phase '${_phaseName}'`,
+              null,
+            );
+            thinkingHint = 'Advancing phase';
+            continue;
+          }
+        }
+
         // Print token/memory summary before return (reset accumulator)
         if (intent === 'return') {
           this._printTokenSummary(session, contextMemory, { reset: true });

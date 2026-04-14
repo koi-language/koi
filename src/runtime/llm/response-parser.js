@@ -4,7 +4,6 @@
  */
 
 import { channel } from '../io/channel.js';
-import { actionRegistry } from '../agent/action-registry.js';
 
 /**
  * Log a debug message (only when KOI_DEBUG_LLM=1).
@@ -193,23 +192,16 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
           } catch { /* fall through */ }
         }
       }
-      // Recovery: use a fast model to convert the malformed response into valid JSON.
-      // The recovery prompt includes the available tools so the model knows the schema.
-      if (agent && callUtilityFn) {
-        try {
-          const toolDocs = actionRegistry.generatePromptDocumentation(agent);
-          const recoveryPrompt = `An LLM produced this INVALID response instead of JSON:\n\n${cleaned.substring(0, 500)}\n\nConvert it into a valid JSON action. Available actions:\n${toolDocs.substring(0, 2000)}\n\nReturn ONLY valid JSON: {"actionType":"direct","intent":"<action_name>",...}`;
-          const recovered = await callUtilityFn('Return ONLY valid JSON. No markdown.', recoveryPrompt, 300);
-          channel.log('llm', `[recovery] Attempting to fix malformed response: "${cleaned.substring(0, 100)}"`);
-          const recoveredCleaned = recovered.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-          const recoveredParsed = JSON.parse(recoveredCleaned);
-          channel.log('llm', `[recovery] Success: ${JSON.stringify(recoveredParsed).substring(0, 200)}`);
-          return normalizeReactiveAction(recoveredParsed);
-        } catch (recoveryErr) {
-          channel.log('llm', `[recovery] Failed: ${recoveryErr.message}`);
-        }
-      }
-      throw new Error(`Failed to parse reactive LLM response as JSON: ${firstErr.message}\nResponse: ${cleaned.substring(0, 200)}`);
+      // No recovery via a secondary LLM: we must NEVER invent actions the
+      // agent did not explicitly emit. A second model "fixing" a malformed
+      // response is guessing intent on behalf of the real agent — the same
+      // anti-pattern the user has banned. Surface the parse failure instead
+      // so the real agent retries with a valid JSON action.
+      throw new Error(
+        `Your response was not valid JSON and could not be parsed. ${firstErr.message}. ` +
+        `Response received: ${cleaned.substring(0, 300)}. ` +
+        `Retry with a valid JSON action (e.g. {"actionType":"direct","intent":"print","message":"..."}).`
+      );
     }
   }
 
@@ -334,13 +326,18 @@ export function normalizeReactiveAction(parsed) {
     parsed.actionType = 'direct';
   }
 
-  // Validate minimal structure — if no action fields, treat as raw return data
+  // NEVER invent actions on behalf of the model. If the payload has no
+  // `intent`/`actionType`/`type`, it's not an action — it's a malformed
+  // response (JSON that parsed but doesn't describe any action, e.g. a bare
+  // `{ "error": "..." }` hallucinated by the LLM). Throw with a clear,
+  // model-readable explanation so the upstream handler surfaces it as
+  // _llm_error feedback and the LLM retries with a proper action.
   if (!parsed.intent && !parsed.actionType && !parsed.type) {
-    if (Object.keys(parsed).length > 0) {
-      logDebug('Reactive response was raw data, wrapping as return action');
-      return { actionType: 'direct', intent: 'return', data: parsed };
-    }
-    throw new Error(`Invalid reactive action: missing "intent" or "actionType". Got: ${JSON.stringify(parsed).substring(0, 200)}`);
+    throw new Error(
+      `Your response did not contain a valid action. Expected JSON with an "intent" or "actionType" field (e.g. {"actionType":"direct","intent":"print","message":"..."}). ` +
+      `Got: ${JSON.stringify(parsed).substring(0, 300)}. ` +
+      `Retry with a valid action. If you wanted to finish the task, emit {"actionType":"direct","intent":"return","data":{...}} explicitly.`
+    );
   }
 
   return parsed;
