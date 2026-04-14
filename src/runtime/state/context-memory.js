@@ -183,6 +183,24 @@ function getTTL(intent) {
   return ACTION_TTL[intent] || ACTION_TTL._default;
 }
 
+// Compute a stable key that groups an action with previous attempts of the "same thing".
+// Used to invalidate stale failure memories when a later success proves the earlier
+// error was transient or already resolved.
+function _computeActionKey(action) {
+  if (!action) return null;
+  const intent = action.intent || action.type;
+  if (!intent) return null;
+  if (intent === 'shell') {
+    const cmd = (action.command || '').trim();
+    if (!cmd) return 'shell';
+    // First token of the command line (e.g. "tree src" → "shell:tree").
+    const first = cmd.split(/\s+/)[0];
+    return `shell:${first}`;
+  }
+  const target = action.path || action.file || action.url || action.tool || '';
+  return target ? `${intent}:${target}` : intent;
+}
+
 // ─── Classification ───────────────────────────────────────────────────────
 
 /**
@@ -247,8 +265,14 @@ export function classifyFeedback(action, result, error) {
     // their useful output to stdout even when exiting with a non-zero code.
     const exitCodeStr = result.exitCode != null ? ` (exit code ${result.exitCode})` : '';
     const stdoutPart = result.stdout ? `\nOutput:\n${result.stdout.substring(0, 3000)}` : '';
-    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}\n\n⚠️ This command FAILED. You MUST NOT report success for this operation. If this was a test run, the test FAILED.`;
-    return { immediate, shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${result.error.substring(0, 200)}`, permanent: null, ...getTTL(intent) };
+    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
+    return {
+      immediate,
+      shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${result.error.substring(0, 200)}`,
+      permanent: null,
+      failureKey: _computeActionKey(action),
+      ...getTTL(intent),
+    };
   }
 
   // Extract image blocks generically from any action that returns MCP-style content
@@ -291,10 +315,10 @@ export function classifyFeedback(action, result, error) {
     }
 
     case 'edit_file':
-      return { immediate, shortTerm: `✅ edit ${action.path}`, permanent: null, ...getTTL(intent) };
+      return { immediate, shortTerm: `✅ edit ${action.path}`, permanent: null, successKey: _computeActionKey(action), ...getTTL(intent) };
 
     case 'write_file':
-      return { immediate, shortTerm: `✅ write ${action.path}`, permanent: null, ...getTTL(intent) };
+      return { immediate, shortTerm: `✅ write ${action.path}`, permanent: null, successKey: _computeActionKey(action), ...getTTL(intent) };
 
     case 'search': {
       const query = action.query || action.pattern || action.path || '';
@@ -311,14 +335,28 @@ export function classifyFeedback(action, result, error) {
       if (shellFailed) {
         const exitCodeStr = result?.exitCode != null ? ` (exit code ${result.exitCode})` : '';
         const shellMsg = truncOut
-          ? `❌${id} SHELL COMMAND FAILED${exitCodeStr}. Output:\n${truncOut}\n\n⚠️ This command FAILED. You MUST NOT report success for this operation.`
+          ? `❌${id} SHELL COMMAND FAILED${exitCodeStr}. Output:\n${truncOut}`
           : `❌${id} shell: command failed${exitCodeStr} with no output`;
-        return { immediate: shellMsg, shortTerm: `❌ shell FAILED${exitCodeStr}`, needsSummary: true, permanent: null, ...getTTL('shell') };
+        return {
+          immediate: shellMsg,
+          shortTerm: `❌ shell FAILED${exitCodeStr}`,
+          needsSummary: true,
+          permanent: null,
+          failureKey: _computeActionKey(action),
+          ...getTTL('shell'),
+        };
       }
       const shellMsg = truncOut
         ? `✅${id} shell output:\n${truncOut}`
         : `✅${id} shell: ${action.description || 'command'} (no output)`;
-      return { immediate: shellMsg, shortTerm: null, needsSummary: true, permanent: null, ...getTTL('shell') };
+      return {
+        immediate: shellMsg,
+        shortTerm: null,
+        needsSummary: true,
+        permanent: null,
+        successKey: _computeActionKey(action),
+        ...getTTL('shell'),
+      };
     }
 
     case 'print':
@@ -700,6 +738,22 @@ export class ContextMemory {
       }
     }
 
+    // Invalidate prior failure entries with matching key when a later success proves
+    // the earlier error is stale. Prevents toxic warnings like "tree FAILED" from
+    // haunting the context after a subsequent `tree src` ran successfully.
+    if (opts.successKey) {
+      let _invalidated = 0;
+      for (const e of this.entries) {
+        if (e.failureKey === opts.successKey && e.tier !== 'expired') {
+          e.tier = 'expired';
+          _invalidated++;
+        }
+      }
+      if (_invalidated > 0) {
+        channel.log('memory', `Invalidated ${_invalidated} prior failure(s) for key "${opts.successKey}"`);
+      }
+    }
+
     const entry = {
       role,
       immediate,
@@ -716,6 +770,9 @@ export class ContextMemory {
       needsPermanentSummary: opts.needsPermanentSummary || false,
       // Tag for replacement tracking
       replaceTag: opts.replaceTag || null,
+      // Key used to retroactively expire this entry when a later success of the
+      // same "type" proves the failure was transient (see _computeActionKey).
+      failureKey: opts.failureKey || null,
     };
     if (opts.ephemeral) entry.ephemeral = true;
     if (opts.attachments?.length > 0) entry.attachments = opts.attachments;

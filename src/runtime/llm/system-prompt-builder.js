@@ -30,6 +30,15 @@ export async function buildSystemPrompt(agent) {
   const _offsetStr = `${_offsetMin <= 0 ? '+' : '-'}${_absH}:${_absM}`;
   const now = `${_now.getFullYear()}-${_pad(_now.getMonth() + 1)}-${_pad(_now.getDate())}T${_pad(_now.getHours())}:${_pad(_now.getMinutes())}:${_pad(_now.getSeconds())}${_offsetStr}`;
   const cwd = process.cwd();
+  // Platform — tell the agent explicitly so it picks the right shell
+  // builtins. Without this, agents guess from cwd shape ("/Users/..." →
+  // mac, "C:\..." → Windows) and often propose bash-only commands
+  // (`ls`, `chmod`, `rm -rf`) on Windows where they don't exist.
+  const _platformLabel = process.platform === 'darwin' ? 'macOS (darwin)'
+    : process.platform === 'win32' ? 'Windows (win32) — shell is cmd.exe / PowerShell, NOT bash. Use `dir`, `type`, `copy`, `move`, `del`, `where`, `mkdir`. PowerShell cmdlets also work: `Get-ChildItem`, `Remove-Item`, `Test-Path`'
+    : process.platform === 'linux' ? 'Linux'
+    : process.platform;
+  const platformField = `\n| Platform | ${_platformLabel} |`;
   const agentDisplayName = agent?.name || 'unknown';
   const statusPhase = agent?.state?.statusPhase || null;
   const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
@@ -283,7 +292,7 @@ ${phaseSystemBlock}
 
 | Field | Value |
 |---|---|
-| Working directory | \`${cwd}\` |${langField}
+| Working directory | \`${cwd}\` |${platformField}${langField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
