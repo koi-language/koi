@@ -1227,6 +1227,24 @@ CRITICAL RULES:
         }
       }
 
+      // Estimate input size from contextMemory so the selector can skip
+      // models whose context window won't fit the payload. Without this,
+      // a ballooned shell output (e.g. grep into node_modules) can be
+      // routed to a 1M-token model that still rejects with 413.
+      let _minContextK = 0;
+      try {
+        const _preMessages = contextMemory.toMessages();
+        const _preChars = _preMessages.reduce((sum, m) => {
+          const c = m.content;
+          if (typeof c === 'string') return sum + c.length;
+          if (Array.isArray(c)) return sum + c.reduce((s, p) => s + (p.text || '').length, 0);
+          return sum;
+        }, 0);
+        const _preTokens = Math.ceil(_preChars / 4);
+        _minContextK = Math.ceil(_preTokens / 1000) + 4; // +4K headroom for output
+        channel.log('llm', `[auto] Input estimate: ~${_preTokens} tokens → requiring contextK ≥ ${_minContextK}`);
+      } catch { /* best-effort; fall back to no minimum */ }
+
       // Delegate all model selection + difficulty boost logic to the provider factory
       const resolved = resolveModel({
         type: 'llm',
@@ -1236,6 +1254,7 @@ CRITICAL RULES:
         requiresImage: _requiresImage,
         session,
         agentName,
+        minContextK: _minContextK,
         availableProviders: this._availableProviders,
         clients: this._gatewayMode ? this._gatewayClients() : { openai: this._oa, anthropic: this._ac, gemini: this._gc },
       });

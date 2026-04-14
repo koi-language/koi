@@ -1052,16 +1052,13 @@ When a command requires sudo, just use sudo normally in the command. The system 
       // For the result we report stdout as the combined output (PTY merges them),
       // and stderr only when running in spawn fallback mode.
       // Truncate very long outputs to avoid blowing up LLM context.
-      // Keep first 100 lines + last 100 lines, cut the middle.
-      const _MAX_LINES = 200;
+      // Single byte cap — keeps head + tail, drops the middle.
+      const _MAX_BYTES = 64000; // ~16K tokens worth
       const _truncate = (s) => {
-        const lines = s.split('\n');
-        if (lines.length <= _MAX_LINES) return s;
-        const half = Math.floor(_MAX_LINES / 2);
-        const head = lines.slice(0, half);
-        const tail = lines.slice(-half);
-        const skipped = lines.length - _MAX_LINES;
-        return head.join('\n') + `\n\n... [${skipped} lines truncated] ...\n\n` + tail.join('\n');
+        if (s.length <= _MAX_BYTES) return s;
+        const half = Math.floor(_MAX_BYTES / 2);
+        const cut = s.length - _MAX_BYTES;
+        return s.substring(0, half) + `\n\n... [${cut} bytes truncated] ...\n\n` + s.substring(s.length - half);
       };
       const stdoutStr = _truncate(combinedStr);
       const elapsed = _fmtElapsed(Date.now() - startTime);
