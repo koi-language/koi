@@ -577,7 +577,14 @@ export class Agent {
     //
     // Without this call, the classifier would happily mutate state
     // in the background while the agent stayed idle forever.
-    if (msg.from === 'user') {
+    //
+    // Skip if the message was already pre-delivered from the inbox side
+    // (MessageInbox._processNext fires deliverClassifiedInput directly
+    // when classification finishes while a prompt_user is blocked — see
+    // the `_preDelivered` flag there). Otherwise we would queue a
+    // duplicate for the NEXT prompt_user, which ends up processed as a
+    // second user message and creates ghost tasks.
+    if (msg.from === 'user' && !msg._preDelivered) {
       try {
         const _deliver = Agent._cliHooks?.deliverClassifiedInput;
         if (typeof _deliver === 'function') {

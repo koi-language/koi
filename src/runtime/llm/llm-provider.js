@@ -617,6 +617,10 @@ export class LLMProvider {
         createLLMFn: createLLM,
         costCenter,
         logFn: (cat, msg) => channel.log(cat, msg),
+        // Block classification until remote models are loaded (gateway mode).
+        // Prevents the cold-start race where the first inbound message is
+        // classified against an empty provider list.
+        waitForReadyFn: () => this._modelsReady,
       });
     }
     return this._classifier;
@@ -889,7 +893,8 @@ CRITICAL RULES:
         // For the main agent: fall back to the raw JSON context blob.
         let contextStr = '';
         const _args = context.args;
-        if (isDelegate && _args && typeof _args === 'object' && Object.keys(_args).length > 0) {
+        const _hasTaskSpec = isDelegate && _args && typeof _args === 'object' && Object.keys(_args).length > 0;
+        if (_hasTaskSpec) {
           const _specLines = Object.entries(_args)
             .filter(([, v]) => v != null && v !== '')
             .map(([k, v]) => `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
@@ -911,16 +916,30 @@ CRITICAL RULES:
             _imageNote = `\n\n🖼️ ${_imgCount === 1 ? 'IMAGE' : _imgCount + ' IMAGES'} ATTACHED: The user included ${_imgCount === 1 ? 'an image' : _imgCount + ' images'} with their request. Examine ${_imgCount === 1 ? 'it' : 'them'} carefully — ${_imgCount === 1 ? 'it' : 'they'} may contain visual context, annotations, or hints relevant to the task.${_attIds}`;
           }
           contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
-        } else if (Object.keys(context).length > 0) {
-          contextStr = `\nContext: ${JSON.stringify(context)}`;
         }
+        // NOTE: we intentionally no longer serialize `context` for non-delegate
+        // agents. For the root agent (System) the context is just ephemeral
+        // runtime state (args:{}, state:{statusPhase,userLanguage}) — dumping
+        // it into the starter message as a JSON blob AND then pinning it to
+        // long-term memory was polluting the Memory Inspector with entries
+        // like: `Context: {"args":{},"state":{"statusPhase":"understanding",
+        // "userLanguage":"Spanish"}}`. The runtime phase / language already
+        // reach the LLM via the system prompt's dynamic block, so there is
+        // nothing to lose by dropping it here.
 
         // Playbook is now in the system prompt; first user message just starts execution.
         const startMsg = `Return your FIRST action.${contextStr}${mcpErrorStr}`;
-        // Place directly in long-term so it never ages out — the agent must always know its task.
-        // permanent must be non-null since long-term entries render via entry.permanent in toMessages().
-        const permSpec = contextStr ? contextStr.substring(0, 4000) : startMsg.substring(0, 2000);
-        contextMemory.add('user', startMsg, permSpec, permSpec, { directLongTerm: true });
+        if (_hasTaskSpec) {
+          // Delegate task spec: pin to long-term so the agent never forgets
+          // what it was asked to do. permanent must be non-null since
+          // long-term entries render via entry.permanent in toMessages().
+          const permSpec = contextStr.substring(0, 4000);
+          contextMemory.add('user', startMsg, permSpec, permSpec, { directLongTerm: true });
+        } else {
+          // Non-delegate starter message: keep it in normal working memory,
+          // let it age out naturally with the rest of the turn history.
+          contextMemory.add('user', startMsg, startMsg, null);
+        }
       }
     } else {
       // Actions have been executed — feed ALL new results as feedback (not just the last).

@@ -780,7 +780,15 @@ export class ContextMemory {
     const entry = {
       role,
       immediate,
-      shortTerm: shortTerm || immediate,
+      // IMPORTANT: do NOT default shortTerm to `immediate`. The fallback
+      // silently bypasses LLM summarization: `_summarizeIfNeeded` only
+      // queues an entry when `!entry.shortTerm`, so leaving this populated
+      // with the raw text means medium-term forever shows the literal
+      // immediate — ie. no summary, ever. Callers that have a cheap
+      // pre-computed short form (classifyFeedback / classifyResponse) pass
+      // it explicitly; everyone else leaves it null so the summarizer
+      // picks the entry up when it ages out of short-term.
+      shortTerm: shortTerm ?? null,
       permanent,
       ts: Date.now(),
       turnAdded: this.turnCounter,
@@ -788,8 +796,12 @@ export class ContextMemory {
       // Per-entry TTL overrides
       shortDuration: opts.shortDuration,
       mediumDuration: opts.mediumDuration,
-      // Deferred summarization flags
-      needsSummary: opts.needsSummary || false,
+      // Deferred summarization flags. If the caller didn't pre-compute a
+      // `shortTerm`, auto-mark long immediates as needing summarization —
+      // otherwise they'd transition to medium-term with `shortTerm == null`
+      // and `toMessages()` would drop them, or with the silent-fallback bug
+      // we just removed they'd travel forever as the literal raw text.
+      needsSummary: opts.needsSummary ?? (shortTerm == null && typeof immediate === 'string' && immediate.length > 80),
       needsPermanentSummary: opts.needsPermanentSummary || false,
       // Tag for replacement tracking
       replaceTag: opts.replaceTag || null,
@@ -845,7 +857,16 @@ export class ContextMemory {
           entry._pendingMedDur = medDur;
           toSummarize.push(entry);
         } else {
-          // Trivial entry (short immediate) — transition directly, no summary needed.
+          // Trivial entry (short immediate, already has a shortTerm, or
+          // below the summarization threshold) — transition directly, no
+          // LLM summary needed. If shortTerm is still unset (typical for a
+          // ≤80-char user message that add() left null), copy immediate
+          // into shortTerm so `toMessages()` keeps this entry visible in
+          // medium-term — otherwise `content = entry.shortTerm` would be
+          // null and the entry would vanish from the LLM context.
+          if (!entry.shortTerm && entry.immediate) {
+            entry.shortTerm = entry.immediate;
+          }
           entry.tier = 'medium-term';
           entry.tierEnteredAt = this.turnCounter;
         }

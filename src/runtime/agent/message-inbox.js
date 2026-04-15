@@ -130,7 +130,34 @@ export class MessageInbox {
     this._processed.push({ message: entry, result });
     channel.log('inbox', `${this._agent.name}: classified "${entry.text.substring(0, 60)}" → ${result.kind}${result.targetTaskId ? ` (task #${result.targetTaskId})` : ''}`);
 
-    // Wake up the main loop so it drains the result
+    // Wake up the main loop so it drains the result. Two cases:
+    //
+    // 1) Agent is awaiting `_wakeupPromise` between iterations → the
+    //    resolve below unparks it and the top-of-loop drain runs.
+    //
+    // 2) Agent is blocked INSIDE a prompt_user action — very common on
+    //    cold start when the user sends their first message right as the
+    //    reactive loop is firing up. The top-of-loop drain will NOT run
+    //    again until prompt_user resolves, so `_wakeAgent()` alone is not
+    //    enough: we also have to deliver the text to the pending input
+    //    waiter. That unblocks prompt_user, the loop continues, the next
+    //    iteration's drain applies the classified result normally.
+    //
+    //    We mark the entry as `_preDelivered` so `_applyInboxResult` does
+    //    not re-deliver the same text (which would queue a duplicate for
+    //    the next prompt_user).
+    try {
+      const cliHooks = this._agent?.constructor?._cliHooks;
+      const uiBridge = cliHooks?.getUiBridge?.();
+      if (uiBridge?.hasInputWaiter && entry.from === 'user' && typeof cliHooks?.deliverClassifiedInput === 'function') {
+        entry._preDelivered = true;
+        cliHooks.deliverClassifiedInput(entry.text);
+        channel.log('inbox', `${this._agent.name}: unblocked waiting prompt_user with classified input`);
+      }
+    } catch (err) {
+      channel.log('inbox', `${this._agent.name}: pre-deliver failed: ${err?.message || err}`);
+    }
+
     this._wakeAgent();
   }
 

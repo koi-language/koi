@@ -15,13 +15,20 @@ export class TaskClassifier {
    * @param {function(string, object, string, object): object} deps.createLLMFn — creates LLM instance
    * @param {object}                   deps.costCenter       — cost center instance for recording usage
    * @param {function(string, string): void} deps.logFn      — logging function (category, message)
+   * @param {function(): (Promise<void>|null)} [deps.waitForReadyFn] — optional
+   *        hook awaited at the start of every classifier call. Lets callers
+   *        (e.g. gateway mode) block classification until remote models have
+   *        been loaded, avoiding a race where the first user message lands
+   *        before `_availableProviders` is populated and the classifier gets
+   *        "No models available" from a cold gateway.
    */
-  constructor({ getClient, getAvailableProvidersFn, createLLMFn, costCenter, logFn }) {
+  constructor({ getClient, getAvailableProvidersFn, createLLMFn, costCenter, logFn, waitForReadyFn }) {
     this._getClient = getClient;
     this._getAvailableProvidersFn = getAvailableProvidersFn;
     this._createLLMFn = createLLMFn;
     this._costCenter = costCenter;
     this._log = logFn;
+    this._waitForReadyFn = waitForReadyFn;
   }
 
   // ── Project context for task classifier (cached) ──────────────────────────
@@ -268,6 +275,11 @@ ${taskDescription}`;
     const minReasoning = opts.minReasoning ?? 40;
     const label = opts.label || 'cheap-json';
 
+    // Wait for remote model list to finish loading (gateway mode) before
+    // asking the factory for candidates. Without this, a message that lands
+    // in the first ~700ms after engine start hits an empty provider list.
+    try { await this._waitForReadyFn?.(); } catch (_) {}
+
     const _allModels = getAllCandidates('reasoning', minReasoning, this._getAvailableProvidersFn());
     const _candidates = _allModels.map(c => ({
       client: this._getClient(c.provider),
@@ -324,6 +336,11 @@ ${taskDescription}`;
       this._log('classify-prompt', `--- ${classifierType.toUpperCase()} CLASSIFIER PROMPT ---\n${prompt}\n--- END ---`);
     }
     this._log('llm', `[classify] Using ${classifierType} classifier`);
+
+    // Wait for remote model list to finish loading (gateway mode) before
+    // asking the factory for candidates. Without this, a cold-start message
+    // gets "No models available" even though providers arrive ~700ms later.
+    try { await this._waitForReadyFn?.(); } catch (_) {}
 
     // Get candidate models for classification, sorted by cost (cheapest first).
     // The classifier MUST be a competent model — a weak model (like nano) will underestimate
