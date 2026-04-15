@@ -1061,6 +1061,14 @@ When a command requires sudo, just use sudo normally in the command. The system 
         return s.substring(0, half) + `\n\n... [${cut} bytes truncated] ...\n\n` + s.substring(s.length - half);
       };
       const stdoutStr = _truncate(combinedStr);
+      // stderrStr is only populated in spawn-fallback mode (PTY merges both into
+      // outputChunks). Truncate it with the same cap so error payloads don't
+      // leak megabytes of output into the LLM context.
+      const stderrTrunc = _truncate(stderrStr);
+      // Truncated combined output is what the error-fallback path uses when
+      // stderr is empty — NEVER the raw `combinedStr`, which can be >50MB on a
+      // runaway grep and will poison contextMemory.
+      const combinedTrunc = _truncate(combinedStr);
       const elapsed = _fmtElapsed(Date.now() - startTime);
 
       // Show output preview (first 3 lines + collapse the rest)
@@ -1075,25 +1083,39 @@ When a command requires sudo, just use sudo normally in the command. The system 
           .map(l => { const parts = l.split('\r'); return parts[parts.length - 1]; }) // resolve \r
           .filter(l => l.trim());
         const lines = _clean;
+        // Every output-rendering call below MUST carry the explicit
+        // _shellActionId so the GUI can route the bubble correctly. The
+        // channel falls back to _currentActionId otherwise, which in
+        // parallel executions is already clobbered by the next shell's
+        // beginAction — causing previews and "full output" payloads to
+        // land in the wrong bubble (or as free-floating markdown).
+        const _aidOpts = _shellActionId ? { actionId: _shellActionId } : {};
         if (_inScope) {
-          // Inside parallel scope: compact one-line summary
+          // Inside parallel scope: compact one-line summary in the bubble
+          // detail, but ALSO send the full captured output so the "expand"
+          // view in the bubble has something to show. Skipping this is
+          // what caused the tree output to be re-narrated by the LLM as
+          // markdown below the bubble.
           const preview = lines.length > 0 ? lines[0].substring(0, 80) : (t('noOutput') || 'No output');
           const extra = lines.length > 1 ? ` … +${lines.length - 1} lines` : '';
+          if (channel.sendShellFullOutput) {
+            channel.sendShellFullOutput(_shellActionId, command, output || '');
+          }
           channel.endAction(!isError, `${preview}${extra}`, _shellActionId);
           return;
         }
         if (lines.length === 0) {
-          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(${t('noOutput') || 'No output'})\x1b[0m`);
+          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(${t('noOutput') || 'No output'})\x1b[0m`, _aidOpts);
           return;
         }
         const visible = lines.slice(0, _PREVIEW_LINES);
         const hidden = lines.length - visible.length;
         visible.forEach((line, i) => {
           const prefix = i === 0 ? '  \x1b[2m⎿\x1b[0m  ' : '     ';
-          channel.printCompact(`${prefix}\x1b[2m${line.substring(0, 120)}\x1b[0m`);
+          channel.printCompact(`${prefix}\x1b[2m${line.substring(0, 120)}\x1b[0m`, _aidOpts);
         });
         if (hidden > 0) {
-          channel.printCompact(`     \x1b[38;2;120;120;120m… +${hidden} lines\x1b[0m`);
+          channel.printCompact(`     \x1b[38;2;120;120;120m… +${hidden} lines\x1b[0m`, _aidOpts);
         }
       };
 
@@ -1102,7 +1124,10 @@ When a command requires sudo, just use sudo normally in the command. The system 
         if (isSilent || _inScope || timeoutMs === 120000) return;
         const s = Math.round(timeoutMs / 1000);
         const tStr = s >= 60 ? (s % 60 === 0 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 60)}m ${s % 60}s`) : `${s}s`;
-        channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(timeout ${tStr})\x1b[0m`);
+        channel.printCompact(
+          `  \x1b[2m⎿\x1b[0m  \x1b[38;2;120;120;120m(timeout ${tStr})\x1b[0m`,
+          _shellActionId ? { actionId: _shellActionId } : {},
+        );
       };
 
       // User pressed the Stop button in the GUI — surface this as data
@@ -1111,7 +1136,10 @@ When a command requires sudo, just use sudo normally in the command. The system 
         _shellOutputCallback?.(false);
         reportDone?.();
         if (!isSilent) {
-          channel.printCompact(`  \x1b[2m⎿\x1b[0m  \x1b[38;2;200;140;80mstopped by user\x1b[0m`);
+          channel.printCompact(
+            `  \x1b[2m⎿\x1b[0m  \x1b[38;2;200;140;80mstopped by user\x1b[0m`,
+            _shellActionId ? { actionId: _shellActionId } : {},
+          );
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
         if (!isSilent && !_inScope) channel.endAction(false, 'stopped by user', _shellActionId);
@@ -1142,8 +1170,8 @@ When a command requires sudo, just use sudo normally in the command. The system 
           success: false,
           exitCode: closeCode || 1,
           stdout: stdoutStr,
-          stderr: stderrStr,
-          error: stderrStr || combinedStr || `Command exited with code ${closeCode}`
+          stderr: stderrTrunc,
+          error: stderrTrunc || combinedTrunc || `Command exited with code ${closeCode}`
         };
       } else {
         _shellOutputCallback?.(false);
@@ -1153,7 +1181,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
         if (!isSilent && !_inScope) channel.endAction(true, '', _shellActionId);
-        yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrStr };
+        yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrTrunc };
       }
       // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.
     } finally {

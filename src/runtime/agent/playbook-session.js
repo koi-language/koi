@@ -83,12 +83,18 @@ export class PlaybookSession {
     const errorKey = this._errorKey(action);
 
     if (error || isResultError) {
-      this.lastError = error || { message: result.error };
       this.consecutiveErrors++;
 
-      // Log this failure so we can warn the LLM if it tries the same thing again
-      const errorMsg = error ? (error.message || String(error)) : result.error;
-      this._errorLog.set(errorKey, { error: errorMsg, iteration: this.iteration });
+      // _llm_error is internal bookkeeping — do NOT expose it as `lastError`
+      // or add it to `_errorLog`, because both surface in buildFeedbackContext()
+      // and the model should never see its own parse/network failures
+      // (causes defeatist "I give up" hallucinations on retry).
+      const _isLlmError = (action?.intent || action?.type) === '_llm_error';
+      if (!_isLlmError) {
+        this.lastError = error || { message: result.error };
+        const errorMsg = error ? (error.message || String(error)) : result.error;
+        this._errorLog.set(errorKey, { error: errorMsg, iteration: this.iteration });
+      }
     } else {
       this.lastError = null;
       this.consecutiveErrors = 0;
@@ -142,7 +148,7 @@ export class PlaybookSession {
         parts.push('Multiple MCP failures detected. DIAGNOSE: check available tools on that MCP server for status/diagnostic tools and use them to understand the current state before retrying. The MCP server may have been restarted automatically.');
       }
 
-      parts.push('NEVER give up. Try a DIFFERENT approach — do NOT repeat the same action that failed. Think about what went wrong and find an alternative path to achieve the goal.');
+      parts.push('Try a DIFFERENT approach — do NOT repeat the same action that failed. Think about what went wrong and find an alternative path (different tool, different arguments, different angle) to achieve the goal.');
     }
 
     // Past unresolved failures — remind the LLM what already failed
@@ -154,38 +160,44 @@ export class PlaybookSession {
       }
     }
     if (this._errorLog.size > 0) {
-      const failures = [];
-      for (const [key, { error }] of this._errorLog) {
-        failures.push(`  • ${key} → ${error}`);
-      }
-      parts.push(`⚠️ PAST FAILURES (still unresolved — do NOT retry these without fixing the cause first):\n${failures.join('\n')}`);
+      // Only show the 2 most recent unresolved failures. A long wall of past
+      // failures primes defeatist "everything fails, return success:false"
+      // hallucinations on reasoning models.
+      const entries = Array.from(this._errorLog.entries())
+        .sort((a, b) => (b[1].iteration ?? 0) - (a[1].iteration ?? 0))
+        .slice(0, 2);
+      const failures = entries.map(([key, { error }]) => `  • ${key} → ${error}`);
+      parts.push(`⚠️ RECENT UNRESOLVED FAILURES (do NOT retry these without fixing the cause first):\n${failures.join('\n')}`);
     }
 
     // Recent action history summary — helps the LLM track progress and avoid loops.
     // Shows the last 5 actions with their results (condensed).
     // Especially critical for mobile navigation where the LLM does 20+ iterations
     // and older actions have already been compressed out of context.
-    if (this.actionHistory.length > 1) {
+    // _llm_error is internal bookkeeping — the model should NEVER see its own
+    // parse/network failures in context, because that nudges it toward
+    // defeatist "every tool returned nothing, I give up with success:false"
+    // hallucinations. Filter them out of the LLM-visible history.
+    const _visibleHistory = this.actionHistory.filter(e => (e.action?.intent || e.action?.type) !== '_llm_error');
+    if (_visibleHistory.length > 1) {
       const HISTORY_WINDOW = 10;
-      const recentActions = this.actionHistory.slice(-HISTORY_WINDOW, -1); // exclude last (shown separately below)
+      const recentActions = _visibleHistory.slice(-HISTORY_WINDOW, -1); // exclude last (shown separately below)
       if (recentActions.length > 0) {
-        const total = this.actionHistory.length;
-        const lines = recentActions.map((entry, i) => {
-          const idx = total - recentActions.length + i;
+        // Deliberately NO total count and NO per-action index numbers: exposing
+        // a growing counter to reasoning models primes defeatist "I'm running
+        // out of time/steps, return success:false" hallucinations. Plain bullets.
+        const lines = recentActions.map((entry) => {
           const intent = entry.action.intent || entry.action.type || '?';
           const args = this._formatActionArgs(entry.action);
           if (entry.error) {
-            return `  ${idx}. ${intent}${args} → FAILED`;
+            return `  • ${intent}${args} → FAILED`;
           }
           const ok = entry.result?.success === false ? '→ FAILED' : '→ ok';
-          return `  ${idx}. ${intent}${args} ${ok}`;
+          return `  • ${intent}${args} ${ok}`;
         });
-        parts.push(`ACTIONS SO FAR (${total} total, last ${recentActions.length} shown):\n${lines.join('\n')}`);
+        parts.push(`RECENT ACTIONS:\n${lines.join('\n')}`);
       }
     }
-
-    // Step counter
-    parts.push(`STEP: ${this.iteration + 1}${this.maxIterations ? ` of ${this.maxIterations}` : ''}`);
 
     // Task reminder — always present so the agent never loses sight of its mission.
     const args = this.actionContext?.args;
@@ -203,8 +215,9 @@ export class PlaybookSession {
       parts.push(`\u26a0\ufe0f ${warning}`);
     }
 
-    // Last action result
-    const lastEntry = this.actionHistory[this.actionHistory.length - 1];
+    // Last action result — skip _llm_error entries (internal bookkeeping,
+    // not something the model should see as "its last action").
+    const lastEntry = _visibleHistory[_visibleHistory.length - 1];
     if (lastEntry && !lastEntry.error) {
       const intent = lastEntry.action.intent || lastEntry.action.type || 'unknown';
       const id = lastEntry.action.id ? ` [${lastEntry.action.id}]` : '';

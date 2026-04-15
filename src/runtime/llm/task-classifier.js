@@ -115,10 +115,10 @@ ${taskDescription}`;
       A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
       B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: 'none' },
       C: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'low' },
-      E: { code: 65,  reasoning: 70,  risk: 20, reasoningEffort: 'low' },
-      F: { code: 60,  reasoning: 65,  risk: 10, reasoningEffort: 'low' },
-      G: { code: 50,  reasoning: 60,  risk: 60, reasoningEffort: 'low' },
+      D: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'medium' },
+      E: { code: 65,  reasoning: 70,  risk: 20, reasoningEffort: 'high' },
+      F: { code: 60,  reasoning: 65,  risk: 10, reasoningEffort: 'medium' },
+      G: { code: 50,  reasoning: 60,  risk: 60, reasoningEffort: 'medium' },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);
@@ -146,6 +146,12 @@ ${taskDescription}`;
     const prompt = `Pick the ONE category (A-V) that best matches this task. Return ONLY json: {"cat":"X"}
 
 IMPORTANT: When in doubt between two categories, ALWAYS pick the HIGHER (more complex) one. Underestimating costs quality; overestimating costs pennies.
+
+CRITICAL GUIDANCE (common mis-classifications):
+- Writing/generating substantial content (documentation, README, architecture overview, BRAXIL.md, multi-section reports, project analyses "from top to bottom") is M or P — NEVER D or E. D/E are for ANSWERING questions in chat, not for producing multi-kilobyte deliverables.
+- Any task that says "comprehensive", "full analysis", "top to bottom", "all sections", or lists explicit section headings is P (planning + decomposition needed).
+- If the expected output is a file the agent has to write, it is at minimum M (multi-file work / real code output). Never A-E.
+- Delegation to another agent ("invoke SoftwareDeveloper to do X") inherits X's complexity — classify by WHAT is being delegated, not by the delegation wrapper.
 ${projectContext ? `\nPROJECT CONTEXT (use this to gauge complexity — a rename in a 500-file project is harder than in a 5-file project):\n${projectContext}\n` : ''}${discoveryContext ? `\nDISCOVERY CONTEXT (what the agent found while exploring — use this to refine your estimate):\n${discoveryContext}\n` : ''}
 
 CATEGORIES:
@@ -206,30 +212,36 @@ Task:
 
 ${taskDescription}`;
 
+    // Effort policy:
+    //   low    — trivial lookup / one-liner / small fix (A-C, F, H, K)
+    //   medium — real multi-step work (D, E, G/G2, I, J, L, M, N, O, Q, R, V)
+    //   high   — planning, debugging complex flows, architecture, expert-level (P, S, T, U)
+    // Default to medium. Low is the exception, not the rule — under-classifying
+    // causes reasoning models to hallucinate success without doing work.
     const CATEGORY_PROFILES = {
       A: { code: 40,  reasoning: 10,  risk: 10, reasoningEffort: 'low' },
       B: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
       C: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
-      E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
+      D: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
+      E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
       F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'low' },
-      G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
-      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'low' },
+      G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
+      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
       H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: 'low' },
-      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'low' },
-      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'low' },
+      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
+      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
       K: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: 'low' },
-      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'low' },
-      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'low' },
-      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'low' },
+      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'medium' },
+      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'medium' },
+      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'medium' },
       O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'medium' },
       P: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
-      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'low' },
+      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'medium' },
       R: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
-      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'medium' },
-      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'medium' },
+      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'high' },
+      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
       U: { code: 90,  reasoning: 85,  risk: 20, reasoningEffort: 'high' },
-      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'low' },
+      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName);
