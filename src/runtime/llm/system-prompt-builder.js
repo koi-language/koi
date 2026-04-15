@@ -269,15 +269,33 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${isActive ? ' **(ACTIVE — what the user is currently looking at)**' : ''}`);
       }
       lines.push('');
-      lines.push('**The active document is what the user is currently looking at on their screen.** When the user says "this", "esto", "ves esto?", "the document", "the pdf", "the image", or refers to something visible without naming it — they mean the ACTIVE document.');
+      lines.push('**The ACTIVE document is what the user is currently looking at on their screen.** Treat it as the default target of every request that does not explicitly name a different file, URL, or project path. Specifically:');
       lines.push('');
-      lines.push('To read any of these documents, use `read_file` with the exact path shown above. Do NOT invent paths — only use paths from this list.');
+      lines.push('1. **Implicit references** — "this", "esto", "ves esto?", "aquí", "the document", "the pdf", "the image", or any request that does not name a specific target, ALWAYS mean the ACTIVE document. Never ignore it to go explore the project codebase instead.');
+      lines.push('2. **Read** — call `read_file` with the exact path (for image / pdf / text / word / html tabs) or exact URL (for web tabs) shown above. Never invent paths — only use what is listed here. For images and web pages the content is attached as vision input; if the user has drawn annotations, a second image labeled `[ANNOTATIONS OVERLAY]` follows as visual guidance complementing their prompt.');
+      lines.push('3. **Write / edit / fill** — when the user asks you to add, write, fill, update, replace, rename, continue, or otherwise modify content WITHOUT specifying a different target, apply it to the ACTIVE document if it is a text-like file (text, html). Use `edit_file` or `write_file` with its exact path; the GUI editor reloads from disk automatically. Examples that target the active text doc: "añade una intro", "pon un texto introductorio", "continúa el texto", "escribe aquí", "ponlo en el documento", "fill in the content", "write a title", "replace this section".');
+      lines.push('   - **Do this inline. DO NOT delegate** these edits to SoftwareDeveloper or any other sub-agent. Delegation is only for non-trivial changes spread across the project codebase. The user\'s open working-area document is ALWAYS handled directly by the agent receiving the message — there is nothing to "plan" or "explore" first.');
+      lines.push('   - **Append vs replace**: "continúa", "sigue", "añade al final", "add more" → preserve existing content and `edit_file` after the last line. "replace this", "rewrite this", "start over" → replace the selection (or whole file if there is no selection).');
+      lines.push('   - **Mandatory discipline**: NEVER return `success` on a write request without having actually executed `edit_file` or `write_file` first. Hallucinating completion ("documento actualizado", "texto añadido") without a tool call is a hard failure. If you cannot perform the edit for any reason, say so explicitly with `print` and `prompt_user` — do not fake it.');
+      lines.push('4. **Images / PDFs / web** — if the user asks you to "edit" or "change" a non-text active doc (image, pdf, web page), you cannot modify it directly. Instead: describe what you would do, then ask the user to confirm or provide a destination, OR call the appropriate generation/screenshot tool.');
+      lines.push('5. **Ambiguity** — if there are multiple open text documents and the request could reasonably target more than one, ASK the user with `prompt_user` before writing. Never guess silently when a write could overwrite the wrong file.');
+      lines.push('6. **Never fabricate** — do NOT invent file paths, do NOT go searching the repo when an obvious active document is sitting right in front of the user. The working-area list above is authoritative.');
+      lines.push('7. **Caret & selection** — when you `read_file` the active text document, the result may include an `editor` field with the user\'s caret position or selected range. If present, treat it as the primary anchor for demonstratives: "this", "esto", "here", "change this", "replace this", "move it up", etc. always refer to that caret/selection first. The `editor.summary` already explains it in natural language — read it carefully before deciding what to modify.');
       if (active && (active.path || active.url)) {
+        const activeLoc = active.path || active.url;
+        const isText = active.type === 'text' || active.type === 'html';
         lines.push('');
         lines.push('Example — read the active document:');
         lines.push('```json');
-        lines.push(`{ "intent": "read_file", "path": "${active.path || active.url}" }`);
+        lines.push(`{ "intent": "read_file", "path": "${activeLoc}" }`);
         lines.push('```');
+        if (isText) {
+          lines.push('');
+          lines.push('Example — write into the active text document (default target for "add/write/fill" requests):');
+          lines.push('```json');
+          lines.push(`{ "intent": "write_file", "path": "${activeLoc}", "content": "..." }`);
+          lines.push('```');
+        }
       }
       openDocumentsBlock = lines.join('\n') + '\n';
     }

@@ -195,6 +195,74 @@ async function _loadPdfjsFromCache() {
   return _pdfjsCached;
 }
 
+/**
+ * Queue the active working-area document (image or web screenshot) for the
+ * next LLM turn as a vision input, and — if the user has drawn annotations on
+ * it — also queue the annotated composite as a second image preceded by a
+ * text caption marking it as user markup. This is used both for the URL
+ * branch (web tabs) and as a follow-up after reading an image file that
+ * happens to be the active working-area document.
+ */
+async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
+  const session = agent?._activeSession;
+  if (!session) {
+    return {
+      success: false,
+      error: 'No active session — cannot queue document for vision.',
+    };
+  }
+
+  const sourcePath = doc.sourcePath || doc.path;
+  if (!sourcePath || !fs.existsSync(sourcePath)) {
+    return {
+      success: false,
+      error: `Active document has no readable source on disk (looked for: ${sourcePath || 'none'}).`,
+    };
+  }
+
+  const srcExt = path.extname(sourcePath).toLowerCase().slice(1);
+  const srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
+  const srcB64 = fs.readFileSync(sourcePath).toString('base64');
+
+  if (!session._pendingMcpImages) session._pendingMcpImages = [];
+  session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: sourcePath });
+  channel.log('read_file', `Active ${doc.type} queued for vision: ${sourcePath}`);
+
+  let annotationNote = '';
+  const overlayPath = doc.annotationOverlayPath;
+  if (overlayPath && fs.existsSync(overlayPath)) {
+    const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
+    const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
+    const ovB64 = fs.readFileSync(overlayPath).toString('base64');
+    const caption =
+      '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
+      'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
+      'painted on top of the exact same image you just saw. Use it as a visual guide ' +
+      'that complements the text prompt: the shapes and their positions indicate what ' +
+      'the user is referring to. The colors themselves are meaningless — only the ' +
+      'regions and the shapes\' intent matter. Do not treat the markup as part of the ' +
+      'design or copy its colors into your output.';
+    session._pendingMcpImages.push({
+      mimeType: ovMime,
+      data: ovB64,
+      _debugPath: overlayPath,
+      caption,
+      role: 'annotation_overlay',
+    });
+    channel.log('read_file', `Annotation overlay queued for vision: ${overlayPath}`);
+    annotationNote = ' The user has drawn annotations over it — a second image labeled "ANNOTATIONS OVERLAY" follows, marking which areas they are pointing at.';
+  }
+
+  return {
+    success: true,
+    path: originalRequestPath,
+    type: doc.url ? 'web' : 'image',
+    message:
+      `Active working-area ${doc.url ? 'web page' : 'image'} attached for visual analysis.` +
+      annotationNote,
+  };
+}
+
 export default {
   type: 'read_file',
   intent: 'read_file',
@@ -230,6 +298,30 @@ export default {
   async execute(action, agent) {
     let filePath = action.path;
     if (!filePath) throw new Error('read_file: "path" field is required');
+
+    // URL branch — the system prompt tells the agent to read the active
+    // working-area document with its `path or url`. For web tabs that means
+    // read_file gets an http(s) URL, which is obviously not a file on disk.
+    // Resolve it through the open-documents store: if the URL matches an
+    // open web tab, queue the GUI-captured screenshot (and any annotation
+    // overlay the user has drawn) for vision, then return.
+    if (/^https?:\/\//i.test(filePath)) {
+      try {
+        const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+        const doc = openDocumentsStore.findByPathOrUrl(filePath);
+        if (!doc) {
+          return {
+            success: false,
+            error: `URL "${filePath}" is not an open working-area document. Use web_fetch for arbitrary URLs.`,
+          };
+        }
+        const queued = await _queueActiveDocumentForVision(doc, agent, filePath);
+        if (queued.success) return queued;
+        return queued;
+      } catch (err) {
+        return { success: false, error: `Failed to read active web document: ${err.message}` };
+      }
+    }
 
     // Resolve attachment IDs (att-N) transparently via the attachment registry.
     // Agents reference attachments by ID; read_file resolves them to actual paths.
@@ -299,45 +391,48 @@ export default {
       // Queue the image for the next LLM turn as a vision input.
       const session = agent?._activeSession;
       if (session) {
-        const fileName = path.basename(resolvedPath);
-        const isAnnotation = fileName.startsWith('braxil-annotation-');
-
-        // Annotation images must NEVER be shown to the LLM as visual input.
-        // LLMs confuse annotation overlays (colored shapes, arrows) with actual
-        // design elements and copy their colors/shapes into the output.
-        // Instead, return the sidecar JSON description (if available) as text.
-        if (isAnnotation) {
-          channel.log('read_file', `Annotation image — returning text description only (not queued for vision): ${filePath}`);
-          const sidecarPath = resolvedPath + '.annotations.json';
-          let annotationDesc = 'This is an annotation image showing the user\'s markup on a screenshot. The drawn shapes (rectangles, circles, arrows) indicate which areas the user wants changed. Their colors are meaningless — only their position matters.';
-          if (fs.existsSync(sidecarPath)) {
-            try {
-              const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'));
-              const annList = (sidecar.annotations || []).map((a, i) => {
-                const shape = a.type || 'shape';
-                const text = a.text ? ` with text "${a.text}"` : '';
-                return `  ${i + 1}. ${shape}${text} at position (${Math.round(a.points?.[0]?.x || 0)}, ${Math.round(a.points?.[0]?.y || 0)})`;
-              }).join('\n');
-              if (annList) annotationDesc += `\n\nAnnotations found:\n${annList}`;
-              if (sidecar.source) annotationDesc += `\n\nSource image: ${sidecar.source}`;
-            } catch {}
-          }
-          return {
-            success: true,
-            path: filePath,
-            type: 'annotation',
-            message: annotationDesc,
-          };
-        }
-
         if (!session._pendingMcpImages) session._pendingMcpImages = [];
         session._pendingMcpImages.push({ mimeType: mime, data: b64, _debugPath: filePath });
         channel.log('read_file', `Image queued for vision: ${filePath}`);
+
+        // If this image is also the active working-area document and the
+        // user has drawn annotations over it, queue the annotated composite
+        // right after the original so the LLM sees them as a pair.
+        let annotationNote = '';
+        try {
+          const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+          const doc = openDocumentsStore.findByPathOrUrl(resolvedPath) ||
+                      openDocumentsStore.findByPathOrUrl(filePath);
+          const overlayPath = doc?.annotationOverlayPath;
+          if (overlayPath && fs.existsSync(overlayPath)) {
+            const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
+            const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
+            const ovB64 = fs.readFileSync(overlayPath).toString('base64');
+            const caption =
+              '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
+              'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
+              'painted on top of the exact same image you just saw. Use it as a visual guide ' +
+              'that complements the text prompt: the shapes and their positions indicate what ' +
+              'the user is referring to. The colors themselves are meaningless — only the ' +
+              'regions and the shapes\' intent matter. Do not treat the markup as part of the ' +
+              'design or copy its colors into your output.';
+            session._pendingMcpImages.push({
+              mimeType: ovMime,
+              data: ovB64,
+              _debugPath: overlayPath,
+              caption,
+              role: 'annotation_overlay',
+            });
+            channel.log('read_file', `Annotation overlay queued for vision: ${overlayPath}`);
+            annotationNote = ' The user has drawn annotations over it — a second image labeled "ANNOTATIONS OVERLAY" follows, marking which areas they are pointing at.';
+          }
+        } catch { /* store unavailable — ignore */ }
+
         return {
           success: true,
           path: filePath,
           type: 'image',
-          message: `Image loaded and attached for visual analysis. You will see the image on your next response.`
+          message: `Image loaded and attached for visual analysis. You will see the image on your next response.${annotationNote}`
         };
       }
       // Fallback: no agent available, return base64 directly
@@ -574,6 +669,20 @@ export default {
 
     const wasTruncated = endIdx < allLines.length && !action.limit;
 
+    // If this file is the active working-area document and the GUI has
+    // published a cursor/selection, attach it so the agent knows where the
+    // user is pointing ("change this"). Only included for text-like types
+    // the user can actually edit in place.
+    let editor = null;
+    try {
+      const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+      const doc = openDocumentsStore.findByPathOrUrl(resolvedPath) ||
+                  openDocumentsStore.findByPathOrUrl(filePath);
+      if (doc && (doc.selectionStart != null || doc.selectionEnd != null)) {
+        editor = _describeEditorSelection(content, doc.selectionStart, doc.selectionEnd);
+      }
+    } catch { /* store unavailable — ignore */ }
+
     return {
       success: true,
       path: filePath,
@@ -581,7 +690,71 @@ export default {
       totalLines: allLines.length,
       from: offset,
       to: endIdx,
+      ...(editor && { editor }),
       ...(wasTruncated && { truncated: true, hint: `File has ${allLines.length} lines. Use offset/limit to read more.` })
     };
   }
 };
+
+/**
+ * Convert a (start, end) character-offset pair from the GUI text editor
+ * into a human-readable cursor/selection block the LLM can reason about.
+ * Returns an object with 1-based line/column coordinates, the selected
+ * text (truncated for large selections), and a short `summary` string
+ * that can be shown inline or read alone.
+ */
+function _describeEditorSelection(content, start, end) {
+  if (typeof start !== 'number' || typeof end !== 'number') return null;
+  const len = content.length;
+  const lo = Math.max(0, Math.min(start, end, len));
+  const hi = Math.max(0, Math.min(Math.max(start, end), len));
+
+  const offsetToLineCol = (offset) => {
+    let line = 1;
+    let col = 1;
+    for (let i = 0; i < offset; i++) {
+      if (content.charCodeAt(i) === 10 /* \n */) {
+        line++;
+        col = 1;
+      } else {
+        col++;
+      }
+    }
+    return { line, col };
+  };
+
+  const startPos = offsetToLineCol(lo);
+  if (lo === hi) {
+    return {
+      type: 'cursor',
+      line: startPos.line,
+      column: startPos.col,
+      summary: `User's caret is at line ${startPos.line}, column ${startPos.col}. No text is selected; when the user says "here" or "this line" they mean that position.`,
+    };
+  }
+
+  const endPos = offsetToLineCol(hi);
+  const MAX_SNIPPET = 500;
+  let snippet = content.slice(lo, hi);
+  const truncated = snippet.length > MAX_SNIPPET;
+  if (truncated) snippet = snippet.slice(0, MAX_SNIPPET) + '…';
+
+  const sameLine = startPos.line === endPos.line;
+  const rangeDesc = sameLine
+    ? `line ${startPos.line}, columns ${startPos.col}–${endPos.col}`
+    : `line ${startPos.line} col ${startPos.col} → line ${endPos.line} col ${endPos.col}`;
+
+  return {
+    type: 'selection',
+    startLine: startPos.line,
+    startColumn: startPos.col,
+    endLine: endPos.line,
+    endColumn: endPos.col,
+    selectedText: snippet,
+    truncated,
+    summary:
+      `User has text selected: ${rangeDesc}. When they say "this", "esto", "change this", ` +
+      `"replace this", or refer to something without naming it, they mean the SELECTED text below. ` +
+      `Selected text${truncated ? ' (truncated)' : ''}:\n"""${snippet}"""`,
+  };
+}

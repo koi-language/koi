@@ -28,6 +28,16 @@ export const openDocumentsStore = {
 
   hasAny() { return _documents.length > 0; },
 
+  /// Find an open document by its file path or URL. Used by read_file to
+  /// decide whether the agent is reading the active work-area document, in
+  /// which case the GUI-captured source/annotation images get injected into
+  /// vision. Returns null if no document matches.
+  findByPathOrUrl(pathOrUrl) {
+    if (!pathOrUrl) return null;
+    const needle = String(pathOrUrl);
+    return _documents.find(d => d.path === needle || d.url === needle) || null;
+  },
+
   /** Human-readable summary for injection into action descriptions. */
   summary() {
     if (_documents.length === 0) {

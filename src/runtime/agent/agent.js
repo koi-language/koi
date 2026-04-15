@@ -2819,10 +2819,8 @@ export class Agent {
           try {
             const { attachmentRegistry } = await import('../state/attachment-registry.js');
             const _attParts = _quotaAttachments.map(a => {
-              const id = attachmentRegistry.register(a.path, { role: a.role });
-              const entry = attachmentRegistry.get(id);
-              const roleTag = entry?.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
-              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'}${roleTag})`;
+              const id = attachmentRegistry.register(a.path);
+              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
             });
             _attNote = `\n[Attached ${_attParts.join(', ')}]`;
           } catch {
@@ -2948,10 +2946,8 @@ export class Agent {
           try {
             const { attachmentRegistry } = await import('../state/attachment-registry.js');
             const _attParts = _promptAtts.map(a => {
-              const id = attachmentRegistry.register(a.path, { role: a.role });
-              const entry = attachmentRegistry.get(id);
-              const roleTag = entry?.role === 'annotation' ? ', ANNOTATION — shows changes the user wants' : '';
-              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'}${roleTag})`;
+              const id = attachmentRegistry.register(a.path);
+              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
             });
             _attNote = `\n[Attached ${_attParts.join(', ')}]`;
           } catch {

@@ -325,6 +325,14 @@ export class LLMProvider {
     // in / added API keys. If the env now contains credentials, pick
     // them up on the fly instead of throwing NO_PROVIDER.
     this._maybeLateInitFromEnv();
+    // If late-init just flipped us into gateway mode it started loading
+    // the model catalog asynchronously. Block on that before returning —
+    // otherwise the very next LLM call fires with _availableProviders=[]
+    // and factory.js throws NO_PROVIDERS, forcing a 10-20s retry cycle at
+    // cold start.
+    if (this._modelsReady) {
+      await this._modelsReady;
+    }
     if (this._availableProviders.length > 0) return;
     // Gateway mode: all providers are available via the braxil.ai backend
     if (this._koiGateway) return;
@@ -1327,17 +1335,8 @@ CRITICAL RULES:
 
         const textContent = typeof msg.content === 'string' ? msg.content : '';
 
-        // Filter out annotation images — they contain user markup (colored shapes,
-        // arrows) that LLMs confuse with actual design elements. The annotation's
-        // meaning is already captured in the text; showing the image only causes
-        // the LLM to copy annotation colors/shapes into its output.
-        const _nonAnnotationAtts = imageAtts.filter(a => a.role !== 'annotation');
-        if (_nonAnnotationAtts.length < imageAtts.length) {
-          channel.log('llm', `[auto] Filtered ${imageAtts.length - _nonAnnotationAtts.length} annotation image(s) from inline attachments`);
-        }
-
         const imageParts = (await Promise.all(
-          _nonAnnotationAtts.map(async a => {
+          imageAtts.map(async a => {
             const opt = await _optimizeImage(a.path);
             return opt ? { ...opt, path: a.path } : null;
           })
@@ -1381,15 +1380,7 @@ CRITICAL RULES:
         session._lastConsumedImages = [...session._pendingMcpImages];
       }
       {
-        // Filter out annotation images — they contain user markup (colored shapes,
-        // arrows) that LLMs confuse with actual design elements. The annotation's
-        // meaning is already captured in the text description; showing the image
-        // to the LLM only causes it to copy annotation colors/shapes into its output.
-        const _visualImages = session._pendingMcpImages.filter(p => p.role !== 'annotation');
-        const _skippedAnnotations = session._pendingMcpImages.length - _visualImages.length;
-        if (_skippedAnnotations > 0) {
-          channel.log('llm', `[auto] Filtered ${_skippedAnnotations} annotation image(s) from LLM context (text description preserved)`);
-        }
+        const _visualImages = session._pendingMcpImages;
 
         if (_visualImages.length > 0) {
           const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
@@ -1397,13 +1388,19 @@ CRITICAL RULES:
             const existing = messages[lastUserIdx].content;
             const textContent = typeof existing === 'string' ? existing
               : Array.isArray(existing) ? existing.find(p => p.type === 'text')?.text ?? '' : '';
+            // Each pending image may carry a `caption` — a text block that
+            // must precede it (used to mark annotation overlays so the LLM
+            // does not mistake user markup for original design elements).
             if (this.provider === 'anthropic') {
               messages[lastUserIdx] = {
                 role: 'user',
                 content: [
-                  ..._visualImages.map(p => ({
-                    type: 'image', source: { type: 'base64', media_type: p.mimeType, data: p.data }
-                  })),
+                  ..._visualImages.flatMap(p => {
+                    const blocks = [];
+                    if (p.caption) blocks.push({ type: 'text', text: p.caption });
+                    blocks.push({ type: 'image', source: { type: 'base64', media_type: p.mimeType, data: p.data } });
+                    return blocks;
+                  }),
                   { type: 'text', text: textContent },
                 ]
               };
@@ -1412,9 +1409,12 @@ CRITICAL RULES:
                 role: 'user',
                 content: [
                   { type: 'text', text: textContent },
-                  ..._visualImages.map(p => ({
-                    type: 'image_url', image_url: { url: `data:${p.mimeType};base64,${p.data}` }
-                  })),
+                  ..._visualImages.flatMap(p => {
+                    const blocks = [];
+                    if (p.caption) blocks.push({ type: 'text', text: p.caption });
+                    blocks.push({ type: 'image_url', image_url: { url: `data:${p.mimeType};base64,${p.data}` } });
+                    return blocks;
+                  }),
                 ]
               };
             }

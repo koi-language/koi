@@ -35,6 +35,9 @@ let _remoteLastAttempt = 0;
 const _REMOTE_RETRY_MS = 30_000; // retry every 30s on failure
 const _REMOTE_POLL_MS = 60_000;  // poll for changes every 60s
 let _pollTimer = null;
+/** In-flight fetch promise — concurrent callers share it instead of racing the
+ *  same HTTP request. Cleared as soon as it resolves. */
+let _inflightLoad = null;
 
 /** Load local models.json as fallback when backend is unavailable. */
 function _useLocalFallback(reason) {
@@ -53,6 +56,12 @@ function _useLocalFallback(reason) {
  * Starts a background poll timer on first successful load.
  */
 export async function loadRemoteModels() {
+  // Share a single in-flight request between concurrent callers so cold-start
+  // preload (bin-entry) and the first syncGatewayProviders() call don't fire
+  // two parallel HTTP requests — the second one would race against itself
+  // and add another ~500ms of latency for no reason.
+  if (_inflightLoad) return _inflightLoad;
+
   const now = Date.now();
   const isEmpty = Object.keys(modelsData).length === 0;
   // Always retry if modelsData is empty (critical — no models = can't work)
@@ -64,6 +73,11 @@ export async function loadRemoteModels() {
   }
   _remoteLastAttempt = now;
 
+  _inflightLoad = _doLoadRemoteModels().finally(() => { _inflightLoad = null; });
+  return _inflightLoad;
+}
+
+async function _doLoadRemoteModels() {
   const base = process.env.KOI_API_URL || 'http://localhost:3000';
   // Both gateway and API keys mode use /gateway/models.json (all models with scores).
   // In gateway mode, the backend filters by user plan; in API keys mode, all models are returned.

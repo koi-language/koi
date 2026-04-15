@@ -89,39 +89,24 @@ const generateImageAction = {
       } else {
         referenceImages = [];
         const maxRef = caps.maxReferenceImages || 1;
-        // Resolve attachment IDs (att-N) to real paths, filtering out annotations.
-        // Annotations contain user markup that would contaminate the generated image.
-        const _filteredRefs = [];
+        // Resolve attachment IDs (att-N) to real paths.
+        const _resolvedRefs = [];
         try {
           const { attachmentRegistry: _ar } = await import('../../state/attachment-registry.js');
           for (const p of action.referenceImages) {
             if (typeof p === 'string' && /^att-\d+$/.test(p)) {
               const entry = _ar.get(p);
-              if (entry?.role === 'annotation') {
-                channel.log('image', `Skipping annotation attachment as reference: ${p} (${entry.fileName})`);
-                continue;
-              }
               if (entry?.path) {
-                _filteredRefs.push(entry.path);
+                _resolvedRefs.push(entry.path);
                 continue;
               }
             }
-            // Raw path fallback — also check filename
-            const name = typeof p === 'string' ? path.basename(p) : '';
-            if (name.startsWith('braxil-annotation-')) {
-              channel.log('image', `Skipping annotation image as reference: ${name}`);
-              continue;
-            }
-            _filteredRefs.push(p);
+            _resolvedRefs.push(p);
           }
         } catch {
-          // Fallback: filter by filename only
-          for (const p of action.referenceImages) {
-            const name = typeof p === 'string' ? path.basename(p) : '';
-            if (!name.startsWith('braxil-annotation-')) _filteredRefs.push(p);
-          }
+          _resolvedRefs.push(...action.referenceImages);
         }
-        for (const filePath of _filteredRefs.slice(0, maxRef)) {
+        for (const filePath of _resolvedRefs.slice(0, maxRef)) {
           const resolvedPath = path.resolve(filePath);
           if (!fs.existsSync(resolvedPath)) {
             return { success: false, error: `Reference image not found: ${filePath}` };
