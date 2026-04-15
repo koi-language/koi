@@ -1159,17 +1159,11 @@ export class Agent {
             const cliSelect = (await import('../io/channel.js')).channel.select;
             Agent._cliHooks?.onBusy?.(false);
 
-            // Format: only show unfinished tasks (completed ones are not shown here).
-            const UNFINISHED_LIMIT = 5;
-
-            const fmtTask = t =>
-              `  ${t.status === 'in_progress' ? '●' : '☐'}  ${t.subject}`;
-
-            const unfinishedLines = unfinished.slice(0, UNFINISHED_LIMIT).map(fmtTask);
-            const unfinishedExtra = unfinished.length - UNFINISHED_LIMIT;
-            if (unfinishedExtra > 0) unfinishedLines.push(`    … +${unfinishedExtra} more`);
-
-            channel.print(unfinishedLines.join('\n'));
+            // The Tasks widget (floating/docked) is the single surface
+            // for the task list — do NOT print the checklist into the
+            // chat body. The resume dialog below is the only thing the
+            // user sees; once they confirm, `taskManager.showPanel()`
+            // populates the widget.
             const _s = globalThis.__koiStrings || {};
             channel.clear();
             // Small delay to let Ink process the busy=false and render the select
