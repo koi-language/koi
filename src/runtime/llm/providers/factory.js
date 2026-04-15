@@ -30,7 +30,7 @@ import { NanoBanana2ImageGen } from './banana.js';
 
 // ── Re-export from auto-model-selector (circuit breaker, provider discovery) ─
 // These are consumed by llm-provider.js for error handling.
-export { markProviderTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE, getAllCandidates } from '../auto-model-selector.js';
+export { markProviderTimeout, markModelTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, DEFAULT_TASK_PROFILE, getAllCandidates } from '../auto-model-selector.js';
 import { selectAutoModel } from '../auto-model-selector.js';
 import { channel } from '../../io/channel.js';
 

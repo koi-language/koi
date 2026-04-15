@@ -145,33 +145,64 @@ export function lookupRemoteModel(modelId) {
  *  This is deliberately conservative: moderate scores, thinking on. */
 export const DEFAULT_TASK_PROFILE = { taskType: 'code', difficulty: 70, code: 70, reasoning: 70, thinking: true };
 
-// ── Circuit breaker: per-provider timeout cooldown ────────────────────────
-// After N consecutive timeouts, a provider is skipped for an escalating period.
-// Cooldown steps (ms): 1.5m → 5m → 15m
+// ── Circuit breaker: timeout cooldowns ────────────────────────────────────
+// Two levels of cooldown:
+//   • per-provider — whole provider out (used for 429, auth, global outage)
+//   • per-model    — single model out (used for mid-stream failures or an
+//                     individual model timing out; keeps sibling models
+//                     from the same provider available)
+// After N consecutive failures, the entry is skipped for an escalating
+// period: 1.5m → 5m → 15m.
 const COOLDOWN_STEPS_MS = [90_000, 300_000, 900_000];
 const _providerCooldowns = new Map(); // provider → { failures, until }
+const _modelCooldowns = new Map();    // "provider/model" → { failures, until }
 
-/** Mark a provider as having timed out. Applies progressive cooldown. */
-export function markProviderTimeout(provider) {
-  const entry = _providerCooldowns.get(provider) || { failures: 0, until: 0 };
+function _applyCooldown(map, key, label) {
+  const entry = map.get(key) || { failures: 0, until: 0 };
   entry.failures++;
   const step = Math.min(entry.failures - 1, COOLDOWN_STEPS_MS.length - 1);
   entry.until = Date.now() + COOLDOWN_STEPS_MS[step];
-  _providerCooldowns.set(provider, entry);
+  map.set(key, entry);
   const secs = COOLDOWN_STEPS_MS[step] / 1000;
   // Log to file only — not visible to the user
   if (process.env.KOI_LOG_FILE) {
-    try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[circuit-breaker] ${provider} on cooldown for ${secs}s (timeout #${entry.failures})\n`); } catch {}
+    try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[circuit-breaker] ${label} on cooldown for ${secs}s (failure #${entry.failures})\n`); } catch {}
   }
 }
 
-/** Reset cooldown for a provider after a successful call. */
-export function clearProviderCooldown(provider) {
-  _providerCooldowns.delete(provider);
+/** Mark a provider as having timed out. Applies progressive cooldown. */
+export function markProviderTimeout(provider) {
+  _applyCooldown(_providerCooldowns, provider, provider);
 }
 
-function _isOnCooldown(provider) {
+/**
+ * Mark a specific model as having failed (mid-stream error, per-model
+ * timeout, etc.) so the auto-selector picks a different candidate on the
+ * next call while keeping sibling models of the same provider available.
+ */
+export function markModelTimeout(provider, model) {
+  if (!provider || !model) return;
+  _applyCooldown(_modelCooldowns, `${provider}/${model}`, `${provider}/${model}`);
+}
+
+/** Reset cooldown for a provider (and all its models) after a successful call. */
+export function clearProviderCooldown(provider) {
+  _providerCooldowns.delete(provider);
+  // Also clear any per-model entries for this provider so a recovered
+  // provider gets its full model roster back immediately.
+  for (const key of [..._modelCooldowns.keys()]) {
+    if (key.startsWith(`${provider}/`)) _modelCooldowns.delete(key);
+  }
+}
+
+function _isProviderOnCooldown(provider) {
   const entry = _providerCooldowns.get(provider);
+  if (!entry || !entry.until) return false;
+  return Date.now() < entry.until;
+}
+
+function _isModelOnCooldown(provider, model) {
+  const entry = _modelCooldowns.get(`${provider}/${model}`);
   if (!entry || !entry.until) return false;
   return Date.now() < entry.until;
 }
@@ -207,12 +238,14 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
   const wantsThinking = profile?.thinking ?? false;
 
   for (const provider of providers) {
-    if (!skipCooldown && _isOnCooldown(provider)) continue;
+    if (!skipCooldown && _isProviderOnCooldown(provider)) continue;
     const providerModels = modelsData[provider];
     if (!providerModels) continue;
 
     for (const [modelName, caps] of Object.entries(providerModels)) {
       if (caps.outputType !== 'text') continue;
+      // Per-model cooldown: skip models that recently errored mid-stream.
+      if (!skipCooldown && _isModelOnCooldown(provider, modelName)) continue;
       if (requiresImage && !caps.inputImage) continue;
       // Skip OpenRouter-only models in standalone mode (direct API keys).
       // These don't exist on the provider's native API:

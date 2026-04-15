@@ -21,7 +21,7 @@ import { actionRegistry } from '../agent/action-registry.js';
 import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
 
-import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
+import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, markModelTimeout, clearProviderCooldown } from './providers/factory.js';
 import { resolveMaxOutputTokens } from './max-tokens-policy.js';
 import { channel } from '../io/channel.js';
 
@@ -1812,8 +1812,13 @@ CRITICAL RULES:
     // internally before sending the first chunk, so use a longer timeout.
     const _modelCaps = getModelCaps(this.model);
     const _isThinkingCapable = this._useThinking || _modelCaps?.thinking;
-    const STREAM_INACTIVITY_MS = _isThinkingCapable ? 300_000 : 60_000;
-    const STREAM_INACTIVITY_LABEL = _isThinkingCapable ? '5m' : '60s';
+    // Hard cap for streams that go silent. Thinking models emit heartbeats
+    // (empty reasoning chunks) every few seconds so they should never need
+    // more than ~2 min of real inactivity; waiting 5 min just makes the
+    // user stare at a blank screen before the provider eventually errors
+    // out on its own. Non-thinking models stay on the tighter 60s window.
+    const STREAM_INACTIVITY_MS = _isThinkingCapable ? 120_000 : 60_000;
+    const STREAM_INACTIVITY_LABEL = _isThinkingCapable ? '2m' : '60s';
     const _inactivityCtrl = new AbortController();
     let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
     let _firstContentReceived = false;
@@ -1888,20 +1893,38 @@ CRITICAL RULES:
         session._pendingMcpImages = [...session._consumedThisCall];
         channel.log('llm', `[auto] Restoring ${session._consumedThisCall.length} image(s) after LLM error for retry`);
       }
+      // Resolve which model actually handled this call so the per-model
+      // cooldown hits the specific failing model (e.g. gemini-3.1-pro-preview)
+      // instead of the whole provider.
+      const _effModel    = session?._autoModel    || this.model;
+      const _effProvider = session?._autoProvider || this.provider;
+
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
       if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {
         channel.log('llm', `Stream inactivity timeout — no chunks for ${STREAM_INACTIVITY_LABEL}`);
-        if (this._autoMode) markProviderTimeout(this.provider);
+        if (this._autoMode) {
+          markModelTimeout(_effProvider, _effModel);
+          markProviderTimeout(_effProvider);
+        }
         throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_LABEL} (no chunks received)`);
       }
-      // Circuit breaker: only timeouts put provider on cooldown.
-      // Connection errors are transient network issues — do NOT exclude the provider,
-      // just let the normal backoff retry with the same provider. If all providers
-      // get connection errors, it's a network problem, not a provider problem.
+      // Circuit breaker: timeouts put the provider on cooldown, but we
+      // ALSO put mid-stream provider errors (and any non-4xx failure)
+      // on a per-model cooldown so the next retry can pick a sibling
+      // model instead of hammering the same broken one. Connection
+      // errors are transient network issues — leave those alone so a
+      // blip doesn't wipe out the whole candidate list.
       const _isTimeout = /timed?\s*out|timeout/i.test(_callErr.message || '');
       const _isConnError = /connection error|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed/i.test(_callErr.message || '');
-      if (_isTimeout && !_isConnError && this._autoMode) markProviderTimeout(this.provider);
+      if (_isTimeout && !_isConnError && this._autoMode) {
+        markModelTimeout(_effProvider, _effModel);
+        markProviderTimeout(_effProvider);
+      } else if (!_isConnError && this._autoMode) {
+        // Generic provider error mid-stream (e.g. "Provider returned error").
+        // Sideline just this model so the retry picks a different one.
+        markModelTimeout(_effProvider, _effModel);
+      }
       // In auto mode: a 4xx from a provider means the key is invalid/unauthorized or the
       // model is unavailable. Remove that provider from candidates so we don't hammer it
       // on every retry iteration — the agent would otherwise loop forever with the same error.
