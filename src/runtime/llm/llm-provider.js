@@ -22,6 +22,7 @@ import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
 
 import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, clearProviderCooldown } from './providers/factory.js';
+import { resolveMaxOutputTokens } from './max-tokens-policy.js';
 import { channel } from '../io/channel.js';
 
 // ── Extracted modules ────────────────────────────────────────────────────────
@@ -1279,6 +1280,30 @@ CRITICAL RULES:
       if (this._effectiveLLMProvider === 'openai')        this.openai    = this._oa;
       else if (this._effectiveLLMProvider === 'gemini')    this.openai    = this._gc;
       else if (this._effectiveLLMProvider === 'anthropic') this.anthropic = this._ac;
+
+      // ── Resolve effective max_output_tokens via the single-source policy ──
+      // This replaces ad-hoc defaults (16K globally, 4000 in callChat, etc.)
+      // and consumes the optional per-phase override if declared in .koi.
+      // The value is assigned to this.maxTokens so the next _createLLM()
+      // constructs BaseLLM with the correct cap.
+      try {
+        const _modelCaps = getModelCaps(resolved.model);
+        const _phaseOverride = session?._phaseProfile?.maxOutputTokens;
+        // Exhaustion handler (agent.js) may have bumped this for retry —
+        // honour it by treating it as a session-level override.
+        const _sessionBump = session?._maxTokensBump;
+        const _override = _sessionBump || _phaseOverride;
+        const { value, kind, source } = resolveMaxOutputTokens({
+          profile: resolved.profile || profile,
+          useThinking: this._useThinking,
+          phaseOverride: _override,
+          caps: _modelCaps,
+        });
+        this.maxTokens = value;
+        channel.log('llm', `[auto] maxOutputTokens=${value} (${source}, kind=${kind}, thinking=${this._useThinking})`);
+      } catch (_e) {
+        channel.log('llm', `[auto] max-tokens policy failed (${_e.message}); keeping this.maxTokens=${this.maxTokens}`);
+      }
     }
 
     // Build messages from tiered memory

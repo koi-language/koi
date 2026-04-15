@@ -194,7 +194,7 @@ function _applyBump(agent, dim, delta, { min, max }) {
 // ─── Helpers for phase profile ──────────────────────────────────────────
 
 function _profileFromPhase(phaseProps) {
-  // phaseProps is like { reasoning: 'high', code: 'medium' }
+  // phaseProps is like { reasoning: 'high', code: 'medium', maxOutputTokens: 8000 }
   const profile = { ...phaseProps };
   if (typeof phaseProps.reasoning === 'string') {
     profile.reasoningEffort = phaseProps.reasoning;
@@ -202,6 +202,13 @@ function _profileFromPhase(phaseProps) {
   }
   if (typeof phaseProps.code === 'string') {
     profile.codeValue = _levelToScore(phaseProps.code);
+  }
+  // maxOutputTokens is consumed by max-tokens-policy.js as an optional override
+  // on the policy's base value. Accept both camelCase and the KOI-style snake.
+  if (typeof phaseProps.maxOutputTokens === 'number') {
+    profile.maxOutputTokens = phaseProps.maxOutputTokens;
+  } else if (typeof phaseProps.max_output_tokens === 'number') {
+    profile.maxOutputTokens = phaseProps.max_output_tokens;
   }
   return profile;
 }

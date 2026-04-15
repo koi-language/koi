@@ -1617,8 +1617,9 @@ export class Agent {
         }
 
         // Detect "exhausted thinking budget" style errors (model spent all
-        // max_tokens on reasoning and emitted no content). For these, bump
-        // down the effort so the retry has budget for actual content.
+        // max_tokens on reasoning and emitted no content). Two recovery levers:
+        // lower the reasoning effort, or raise the max_tokens budget so the
+        // model has room for actual content.
         const _isThinkingExhaustion = /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(error.message || '');
         if (_isThinkingExhaustion && this.llmProvider?._activeSession) {
           const _sess = this.llmProvider._activeSession;
@@ -1627,8 +1628,22 @@ export class Agent {
           const _levels = ['high', 'medium', 'low', 'none'];
           const _idx = _levels.indexOf(_prev);
           if (_idx >= 0 && _idx < _levels.length - 1) {
+            // Effort can still be lowered — drop one notch.
             _sess._phaseProfile.reasoningEffort = _levels[_idx + 1];
             channel.log('llm', `${this.name}: Thinking exhaustion detected — lowered effort ${_prev} → ${_levels[_idx + 1]} for retry`);
+          } else {
+            // Effort already at floor ('low' or 'none'). The model needs MORE
+            // output budget, not less reasoning. Bump via a session-level
+            // override consumed by max-tokens-policy.js on the next resolve,
+            // AND patch this.llmProvider.maxTokens directly so the immediate
+            // retry also sees the new cap. Force reclassification so the
+            // selector can escalate to a different model if needed.
+            const _prevMax = _sess._maxTokensBump || this.llmProvider?.maxTokens || 8000;
+            const _newMax = Math.min(_prevMax * 2, 64000);
+            _sess._maxTokensBump = _newMax;
+            if (this.llmProvider) this.llmProvider.maxTokens = _newMax;
+            _sess._needsReclassify = true;
+            channel.log('llm', `${this.name}: Thinking exhaustion at floor effort — bumped maxTokens ${_prevMax} → ${_newMax} and triggered reclassify`);
           }
         }
 

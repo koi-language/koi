@@ -264,11 +264,17 @@ export function classifyFeedback(action, result, error) {
     // Include stdout if present — many CLI tools (flutter analyze, tsc, etc.) write
     // their useful output to stdout even when exiting with a non-zero code.
     const exitCodeStr = result.exitCode != null ? ` (exit code ${result.exitCode})` : '';
+    // Cap result.error — some tools dump the entire raw output here as a
+    // fallback, and an unbounded interpolation here has already poisoned
+    // contextMemory with 50MB+ entries in the past.
+    const errText = typeof result.error === 'string'
+      ? (result.error.length > 3000 ? result.error.substring(0, 3000) + '...[truncated]' : result.error)
+      : String(result.error);
     const stdoutPart = result.stdout ? `\nOutput:\n${result.stdout.substring(0, 3000)}` : '';
-    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${result.error}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
+    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${errText}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
     return {
       immediate,
-      shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${result.error.substring(0, 200)}`,
+      shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${errText.substring(0, 200)}`,
       permanent: null,
       failureKey: _computeActionKey(action),
       ...getTTL(intent),
@@ -728,6 +734,23 @@ export class ContextMemory {
    * @param {object} opts - Classification options (shortDuration, mediumDuration, needsSummary, etc.)
    */
   add(role, immediate, shortTerm = null, permanent = null, opts = {}) {
+    // Last-resort hard cap on entry size. No individual context entry should
+    // ever exceed this — upstream truncation in tools/classifyFeedback is
+    // expected to do the real job. Hitting this cap means a bug: some path
+    // shoved a raw tool result straight into the context unchecked.
+    // A single runaway grep has melted the session with 50MB+ entries before.
+    const _ENTRY_CAP = 256_000; // ~64K tokens
+    const _capString = (s, label) => {
+      if (typeof s !== 'string' || s.length <= _ENTRY_CAP) return s;
+      const half = Math.floor(_ENTRY_CAP / 2);
+      const cut = s.length - _ENTRY_CAP;
+      channel.log('memory', `⚠️ contextMemory entry ${label} exceeds cap (${s.length} > ${_ENTRY_CAP}) — truncating (bug: upstream failed to cap)`);
+      return s.substring(0, half) + `\n\n... [${cut} chars truncated — upstream bug] ...\n\n` + s.substring(s.length - half);
+    };
+    immediate = _capString(immediate, 'immediate');
+    shortTerm = _capString(shortTerm, 'shortTerm');
+    permanent = _capString(permanent, 'permanent');
+
     // Handle replaceTag: expire old entries with the same tag
     if (opts.replaceTag) {
       if (opts.clearTag) {
