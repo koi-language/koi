@@ -466,8 +466,8 @@ When a command requires sudo, just use sudo normally in the command. The system 
       description: { type: 'string', description: 'Human-friendly reason WHY this command is needed (shown to user). Express NEED, not action. Good: "Need to install X because Y". Bad: "Installing X".' },
       cwd: { type: 'string', description: 'Working directory for the command (optional)' },
       background: { type: 'boolean', description: 'If true, launch without waiting for completion. Use for commands that start long-running processes: apps, emulators, dev servers (e.g. flutter run, open -a Simulator, npm start).' },
-      timeout: { type: 'number', description: 'Timeout in milliseconds before the command is killed (default: 120000 = 2 min). Set higher for long-running commands like terraform apply, docker build, long test suites.' },
-      silent_timeout: { type: 'number', description: 'How long (ms) to wait without output before checking if the process is stuck (default: 10000 = 10s). Set higher for inherently slow commands that produce no output for long periods: nmap, nikto, sqlmap, gobuster, ffuf, large compilations, video encoding.' },
+      timeout: { type: 'number', description: 'Timeout in milliseconds before the command is killed (default: 120000 = 2 min, HARD MAX: 900000 = 15 min). For genuinely long work (big terraform apply, huge docker build, slow test suites that realistically exceed 15 minutes), launch with background=true instead of raising the timeout — the runtime will not accept a timeout above 15 minutes and will clamp it silently.' },
+      silent_timeout: { type: 'number', description: 'How long (ms) without any output before checking if the process is stuck (default: 10000 = 10s, HARD MAX: 300000 = 5 min). Raise for inherently silent commands (nmap, nikto, sqlmap, gobuster, ffuf, large compilations, video encoding). Values above 5 min are clamped.' },
       stream_interval: { type: 'number', description: 'How often (in ms) to snapshot streaming output for agent analysis during long-running commands (default: 30000 = 30s). Set lower for commands where you want more frequent progress checks.' }
     },
     required: ['command', 'description']
@@ -490,6 +490,39 @@ When a command requires sudo, just use sudo normally in the command. The system 
       throw new Error('shell: "command" field is required');
     }
 
+    // ── Hard caps ─────────────────────────────────────────────────────────
+    // Defaults give a sane fallback when the LLM omits these fields, but
+    // without a hard ceiling a single bad delegate response ("timeout:
+    // 36000000") wedges the whole agent for hours. Clamp them here so no
+    // command can block the reactive loop longer than the operator expects.
+    //
+    // If the user really needs a longer build (terraform apply on a big
+    // cluster, docker build of a large image), they should run the command
+    // with background=true, not by passing absurd timeouts.
+    const _MAX_TIMEOUT_MS = 15 * 60 * 1000;      // 15 min absolute ceiling
+    const _MAX_SILENT_MS  =  5 * 60 * 1000;      // 5 min without output
+    const _MIN_TIMEOUT_MS = 1000;                // 1s floor — below is useless
+    const _MIN_SILENT_MS  = 1000;
+    // Numeric coercion — some LLMs send strings. Fallback to default on NaN.
+    const _coerce = (v, def) => {
+      const n = typeof v === 'number' ? v : Number(v);
+      return Number.isFinite(n) && n > 0 ? n : def;
+    };
+    const _rawTimeout = _coerce(timeoutMs, 120000);
+    const _rawSilent  = _coerce(silentTimeoutMs, 10000);
+    timeoutMs       = Math.min(Math.max(_rawTimeout, _MIN_TIMEOUT_MS), _MAX_TIMEOUT_MS);
+    silentTimeoutMs = Math.min(Math.max(_rawSilent,  _MIN_SILENT_MS),  _MAX_SILENT_MS);
+    if (_rawTimeout !== timeoutMs) {
+      channel.log('shell', `⚠ timeout ${_rawTimeout}ms clamped to ${timeoutMs}ms (15min max). Use background=true for genuinely long commands.`);
+    }
+    if (_rawSilent !== silentTimeoutMs) {
+      channel.log('shell', `⚠ silent_timeout ${_rawSilent}ms clamped to ${silentTimeoutMs}ms (5min max).`);
+    }
+    // silent_timeout must always be <= timeout (otherwise it never fires)
+    if (silentTimeoutMs > timeoutMs) {
+      silentTimeoutMs = Math.max(_MIN_SILENT_MS, Math.floor(timeoutMs / 2));
+    }
+
     // Auto-detect trailing "&" as background launch.
     // This catches LLMs that add "&" to the command string instead of passing
     // background: true. Without this, the shell waits forever for a server
@@ -504,6 +537,12 @@ When a command requires sudo, just use sudo normally in the command. The system 
 
     const _cmdFull = command.split('\n')[0];
     const cmdPreview = _cmdFull.length > 60 ? _cmdFull.substring(0, 60) + '...' : _cmdFull;
+    // Log the command text to koi.log so post-mortem debugging knows what
+    // was actually being run when a hang happens. The UI already sees it
+    // via beginAction, but koi.log did NOT include it — all you'd see is
+    // `Starting parallel delegate: shell`, which is useless when the
+    // shell wedges on `pnpm install` / interactive prompts / pty hangs.
+    channel.log('shell', `$ ${cmdPreview}${cwd ? ` (cwd: ${cwd})` : ''}${background ? ' [background]' : ''} · timeout ${Math.round(timeoutMs / 1000)}s · silent ${Math.round(silentTimeoutMs / 1000)}s`);
 
     // Reject commands with obvious placeholder values like <your_api_key>, <TOKEN>, etc.
     const placeholderMatch = command.match(/<[a-zA-Z_][a-zA-Z0-9_]*>/);
@@ -683,6 +722,11 @@ When a command requires sudo, just use sudo normally in the command. The system 
     const stderrChunks = []; // only populated in spawn fallback
 
     _shellOutputCallback?.(null); // signal: new command, reset log buffer
+    // Same signal to the GUI stream — wipe any live buffer for this
+    // action and get ready to paint fresh chunks.
+    if (channel.sendShellOutputChunk && _shellActionId) {
+      channel.sendShellOutputChunk(_shellActionId, null);
+    }
 
     let _passwordPending = false;
     let _inputNeededInfo = null; // Set by _scheduleDetect; consumed by the generator loop.
@@ -873,6 +917,12 @@ When a command requires sudo, just use sudo normally in the command. The system 
         outputChunks.push(Buffer.from(data));
         _shellOutputCallback?.(data);
         const dataStr = Buffer.from(data).toString();
+        // Stream to the GUI in real time so the user can watch long
+        // commands (pnpm install, docker build, create-next-app, etc.)
+        // instead of staring at a silent spinner until they finish.
+        if (channel.sendShellOutputChunk && _shellActionId) {
+          channel.sendShellOutputChunk(_shellActionId, dataStr);
+        }
         if (!_checkPasswordPrompt(dataStr)) {
           _checkInteractivePrompt(dataStr);
           _scheduleDataWakeup();
@@ -923,6 +973,9 @@ When a command requires sudo, just use sudo normally in the command. The system 
         outputChunks.push(data);
         const str = data.toString();
         _shellOutputCallback?.(str);
+        if (channel.sendShellOutputChunk && _shellActionId) {
+          channel.sendShellOutputChunk(_shellActionId, str);
+        }
         if (!_checkPasswordPrompt(str)) {
           _checkInteractivePrompt(str);
           _scheduleDataWakeup();
@@ -935,6 +988,9 @@ When a command requires sudo, just use sudo normally in the command. The system 
         stderrChunks.push(data);
         const str = data.toString();
         _shellOutputCallback?.(str);
+        if (channel.sendShellOutputChunk && _shellActionId) {
+          channel.sendShellOutputChunk(_shellActionId, str);
+        }
         if (!_checkPasswordPrompt(str)) {
           _checkInteractivePrompt(str);
           _scheduleDataWakeup();
