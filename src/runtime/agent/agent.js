@@ -1381,6 +1381,11 @@ export class Agent {
         // to the display log. Phase transitions are already handled by
         // reactions (session.start / invoked at handler entry).
         channel.log('agent', `${this.name}: Fast-start (silent prompt_user, no greeting)`);
+        // Toggle busy OFF so the GUI shows the idle input state while
+        // prompt_user waits. onBusy(true) was set at the top of the
+        // reactive loop; without this toggle the thinking dots stay
+        // visible even though the agent is idle.
+        if (!isDelegate) Agent._cliHooks?.onBusy?.(false);
         response = [
           { actionType: 'direct', intent: 'prompt_user' }
         ];

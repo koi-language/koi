@@ -1172,8 +1172,12 @@ CRITICAL RULES:
 
       // ── Apply declared phase profile overrides ───────────────────────
       // The agent's .koi file may declare per-phase model requirements:
-      //   phases { understanding { reasoning: high } implementing { code: high } }
-      // Values other than "auto" override the classifier's decision.
+      //   phases { understanding { reasoning: none } planning { reasoning: low } }
+      // Values other than "auto" REPLACE the classifier's decision — they
+      // are an explicit cap. A coordinator with `reasoning: none` should
+      // use a cheap model regardless of how complex the user's request is;
+      // the complexity only matters for the delegate agents that actually
+      // do the work.
       const _phaseProfile = session._phaseProfile;
       if (_phaseProfile && Object.keys(_phaseProfile).length > 0) {
         const _levelToScore = { none: 0, low: 30, medium: 60, high: 90 };
@@ -1184,15 +1188,15 @@ CRITICAL RULES:
         if (_phaseProfile.reasoning && _phaseProfile.reasoning !== 'auto') {
           const score = _levelToScore[_phaseProfile.reasoning];
           if (score !== undefined) {
-            _newProfile.reasoning = Math.max(_newProfile.reasoning || 0, score);
-            _newProfile.reasoningEffort = _compareEffort(_newProfile.reasoningEffort, _levelToEffort[_phaseProfile.reasoning]);
+            _newProfile.reasoning = score;
+            _newProfile.reasoningEffort = _levelToEffort[_phaseProfile.reasoning];
             _changed = true;
           }
         }
         if (_phaseProfile.code && _phaseProfile.code !== 'auto') {
           const score = _levelToScore[_phaseProfile.code];
           if (score !== undefined) {
-            _newProfile.code = Math.max(_newProfile.code || 0, score);
+            _newProfile.code = score;
             _changed = true;
           }
         }
