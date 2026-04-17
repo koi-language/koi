@@ -234,6 +234,7 @@ class ActionRegistry {
     const CORE_INTENTS = new Set([
       'print', 'prompt_user', 'prompt_form', 'return', 'phase_done',
       'delegate', 'open_toolset', 'get_tool_info',
+      'learn_fact', 'recall_facts',
     ]);
 
     const coreActions = actions.filter(a => CORE_INTENTS.has(a.intent || a.type));

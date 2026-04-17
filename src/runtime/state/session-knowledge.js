@@ -24,6 +24,7 @@ const VALID_CATEGORIES = new Set([
   'credential',   // env var names (never values) for secrets
   'status',       // service URLs, cluster names, deployment outputs
   'dependency',   // inter-service dependencies, required env vars
+  'other',        // anything that doesn't fit the above
 ]);
 
 const MAX_VALUE_LEN = 300;

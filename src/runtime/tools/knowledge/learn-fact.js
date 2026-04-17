@@ -69,13 +69,9 @@ export default {
       return { success: true, stored: false, message: 'Noted.' };
     }
 
-    // Reject "other" category — forces the LLM to pick a real category
+    // Accept any category — normalize unknown ones to 'other'
     const _validCategories = new Set(['tech_stack', 'path', 'config', 'credential', 'status', 'dependency']);
-    const effectiveCategory = _validCategories.has(category) ? category : null;
-    if (!effectiveCategory) {
-      channel.log('knowledge', `[${agent?.name || '?'}] REJECTED learn_fact: invalid category "${category}" for key "${key}"`);
-      return { success: false, error: `Invalid category "${category}". Must be one of: tech_stack, path, config, credential, status, dependency. If your fact doesn't fit any category, it probably shouldn't be stored.` };
-    }
+    const effectiveCategory = _validCategories.has(category) ? category : 'other';
 
     const store = scope === 'plan' ? planKnowledge : sessionKnowledge;
     store.learn(key, value, {

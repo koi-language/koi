@@ -946,6 +946,11 @@ export class Agent {
     // Track the root (non-delegate) agent for slash commands like /memory
     if (!isDelegate) {
       Agent._rootAgent = this;
+      // Load user-defined markdown agents (.koi/agents/*.md) once at startup
+      try {
+        const { initUserAgents } = await import('./md-agent-loader.js');
+        await initUserAgents();
+      } catch { /* non-fatal */ }
     }
 
     const session = new PlaybookSession({
@@ -4383,6 +4388,16 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
       if (team && team.members) {
         accessibleTeams.push(team);
       }
+    }
+
+    // Include user-defined markdown agents (.koi/agents/*.md)
+    // Available to any agent with delegate permission.
+    if (this.role?.can('delegate')) {
+      try {
+        const { getUserAgentsTeam } = await import('./md-agent-loader.js');
+        const userTeam = getUserAgentsTeam();
+        if (userTeam?.members) accessibleTeams.push(userTeam);
+      } catch { /* non-fatal */ }
     }
 
     if (accessibleTeams.length === 0) {

@@ -326,18 +326,21 @@ export function normalizeReactiveAction(parsed) {
     parsed.actionType = 'direct';
   }
 
-  // NEVER invent actions on behalf of the model. If the payload has no
-  // `intent`/`actionType`/`type`, it's not an action — it's a malformed
-  // response (JSON that parsed but doesn't describe any action, e.g. a bare
-  // `{ "error": "..." }` hallucinated by the LLM). Throw with a clear,
-  // model-readable explanation so the upstream handler surfaces it as
-  // _llm_error feedback and the LLM retries with a proper action.
+  // If the payload has no intent/actionType/type but looks like a final
+  // summary or message, auto-wrap as a return action instead of crashing.
   if (!parsed.intent && !parsed.actionType && !parsed.type) {
-    throw new Error(
-      `Your response did not contain a valid action. Expected JSON with an "intent" or "actionType" field (e.g. {"actionType":"direct","intent":"print","message":"..."}). ` +
-      `Got: ${JSON.stringify(parsed).substring(0, 300)}. ` +
-      `Retry with a valid action. If you wanted to finish the task, emit {"actionType":"direct","intent":"return","data":{...}} explicitly.`
-    );
+    const _text = parsed.summary || parsed.message || parsed.text || parsed.result || parsed.answer;
+    if (_text && typeof _text === 'string') {
+      parsed.actionType = 'direct';
+      parsed.intent = 'return';
+      parsed.data = { success: true, summary: _text };
+    } else {
+      throw new Error(
+        `Your response did not contain a valid action. Expected JSON with an "intent" or "actionType" field (e.g. {"actionType":"direct","intent":"print","message":"..."}). ` +
+        `Got: ${JSON.stringify(parsed).substring(0, 300)}. ` +
+        `Retry with a valid action. If you wanted to finish the task, emit {"actionType":"direct","intent":"return","data":{...}} explicitly.`
+      );
+    }
   }
 
   return parsed;

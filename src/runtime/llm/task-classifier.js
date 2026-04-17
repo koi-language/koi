@@ -1,5 +1,6 @@
 import path from 'path';
 import { getAllCandidates, DEFAULT_TASK_PROFILE } from './providers/factory.js';
+import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH } from './constants.js';
 
 /**
  * Task and interaction classifier — extracted from LLMProvider.
@@ -119,13 +120,13 @@ G: "deploy to production", "check the Railway logs", "docker compose up", "why a
 ${taskDescription}`;
 
     const CATEGORY_PROFILES = {
-      A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
-      B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: 'none' },
-      C: { code: 30,  reasoning: 25,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 45,  reasoning: 40,  risk: 15, reasoningEffort: 'low' },
-      E: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'medium' },
-      F: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
-      G: { code: 40,  reasoning: 45,  risk: 50, reasoningEffort: 'low' },
+      A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: EFFORT_NONE },
+      B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: EFFORT_NONE },
+      C: { code: 30,  reasoning: 25,  risk: 10, reasoningEffort: EFFORT_LOW },
+      D: { code: 45,  reasoning: 40,  risk: 15, reasoningEffort: EFFORT_LOW },
+      E: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
+      F: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: EFFORT_LOW },
+      G: { code: 40,  reasoning: 45,  risk: 50, reasoningEffort: EFFORT_LOW },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);
@@ -226,29 +227,29 @@ ${taskDescription}`;
     // Default to medium. Low is the exception, not the rule — under-classifying
     // causes reasoning models to hallucinate success without doing work.
     const CATEGORY_PROFILES = {
-      A: { code: 40,  reasoning: 10,  risk: 10, reasoningEffort: 'low' },
-      B: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
-      C: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
-      E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
-      F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'low' },
-      G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
-      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: 'medium' },
-      H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: 'low' },
-      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: 'medium' },
-      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: 'medium' },
-      K: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: 'low' },
-      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: 'medium' },
-      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: 'medium' },
-      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: 'medium' },
-      O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: 'medium' },
-      P: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
-      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: 'medium' },
-      R: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
-      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: 'high' },
-      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: 'high' },
-      U: { code: 90,  reasoning: 85,  risk: 20, reasoningEffort: 'high' },
-      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: 'medium' },
+      A: { code: 40,  reasoning: 10,  risk: 10, reasoningEffort: EFFORT_LOW },
+      B: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: EFFORT_LOW },
+      C: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: EFFORT_LOW },
+      D: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: EFFORT_LOW },
+      G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: EFFORT_LOW },
+      I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
+      J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      K: { code: 50,  reasoning: 70,  risk: 70, reasoningEffort: EFFORT_LOW },
+      L: { code: 60,  reasoning: 75,  risk: 60, reasoningEffort: EFFORT_MEDIUM },
+      M: { code: 70,  reasoning: 60,  risk: 30, reasoningEffort: EFFORT_MEDIUM },
+      N: { code: 70,  reasoning: 70,  risk: 40, reasoningEffort: EFFORT_MEDIUM },
+      O: { code: 70,  reasoning: 70,  risk: 30, reasoningEffort: EFFORT_MEDIUM },
+      P: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: EFFORT_HIGH },
+      Q: { code: 70,  reasoning: 60,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
+      R: { code: 75,  reasoning: 70,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
+      S: { code: 80,  reasoning: 80,  risk: 30, reasoningEffort: EFFORT_HIGH },
+      T: { code: 60,  reasoning: 85,  risk: 10, reasoningEffort: EFFORT_HIGH },
+      U: { code: 90,  reasoning: 85,  risk: 20, reasoningEffort: EFFORT_HIGH },
+      V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName);

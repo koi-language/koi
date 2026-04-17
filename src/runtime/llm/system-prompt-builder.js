@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { actionRegistry } from '../agent/action-registry.js';
+import { getUserAgentsTeam } from '../agent/md-agent-loader.js';
 
 // =========================================================================
 // SYSTEM PROMPT BUILDER — standalone functions extracted from LLMProvider
@@ -495,6 +496,19 @@ export function collectPeerIntents(agent) {
         collectFrom(name, member, team.name);
       }
     }
+  }
+
+  // User-defined markdown agents (.koi/agents/*.md)
+  // Available to any agent with delegate permission.
+  if (agent.role?.can('delegate')) {
+    try {
+      const userTeam = getUserAgentsTeam();
+      if (userTeam?.members) {
+        for (const [name, member] of Object.entries(userTeam.members)) {
+          collectFrom(name, member, null);
+        }
+      }
+    } catch { /* non-fatal */ }
   }
 
   return result;

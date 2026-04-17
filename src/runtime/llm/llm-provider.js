@@ -20,6 +20,7 @@ try {
 import { actionRegistry } from '../agent/action-registry.js';
 import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
+import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_RANK, THINKING_INACTIVITY_MS, DEFAULT_INACTIVITY_MS } from './constants.js';
 
 import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, markModelTimeout, clearProviderCooldown } from './providers/factory.js';
 import { resolveMaxOutputTokens } from './max-tokens-policy.js';
@@ -57,9 +58,8 @@ function formatPromptForDebug(text) {
  * first 20 chars … last 10 chars so the output stays readable.
  */
 /** Compare two reasoning efforts, return the higher one. */
-const _effortRank = { none: 0, low: 1, medium: 2, high: 3 };
 function _compareEffort(a, b) {
-  return (_effortRank[a] || 0) >= (_effortRank[b] || 0) ? (a || 'medium') : (b || 'medium');
+  return (EFFORT_RANK[a] || 0) >= (EFFORT_RANK[b] || 0) ? (a || EFFORT_MEDIUM) : (b || EFFORT_MEDIUM);
 }
 
 function _truncB64Debug(str) {
@@ -500,7 +500,7 @@ export class LLMProvider {
       maxTokens: this.maxTokens,
       useThinking: this._useThinking,
       reasoningScore: this._reasoningScore ?? 50,
-      reasoningEffort: this._reasoningEffort ?? 'medium',
+      reasoningEffort: this._reasoningEffort ?? EFFORT_MEDIUM,
       ...opts,
     });
   }
@@ -980,65 +980,76 @@ CRITICAL RULES:
         for (let i = 0; i < newEntries.length - 1; i++) {
           const entry = newEntries[i];
           const classified = classifyFeedback(entry.action, entry.result, entry.error);
-          contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent, classified);
+          if (classified) {
+            contextMemory.add('user', classified.immediate, classified.shortTerm, classified.permanent, classified);
+          }
         }
 
         // Process the last entry with full handling (commit context, images, "Continue.")
         const lastEntry = newEntries[newEntries.length - 1];
         const classified = classifyFeedback(lastEntry.action, lastEntry.result, lastEntry.error);
 
-        // Build the immediate content (full detail + commit context + continue)
-        // Include attachment references in context memory so agents can re-reference them
-        // Build text references for attached files
-        const _promptAtts = session._promptAttachments || [];
-        const _imgPaths = _promptAtts.filter(a => a.type === 'image').map(a => a.path);
-        const _imgRef = _imgPaths.length > 0
-          ? `\n[Attached images: ${_imgPaths.map(p => `"${p}"`).join(', ')}]`
-          : '';
-        const _imgShort = _imgPaths.length > 0
-          ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
-          : '';
-        // "Continue." signals the LLM to keep working. Skip it for
-        // prompt_user results — those are the user's actual words, not
-        // an action outcome that needs a follow-up instruction.
-        const _lastIntent = lastEntry.action?.intent || lastEntry.action?.type || '';
-        const _continueTag = _lastIntent === 'prompt_user' ? '' : '\nContinue.';
-        const immediate = `${classified.immediate}${_imgRef}${commitContext}${_continueTag}`;
-        const _shortWithImg = _imgShort
-          ? `${classified.shortTerm || ''}${_imgShort}`
-          : classified.shortTerm;
-        // Pass attachments as part of the message — they are resolved when building LLM request
-        contextMemory.add('user', immediate, _shortWithImg, classified.permanent, {
-          ...classified,
-          attachments: _promptAtts,
-        });
-        // Remember that this call had image attachments — used later by model selector
-        // to ensure a vision-capable model is chosen. Must be set BEFORE clearing
-        // _promptAttachments, since the classifier runs after this block.
-        if (_promptAtts.some(a => a.type === 'image')) {
-          session._hasImageAttachments = true;
-        }
-        session._promptAttachments = null;
-
-        // Queue MCP image results for multimodal injection into the next LLM call.
-        // Skip if the compose resolver already injected images (e.g. frame_server_state
-        // screenshot) — those are always fresher than action-result images from the
-        // previous iteration, and stacking both causes duplicate images.
-        if (classified.imageBlocks?.length > 0 && !session._pendingMcpImages?.length) {
-          session._pendingMcpImages = [];
-
-          if (process.env.KOI_DEBUG_LLM) {
-            const tool = lastEntry.action.tool || 'mcp';
-            classified.imageBlocks.forEach((block, i) => {
-              const ext = (block.mimeType || 'image/png').split('/')[1] || 'png';
-              const tmpFile = path.join(os.tmpdir(), `koi-${tool}-${Date.now()}-${i}.${ext}`);
-              fs.writeFileSync(tmpFile, Buffer.from(block.data, 'base64'));
-              console.error(`[MCP Image] ${tool} → ${tmpFile}`);
-              block._debugPath = tmpFile; // used at send-time for attachment log
-            });
+        if (classified) {
+          // Build the immediate content (full detail + commit context + continue)
+          // Include attachment references in context memory so agents can re-reference them
+          // Build text references for attached files
+          const _promptAtts = session._promptAttachments || [];
+          const _imgPaths = _promptAtts.filter(a => a.type === 'image').map(a => a.path);
+          const _imgRef = _imgPaths.length > 0
+            ? `\n[Attached images: ${_imgPaths.map(p => `"${p}"`).join(', ')}]`
+            : '';
+          const _imgShort = _imgPaths.length > 0
+            ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
+            : '';
+          // "Continue." signals the LLM to keep working. Skip it for
+          // terminal/display actions that don't need a follow-up:
+          //   - prompt_user: user's actual words
+          //   - print: display-only, no follow-up needed
+          //   - return: task is done
+          // Without this, print results get fed back to the LLM as a
+          // "user" message with Continue., causing a redundant second call.
+          const _lastIntent = lastEntry.action?.intent || lastEntry.action?.type || '';
+          const _terminalIntents = new Set(['prompt_user', 'print', 'return']);
+          const _continueTag = _terminalIntents.has(_lastIntent) ? '' : '\nContinue.';
+          const immediate = `${classified.immediate}${_imgRef}${commitContext}${_continueTag}`;
+          const _shortWithImg = _imgShort
+            ? `${classified.shortTerm || ''}${_imgShort}`
+            : classified.shortTerm;
+          // Pass attachments as part of the message — they are resolved when building LLM request
+          contextMemory.add('user', immediate, _shortWithImg, classified.permanent, {
+            ...classified,
+            attachments: _promptAtts,
+          });
+          // Remember that this call had image attachments — used later by model selector
+          // to ensure a vision-capable model is chosen. Must be set BEFORE clearing
+          // _promptAttachments, since the classifier runs after this block.
+          if (_promptAtts.some(a => a.type === 'image')) {
+            session._hasImageAttachments = true;
           }
+          session._promptAttachments = null;
 
-          session._pendingMcpImages.push(...classified.imageBlocks);
+          // Queue MCP image results for multimodal injection into the next LLM call.
+          // Skip if the compose resolver already injected images (e.g. frame_server_state
+          // screenshot) — those are always fresher than action-result images from the
+          // previous iteration, and stacking both causes duplicate images.
+          if (classified.imageBlocks?.length > 0 && !session._pendingMcpImages?.length) {
+            session._pendingMcpImages = [];
+
+            if (process.env.KOI_DEBUG_LLM) {
+              const tool = lastEntry.action.tool || 'mcp';
+              classified.imageBlocks.forEach((block, i) => {
+                const ext = (block.mimeType || 'image/png').split('/')[1] || 'png';
+                const tmpFile = path.join(os.tmpdir(), `koi-${tool}-${Date.now()}-${i}.${ext}`);
+                fs.writeFileSync(tmpFile, Buffer.from(block.data, 'base64'));
+                console.error(`[MCP Image] ${tool} → ${tmpFile}`);
+                block._debugPath = tmpFile; // used at send-time for attachment log
+              });
+            }
+
+            session._pendingMcpImages.push(...classified.imageBlocks);
+          }
+        } else {
+          session._promptAttachments = null;
         }
       }
     }
@@ -1192,7 +1203,7 @@ CRITICAL RULES:
       const _phaseProfile = session._phaseProfile;
       if (_phaseProfile && Object.keys(_phaseProfile).length > 0) {
         const _levelToScore = { none: 0, low: 30, medium: 60, high: 90 };
-        const _levelToEffort = { none: 'none', low: 'low', medium: 'medium', high: 'high' };
+        const _levelToEffort = { none: EFFORT_NONE, low: EFFORT_LOW, medium: EFFORT_MEDIUM, high: EFFORT_HIGH };
         let _changed = false;
         const _newProfile = { ...profile };
 
@@ -1204,7 +1215,7 @@ CRITICAL RULES:
             // Thinking is only justified for medium+ effort. If the
             // phase caps reasoning at none/low, disable thinking even
             // if the classifier originally enabled it.
-            _newProfile.thinking = _phaseProfile.reasoning !== 'none' && _phaseProfile.reasoning !== 'low' ? _newProfile.thinking : false;
+            _newProfile.thinking = _phaseProfile.reasoning !== EFFORT_NONE && _phaseProfile.reasoning !== EFFORT_LOW ? _newProfile.thinking : false;
             _changed = true;
           }
         }
@@ -1322,7 +1333,7 @@ CRITICAL RULES:
       this.model        = resolved.model;
       this._useThinking = resolved.useThinking;
       this._reasoningScore = resolved.profile?.reasoning ?? 50;
-      this._reasoningEffort = resolved.profile?.reasoningEffort ?? 'low';
+      this._reasoningEffort = resolved.profile?.reasoningEffort ?? EFFORT_LOW;
       if (this._effectiveLLMProvider === 'openai')        this.openai    = this._oa;
       else if (this._effectiveLLMProvider === 'gemini')    this.openai    = this._gc;
       else if (this._effectiveLLMProvider === 'anthropic') this.anthropic = this._ac;
@@ -1589,7 +1600,7 @@ CRITICAL RULES:
 
     // Update status line with estimated input tokens before sending
     const _fmtTk = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-    const _effortLabel = this._reasoningEffort && this._reasoningEffort !== 'none' ? ` · effort:${this._reasoningEffort}` : '';
+    const _effortLabel = this._reasoningEffort && this._reasoningEffort !== EFFORT_NONE ? ` · effort:${this._reasoningEffort}` : '';
     channel.setInfo('tokens', `↑${_fmtTk(_estInputTokens)} tokens · ${this.provider}/${this.model}${_effortLabel}`);
 
     channel.log('llm', `Sending to ${this.provider}/${this.model} (${msgCount} messages, ~${_estInputTokens} tokens, last user msg: ${lastUserMsgText.length} chars)`);
@@ -1831,21 +1842,23 @@ CRITICAL RULES:
     // internally before sending the first chunk, so use a longer timeout.
     const _modelCaps = getModelCaps(this.model);
     const _isThinkingCapable = this._useThinking || _modelCaps?.thinking;
-    // Hard cap for streams that go silent. Thinking models emit heartbeats
-    // (empty reasoning chunks) every few seconds so they should never need
-    // more than ~2 min of real inactivity; waiting 5 min just makes the
-    // user stare at a blank screen before the provider eventually errors
-    // out on its own. Non-thinking models stay on the tighter 60s window.
-    const STREAM_INACTIVITY_MS = _isThinkingCapable ? 120_000 : 60_000;
-    const STREAM_INACTIVITY_LABEL = _isThinkingCapable ? '2m' : '60s';
-    // Hard total timeout: even with heartbeats, no single LLM call should
-    // take more than 90 seconds. If the model is still "thinking" after
-    // that, it's stuck or the task is too complex for a single call.
-    const STREAM_TOTAL_MS = 90_000;
+    // Inactivity timeout scales with reasoning effort — higher effort means
+    // the model may buffer longer before sending the first content chunk.
+    const _effort = this._reasoningEffort || EFFORT_NONE;
+    const STREAM_INACTIVITY_MS = _isThinkingCapable
+      ? (THINKING_INACTIVITY_MS[_effort] || THINKING_INACTIVITY_MS[EFFORT_LOW])
+      : DEFAULT_INACTIVITY_MS;
+    const STREAM_INACTIVITY_LABEL = `${STREAM_INACTIVITY_MS / 1000}s`;
+    // Hard total timeout: absolute cap for a single LLM call (including thinking).
+    // Scales with effort — high-effort thinking models can legitimately take minutes.
+    const STREAM_TOTAL_MS = STREAM_INACTIVITY_MS * 2;
+    const STREAM_TOTAL_LABEL = `${STREAM_TOTAL_MS / 1000}s`;
     const _inactivityCtrl = new AbortController();
+    let _totalTimerFired = false;
     let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
     const _totalTimer = setTimeout(() => {
-      channel.log('llm', `[stream] TOTAL timeout (${STREAM_TOTAL_MS / 1000}s) — aborting stream`);
+      _totalTimerFired = true;
+      channel.log('llm', `[stream] TOTAL timeout (${STREAM_TOTAL_LABEL}) — aborting stream`);
       _inactivityCtrl.abort();
     }, STREAM_TOTAL_MS);
     let _firstContentReceived = false;
@@ -1929,12 +1942,14 @@ CRITICAL RULES:
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
       if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {
-        channel.log('llm', `Stream inactivity timeout — no chunks for ${STREAM_INACTIVITY_LABEL}`);
+        const _timeoutKind = _totalTimerFired ? 'total' : 'inactivity';
+        const _timeoutLabel = _totalTimerFired ? STREAM_TOTAL_LABEL : STREAM_INACTIVITY_LABEL;
+        channel.log('llm', `Stream ${_timeoutKind} timeout — ${_timeoutLabel}`);
         if (this._autoMode) {
           markModelTimeout(_effProvider, _effModel);
           markProviderTimeout(_effProvider);
         }
-        throw new Error(`LLM stream inactivity timeout after ${STREAM_INACTIVITY_LABEL} (no chunks received)`);
+        throw new Error(`LLM stream ${_timeoutKind} timeout after ${_timeoutLabel} (no chunks received)`);
       }
       // Circuit breaker: timeouts put the provider on cooldown, but we
       // ALSO put mid-stream provider errors (and any non-4xx failure)
