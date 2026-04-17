@@ -241,13 +241,11 @@ FINAL NON-NEGOTIABLE RULES
 ========================================
 
 1. Never answer in natural language
-2. Never explain reasoning
-3. Never describe what you will do
-4. Never invent intents
-5. Never fabricate facts not present in action results
-6. Never emit incomplete actions
-7. Never return before the whole task is done
-8. Always prefer evidence over speculation
+2. Never invent intents
+3. Never fabricate facts not present in action results
+4. Never emit incomplete actions
+5. Never return before the whole task is done
+6. Always prefer evidence over speculation
 
 ${resourceSection}${intentNesting}
 
@@ -510,9 +508,11 @@ export function buildExpandedResourceSection(resources, agent) {
   let doc = '';
 
   // ── AVAILABLE ACTIONS ───────────────────────────────────────────────────
+  // Toolset mode: show toolset groups (table) + core tools inline.
+  // Agents call open_toolset/get_tool_info for details on demand.
   for (const resource of resources) {
     if (resource.type === 'direct') {
-      doc += actionRegistry.generatePromptDocumentation(agent);
+      doc += actionRegistry.generateToolsetDocumentation(agent);
     }
   }
 
@@ -599,35 +599,40 @@ export function buildExpandedResourceSection(resources, agent) {
  */
 export async function buildReactiveSystemPrompt(agent, playbook = null) {
   const { static: staticBase, dynamic } = await buildSystemPrompt(agent);
-  // Layout for maximum cache hit rate:
-  //   1. Agent header (agent + phase — static per variant, cacheable)
-  //   2. Static generic rules (output contract, golden rule, action model, tools) — never changes
-  //   3. Agent playbook (changes per agent but stable within an agent's session)
-  //   4. Dynamic runtime context (timestamp, task counts, phase) — changes every turn
+  // Layout: agent-specific content FIRST (most visible to LLM attention),
+  // generic boilerplate LAST (output contract, tools, action model).
+  //   1. Agent playbook (agent's own instructions — what matters most)
+  //   2. Dynamic runtime context (timestamp, phase, task state)
+  //   3. Static generic rules (output contract, golden rule, action model, tools)
+  //
+  // This puts the agent's identity and task-specific rules at the top of
+  // the system prompt where LLM attention is strongest, and pushes the
+  // structural boilerplate (JSON format, action list) to the end.
+
   // Structured cache-aware playbook from compiler taint analysis
   if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
     const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
     return {
       _cacheKey: playbook._cacheKey,
-      static: [staticBase, _s(playbook.static)].filter(Boolean).join('\n\n'),
+      static: [_s(playbook.static), staticBase].filter(Boolean).join('\n\n'),
       dynamic: [_s(playbook.dynamic), dynamic].filter(Boolean).join('\n\n'),
     };
   }
 
   // Legacy: plain string playbook (or flatten object without _cacheKey)
-  const parts = [staticBase];
   let playbookStr = '';
   if (typeof playbook === 'string') {
     playbookStr = playbook.trim();
   } else if (typeof playbook === 'object' && playbook !== null) {
-    // Flatten any object that slipped through without _cacheKey
     playbookStr = typeof playbook.static === 'string' && typeof playbook.dynamic === 'string'
       ? [playbook.static, playbook.dynamic].filter(Boolean).join('\n')
       : typeof playbook.text === 'string'
         ? playbook.text
         : String(playbook);
   }
+  const parts = [];
   if (playbookStr) parts.push(playbookStr);
   parts.push(dynamic);
+  parts.push(staticBase);
   return parts.join('\n\n');
 }

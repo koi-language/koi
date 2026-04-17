@@ -12,7 +12,7 @@ export default {
   intent: 'lsp_diagnostics',
   description: 'Get compiler/linter diagnostics (errors, warnings) from the LSP server. No file means all diagnostics. Fields: optional "file" (path to check). Returns: { success, diagnostics: { [file]: [{ line, character, severity, message, source }] } }.',
   thinkingHint: 'Checking diagnostics',
-  permission: 'read',
+  permission: 'use_lsp',
   hidden: false,
 
   schema: {

@@ -998,7 +998,12 @@ CRITICAL RULES:
         const _imgShort = _imgPaths.length > 0
           ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
           : '';
-        const immediate = `${classified.immediate}${_imgRef}${commitContext}\nContinue.`;
+        // "Continue." signals the LLM to keep working. Skip it for
+        // prompt_user results — those are the user's actual words, not
+        // an action outcome that needs a follow-up instruction.
+        const _lastIntent = lastEntry.action?.intent || lastEntry.action?.type || '';
+        const _continueTag = _lastIntent === 'prompt_user' ? '' : '\nContinue.';
+        const immediate = `${classified.immediate}${_imgRef}${commitContext}${_continueTag}`;
         const _shortWithImg = _imgShort
           ? `${classified.shortTerm || ''}${_imgShort}`
           : classified.shortTerm;
@@ -1060,8 +1065,9 @@ CRITICAL RULES:
       const _isNewUserMessage = !!session._needsReclassify;
       if (_isNewUserMessage) session._needsReclassify = false;
       channel.log('llm', `[classify] Reclassify check: needsReclassify=${_isNewUserMessage}, hasProfile=${!!session._autoProfile}, isFirstCall=${isFirstCall}, isDelegateReturn=${_isDelegateReturn}`);
-      // Agent requested reclassification via reclassify_complexity action
-      const _agentRequestedReclassify = _lastAction?.action?.intent === 'reclassify_complexity';
+      // reclassify_complexity is disabled (hidden). Keep the variable for
+      // compatibility but never trigger agent-requested reclassification.
+      const _agentRequestedReclassify = false;
       // Detect loops: same action repeated 3+ times → model is too weak, reclassify with escalation context
       const _recentActions = (session.actionHistory || []).slice(-3);
       const _isLoop = _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === _recentActions[0]?.action?.intent);
@@ -1069,6 +1075,11 @@ CRITICAL RULES:
       const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || _isNewUserMessage || _agentRequestedReclassify || _isLoop;
 
       if (_shouldReclassify) {
+        // Coordinators just route tasks to delegates — they never need
+        // expensive models regardless of task complexity. Skip the
+        // classifier entirely and use a fixed fast profile. The
+        // delegate agents that actually do the work will get their
+        // own classification when they start.
         // Build classification context — try every source of context, never give up.
         // Two classifier paths:
         // 1. User message → interaction classifier (clean message, isUserMessage=true)
@@ -1190,6 +1201,10 @@ CRITICAL RULES:
           if (score !== undefined) {
             _newProfile.reasoning = score;
             _newProfile.reasoningEffort = _levelToEffort[_phaseProfile.reasoning];
+            // Thinking is only justified for medium+ effort. If the
+            // phase caps reasoning at none/low, disable thinking even
+            // if the classifier originally enabled it.
+            _newProfile.thinking = _phaseProfile.reasoning !== 'none' && _phaseProfile.reasoning !== 'low' ? _newProfile.thinking : false;
             _changed = true;
           }
         }
@@ -1823,8 +1838,16 @@ CRITICAL RULES:
     // out on its own. Non-thinking models stay on the tighter 60s window.
     const STREAM_INACTIVITY_MS = _isThinkingCapable ? 120_000 : 60_000;
     const STREAM_INACTIVITY_LABEL = _isThinkingCapable ? '2m' : '60s';
+    // Hard total timeout: even with heartbeats, no single LLM call should
+    // take more than 90 seconds. If the model is still "thinking" after
+    // that, it's stuck or the task is too complex for a single call.
+    const STREAM_TOTAL_MS = 90_000;
     const _inactivityCtrl = new AbortController();
     let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
+    const _totalTimer = setTimeout(() => {
+      channel.log('llm', `[stream] TOTAL timeout (${STREAM_TOTAL_MS / 1000}s) — aborting stream`);
+      _inactivityCtrl.abort();
+    }, STREAM_TOTAL_MS);
     let _firstContentReceived = false;
     let _thinkingTokens = 0; // Accumulated thinking/reasoning tokens (for cost tracking)
     const _resetTimer = () => {
@@ -1974,6 +1997,7 @@ CRITICAL RULES:
       throw _callErr;
     } finally {
       clearTimeout(_inactivityTimer);
+      clearTimeout(_totalTimer);
       if (_abortHandler) abortSignal.removeEventListener('abort', _abortHandler);
     }
     const _apiMs = Date.now() - _t0;
@@ -2011,9 +2035,8 @@ CRITICAL RULES:
       const _parts = [];
       if (usage.input > 0) _parts.push(`↑${_fmtTk(usage.input)}`);
       const _outTotal = (usage.output || 0) + (usage.thinking || 0);
-      if (_outTotal > 0) {
-        _parts.push(`↓${_fmtTk(_outTotal)} tokens`);
-      }
+      if (_outTotal > 0) _parts.push(`↓${_fmtTk(_outTotal)}`);
+      if (_parts.length > 0) _parts.push('tokens');
       if (_parts.length > 0) channel.setInfo('tokens', _parts.join(' '));
     }
 

@@ -284,11 +284,11 @@ PhaseIdent
   = chars:[a-zA-Z_][a-zA-Z0-9_]* { return text(); }
 
 // ============================================================
-// Reactions — event-driven phase/profile transitions
+// Transitions (formerly "reactions") — event-driven phase/profile transitions
 // ============================================================
 
 ReactionsDecl
-  = "reactions" _ "{" _ clauses:ReactionClause* _ "}" _ {
+  = "transitions" _ "{" _ clauses:ReactionClause* _ "}" _ {
       return { type: 'ReactionsDecl', clauses, location: location() };
     }
 
@@ -297,15 +297,16 @@ ReactionClause
       return { type: 'ReactionClause', events, body, location: location() };
     }
 
-// One or more event headers, either comma-separated on one "on" line
-// or stacked across multiple "on" lines. Grammar captures both forms.
+// One or more event headers, either comma-separated on one "when"/"on" line
+// or stacked across multiple "when"/"on" lines. Grammar captures both forms.
+// "on" is the deprecated form; "when" is the canonical keyword since 2026-04.
 ReactionEvents
   = first:ReactionOnHeader rest:(_ ReactionOnHeader)* {
       return [].concat(first, ...rest.map(r => r[1]));
     }
 
 ReactionOnHeader
-  = "on" _ first:ReactionEvent tail:(_ "," _ ReactionEvent)* {
+  = "when" _ first:ReactionEvent tail:(_ "," _ ReactionEvent)* {
       return [first, ...tail.map(t => t[3])];
     }
 
@@ -525,7 +526,8 @@ EventHandler
 HandlerName
   = name:$([a-zA-Z_][a-zA-Z0-9_]*) &{
       const reserved = ['run', 'import', 'skill', 'role', 'can', 'team', 'agent',
-                        'uses', 'llm', 'default', 'on', 'state', 'playbook', 'resilience', 'amnesia', 'mcp', 'prompt',
+                        'uses', 'llm', 'default', 'on', 'when', 'state', 'playbook', 'resilience', 'amnesia', 'mcp', 'prompt',
+                        'transitions',
                         'export', 'async', 'function', 'var', 'const', 'let', 'if', 'else', 'for', 'of', 'in', 'while',
                         'return', 'await', 'send', 'timeout', 'use', 'override', 'affordance',
                         'expose', 'private',
@@ -1388,7 +1390,8 @@ ImportType
 
 ReservedWord
   = ("import" / "skill" / "role" / "can" / "team" / "agent" / "skill" /
-     "uses" / "llm" / "default" / "on" / "state" / "playbook" / "resilience" / "mcp" / "prompt" /
+     "uses" / "llm" / "default" / "on" / "when" / "state" / "playbook" / "resilience" / "mcp" / "prompt" /
+     "transitions" /
      "export" / "async" / "function" / "var" / "const" / "let" / "if" / "else" / "for" / "of" / "in" / "while" /
      "try" / "catch" / "finally" / "throw" / "instanceof" /
      "return" / "await" / "send" / "timeout" / "use" / "run" /

@@ -275,7 +275,7 @@ export default {
             return {
               success: true,
               mode: 'query',
-              note: 'Semantic index not ready yet — used BM25 fallback. Run index_code or wait for background indexing.',
+              note: 'Semantic index not ready yet — used BM25 fallback. Background indexing will complete shortly.',
               count: fallbackResults.length,
               results: fallbackResults
             };

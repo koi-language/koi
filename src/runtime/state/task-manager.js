@@ -19,6 +19,7 @@
 import fs from 'fs';
 import path from 'path';
 import { channel } from '../io/channel.js';
+import { t } from '../i18n.js';
 
 const STATUS_ICONS = {
   pending:     '☐',
@@ -294,9 +295,17 @@ class TaskManager {
       const nonDeleted = Object.values(this._tasks).filter(t => t.status !== 'deleted');
       if (nonDeleted.length > 0 && nonDeleted.every(t => t.status === 'completed')) {
         this._allCompletedNotified = true;
+        // Clear plan-scoped knowledge — it was useful while tasks
+        // were executing but is no longer needed once the plan is done.
+        import('../state/session-knowledge.js').then(({ planKnowledge }) => {
+          if (planKnowledge.size > 0) {
+            channel.log('knowledge', `[task-manager] Plan complete — clearing ${planKnowledge.size} plan-scoped facts`);
+            planKnowledge.clear();
+          }
+        }).catch(() => {});
         setTimeout(() => {
           channel.setTaskPanel([]);
-          channel.print('\x1b[32m✓ All tasks completed.\x1b[0m');
+          channel.print(`\x1b[32m${t('allTasksCompleted')}\x1b[0m`);
         }, 300);
       }
     }

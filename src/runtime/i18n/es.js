@@ -63,4 +63,7 @@ export default {
   reconsidering: 'Reconsiderando — comando shell falló',
   processingResponseFrom: 'Procesando respuesta de',
   scanningProject: 'escaneando proyecto...',
+
+  // Task manager
+  allTasksCompleted: '✓ Todas las tareas completadas.',
 };

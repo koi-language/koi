@@ -449,7 +449,13 @@ export function createLLM(provider, client, model, opts = {}) {
 
   switch (provider) {
     case 'openai':
-      if (caps.api === 'responses') return new OpenAIResponsesLLM(client, model, fullOpts);
+      // In gateway mode (OpenRouter), always use chat/completions.
+      // OpenRouter accepts any model on this endpoint and converts
+      // internally. The 'responses' variant is only needed for direct
+      // OpenAI API calls with codex models (which reject chat/completions).
+      if (caps.api === 'responses' && !process.env.KOI_AUTH_TOKEN) {
+        return new OpenAIResponsesLLM(client, model, fullOpts);
+      }
       return new OpenAIChatLLM(client, model, fullOpts);
     case 'anthropic':
       return new AnthropicLLM(client, model, fullOpts);

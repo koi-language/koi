@@ -10,13 +10,13 @@
  * Bad candidates: file contents, generated code, intermediate results.
  */
 
-import { sessionKnowledge } from '../../state/session-knowledge.js';
+import { sessionKnowledge, planKnowledge } from '../../state/session-knowledge.js';
 import { channel } from '../../io/channel.js';
 
 export default {
   type: 'learn_fact',
   intent: 'learn_fact',
-  description: 'Store a reusable project fact so other agents don\'t have to rediscover it. ONLY for: tech stacks, file paths, config values, env var names, service URLs, dependencies. NEVER for: user intent, task summaries, what you did, progress, conversation context. Fields: "key" (unique snake_case id), "value" (concise, max 200 chars — no code/file contents), "category" (tech_stack|path|config|credential|status|dependency)',
+  description: 'Store a reusable fact so other agents don\'t have to rediscover it. Two scopes: "session" (default, durable project knowledge) and "plan" (implementation details shared between tasks of the current plan — auto-cleared when all tasks complete). ONLY for: tech stacks, file paths, config values, env var names, service URLs, dependencies. NEVER for: user intent, task summaries, what you did, progress, conversation context. Fields: "key" (unique snake_case id), "value" (concise, max 200 chars), "category" (tech_stack|path|config|credential|status|dependency), "scope" (session|plan, default session)',
   thinkingHint: 'Sharing knowledge',
   permission: null,
   hidden: false,
@@ -35,7 +35,12 @@ export default {
       category: {
         type: 'string',
         enum: ['tech_stack', 'path', 'config', 'credential', 'status', 'dependency'],
-        description: 'Category — must be one of: tech_stack, path, config, credential, status, dependency. No generic "other" category.',
+        description: 'Category — must be one of: tech_stack, path, config, credential, status, dependency.',
+      },
+      scope: {
+        type: 'string',
+        enum: ['session', 'plan'],
+        description: 'Scope. "session" (default) = durable project knowledge that persists across the session. "plan" = transient implementation details shared between tasks of the current plan (auto-cleared when all tasks complete). Use "plan" for: files you created, patterns you established, intermediate findings that help sibling tasks. Use "session" for: tech stacks, project structure, env vars, config.',
       },
     },
     required: ['key', 'value'],
@@ -50,7 +55,7 @@ export default {
   ],
 
   async execute(action, agent) {
-    const { key, value, category = 'other' } = action;
+    const { key, value, category = 'other', scope = 'session' } = action;
 
     if (!key || !value) {
       return { success: false, error: 'learn_fact: "key" and "value" are required' };
@@ -72,13 +77,14 @@ export default {
       return { success: false, error: `Invalid category "${category}". Must be one of: tech_stack, path, config, credential, status, dependency. If your fact doesn't fit any category, it probably shouldn't be stored.` };
     }
 
-    sessionKnowledge.learn(key, value, {
+    const store = scope === 'plan' ? planKnowledge : sessionKnowledge;
+    store.learn(key, value, {
       category: effectiveCategory,
       agentName: agent?.name || 'unknown',
     });
 
-    channel.log('knowledge', `[${agent?.name || '?'}] learned [${effectiveCategory}] ${key}: ${String(value).slice(0, 80)}`);
+    channel.log('knowledge', `[${agent?.name || '?'}] learned [${scope}/${effectiveCategory}] ${key}: ${String(value).slice(0, 80)}`);
 
-    return { success: true, key, category: effectiveCategory, stored: true };
+    return { success: true, key, category: effectiveCategory, scope, stored: true };
   },
 };

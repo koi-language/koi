@@ -33,7 +33,11 @@ export class OpenAIChatLLM extends BaseLLM {
         response_format: { type: 'json_object' },
         stream: true,
         stream_options: { include_usage: true },
-        ...(this.caps.thinking && { reasoning_effort: (!this.reasoningEffort || this.reasoningEffort === 'none') ? 'low' : this.reasoningEffort }),
+        // Only send reasoning_effort when we actually WANT reasoning.
+        // Sending 'low' or 'none' still triggers internal reasoning on
+        // some models (Gemini), burning the entire max_tokens budget.
+        // Omitting the field entirely disables reasoning.
+        ...(this.caps.thinking && this.reasoningEffort && this.reasoningEffort !== 'none' && { reasoning_effort: this.reasoningEffort }),
       });
       channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature}`);
       const options = abortSignal ? { signal: abortSignal } : {};
@@ -167,7 +171,7 @@ export class OpenAIChatLLM extends BaseLLM {
         temperature,
         max_completion_tokens: maxTokens,
         ...(responseFormat && { response_format: responseFormat }),
-        ...(this.caps.thinking && { reasoning_effort: (!this.reasoningEffort || this.reasoningEffort === 'none') ? 'low' : this.reasoningEffort }),
+        ...(this.caps.thinking && this.reasoningEffort && this.reasoningEffort !== 'none' && { reasoning_effort: this.reasoningEffort }),
       });
       channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens || maxTokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature ?? temperature}`);
       const options = controller ? { signal: controller.signal } : {};
@@ -285,11 +289,10 @@ export class OpenAIResponsesLLM extends BaseLLM {
         text: { format: { type: 'json_object' } },
         stream: true
       };
-      // Control reasoning effort based on thinking mode
-      if (this.caps.thinking && !this.useThinking) {
-        params.reasoning = { effort: 'low', summary: 'auto' };
-      } else if (this.caps.thinking && this.useThinking) {
-        params.reasoning = { effort: 'high', summary: 'auto' };
+      // Only enable reasoning when explicitly requested. Sending 'low'
+      // still burns output tokens on internal reasoning.
+      if (this.caps.thinking && this.reasoningEffort && this.reasoningEffort !== 'none') {
+        params.reasoning = { effort: this.reasoningEffort, summary: 'auto' };
       }
 
       const options = abortSignal ? { signal: abortSignal } : {};
@@ -406,13 +409,11 @@ export class OpenAIResponsesLLM extends BaseLLM {
       if (responseFormat === 'json_object') {
         params.text = { format: { type: 'json_object' } };
       }
-      if (this.caps.thinking) {
-        // Honor the configured reasoning effort for these models; default low
-        // matches the non-thinking classifier path.
-        const effort = (!this.reasoningEffort || this.reasoningEffort === 'none')
-          ? 'low'
-          : this.reasoningEffort;
-        params.reasoning = { effort, summary: 'auto' };
+      // Only send reasoning when we actually want it. Sending effort='low'
+      // still triggers internal reasoning on some models (codex), burning
+      // the entire max_output_tokens budget. Omitting the field disables it.
+      if (this.caps.thinking && this.reasoningEffort && this.reasoningEffort !== 'none') {
+        params.reasoning = { effort: this.reasoningEffort, summary: 'auto' };
       }
 
       channel.log('llm', `[request] model=${params.model} max_output_tokens=${params.max_output_tokens} reasoning_effort=${params.reasoning?.effort ?? '(none)'} thinking=${this.useThinking} api=responses`);

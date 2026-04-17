@@ -623,7 +623,7 @@
       "patterns": [
         {
           "name": "keyword.control.koi",
-          "match": "\\b(package|import|role|agent|team|skill|mcp|prompt|compose|on|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all|amnesia|expose|private|reactions|phases)\\b"
+          "match": "\\b(package|import|role|agent|team|skill|mcp|prompt|compose|on|when|playbook|run|export|function|async|await|send|timeout|state|llm|default|can|uses|peers|affordance|event|any|all|amnesia|expose|private|transitions|phases)\\b"
         },
         {
           "comment": "Reaction body constructors: phase(X).start(), effort(X), score(dim, N), bump(dim, N, max: N, min: N)",

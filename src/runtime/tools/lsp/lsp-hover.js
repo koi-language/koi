@@ -5,7 +5,7 @@ export default {
   intent: 'lsp_hover',
   description: 'Get type information and documentation for a symbol at a position using LSP hover. Fields: "file" (path), "line" (1-based), "character" (1-based). Returns: { success, contents } where contents is the hover text (type signature, docs).',
   thinkingHint: 'Getting type info',
-  permission: 'read',
+  permission: 'use_lsp',
   hidden: false,
 
   schema: {

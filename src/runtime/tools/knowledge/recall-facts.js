@@ -9,12 +9,12 @@
  * results when you only need a specific type (e.g. "path", "tech_stack").
  */
 
-import { sessionKnowledge } from '../../state/session-knowledge.js';
+import { sessionKnowledge, planKnowledge } from '../../state/session-knowledge.js';
 
 export default {
   type: 'recall_facts',
   intent: 'recall_facts',
-  description: 'Retrieve shared session knowledge discovered by other agents. Use at task start to avoid rediscovering what others already know. Fields: "category" (optional — tech_stack|path|config|credential|status|dependency|other to filter). Returns: all stored facts as a formatted list, or a message if none exist.',
+  description: 'Retrieve shared knowledge discovered by other agents. Returns BOTH session-level facts (durable project knowledge) AND plan-level facts (transient implementation details shared between tasks of the current plan). Use at task start to avoid rediscovering what others already know. Fields: "category" (optional filter).',
   thinkingHint: 'Recalling knowledge',
   permission: null,
   hidden: false,
@@ -24,7 +24,7 @@ export default {
     properties: {
       category: {
         type: 'string',
-        enum: ['tech_stack', 'path', 'config', 'credential', 'status', 'dependency', 'other'],
+        enum: ['tech_stack', 'path', 'config', 'credential', 'status', 'dependency'],
         description: 'Optional: filter facts by category. Omit to get all facts.',
       },
     },
@@ -34,34 +34,42 @@ export default {
   examples: [
     { actionType: 'direct', intent: 'recall_facts' },
     { actionType: 'direct', intent: 'recall_facts', category: 'path' },
-    { actionType: 'direct', intent: 'recall_facts', category: 'tech_stack' },
   ],
 
   async execute(action) {
     const { category } = action;
+    const sections = [];
 
-    if (sessionKnowledge.size === 0) {
-      return { success: true, knowledge: 'No shared knowledge stored yet in this session.' };
+    // Session knowledge (durable)
+    const sessionFacts = category
+      ? sessionKnowledge.recall(category)
+      : sessionKnowledge.recall();
+    if (sessionFacts.length > 0) {
+      const lines = sessionFacts.map(f =>
+        `- [${f.category}] **${f.key}**: ${f.value}  _(by ${f.agentName})_`
+      );
+      sections.push(`## Session knowledge\n_Durable project facts._\n\n${lines.join('\n')}`);
     }
 
-    if (category) {
-      const facts = sessionKnowledge.recall(category);
-      if (facts.length === 0) {
-        return { success: true, knowledge: `No facts stored for category "${category}" yet.` };
-      }
-      const lines = facts.map(f => `- [${f.category}] **${f.key}**: ${f.value}  _(learned by ${f.agentName})_`);
-      return {
-        success: true,
-        knowledge: `## Session knowledge — ${category}\n\n${lines.join('\n')}`,
-        count: facts.length,
-      };
+    // Plan knowledge (transient, cleared when plan completes)
+    const planFacts = category
+      ? planKnowledge.recall(category)
+      : planKnowledge.recall();
+    if (planFacts.length > 0) {
+      const lines = planFacts.map(f =>
+        `- [${f.category}] **${f.key}**: ${f.value}  _(by ${f.agentName})_`
+      );
+      sections.push(`## Plan knowledge\n_Implementation details from sibling tasks — use them._\n\n${lines.join('\n')}`);
     }
 
-    const formatted = sessionKnowledge.format();
+    if (sections.length === 0) {
+      return { success: true, knowledge: 'No shared knowledge stored yet.' };
+    }
+
     return {
       success: true,
-      knowledge: formatted,
-      count: sessionKnowledge.size,
+      knowledge: sections.join('\n\n'),
+      count: sessionFacts.length + planFacts.length,
     };
   },
 };

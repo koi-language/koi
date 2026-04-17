@@ -5,7 +5,7 @@ export default {
   intent: 'lsp_find_references',
   description: 'Find all references to a symbol using the Language Server Protocol. Semantic analysis, not text search — finds actual usages, not string matches. Fields: "file" (path), "line" (1-based), "character" (1-based). Returns: { success, references: [{ file, line, character }], count }.',
   thinkingHint: 'Finding references',
-  permission: 'read',
+  permission: 'use_lsp',
   hidden: false,
 
   schema: {

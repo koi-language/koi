@@ -13,7 +13,8 @@
       "reasoningThinking": 93,
       "thinking": true,
       "supportsThinkingBudget": true,
-      "cachedInputPer1M": 0.5
+      "cachedInputPer1M": 0.5,
+      "api": "chat"
     },
     "claude-sonnet-4-6": {
       "inputPer1M": 3,
@@ -28,7 +29,8 @@
       "reasoningThinking": 75,
       "thinking": true,
       "supportsThinkingBudget": true,
-      "cachedInputPer1M": 0.3
+      "cachedInputPer1M": 0.3,
+      "api": "chat"
     },
     "claude-haiku-4-5": {
       "inputPer1M": 1,
@@ -43,7 +45,8 @@
       "reasoningThinking": 28,
       "thinking": true,
       "supportsThinkingBudget": true,
-      "cachedInputPer1M": 0.1
+      "cachedInputPer1M": 0.1,
+      "api": "chat"
     }
   },
   "openai": {
@@ -157,7 +160,8 @@
       "codeThinking": 64,
       "reasoningThinking": 40,
       "thinking": true,
-      "cachedInputPer1M": 0.05
+      "cachedInputPer1M": 0.05,
+      "api": "chat"
     },
     "gemini-2.5-flash": {
       "inputPer1M": 0.3,
@@ -172,7 +176,8 @@
       "reasoningThinking": 10,
       "thinking": true,
       "supportsThinkingBudget": true,
-      "cachedInputPer1M": 0.03
+      "cachedInputPer1M": 0.03,
+      "api": "chat"
     },
     "gemini-3.1-pro-preview": {
       "inputPer1M": 2,
@@ -186,7 +191,8 @@
       "codeThinking": 97,
       "reasoningThinking": 97,
       "thinking": true,
-      "cachedInputPer1M": 0.2
+      "cachedInputPer1M": 0.2,
+      "api": "chat"
     },
     "gemini-2.5-flash-lite": {
       "inputPer1M": 0.1,
@@ -201,7 +207,8 @@
       "reasoningThinking": 14,
       "thinking": true,
       "supportsThinkingBudget": true,
-      "cachedInputPer1M": 0.01
+      "cachedInputPer1M": 0.01,
+      "api": "chat"
     }
   }
 }

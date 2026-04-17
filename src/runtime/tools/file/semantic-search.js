@@ -2,7 +2,7 @@
  * Semantic Code Search Action — Search the semantic code index by natural language query.
  *
  * Searches across files, classes, and functions using vector embeddings.
- * Requires a prior index_code run (or background indexing) to populate the index.
+ * Requires background indexing to populate the index (runs automatically on startup).
  *
  * Permission: read
  */
@@ -127,7 +127,7 @@ Search results are leads, not answers:
       if (!(await index.isReady())) {
         return {
           success: false,
-          error: 'Semantic index not built yet. Use index_code first, or wait for background indexing to complete.',
+          error: 'Semantic index not built yet. Background indexing will complete shortly — retry in a moment.',
         };
       }
       channel.log('semantic-search', `[${query.slice(0, 40)}] isReady: ${Date.now() - _t0}ms`);

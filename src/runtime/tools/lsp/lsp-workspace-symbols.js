@@ -15,7 +15,7 @@ export default {
   intent: 'lsp_workspace_symbols',
   description: 'Search for symbols (classes, functions, variables, etc.) across the entire workspace using LSP. Faster and more accurate than grep for finding code constructs. Fields: "query" (search string, can be partial). Returns: { success, symbols: [{ name, kind, file, line, containerName }] }.',
   thinkingHint: 'Searching symbols',
-  permission: 'read',
+  permission: 'use_lsp',
   hidden: false,
 
   schema: {

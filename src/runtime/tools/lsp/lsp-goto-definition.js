@@ -6,7 +6,7 @@ export default {
   intent: 'lsp_goto_definition',
   description: 'Go to the definition of a symbol using the Language Server Protocol. Provides precise, semantic navigation (not text search). Fields: "file" (path to the file), "line" (1-based line number), "character" (1-based column). Returns: { success, definitions: [{ file, line, character }] }. Falls back gracefully if no LSP server is available.',
   thinkingHint: 'Finding definition',
-  permission: 'read',
+  permission: 'use_lsp',
   hidden: false,
 
   schema: {

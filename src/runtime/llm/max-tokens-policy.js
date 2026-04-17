@@ -18,9 +18,11 @@
 
 /** Non-thinking base caps by task kind. */
 export const MAX_OUTPUT_TOKENS_BASE = {
-  route:   300,   // trivial routing / classification
-  extract: 800,   // structured extraction from a short input
-  answer:  1500,  // conversational answer / explanation
+  route:   1000,  // routing / classification — needs headroom because some
+                  // models burn tokens on internal reasoning even with
+                  // effort=none, leaving nothing for the actual response.
+  extract: 1200,  // structured extraction from a short input
+  answer:  2000,  // conversational answer / explanation
   code:    6000,  // write_file / edit_file with non-trivial content
   final:   2000,  // final summary / closing response
 };

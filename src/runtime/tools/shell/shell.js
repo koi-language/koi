@@ -1198,7 +1198,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           );
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(false, 'stopped by user', _shellActionId);
+        if (!isSilent) channel.endAction(false, 'stopped by user', _shellActionId);
         yield {
           success: false,
           userKilled: true,
@@ -1212,7 +1212,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
         reportDone?.();
         if (!isSilent) { _showOutputPreview(closeError.message, true); _showTimeout(); }
         // Signal action finished so the GUI clears the Running/Stop widget
-        if (!isSilent && !_inScope) channel.endAction(false, closeError.message, _shellActionId);
+        if (!isSilent) channel.endAction(false, closeError.message, _shellActionId);
         yield { success: false, exitCode: 1, stdout: '', stderr: '', error: closeError.message };
       } else if (closeCode !== 0) {
         _shellOutputCallback?.(false);
@@ -1221,7 +1221,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           _showOutputPreview(stderrStr || combinedStr, true); _showTimeout();
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, stderrStr || combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(false, `exit ${closeCode}`, _shellActionId);
+        if (!isSilent) channel.endAction(false, `exit ${closeCode}`, _shellActionId);
         yield {
           success: false,
           exitCode: closeCode || 1,
@@ -1236,7 +1236,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
           _showOutputPreview(combinedStr); _showTimeout();
           if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
         }
-        if (!isSilent && !_inScope) channel.endAction(true, '', _shellActionId);
+        if (!isSilent) channel.endAction(true, '', _shellActionId);
         yield { success: true, exitCode: 0, stdout: stdoutStr, stderr: stderrTrunc };
       }
       // No trailing separator — _blockSep() in terminal-channel handles spacing between blocks.

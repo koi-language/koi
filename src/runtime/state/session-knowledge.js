@@ -110,3 +110,18 @@ class SessionKnowledge extends EventEmitter {
 
 // Module-level singleton — shared across all imports in the same process.
 export const sessionKnowledge = new SessionKnowledge();
+
+/**
+ * Plan Knowledge Store — ephemeral shared facts scoped to the current plan.
+ *
+ * When a developer implements a task, it stores implementation details here:
+ * file paths created, patterns used, integration points, etc. Sibling tasks
+ * pick these up via recall so they don't re-explore the same codebase.
+ *
+ * Cleared automatically when all tasks in the plan are completed. This is
+ * the "working memory" of a plan, not durable project knowledge.
+ *
+ * Uses the same SessionKnowledge class but is a SEPARATE instance so the
+ * two stores have independent lifecycles.
+ */
+export const planKnowledge = new SessionKnowledge();

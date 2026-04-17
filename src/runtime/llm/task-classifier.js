@@ -92,7 +92,7 @@ export class TaskClassifier {
 
 Pick the ONE category (A-G) that best describes this user request AND detect the natural language the user wrote it in (English name, e.g. "Spanish", "English", "French"). Return ONLY json: {"cat":"X","lang":"Language"}
 
-IMPORTANT: When in doubt between two categories, ALWAYS pick the HIGHER one. Underestimating complexity causes bad results; overestimating is cheap.
+IMPORTANT: Pick the category that MATCHES the request. Do NOT over-classify — a simple "create an app" is just C or D (the agent will decompose it). Only use E for requests that explicitly need multi-system integration or architecture redesign.
 
 For "lang": return the English name of the natural language used in the request (e.g. "Spanish", "English", "French", "German", "Portuguese", "Italian", "Japanese", "Chinese", "Arabic", "Russian", "Dutch", "Polish"). If the message is too short or language-neutral (single emoji, code-only), return "English" as default.
 
@@ -121,11 +121,11 @@ ${taskDescription}`;
     const CATEGORY_PROFILES = {
       A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: 'none' },
       B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: 'none' },
-      C: { code: 40,  reasoning: 30,  risk: 10, reasoningEffort: 'low' },
-      D: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'medium' },
-      E: { code: 65,  reasoning: 70,  risk: 20, reasoningEffort: 'high' },
-      F: { code: 60,  reasoning: 65,  risk: 10, reasoningEffort: 'medium' },
-      G: { code: 50,  reasoning: 60,  risk: 60, reasoningEffort: 'medium' },
+      C: { code: 30,  reasoning: 25,  risk: 10, reasoningEffort: 'low' },
+      D: { code: 45,  reasoning: 40,  risk: 15, reasoningEffort: 'low' },
+      E: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: 'medium' },
+      F: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: 'low' },
+      G: { code: 40,  reasoning: 45,  risk: 50, reasoningEffort: 'low' },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);
@@ -396,7 +396,10 @@ ${taskDescription}`;
           const catProfile = CATEGORY_PROFILES[cat];
           if (catProfile) {
             const { code: codeScore, reasoning: reasoningScore, risk: riskLevel = 0, reasoningEffort: effort = 'medium' } = catProfile;
-            const needsThinking = effort !== 'none' && effort !== 'low';
+            // Only enable thinking for HIGH effort. Medium is fast enough
+            // without extended reasoning — thinking adds minutes of latency
+            // for marginal quality improvement on most tasks.
+            const needsThinking = effort === 'high';
             const taskType = codeScore >= reasoningScore ? 'code' : 'reasoning';
             const difficulty = Math.max(codeScore, reasoningScore);
             const profile = { taskType, difficulty, code: codeScore, reasoning: reasoningScore, thinking: needsThinking, risk: riskLevel, reasoningEffort: effort };

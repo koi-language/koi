@@ -70,4 +70,7 @@ export default {
   reconsidering: 'Reconsidering — shell command failed',
   processingResponseFrom: 'Processing response from',
   scanningProject: 'scanning project...',
+
+  // Task manager
+  allTasksCompleted: '✓ All tasks completed.',
 };

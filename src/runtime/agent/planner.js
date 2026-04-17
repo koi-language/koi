@@ -101,7 +101,7 @@ export class Planner {
 
 Goal: ${goal}
 
-${actionRegistry.generatePromptDocumentation(agent)}
+${actionRegistry.generateCompactDocumentation(agent)}
 
 Return ONLY JSON (no markdown):
 {
@@ -120,7 +120,7 @@ Return ONLY JSON (no markdown):
 Goal: ${goal}
 Error: ${error}
 
-${actionRegistry.generatePromptDocumentation(agent)}
+${actionRegistry.generateCompactDocumentation(agent)}
 
 Return ONLY JSON (no markdown):
 {

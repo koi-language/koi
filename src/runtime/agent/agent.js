@@ -489,7 +489,7 @@ export class Agent {
       contextMemory.add(
         'user',
         `[INBOX] New message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
-        `Inbox → task #${added.id}`,
+        null,  // No medium-term summary — expires after short-term
         null
       );
     } else if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask && queue) {
@@ -505,7 +505,7 @@ export class Agent {
         });
         contextMemory.add('user',
           `[INBOX] Message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
-          `Inbox → task #${added.id}`, null);
+          null, null);
       } else {
         // Rewrite subject/description. We REPLACE description (not append)
         // because the classifier has already produced a merged version.
@@ -540,7 +540,7 @@ export class Agent {
         contextMemory.add(
           'user',
           `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to task #${existing.id}: ${result.rewrittenTask.subject}`,
-          `Inbox → modify task #${existing.id}`,
+          null,
           null
         );
 
@@ -1220,8 +1220,29 @@ export class Agent {
 
       const knowledgeBlock = sessionKnowledge.format();
       if (knowledgeBlock) {
+        // Remove stale copies so the latest snapshot is the only one in
+        // short-term memory. Without this, every agent start / recall_facts
+        // appends a new copy → duplicates pile up in the context window.
+        contextMemory.entries = contextMemory.entries.filter(
+          e => e.shortTerm !== 'Shared session knowledge'
+        );
         contextMemory.add('user', knowledgeBlock, 'Shared session knowledge', null);
-        channel.log('knowledge', `${this.name}: injected ${sessionKnowledge.size} shared fact(s)`);
+        channel.log('knowledge', `${this.name}: injected ${sessionKnowledge.size} session fact(s)`);
+      }
+
+      // Plan-scoped knowledge: transient facts from sibling tasks.
+      const { planKnowledge } = await import('../state/session-knowledge.js');
+      if (planKnowledge.size > 0) {
+        const planBlock = planKnowledge.format()
+          ?.replace('Shared session knowledge', 'Plan knowledge (sibling tasks)')
+          ?.replace('Facts discovered during this session', 'Implementation details from completed tasks in this plan');
+        if (planBlock) {
+          contextMemory.entries = contextMemory.entries.filter(
+            e => e.shortTerm !== 'Plan knowledge'
+          );
+          contextMemory.add('user', planBlock, 'Plan knowledge', null);
+          channel.log('knowledge', `${this.name}: injected ${planKnowledge.size} plan fact(s)`);
+        }
       }
     }
 
@@ -4964,7 +4985,7 @@ Be specific and concise. Never ask the user for things you or the delegate can d
     // Agent-specific MCPs (declared with `uses mcp`)
     for (const mcpName of this.usesMCPNames) {
       const client = mcpRegistry.get(mcpName);
-      if (client && client.tools.length > 0) {
+      if (client && client.connected && client.tools.length > 0) {
         seen.add(mcpName);
         summaries.push({
           name: mcpName,
@@ -4979,7 +5000,7 @@ Be specific and concise. Never ask the user for things you or the delegate can d
 
     // Global MCPs (from .mcp.json / KOI_GLOBAL_MCP_SERVERS) — available to all agents
     for (const [mcpName, client] of mcpRegistry.entries()) {
-      if (!seen.has(mcpName) && mcpRegistry.isGlobal(mcpName) && client.tools.length > 0) {
+      if (!seen.has(mcpName) && mcpRegistry.isGlobal(mcpName) && client.connected && client.tools.length > 0) {
         summaries.push({
           name: mcpName,
           tools: client.tools.map(t => ({
