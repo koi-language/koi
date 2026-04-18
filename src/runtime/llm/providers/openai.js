@@ -287,6 +287,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
         instructions: systemPrompt,
         input: inputMessages,
         text: { format: { type: 'json_object' } },
+        max_output_tokens: this.maxTokens,
         stream: true
       };
       // Only enable reasoning when explicitly requested. Sending 'low'

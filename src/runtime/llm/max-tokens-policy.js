@@ -77,11 +77,14 @@ export function resolveMaxOutputTokens({ profile, useThinking, phaseOverride, ca
     source = `policy(${kind})`;
   }
 
-  // Thinking models share the budget between reasoning and visible content.
+  // Reasoning models share the budget between reasoning and visible content.
   // Double so the visible portion matches the non-thinking baseline.
-  if (useThinking) {
+  // This applies both when thinking is explicitly enabled AND when the model
+  // always reasons internally (codex, o1, etc.) — indicated by caps.thinking.
+  const alwaysReasons = caps?.thinking === true;
+  if (useThinking || alwaysReasons) {
     value = value * 2;
-    source += ' +thinking';
+    source += alwaysReasons ? ' +reasoning-model' : ' +thinking';
   }
 
   // Clamp to what the model actually supports.

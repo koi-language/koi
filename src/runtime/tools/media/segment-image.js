@@ -21,6 +21,7 @@ export default {
   intent: 'segment_image',
   description: 'Segment objects in an image. Mode "precompute" uses vision+SAM3 text prompts. Mode "point" uses SAM2 with click coordinates.',
   thinkingHint: 'Segmenting image',
+  hidden: true, // GUI-only tool (called by Flutter ImageViewerTab, not by agents)
   permission: 'read',
 
   schema: {
