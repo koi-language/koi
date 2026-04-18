@@ -142,6 +142,10 @@ function _applyPhase(agent, phaseName, eventName) {
   agent.state.statusPhase = phaseName;
 
   channel.log('state', `\x1b[1m\x1b[36m*** [phase] ${agent.name}: ${oldPhase} → ${phaseName} (on ${eventName}) ***\x1b[0m`);
+  // Only emit wave event for real phase-to-phase transitions, not initial (none) → phase
+  if (oldPhase !== '(none)') {
+    channel.emit?.('phaseChange', { agent: agent.name, from: oldPhase, to: phaseName });
+  }
 
   // Reset the session profile to the phase defaults so subsequent bumps
   // apply on top of the new phase base.
