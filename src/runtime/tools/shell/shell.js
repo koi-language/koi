@@ -815,6 +815,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
     // the finally block and the timeout can reference it after assignment.
     let proc;
     let timeout;
+    let timedOut = false;
     let ptyProc = null;
     let child = null;
 
@@ -1010,7 +1011,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
     if (!sudoEnv) _scheduleDetect();
 
     // Timeout and abort handler are set up AFTER proc is assigned above.
-    timeout = setTimeout(() => proc.kill(), timeoutMs);
+    timeout = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
     const onAbort = () => proc.kill();
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
@@ -1035,6 +1036,18 @@ When a command requires sudo, just use sudo normally in the command. The system 
       //   (normal)            — periodic streaming snapshot for agent context.
       while (!isClosed) {
         await new Promise(r => { _wakeUp = r; setTimeout(r, stream_interval); });
+        // Safety net: node-pty sometimes misses the onExit callback on macOS.
+        // Check if the process is still alive. If not, force close.
+        if (!isClosed && proc) {
+          try {
+            const pid = ptyProc?.pid || child?.pid;
+            if (pid) { process.kill(pid, 0); } // throws if dead
+          } catch {
+            // Process is dead but we never got onExit. Force close.
+            channel.log('shell', `[safety-net] Process is dead but onExit did not fire — forcing close`);
+            _onClose(null);
+          }
+        }
         if (!isClosed) {
           const outputSoFar = Buffer.concat(outputChunks).toString();
           const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1186,9 +1199,29 @@ When a command requires sudo, just use sudo normally in the command. The system 
         );
       };
 
+      // Command exceeded its timeout — kill confirmed.
+      if (timedOut) {
+        _shellOutputCallback?.(false);
+        reportDone?.();
+        if (!isSilent) {
+          channel.printCompact(
+            `  \x1b[2m⎿\x1b[0m  \x1b[38;2;200;100;80mtimeout after ${Math.round(timeoutMs / 1000)}s\x1b[0m`,
+            _shellActionId ? { actionId: _shellActionId } : {},
+          );
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
+        }
+        if (!isSilent) channel.endAction(false, `timeout after ${Math.round(timeoutMs / 1000)}s`, _shellActionId);
+        yield {
+          success: false,
+          timedOut: true,
+          exitCode: 124, // conventional timeout exit code
+          stdout: stdoutStr,
+          stderr: stderrTrunc,
+          message: `Command timed out after ${Math.round(timeoutMs / 1000)} seconds. The process was killed. Consider: breaking the command into smaller steps, increasing the timeout, or running it in the background.`
+        };
       // User pressed the Stop button in the GUI — surface this as data
       // (not an abort) so the agent can continue with a different approach.
-      if (_registryEntry.userKilled) {
+      } else if (_registryEntry.userKilled) {
         _shellOutputCallback?.(false);
         reportDone?.();
         if (!isSilent) {

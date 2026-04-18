@@ -899,23 +899,26 @@ CRITICAL RULES:
             .filter(([, v]) => v != null && v !== '')
             .map(([k, v]) => `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
             .join('\n');
-          // If images were propagated from parent, tell the delegate to examine them.
-          // List available attachment IDs so the agent can re-read them via read_file("att-N").
+          // If attachments were provided (images, files, etc.), tell the delegate.
+          // List ALL registered attachment IDs so the agent can access them via read_file("att-N").
           const _imgCount = session._pendingMcpImages?.length || 0;
           let _imageNote = '';
-          if (_imgCount > 0) {
-            // Collect registered attachment IDs for images currently attached
-            let _attIds = '';
-            try {
-              const { attachmentRegistry: _ar } = await import('../state/attachment-registry.js');
-              const _allAtts = _ar.all().filter(a => a.mimeType?.startsWith('image/'));
-              if (_allAtts.length > 0) {
-                _attIds = `\nAvailable attachment IDs: ${_allAtts.map(a => `${a.id} (${a.fileName})`).join(', ')}. Use read_file("att-N") to re-read any of them.`;
+          let _attNote = '';
+          try {
+            const { attachmentRegistry: _ar } = await import('../state/attachment-registry.js');
+            const _allAtts = _ar.all();
+            if (_allAtts.length > 0) {
+              const _images = _allAtts.filter(a => a.mimeType?.startsWith('image/'));
+              const _files = _allAtts.filter(a => !a.mimeType?.startsWith('image/'));
+              if (_images.length > 0) {
+                _imageNote = `\n\n🖼️ ${_images.length === 1 ? 'IMAGE' : _images.length + ' IMAGES'} ATTACHED: Examine ${_images.length === 1 ? 'it' : 'them'} carefully.\nImage IDs: ${_images.map(a => `${a.id} (${a.fileName})`).join(', ')}. Use read_file("att-N") to re-read.`;
               }
-            } catch { /* ignore */ }
-            _imageNote = `\n\n🖼️ ${_imgCount === 1 ? 'IMAGE' : _imgCount + ' IMAGES'} ATTACHED: The user included ${_imgCount === 1 ? 'an image' : _imgCount + ' images'} with their request. Examine ${_imgCount === 1 ? 'it' : 'them'} carefully — ${_imgCount === 1 ? 'it' : 'they'} may contain visual context, annotations, or hints relevant to the task.${_attIds}`;
-          }
-          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
+              if (_files.length > 0) {
+                _attNote = `\n\n📎 ${_files.length === 1 ? 'FILE' : _files.length + ' FILES'} ATTACHED: The user included ${_files.length === 1 ? 'a file' : _files.length + ' files'} with their request.\nFile IDs: ${_files.map(a => `${a.id} (${a.fileName}${a.mimeType ? ', ' + a.mimeType : ''})`).join(', ')}. Use read_file("${_files[0]?.id}") to read. The file path is also available: ${_files.map(a => `${a.id} → ${a.path}`).join(', ')}.`;
+              }
+            }
+          } catch { /* ignore */ }
+          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}${_attNote}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
         }
         // NOTE: we intentionally no longer serialize `context` for non-delegate
         // agents. For the root agent (System) the context is just ephemeral
