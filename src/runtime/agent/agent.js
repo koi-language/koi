@@ -658,6 +658,16 @@ export class Agent {
       // the chat panel was confusing and duplicated that UX.
     }
 
+    // In GUI mode, wait for the Flutter client to connect via WebSocket
+    // before doing anything. The WS server creates globalThis.__guiClientReady
+    // in its constructor (before any agent code runs). Without this wait,
+    // background indexing and prompt_user fire before anyone is listening.
+    if (process.env.KOI_GUI_MODE === '1' && !_fromDelegation && globalThis.__guiClientReady) {
+      channel.log('agent', `${this.name}: Waiting for GUI client to connect...`);
+      await globalThis.__guiClientReady;
+      channel.log('agent', `${this.name}: GUI client connected`);
+    }
+
     // Fire-and-forget: start project indexing in background (once per process).
     // Skip when no real project is open — indexing a user's home directory
     // takes forever, burns CPU, and sends thousands of wasted embedding
@@ -1116,29 +1126,10 @@ export class Agent {
     let thinkingHint = _h('thinking', 'Thinking');
     let exitedOnAbort = false;
 
-    // Fast-start: skip the first LLM call for interactive CLI agents.
-    // When the playbook has __FAST_GREETING__, we skip the LLM entirely on
-    // iteration 0 and emit a silent `prompt_user` so the agent waits for
-    // the first user message without showing any greeting bubble.
-    // Historically we printed a random "Hello!"-style greeting here, but
-    // those bubbles cluttered the chat and, worse, were persisted in the
-    // display log so every session resume re-rendered them.
-    // Check if a project instructions file exists — if not, skip fast-greeting
-    // so the LLM can suggest creating one on first startup.
-    const _hasProjectMd = (() => {
-      try {
-        const _fs = require('fs');
-        const _cwd = process.env.KOI_PROJECT_ROOT || process.cwd();
-        return ['BRAXIL.md', 'braxil.md', 'CLAUDE.md', 'claude.md', 'KOI.md', 'koi.md']
-          .some(f => _fs.existsSync(require('path').join(_cwd, f)));
-      } catch { return true; } // assume exists on error — don't block startup
-    })();
-
-    const isFastGreeting = !isDelegate
-      && !contextMemory.hasHistory()
-      && !session.mcpErrors
-      && _hasProjectMd
-      && (typeof interpolatedPlaybook === 'string' ? interpolatedPlaybook : JSON.stringify(interpolatedPlaybook)).includes('__FAST_GREETING__');
+    // Fast-start: skip the first LLM call — wait for user input immediately.
+    // No greeting, no tokens wasted. Works for new AND restored sessions.
+    // Safe because we already awaited GUI connection above.
+    const isFastStart = !isDelegate && !session.mcpErrors;
 
     // Track the active agent so CLI hooks can access its LLM provider
     Agent._lastActiveAgent = this;
@@ -1251,50 +1242,8 @@ export class Agent {
       }
     }
 
-    // ── PROJECT INIT CHECK: propose BRAXIL.md creation if missing ───────
-    // Algorithmic check (no LLM) — runs once on first startup, non-delegate only.
-    // Skip when KOI_DISABLE_AUTO_INDEX=1 (set by the GUI when launching the
-    // root Braxil.app with no project open). In that case the user hasn't
-    // chosen a project yet, so asking about BRAXIL.md would be meaningless
-    // and the blocking select() would freeze the agent loop.
-    if (!isDelegate && !contextMemory.hasHistory() && !_hasProjectMd
-        && process.env.KOI_DISABLE_AUTO_INDEX !== '1') {
-      try {
-        Agent._cliHooks?.onBusy?.(false);
-        const _initChannel = (await import('../io/channel.js')).channel;
-        _initChannel.print(_initChannel.renderMarkdown(
-          'No project instructions file found (`BRAXIL.md`). This file helps me understand your codebase, conventions, and preferences.'
-        ));
-        const _initChoice = await _initChannel.select(
-          'Want me to explore the project and create one?',
-          [
-            { title: 'Yes, create BRAXIL.md', value: 'yes' },
-            { title: 'No, skip for now', value: 'no' },
-          ],
-          0,
-        );
-        if (!isDelegate) Agent._cliHooks?.onBusy?.(true);
-        if (_initChoice === 'yes') {
-          // Inject the /init prompt — the agent will process it as user input
-          const _initPrompt = (await import('../io/channel.js')).channel;
-          try {
-            const { default: initCmd } = await import(process.env.KOI_CLI_COMMAND_REGISTRY_PATH || '../../cli/commands/init.js');
-            if (initCmd?.execute) {
-              const result = await initCmd.execute(this, '');
-              if (result?.answer) {
-                // Inject as user message so the agent processes it
-                contextMemory.add('user', result.answer, 'User request', null);
-              }
-            }
-          } catch {
-            // Fallback: inject a simple prompt for BRAXIL.md creation
-            contextMemory.add('user', 'Explore this project and create a BRAXIL.md file with project documentation: tech stack, directory structure, how to run/build/test, key files, and coding conventions.', 'User request', null);
-          }
-        }
-      } catch (e) {
-        channel.log('agent', `Project init check failed: ${e.message}`);
-      }
-    }
+    // Project init (BRAXIL.md creation) removed from auto-startup.
+    // Users can run /init manually when they want.
 
     while (!session.isTerminated) {
       // ── Drain the inbox: apply classified messages to this agent's
@@ -1400,17 +1349,10 @@ export class Agent {
       // 1. GET ACTION(S) from LLM — or fast-start on iteration 0
       let response;
 
-      if (isFastGreeting && session.iteration === 0) {
-        // Skip the LLM on iteration 0 — emit a silent prompt_user (no
-        // question) so the agent just waits for the user's first message
-        // without printing anything to the chat or persisting anything
-        // to the display log. Phase transitions are already handled by
-        // reactions (session.start / invoked at handler entry).
-        channel.log('agent', `${this.name}: Fast-start (silent prompt_user, no greeting)`);
-        // Toggle busy OFF so the GUI shows the idle input state while
-        // prompt_user waits. onBusy(true) was set at the top of the
-        // reactive loop; without this toggle the thinking dots stay
-        // visible even though the agent is idle.
+      if (isFastStart && session.iteration === 0) {
+        // Skip the LLM entirely — wait for the user's first message.
+        // No greeting, no tokens wasted. Works for new AND restored sessions.
+        channel.log('agent', `${this.name}: Fast-start (waiting for user input)`);
         if (!isDelegate) Agent._cliHooks?.onBusy?.(false);
         response = [
           { actionType: 'direct', intent: 'prompt_user' }
