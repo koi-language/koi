@@ -55,7 +55,11 @@ export default {
   ],
 
   async execute(action, agent) {
-    const { key, value, category = 'other', scope = 'session' } = action;
+    const { key, category = 'other', scope = 'session' } = action;
+    // Serialize objects — LLMs sometimes pass objects instead of strings
+    const value = typeof action.value === 'object' && action.value !== null
+      ? JSON.stringify(action.value)
+      : action.value;
 
     if (!key || !value) {
       return { success: false, error: 'learn_fact: "key" and "value" are required' };

@@ -48,7 +48,7 @@ class SessionKnowledge extends EventEmitter {
     if (!VALID_CATEGORIES.has(category)) return;
     const entry = {
       key: String(key),
-      value: String(value).slice(0, MAX_VALUE_LEN),
+      value: (typeof value === 'object' ? JSON.stringify(value) : String(value)).slice(0, MAX_VALUE_LEN),
       category,
       agentName: String(agentName),
       ts: Date.now(),
