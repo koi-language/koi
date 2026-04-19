@@ -690,17 +690,39 @@ export class Agent {
       }
     }
 
-    // Delegated invocations run inside an isolated state context so parallel
-    // delegates of the same agent don't share/overwrite each other's phase.
-    if (_fromDelegation) {
-      const freshState = {};
-      return _invocationStateStorage.run(freshState, () =>
-        this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn)
-      );
+    if (!_fromDelegation) {
+      channel.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${eventName}...\x1b[0m`);
     }
 
-    channel.progress(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${eventName}...\x1b[0m`);
-    return this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn);
+    // Emit live lifecycle events so the GUI footer can show which agents
+    // are currently working (and with which skills). Delegate invocations
+    // must also fire these — otherwise the footer never learns about
+    // Worker/Explorer/etc., and skillActivated events have no agent to
+    // attach skills to. A unique instanceId per invocation lets the UI
+    // distinguish parallel delegates of the same agent. Paired end is
+    // fired in finally below so we never leak a "running" state on errors.
+    const _instanceId = `${this.name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    channel.agentStarted?.({
+      name: this.name,
+      instanceId: _instanceId,
+      event: eventName,
+      isDelegate: _fromDelegation,
+      skills: Array.isArray(this.state?.skills) ? [...this.state.skills] : [],
+    });
+    try {
+      if (_fromDelegation) {
+        // Delegated invocations run inside an isolated state context so
+        // parallel delegates of the same agent don't share/overwrite each
+        // other's phase.
+        const freshState = {};
+        return await _invocationStateStorage.run(freshState, () =>
+          this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn)
+        );
+      }
+      return await this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn);
+    } finally {
+      channel.agentEnded?.({ name: this.name, instanceId: _instanceId });
+    }
   }
 
   async _handleInner(eventName, args, _fromDelegation, _parentAnswerFn) {
@@ -2383,6 +2405,20 @@ export class Agent {
               sessionTracker._lastUserRequest = this._lastUserMessage;
             }
 
+            // ── AUTO-MATCH WORKFLOW ────────────────────────────────────────────
+            // On every fresh user message in the root coordinator, check whether
+            // any workflow matches the request. If so, activate it — which
+            // instantiates its script as concrete tasks and fires planner.result
+            // so the System transitions into running_plan. Best-effort: any
+            // failure falls through to normal routing.
+            if (!isDelegate && this._lastUserMessage) {
+              try {
+                await this._autoMatchWorkflow(this._lastUserMessage);
+              } catch (e) {
+                channel.log('workflow', `${this.name}: Auto-match workflow failed: ${e.message}`);
+              }
+            }
+
             // Clear completed tasks on new user input (keeps the slate clean).
             // Do NOT clear pending/in-progress tasks — the user may be continuing
             // work from a resumed session or referring to existing tasks.
@@ -2445,17 +2481,19 @@ export class Agent {
               data: result || null,
             };
 
-            // Fire <delegateAgent>.result reaction
+            // Fire <delegateAgent>.result reaction. Also expose the same
+            // result under the `any` alias so catch-all clauses
+            // `when any.result { ... any.result.success ... }` can read it.
+            const _resultPayload = {
+              success: result?.success !== false && !result?.error,
+              data: result?.data ?? result ?? null,
+              error: result?.error ?? null,
+              taskCount: result?.taskCount ?? result?.data?.taskCount ?? 0,
+              cancelled: result?.cancelled ?? false,
+            };
             const _reactionCtx = {
-              [_delegateAgent]: {
-                result: {
-                  success: result?.success !== false && !result?.error,
-                  data: result?.data ?? result ?? null,
-                  error: result?.error ?? null,
-                  taskCount: result?.taskCount ?? result?.data?.taskCount ?? 0,
-                  cancelled: result?.cancelled ?? false,
-                },
-              },
+              [_delegateAgent]: { result: _resultPayload },
+              any: { result: _resultPayload },
               state: this.state,
             };
             fireReaction(this, `${_delegateAgent}.result`, null, _reactionCtx);
@@ -3509,7 +3547,7 @@ export class Agent {
         }
       }
 
-      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_facts', 'learn_fact', 'list_skills', 'activate_skill', 'deactivate_skill', 'queue_add', 'queue_update']);
+      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_facts', 'learn_fact', 'list_skills', 'activate_skill', 'deactivate_skill', 'list_workflows', 'activate_workflow', 'deactivate_workflow', 'queue_add', 'queue_update']);
       if (_intent && !_SELF_MANAGED.has(_intent)) {
         channel.beginAction(_intent, action.url || action.path || action.pattern || action.query || action.subject || '');
       }
@@ -3911,6 +3949,91 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
       }
     } catch (e) {
       channel.log('skills', `${this.name}: Skill classifier failed: ${e.message}`);
+    }
+  }
+
+  /**
+   * Pick at most one workflow that matches the user's request, and activate it.
+   * Unlike _autoActivateSkills (which runs once at delegate start), this runs
+   * on every fresh user message at the root coordinator: workflows are
+   * dispatched per-request, not per-lifetime.
+   *
+   * Best-effort: any failure here falls through silently — the System then
+   * handles the request via normal routing / delegation.
+   */
+  async _autoMatchWorkflow(userMessage) {
+    const text = (userMessage || '').trim();
+    // Skip very short inputs (greetings, "ok", "sigue") — workflows only make
+    // sense for real requests. Saves a classifier round-trip on chit-chat.
+    if (text.length < 12) return;
+
+    // Skip if the agent is already running an active workflow or has pending
+    // tasks — we don't want to overwrite mid-execution state.
+    if (this.state?.activeWorkflow) return;
+    try {
+      const { taskManager } = await import('../state/task-manager.js');
+      const pending = taskManager.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
+      if (pending.length > 0) return;
+    } catch { /* non-fatal */ }
+
+    let workflows;
+    try {
+      const result = await this.callAction('list_workflows', {});
+      workflows = result?._fullWorkflows || result?.workflows;
+    } catch (e) {
+      channel.log('workflow', `${this.name}: list_workflows failed: ${e.message}`);
+      return;
+    }
+    if (!workflows || workflows.length === 0) return;
+
+    const catalog = workflows.map(w => `- ${w.name}: ${w.description}`).join('\n');
+    const prompt = `You are a workflow matcher. The user just sent a request. Decide whether any of the pre-approved workflows below clearly matches the request type.
+
+A workflow matches ONLY when the user's request is clearly an instance of the task type described in its description. If in doubt, prefer null — normal routing will handle it.
+
+USER REQUEST:
+${text.substring(0, 1000)}
+
+AVAILABLE WORKFLOWS:
+${catalog}
+
+Return ONLY a JSON object, no prose, no markdown fences:
+{ "workflow": "<workflow-name-or-null>" }`;
+
+    try {
+      const { getAllCandidates, createLLM, getAvailableProviders } = await import('../llm/providers/factory.js');
+
+      const providers = this.llmProvider?._availableProviders || getAvailableProviders();
+      const candidates = getAllCandidates('reasoning', 40, providers);
+      if (candidates.length === 0) return;
+
+      const nonThinking = candidates.find(c => !c.thinking) || candidates[0];
+      const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : nonThinking.provider;
+      const client = this.llmProvider._getClient(effectiveProvider);
+      const llm = createLLM(effectiveProvider, client, nonThinking.model, {
+        temperature: 0,
+        maxTokens: 200,
+        useThinking: false,
+      });
+
+      const { text: raw } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 15000 });
+      const stripped = (raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      if (!stripped) return;
+
+      const objMatch = stripped.match(/\{[\s\S]*?\}/);
+      const parsed = JSON.parse(objMatch ? objMatch[0] : stripped);
+      const name = parsed?.workflow;
+
+      if (!name || typeof name !== 'string' || name.toLowerCase() === 'null') return;
+      if (!workflows.some(w => w.name === name)) return;
+
+      channel.log('workflow', `${this.name}: Matched workflow "${name}" — activating`);
+      const activateResult = await this.callAction('activate_workflow', { name, userMessage: text });
+      if (!activateResult?.activated) {
+        channel.log('workflow', `${this.name}: activate_workflow("${name}") did not activate (fallback=${activateResult?.fallback}): ${activateResult?.reason || activateResult?.error || 'unknown'}`);
+      }
+    } catch (e) {
+      channel.log('workflow', `${this.name}: Workflow matcher failed: ${e.message}`);
     }
   }
 

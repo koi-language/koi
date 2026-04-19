@@ -41,8 +41,25 @@ If both user-visible output and workflow completion are required:
   ],
 
   // Executor function - receives the action and agent context
+  _lastPrintedMessage: null,
+  _duplicateCount: 0,
+
   async execute(action, agent) {
     const message = action.message || action.text || action.data || '';
+
+    // Detect duplicate consecutive prints (LLM loop). If the same message
+    // is printed twice in a row, suppress the duplicate and force prompt_user
+    // to break the loop.
+    if (message === this._lastPrintedMessage) {
+      this._duplicateCount++;
+      if (this._duplicateCount >= 1) {
+        channel.log('print', `Suppressed duplicate print (×${this._duplicateCount + 1}). Breaking loop.`);
+        return { printed: false, suppressed: true, message: 'Duplicate print suppressed — call prompt_user to continue.' };
+      }
+    } else {
+      this._lastPrintedMessage = message;
+      this._duplicateCount = 0;
+    }
 
     if (action._alreadyStreamed) {
       channel.printStreamingEnd();

@@ -295,11 +295,18 @@ class PluginManager {
         }, null, 2));
       }
 
-      // Also copy skills to .koi/skills/ for backward compat
+      // Copy skills and agents into the well-known directories that the
+      // runtime scans (.koi/skills, .koi/agents). Symmetric treatment —
+      // both come from the same plugin payload. The resulting paths are
+      // recorded in an install manifest so uninstall can remove them
+      // cleanly instead of leaving orphaned files behind.
       const caps = this._detectCapabilities(baseDir);
+      const installedPaths = { skills: [], agents: [] };
+      const isProject = scope === 'project' && projectRoot;
+
       let skillsCopied = 0;
       if (caps.skills) {
-        const skillsTarget = scope === 'project' && projectRoot
+        const skillsTarget = isProject
           ? path.join(projectRoot, '.koi', 'skills')
           : path.join(os.homedir(), '.koi', 'skills');
         if (!fs.existsSync(skillsTarget)) fs.mkdirSync(skillsTarget, { recursive: true });
@@ -307,10 +314,40 @@ class PluginManager {
           const dest = path.join(skillsTarget, skill.name);
           if (!fs.existsSync(dest)) {
             this._copyRecursive(skill.dir, dest);
+            installedPaths.skills.push(dest);
             skillsCopied++;
           }
         }
       }
+
+      let agentsCopied = 0;
+      if (caps.agents) {
+        const agentsTarget = isProject
+          ? path.join(projectRoot, '.koi', 'agents')
+          : path.join(os.homedir(), '.koi', 'agents');
+        if (!fs.existsSync(agentsTarget)) fs.mkdirSync(agentsTarget, { recursive: true });
+        for (const agent of caps.agents) {
+          // md-agent-loader only scans .md; skip .koi until the runtime
+          // supports compiling them on the fly.
+          if (!agent.path.endsWith('.md')) continue;
+          const dest = path.join(agentsTarget, path.basename(agent.path));
+          if (!fs.existsSync(dest)) {
+            fs.copyFileSync(agent.path, dest);
+            installedPaths.agents.push(dest);
+            agentsCopied++;
+          }
+        }
+      }
+
+      // Write install manifest so uninstall can reverse these copies.
+      try {
+        const manifestDir = path.join(baseDir, '.koi-plugin');
+        fs.mkdirSync(manifestDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(manifestDir, 'install-manifest.json'),
+          JSON.stringify({ scope, installedPaths }, null, 2),
+        );
+      } catch { /* non-fatal */ }
 
       // Register + activate
       const meta = this._readPluginJson(baseDir) || { id: pluginId, name: pluginId };
@@ -319,12 +356,17 @@ class PluginManager {
       this._saveConfig();
 
       const totalCaps = Object.keys(caps).length;
-      channel.log('plugins', `Installed plugin "${pluginId}" (${totalCaps} capabilities, ${skillsCopied} skills copied)`);
+      channel.log(
+        'plugins',
+        `Installed plugin "${pluginId}" (${totalCaps} capabilities, ${skillsCopied} skills, ${agentsCopied} agents)`,
+      );
 
       return {
         success: true,
         pluginId,
         installed: skillsCopied,
+        skillsCopied,
+        agentsCopied,
         capabilities: caps,
         scope,
       };
@@ -346,20 +388,52 @@ class PluginManager {
   }
 
   /**
-   * Uninstall a plugin — remove from cache and deactivate.
+   * Uninstall a plugin — remove cache dir, reverse any installed skills
+   * and agents recorded in the install manifest, and deactivate.
+   * Returns { success, skillsRemoved, agentsRemoved }.
    */
   uninstall(pluginId) {
     const entry = this._plugins.get(pluginId);
-    if (!entry) return false;
+    if (!entry) return { success: false, skillsRemoved: 0, agentsRemoved: 0 };
+
+    let skillsRemoved = 0;
+    let agentsRemoved = 0;
+
+    // Read manifest before removing the cache dir.
+    try {
+      const manifestPath = path.join(entry.dir, '.koi-plugin', 'install-manifest.json');
+      if (fs.existsSync(manifestPath)) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const paths = manifest.installedPaths || {};
+        for (const p of (paths.skills || [])) {
+          try {
+            if (fs.existsSync(p)) {
+              fs.rmSync(p, { recursive: true, force: true });
+              skillsRemoved++;
+            }
+          } catch { /* best effort */ }
+        }
+        for (const p of (paths.agents || [])) {
+          try {
+            if (fs.existsSync(p)) {
+              fs.unlinkSync(p);
+              agentsRemoved++;
+            }
+          } catch { /* best effort */ }
+        }
+      }
+    } catch { /* manifest missing or corrupt — skip reverse copies */ }
+
     try {
       if (fs.existsSync(entry.dir)) {
         fs.rmSync(entry.dir, { recursive: true, force: true });
       }
     } catch {}
+
     this._plugins.delete(pluginId);
     this._activePlugins.delete(pluginId);
     this._saveConfig();
-    return true;
+    return { success: true, skillsRemoved, agentsRemoved };
   }
 
   // ── Activation ─────────────────────────────────────────────────────────

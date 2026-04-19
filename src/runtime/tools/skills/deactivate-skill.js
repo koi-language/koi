@@ -44,6 +44,7 @@ export default {
     await agent.callAction('update_state', { updates: { skills: newSkills } });
 
     channel.print(`\x1b[33m✗\x1b[0m \x1b[2mSkill deactivated: \x1b[1m${skillName}\x1b[0m`);
+    channel.skillDeactivated?.({ agent: agent.name, skill: skillName });
 
     return {
       deactivated: true,

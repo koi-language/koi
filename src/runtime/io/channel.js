@@ -109,6 +109,21 @@ class Channel {
   endAction(success, detail) { this.printCompact(success ? `  ✓ ${detail || ''}` : `  ✗ ${detail || ''}`); }
   /** Reset action grouping (e.g. after user interaction). */
   resetActionGroup() {}
+
+  // ── Live agent / skill activity ────────────────────────────────────────
+  // Broadcast when an agent enters its reactive loop, leaves it, or
+  // (de)activates a skill. Rich UIs (Flutter GUI) use these to render
+  // a live footer showing who is currently working and with what. CLIs
+  // default to no-op — the info is surfaced via logs.
+
+  /** Agent just entered its reactive loop. */
+  agentStarted(info) {}
+  /** Agent just exited its reactive loop. */
+  agentEnded(info) {}
+  /** Agent activated a skill (loaded it into its active context). */
+  skillActivated(info) {}
+  /** Agent deactivated a skill. */
+  skillDeactivated(info) {}
   /** Whether the channel has a streaming UI provider (e.g. Ink) that uses a dynamic area. */
   hasStreamingProvider() { return false; }
 

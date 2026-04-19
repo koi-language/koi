@@ -95,6 +95,10 @@ export default {
     }
 
     channel.log('skill', `Skill activated: ${skillName}`);
+    // Live lifecycle event: lets the GUI footer attach this skill to the
+    // agent that activated it and drop it later on deactivate. Safe no-op
+    // on channels that don't implement it.
+    channel.skillActivated?.({ agent: agent.name, skill: skillName });
 
     return {
       activated: true,

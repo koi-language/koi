@@ -26,9 +26,15 @@ const VALID_DIMS = new Set(['code', 'reasoning']);
 /**
  * Fire an event on the agent. Walks reactions, runs matching bodies.
  *
+ * Catch-all for delegate returns: a clause `when any.result { ... }` acts as a
+ * fallback for any `<delegateName>.result` event. Semantics are specific-wins:
+ * if one or more clauses match the exact delegate name, ONLY those run; the
+ * `any.result` clause is skipped. `any.result` only fires when no specific
+ * clause matched, and only for events whose path ends in `.result`.
+ *
  * @param {Agent} agent - The agent firing the event.
  * @param {string} eventPath - Dot-separated event path (e.g. "phase.done",
- *                             "requirementsGatherer.result", "user.message").
+ *                             "planner.result", "user.message").
  * @param {string|null} eventArg - Optional argument of the event
  *                                 (e.g. phase name for "phase.done").
  * @param {Object} context - Variables visible to reaction expressions.
@@ -36,23 +42,48 @@ const VALID_DIMS = new Set(['code', 'reasoning']);
 export function fireReaction(agent, eventPath, eventArg = null, context = {}) {
   if (!agent?.reactions || !Array.isArray(agent.reactions)) return;
 
+  const _matches = (e, { allowCatchAll }) => {
+    if (typeof e === 'string') {
+      // Legacy format (shouldn't happen after transpiler update, but safe)
+      return e === eventPath && !eventArg;
+    }
+    if (e.path === 'any.result') return !!allowCatchAll;
+    if (e.path !== eventPath) return false;
+    // If the reaction specifies an arg, it must match exactly.
+    // If the reaction omits the arg, it matches any arg value.
+    if (e.arg && e.arg !== eventArg) return false;
+    return true;
+  };
+
+  // Pass 1: specific matches (any.result is skipped).
+  let specificFired = false;
   for (const clause of agent.reactions) {
-    const matched = clause.events.some(e => {
-      if (typeof e === 'string') {
-        // Legacy format (shouldn't happen after transpiler update, but safe)
-        return e === eventPath && !eventArg;
-      }
-      if (e.path !== eventPath) return false;
-      // If the reaction specifies an arg, it must match exactly.
-      // If the reaction omits the arg, it matches any arg value.
-      if (e.arg && e.arg !== eventArg) return false;
-      return true;
-    });
+    const matched = clause.events.some(e => _matches(e, { allowCatchAll: false }));
     if (!matched) continue;
+    specificFired = true;
     try {
       _runBody(agent, clause.body, context, eventPath);
     } catch (err) {
       channel.log('reactions', `Error in reaction for ${eventPath}${eventArg ? `(${eventArg})` : ''}: ${err.message}`);
+    }
+  }
+
+  // Pass 2: any.result fallback — only if no specific matched, and only for
+  // delegate-return events. Guard against the pathological case where a
+  // delegate is literally named "any" (then eventPath === 'any.result' and
+  // pass 1 already handled it above via the specific branch... except pass 1
+  // skips any.result, so treat that as "specific" fired implicitly).
+  if (specificFired) return;
+  if (!eventPath.endsWith('.result')) return;
+  if (eventPath === 'any.result') return;
+
+  for (const clause of agent.reactions) {
+    const matched = clause.events.some(e => _matches(e, { allowCatchAll: true }));
+    if (!matched) continue;
+    try {
+      _runBody(agent, clause.body, context, eventPath);
+    } catch (err) {
+      channel.log('reactions', `Error in any.result reaction for ${eventPath}: ${err.message}`);
     }
   }
 }

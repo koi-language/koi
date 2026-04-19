@@ -112,7 +112,11 @@ You are running in non-interactive (headless) mode. There is no human to answer 
   // LLM prompt caching works on identical prefixes — the longer the unchanging
   // prefix, the higher the cache hit rate. Static rules/tools go first;
   // runtime context (timestamp, phase, cwd) goes at the end.
-  const staticPart = `${koiMd}
+  //
+  // NOTE: koiMd (BRAXIL.md / CLAUDE.md) is returned separately so
+  // buildReactiveSystemPrompt can inject it as the VERY FIRST thing in the
+  // prompt, before even the agent's playbook.
+  const staticPart = `
 ========================================
 OUTPUT CONTRACT (MUST FOLLOW)
 ========================================
@@ -316,7 +320,7 @@ All file paths (read_file, edit_file, write_file, shell) are relative to working
 ${openDocumentsBlock}${nonInteractiveBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 
-  return { static: staticPart, dynamic };
+  return { static: staticPart, dynamic, koiMd };
 }
 
 /**
@@ -612,23 +616,19 @@ export function buildExpandedResourceSection(resources, agent) {
  * @returns {string|object} Complete system prompt
  */
 export async function buildReactiveSystemPrompt(agent, playbook = null) {
-  const { static: staticBase, dynamic } = await buildSystemPrompt(agent);
-  // Layout: agent-specific content FIRST (most visible to LLM attention),
-  // generic boilerplate LAST (output contract, tools, action model).
-  //   1. Agent playbook (agent's own instructions — what matters most)
-  //   2. Dynamic runtime context (timestamp, phase, task state)
-  //   3. Static generic rules (output contract, golden rule, action model, tools)
-  //
-  // This puts the agent's identity and task-specific rules at the top of
-  // the system prompt where LLM attention is strongest, and pushes the
-  // structural boilerplate (JSON format, action list) to the end.
+  const { static: staticBase, dynamic, koiMd: projectSpec } = await buildSystemPrompt(agent);
+  // Layout:
+  //   1. BRAXIL.md / CLAUDE.md (project specification — MUST be first, always)
+  //   2. Agent playbook (agent's own instructions — what matters most)
+  //   3. Dynamic runtime context (timestamp, phase, task state)
+  //   4. Static generic rules (output contract, golden rule, action model, tools)
 
   // Structured cache-aware playbook from compiler taint analysis
   if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
     const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
     return {
       _cacheKey: playbook._cacheKey,
-      static: [_s(playbook.static), staticBase].filter(Boolean).join('\n\n'),
+      static: [projectSpec, _s(playbook.static), staticBase].filter(Boolean).join('\n\n'),
       dynamic: [_s(playbook.dynamic), dynamic].filter(Boolean).join('\n\n'),
     };
   }
@@ -645,6 +645,7 @@ export async function buildReactiveSystemPrompt(agent, playbook = null) {
         : String(playbook);
   }
   const parts = [];
+  if (projectSpec) parts.push(projectSpec); // BRAXIL.md / CLAUDE.md — always first
   if (playbookStr) parts.push(playbookStr);
   parts.push(dynamic);
   parts.push(staticBase);

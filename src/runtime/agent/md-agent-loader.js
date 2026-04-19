@@ -115,18 +115,48 @@ function _createAgentFromMd(filePath, Agent, Role) {
   let description = '';
   let prompt = content;
 
-  // Parse optional YAML frontmatter
+  // Parse optional YAML frontmatter — supports plain values, quoted
+  // scalars, and block scalars (`|` literal, `>` folded) so Claude-style
+  // multi-line `description: |` entries are read as a single string
+  // instead of collapsing to the bare `|` marker.
   if (content.startsWith('---')) {
     const endIdx = content.indexOf('---', 3);
     if (endIdx > 0) {
-      const frontmatter = content.substring(3, endIdx).trim();
+      const frontmatter = content.substring(3, endIdx).replace(/^\n/, '').replace(/\n$/, '');
       prompt = content.substring(endIdx + 3).trim();
 
-      for (const line of frontmatter.split('\n')) {
-        const colonIdx = line.indexOf(':');
-        if (colonIdx < 0) continue;
-        const key = line.substring(0, colonIdx).trim();
-        const value = line.substring(colonIdx + 1).trim();
+      const lines = frontmatter.split('\n');
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        const m = line.match(/^([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*(.*)$/);
+        if (!m) { i++; continue; }
+        const key = m[1];
+        let value = m[2].trim();
+        if (value === '|' || value === '>') {
+          const folded = value === '>';
+          const collected = [];
+          i++;
+          while (i < lines.length) {
+            const next = lines[i];
+            if (next.trim() === '') { collected.push(''); i++; continue; }
+            if (!/^\s/.test(next)) break;
+            collected.push(next.replace(/^\s+/, ''));
+            i++;
+          }
+          while (collected.length && collected[collected.length - 1] === '') {
+            collected.pop();
+          }
+          value = (folded ? collected.join(' ') : collected.join('\n')).trim();
+        } else if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+          i++;
+        } else {
+          i++;
+        }
         if (key === 'name' && value) name = value;
         if (key === 'description' && value) description = value;
       }
