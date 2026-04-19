@@ -233,6 +233,19 @@ export class PlaybookSession {
       if (lastEntry.result && lastEntry.result.denied && lastEntry.result.feedback) {
         parts.push(`\u26d4${id} ${intent} was REJECTED by the user with feedback:\n"${lastEntry.result.feedback}"\n\nYou MUST incorporate this feedback into your next attempt. Do NOT repeat the same approach. The user's feedback overrides any previous plan or instruction.`);
       }
+      // BlockedResult — the downstream provider refused the request based on
+      // its own policy, quota, auth, or rate limit. This is distinct from a
+      // generic failure: the task may succeed if routed to a different
+      // provider family. The Coordinator prompt (see blocked-result-handling.md)
+      // decides whether to retry with an `excludeProviders` hint or surface
+      // the refusal to the user.
+      else if (lastEntry.result && lastEntry.result.blocked === true) {
+        const bt = lastEntry.result.blockType || 'unknown';
+        const prov = lastEntry.result.provider || 'unknown';
+        const reason = lastEntry.result.reason || 'no reason given';
+        const retryable = lastEntry.result.retryable === false ? 'no' : 'yes';
+        parts.push(`\u{1F6AB}${id} ${intent} was BLOCKED by provider "${prov}" (blockType=${bt}, retryable=${retryable}).\nProvider reason: ${reason}\n\nThis is a policy/quota/auth refusal from the provider, not a bug in the request. If retryable=yes, retry the SAME call with \`excludeProviders: ["${prov}"]\` so a different family handles it. If every available provider refuses, report the refusal to the user with the provider's reason — do NOT rewrite the user's prompt to evade the policy.`);
+      }
       // Detect when result payload indicates failure (e.g. MCP returns {success: false, error: "..."})
       else if (lastEntry.result && lastEntry.result.success === false && lastEntry.result.error) {
         const errorMsg = lastEntry.result.error;

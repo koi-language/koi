@@ -2,6 +2,9 @@
  * Call LLM Action - Call an LLM to process data dynamically at runtime
  */
 
+import { ProviderBlockedError } from '../../llm/providers/base.js';
+import { blockedResult } from '../../llm/blocked-result.js';
+
 export default {
   type: 'call_llm',
   intent: 'call_llm',
@@ -107,6 +110,16 @@ Output (result only):`;
       return { result: resultText };
     } catch (error) {
       agent.llmProvider.logError('call_llm action failed', error);
+      // Structured provider block — return as BlockedResult so the
+      // Coordinator can distinguish it from a generic failure.
+      if (error instanceof ProviderBlockedError) {
+        return blockedResult({
+          blockType: error.blockType,
+          provider: error.provider,
+          reason: error.providerReason || error.message,
+          retryable: error.retryable,
+        });
+      }
       throw error;
     }
   }

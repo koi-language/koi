@@ -179,7 +179,12 @@ function _createAgentFromMd(filePath, Agent, Role) {
   const handler = async function() {};
   handler.__playbookOnly__ = true;
   handler.__playbook__ = prompt;
-  handler.__description__ = description;
+  // MD agents only have ONE event handler (`do`). Its affordance shows up in
+  // the routing/system prompt right below the agent's own description — if we
+  // stamp the same long description here, every MD agent renders the same
+  // paragraph twice ("### code-reviewer ...\n  - do: ..."). Use a short generic
+  // invocation hint instead; the agent description above carries the details.
+  handler.__description__ = `Invoke the ${name} agent.`;
 
   // Broad permissions — user agents can do anything
   const role = new Role('MarkdownAgent', [

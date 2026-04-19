@@ -230,11 +230,16 @@ class ActionRegistry {
     const actions = this._filterActions(agent);
     if (actions.length === 0) return '';
 
-    // Core intents shown inline (always visible, no toolset lookup needed)
+    // Core intents shown inline (always visible, no toolset lookup needed).
+    // show_result lives here because it's the canonical way to surface a
+    // generated file/image/url to the user — just as fundamental as print.
+    // Hiding its schema behind get_tool_info led to LLMs either skipping it
+    // entirely or calling it with guessed shapes.
     const CORE_INTENTS = new Set([
       'print', 'prompt_user', 'prompt_form', 'return', 'phase_done',
       'delegate', 'open_toolset', 'get_tool_info',
       'learn_fact', 'recall_facts',
+      'show_result',
     ]);
 
     const coreActions = actions.filter(a => CORE_INTENTS.has(a.intent || a.type));
@@ -270,9 +275,23 @@ class ActionRegistry {
       skills: 'Skill management',
     };
 
-    const validNames = actions.map(a => a.intent || a.type);
+    const coreNames = coreActions.map(a => a.intent || a.type);
+    const toolsetNames = toolsetActions.map(a => a.intent || a.type);
     let doc = '## AVAILABLE ACTIONS\n\n';
-    doc += `Valid intent names: ${validNames.join(', ')}\n\n`;
+
+    // Two-tier intent list — the distinction matters because toolset tools
+    // accept rich parameter sets that you CANNOT guess. If we dumped every
+    // intent into one "Valid intent names" line, models (especially smaller
+    // ones) would recognize the name and fire away with only the obvious
+    // parameter (e.g. generate_image with just "prompt", skipping size,
+    // steps, model, seed, reference_image…). Splitting them into
+    // "direct-safe" vs "needs-get_tool_info-first" puts the protocol
+    // requirement right next to the name so the model reads them together.
+    doc += `Core intents (safe to call directly): ${coreNames.join(', ')}\n`;
+    if (toolsetNames.length > 0) {
+      doc += `Toolset intents (**you MUST call get_tool_info(<name>) once before calling any of these** — parameters are non-obvious): ${toolsetNames.join(', ')}\n`;
+    }
+    doc += '\n';
 
     // Core tools — shown inline with params
     doc += '### Core\n';
@@ -293,7 +312,10 @@ class ActionRegistry {
     }
 
     // Toolsets — grouped table
-    doc += '\n### Toolsets\nUse **open_toolset** to see tool names and parameters. Use **get_tool_info** for full schema and instructions.\n\n';
+    doc += '\n### Toolsets\n';
+    doc += 'Before calling ANY tool listed below, call **get_tool_info("<tool>")** first to learn its full parameter schema. ';
+    doc += 'Use **open_toolset("<toolset>")** to browse all tools in a group. ';
+    doc += 'Do NOT invoke these with guessed parameters — they accept many options (size, model, seed, quality, reference files, …) that you must read from the schema.\n\n';
     doc += '| Toolset | Tools | Description |\n|---|---|---|\n';
     for (const [ts, tsActions] of toolsets) {
       const names = tsActions.map(a => a.intent || a.type).join(', ');

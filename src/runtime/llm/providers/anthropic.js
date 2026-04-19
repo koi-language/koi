@@ -2,8 +2,36 @@
  * Anthropic provider implementations: LLM (Messages API) + Web Search.
  */
 
-import { BaseLLM, BaseSearch } from './base.js';
+import { BaseLLM, BaseSearch, ProviderBlockedError } from './base.js';
 import { channel } from '../../io/channel.js';
+
+/**
+ * Map an Anthropic SDK error to a ProviderBlockedError when it's one of
+ * the known block conditions. Returns null otherwise. Anthropic raises
+ * `APIError`/`PermissionDeniedError`/`RateLimitError` with `.status`,
+ * `.name`, `.error?.type`, `.message`. We match on type first, then
+ * HTTP status.
+ */
+function _classifyAnthropicError(err) {
+  const type = err?.error?.type || err?.type || err?.name || '';
+  const status = err?.status || err?.statusCode || 0;
+  const reason = err?.message || err?.error?.message || 'Unknown provider error';
+
+  if (/overloaded_error|rate_limit_error/.test(type) || status === 429) {
+    return new ProviderBlockedError({ blockType: 'rate_limit', provider: 'anthropic', reason });
+  }
+  if (/permission_error|authentication_error/.test(type) || status === 401 || status === 403) {
+    return new ProviderBlockedError({ blockType: 'auth', provider: 'anthropic', reason });
+  }
+  // Anthropic surfaces policy refusals via stop_reason: 'refusal' (see
+  // streaming/complete code below). On the rare path where it surfaces as
+  // an error — e.g. invalid_request_error with a moderation message — fall
+  // through to message-based detection.
+  if (/content policy|safety|harm|refused/i.test(reason)) {
+    return new ProviderBlockedError({ blockType: 'provider_policy', provider: 'anthropic', reason });
+  }
+  return null;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Anthropic Messages API LLM
@@ -54,6 +82,7 @@ export class AnthropicLLM extends BaseLLM {
     let usage = { input: 0, output: 0, cachedInput: 0 };
     let outChars = 0;
     let _thinkChars = 0;
+    let _stopReason = null;
 
     try {
       const options = abortSignal ? { signal: abortSignal } : {};
@@ -83,6 +112,7 @@ export class AnthropicLLM extends BaseLLM {
             }
           } else if (event.type === 'message_delta') {
             usage.output = event.usage?.output_tokens || 0;
+            if (event.delta?.stop_reason) _stopReason = event.delta.stop_reason;
             if (event.delta?.stop_reason === 'max_tokens') {
               channel.log('llm', `[anthropic] Response hit max_tokens limit (${this.maxTokens}), output truncated at ${outChars} chars`);
             }
@@ -94,7 +124,18 @@ export class AnthropicLLM extends BaseLLM {
       else await _iterate();
     } catch (err) {
       this._logFail(err.message);
+      const blocked = _classifyAnthropicError(err);
+      if (blocked) throw blocked;
       throw err;
+    }
+
+    // Anthropic's structured refusal. Newer models emit stop_reason='refusal'
+    // when the safety system rejects the request. Surface as a policy block.
+    if (_stopReason === 'refusal') {
+      throw new ProviderBlockedError({
+        blockType: 'provider_policy', provider: 'anthropic',
+        reason: 'Anthropic safety system refused the request',
+      });
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
@@ -144,7 +185,15 @@ export class AnthropicLLM extends BaseLLM {
       params.stream = true;
       let buffer = '';
       const usage = { input: 0, output: 0, thinking: 0, cachedInput: 0 };
-      const stream = await this.client.messages.create(params);
+      let _stopReason = null;
+      let stream;
+      try {
+        stream = await this.client.messages.create(params);
+      } catch (err) {
+        const blocked = _classifyAnthropicError(err);
+        if (blocked) throw blocked;
+        throw err;
+      }
       for await (const event of stream) {
         if (event.type === 'message_start') {
           usage.input = event.message?.usage?.input_tokens || 0;
@@ -153,13 +202,33 @@ export class AnthropicLLM extends BaseLLM {
           buffer += event.delta.text || '';
         } else if (event.type === 'message_delta') {
           usage.output = event.usage?.output_tokens || 0;
+          if (event.delta?.stop_reason) _stopReason = event.delta.stop_reason;
         }
+      }
+      if (_stopReason === 'refusal') {
+        throw new ProviderBlockedError({
+          blockType: 'provider_policy', provider: 'anthropic',
+          reason: 'Anthropic safety system refused the request',
+        });
       }
       if (usage.output === 0 && buffer.length > 0) usage.output = Math.ceil(buffer.length / 4);
       return { text: buffer.trim(), usage };
     }
 
-    const message = await this.client.messages.create(params);
+    let message;
+    try {
+      message = await this.client.messages.create(params);
+    } catch (err) {
+      const blocked = _classifyAnthropicError(err);
+      if (blocked) throw blocked;
+      throw err;
+    }
+    if (message.stop_reason === 'refusal') {
+      throw new ProviderBlockedError({
+        blockType: 'provider_policy', provider: 'anthropic',
+        reason: 'Anthropic safety system refused the request',
+      });
+    }
     const text = (message.content.find(b => b.type === 'text')?.text ?? '').trim();
     const usage = {
       input: message.usage?.input_tokens || 0,

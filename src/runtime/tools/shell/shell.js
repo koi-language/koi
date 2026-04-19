@@ -1011,8 +1011,20 @@ When a command requires sudo, just use sudo normally in the command. The system 
     if (!sudoEnv) _scheduleDetect();
 
     // Timeout and abort handler are set up AFTER proc is assigned above.
-    timeout = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
-    const onAbort = () => proc.kill();
+    // _notify() wakes the generator loop immediately instead of waiting for the
+    // next stream_interval tick or a node-pty exit event that may never arrive.
+    // Without it the shell counter keeps ticking and the agent appears frozen
+    // until the user types something — THAT pokes the runtime and surfaces the
+    // timeout as a result. See memory: feedback_shell_timeout_notify.md.
+    timeout = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill(); } catch { /* already gone */ }
+      _notify();
+    }, timeoutMs);
+    const onAbort = () => {
+      try { proc.kill(); } catch { /* already gone */ }
+      _notify();
+    };
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
     // Register this shell in the per-action registry so the GUI Stop button

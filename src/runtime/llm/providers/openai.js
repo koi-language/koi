@@ -3,9 +3,56 @@
  * Embeddings, and Search.
  */
 
-import { BaseLLM, BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen } from './base.js';
+import { BaseLLM, BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen, ProviderBlockedError } from './base.js';
 import { getModelCaps } from '../cost-center.js';
 import { channel } from '../../io/channel.js';
+
+/**
+ * Classify an OpenAI SDK error as a ProviderBlockedError when it maps to a
+ * known block condition (policy refusal, rate limit, quota, auth). Returns
+ * null when the error is something else (network glitch, 500, etc.) — in
+ * that case the caller keeps the original throw semantics.
+ *
+ * OpenAI's SDK raises `APIError` with `.code`, `.type`, `.status`, `.param`
+ * and a `.message`. We match on `.code` first (most stable), then `.type`,
+ * then fall back to a `.status`-based classification. Reason is the raw
+ * provider message so the user can see WHY the provider refused, not a
+ * sanitized summary.
+ */
+function _classifyOpenAIError(err) {
+  const code = err?.code || err?.error?.code || '';
+  const type = err?.type || err?.error?.type || '';
+  const status = err?.status || err?.statusCode || err?.response?.status || 0;
+  const reason = err?.message || err?.error?.message || 'Unknown provider error';
+
+  // Policy / moderation
+  if (code === 'content_policy_violation' || type === 'content_policy_violation'
+      || code === 'moderation_blocked' || /safety system|content policy|moderation/i.test(reason)) {
+    return new ProviderBlockedError({
+      blockType: 'provider_policy', provider: 'openai', reason,
+    });
+  }
+  // Rate limit
+  if (code === 'rate_limit_exceeded' || type === 'rate_limit_exceeded' || status === 429) {
+    return new ProviderBlockedError({
+      blockType: 'rate_limit', provider: 'openai', reason,
+    });
+  }
+  // Quota / billing
+  if (code === 'insufficient_quota' || /quota|billing/i.test(reason)) {
+    return new ProviderBlockedError({
+      blockType: 'quota', provider: 'openai', reason,
+    });
+  }
+  // Auth
+  if (code === 'invalid_api_key' || type === 'invalid_request_error' && status === 401
+      || status === 401 || status === 403) {
+    return new ProviderBlockedError({
+      blockType: 'auth', provider: 'openai', reason,
+    });
+  }
+  return null;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenAI Chat Completions LLM
@@ -85,6 +132,11 @@ export class OpenAIChatLLM extends BaseLLM {
       if (race) await Promise.race([_iterate(), race]);
       else await _iterate();
     } catch (err) {
+      // Classify the error before any recovery attempt — a policy/quota/
+      // auth error isn't something to recover from with partial JSON.
+      const blocked = _classifyOpenAIError(err);
+      if (blocked) { this._logFail(err.message); throw blocked; }
+
       // If we already accumulated content before the stream broke (e.g.
       // "JSON error injected into SSE stream" from Gemini proxies),
       // try to use what we have instead of failing the whole call.
@@ -100,6 +152,18 @@ export class OpenAIChatLLM extends BaseLLM {
         this._logFail(err.message);
         throw err;
       }
+    }
+
+    // finish_reason === 'content_filter' happens when OpenAI's safety system
+    // suppressed the response mid-stream. No throw from the SDK — the stream
+    // just ends early with an empty or truncated buffer. Detect it here so
+    // the caller gets a ProviderBlockedError instead of a generic "no content".
+    if (_finishReason === 'content_filter') {
+      throw new ProviderBlockedError({
+        blockType: 'provider_policy',
+        provider: 'openai',
+        reason: 'OpenAI content filter suppressed the response',
+      });
     }
 
     if (usage.output === 0 && outChars > 0) usage.output = Math.ceil(outChars / 4);
@@ -175,7 +239,20 @@ export class OpenAIChatLLM extends BaseLLM {
       });
       channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens || maxTokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature ?? temperature}`);
       const options = controller ? { signal: controller.signal } : {};
-      const completion = await this.client.chat.completions.create(params, options);
+      let completion;
+      try {
+        completion = await this.client.chat.completions.create(params, options);
+      } catch (err) {
+        const blocked = _classifyOpenAIError(err);
+        if (blocked) throw blocked;
+        throw err;
+      }
+      if (completion.choices?.[0]?.finish_reason === 'content_filter') {
+        throw new ProviderBlockedError({
+          blockType: 'provider_policy', provider: 'openai',
+          reason: 'OpenAI content filter suppressed the response',
+        });
+      }
       const text = completion.choices[0].message.content?.trim() || '';
       const usage = {
         input: completion.usage?.prompt_tokens || 0,
@@ -339,6 +416,8 @@ export class OpenAIResponsesLLM extends BaseLLM {
       else await _iterate();
     } catch (err) {
       this._logFail(err.message);
+      const blocked = _classifyOpenAIError(err);
+      if (blocked) throw blocked;
       throw err;
     }
 
@@ -420,7 +499,14 @@ export class OpenAIResponsesLLM extends BaseLLM {
       channel.log('llm', `[request] model=${params.model} max_output_tokens=${params.max_output_tokens} reasoning_effort=${params.reasoning?.effort ?? '(none)'} thinking=${this.useThinking} api=responses`);
 
       const options = controller ? { signal: controller.signal } : {};
-      const response = await this.client.responses.create(params, options);
+      let response;
+      try {
+        response = await this.client.responses.create(params, options);
+      } catch (err) {
+        const blocked = _classifyOpenAIError(err);
+        if (blocked) throw blocked;
+        throw err;
+      }
 
       // Extract the text output. The Responses API returns an array of
       // output items; we only care about text content.
@@ -629,6 +715,8 @@ export class OpenAIImageGen extends BaseImageGen {
       };
     } catch (err) {
       channel.log('image', `OpenAI image generate FAILED: ${err.message}`);
+      const blocked = _classifyOpenAIError(err);
+      if (blocked) throw blocked;
       throw err;
     }
   }
@@ -673,6 +761,8 @@ export class OpenAIImageGen extends BaseImageGen {
       };
     } catch (err) {
       channel.log('image', `OpenAI image edit FAILED: ${err.message}`);
+      const blocked = _classifyOpenAIError(err);
+      if (blocked) throw blocked;
       throw err;
     }
   }

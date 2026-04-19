@@ -9,6 +9,34 @@ import { channel } from '../../io/channel.js';
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ProviderBlockedError — thrown by a provider when the downstream refused
+// based on its own policy (content filter, safety system, quota, auth).
+// Actions catch this and convert it into a BlockedResult for the agent.
+// This is deliberately an Error subclass so it propagates through the
+// existing throw/catch plumbing without rewriting every call site — callers
+// that don't care about the distinction still see it as a failure; callers
+// that care can `instanceof`-check and react.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class ProviderBlockedError extends Error {
+  /**
+   * @param {Object} opts
+   * @param {'provider_policy'|'rate_limit'|'quota'|'auth'|'bad_request'} opts.blockType
+   * @param {string} opts.provider  — Provider family name (e.g. 'openai'). NOT the model id.
+   * @param {string} opts.reason    — Literal or summarized message from the provider.
+   * @param {boolean} [opts.retryable]  — Override the blockType's default retryable hint.
+   */
+  constructor({ blockType, provider, reason, retryable }) {
+    super(reason || `Provider ${provider} blocked the request (${blockType})`);
+    this.name = 'ProviderBlockedError';
+    this.blockType = blockType;
+    this.provider = provider;
+    this.providerReason = reason;
+    if (typeof retryable === 'boolean') this.retryable = retryable;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // BaseLLM — Chat / Reasoning / Reactive completions
 // ─────────────────────────────────────────────────────────────────────────────
 

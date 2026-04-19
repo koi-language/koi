@@ -12,6 +12,8 @@
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
+import { ProviderBlockedError } from '../../llm/providers/base.js';
+import { blockedResult } from '../../llm/blocked-result.js';
 
 import fs from 'fs';
 import path from 'path';
@@ -48,7 +50,8 @@ const generateImageAction = {
       referenceImages: { type: 'array',  description: 'Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.', items: { type: 'string' } },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
-      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should let the backend pick the cheapest capable model).' }
+      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should let the backend pick the cheapest capable model).' },
+      excludeProviders:{ type: 'array',  description: 'Retry hint: skip these provider families when picking a model. Use on retry after a previous call returned blocked:true — pass the blocked provider here so the next attempt uses a different family. Examples: ["openai"], ["openai","google"].', items: { type: 'string' } }
     },
     required: ['prompt']
   },
@@ -67,10 +70,17 @@ const generateImageAction = {
     // Get clients from the agent's LLM provider
     const clients = agent?.llmProvider?.getClients?.() || {};
 
-    // Resolve image provider
+    // Resolve image provider. `excludeProviders` is populated by the
+    // Coordinator on retry — it passes the provider family from the
+    // previous BlockedResult so the factory picks a different one.
     let resolved;
     try {
-      resolved = resolveModel({ type: 'image', clients, model: action.model });
+      resolved = resolveModel({
+        type: 'image',
+        clients,
+        model: action.model,
+        excludeProviders: Array.isArray(action.excludeProviders) ? action.excludeProviders : undefined,
+      });
     } catch (err) {
       return { success: false, error: err.message };
     }
@@ -156,6 +166,22 @@ const generateImageAction = {
     try {
       result = await instance.generate(prompt, genOpts);
     } catch (genErr) {
+      // Structured block from the provider: policy refusal, rate limit,
+      // auth, quota. This is the happy path for "the provider said no" —
+      // the Coordinator reads `blocked: true` + `retryable` and decides
+      // whether to try a different provider.
+      if (genErr instanceof ProviderBlockedError) {
+        return {
+          ...blockedResult({
+            blockType: genErr.blockType,
+            provider: genErr.provider || resolved.provider,
+            reason: genErr.providerReason || genErr.message,
+            retryable: genErr.retryable,
+          }),
+          model: resolved.model,
+        };
+      }
+
       const errMsg = genErr.message || String(genErr);
       const details = genErr.details || null;
       // Structured router error — backend couldn't find a model whose HARD
@@ -179,11 +205,36 @@ const generateImageAction = {
           hint: 'No single active model satisfies every hard constraint at once. Inspect `alternatives` — each key is one of your requested features and its list is the models that would accept it in isolation. Cross-reference the lists to find a combination that is actually supported, then retry with a compatible request (different resolution, different aspectRatio, fewer reference images, smaller n, etc.).',
         };
       }
-      // Detect common error types for the agent to interpret
+      // Fallback classification for providers that don't (yet) throw
+      // ProviderBlockedError. Uses message-matching on the provider's raw
+      // error text — less reliable than the structured path above, but
+      // still surfaces the common cases in a shape the Coordinator can
+      // route around. New providers should throw ProviderBlockedError
+      // directly so we can drop these regexes over time.
       const isContentPolicy = /safety|policy|nsfw|blocked|prohibited|inappropriate|harmful/i.test(errMsg);
       const isTimeout = /timeout|timed out|deadline/i.test(errMsg);
       const isQuota = /quota|rate.limit|429|too many/i.test(errMsg);
-      const errorType = isContentPolicy ? 'content_policy' : isTimeout ? 'timeout' : isQuota ? 'rate_limit' : 'generation_error';
+      if (isContentPolicy) {
+        return {
+          ...blockedResult({
+            blockType: 'provider_policy',
+            provider: resolved.provider,
+            reason: errMsg,
+          }),
+          model: resolved.model,
+        };
+      }
+      if (isQuota) {
+        return {
+          ...blockedResult({
+            blockType: /quota/i.test(errMsg) ? 'quota' : 'rate_limit',
+            provider: resolved.provider,
+            reason: errMsg,
+          }),
+          model: resolved.model,
+        };
+      }
+      const errorType = isTimeout ? 'timeout' : 'generation_error';
       return {
         success: false,
         provider: resolved.provider,

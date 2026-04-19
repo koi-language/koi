@@ -3,8 +3,55 @@
  * Gemini does not offer a search-augmented model via the OpenAI-compatible API.
  */
 
-import { BaseLLM, BaseEmbedding, BaseImageGen, BaseVideoGen } from './base.js';
+import { BaseLLM, BaseEmbedding, BaseImageGen, BaseVideoGen, ProviderBlockedError } from './base.js';
 import { channel } from '../../io/channel.js';
+
+/**
+ * Gemini REST error → ProviderBlockedError. Gemini surfaces policy refusals
+ * three different ways depending on endpoint:
+ *
+ *   1. Generative API via OpenAI-compat: 400 with "safety" in the message,
+ *      or finish_reason === 'SAFETY' / 'PROHIBITED_CONTENT'.
+ *   2. Native REST (image/video): body contains `promptFeedback.blockReason`
+ *      or `candidates[0].finishReason === 'SAFETY'`.
+ *   3. HTTP errors with status 400/429/403 where the body mentions safety.
+ *
+ * This helper accepts EITHER a raw Error (from SDK) or a parsed JSON body
+ * (from native REST) and returns a ProviderBlockedError when applicable.
+ */
+function _classifyGeminiError(errOrBody) {
+  if (!errOrBody) return null;
+  // SDK error path
+  if (errOrBody instanceof Error) {
+    const err = errOrBody;
+    const status = err?.status || err?.statusCode || 0;
+    const reason = err?.message || 'Unknown provider error';
+    if (/safety|harm|blocked|sexually explicit|dangerous/i.test(reason)) {
+      return new ProviderBlockedError({ blockType: 'provider_policy', provider: 'gemini', reason });
+    }
+    if (status === 429 || /quota|rate/i.test(reason)) {
+      return new ProviderBlockedError({
+        blockType: /quota/i.test(reason) ? 'quota' : 'rate_limit',
+        provider: 'gemini', reason,
+      });
+    }
+    if (status === 401 || status === 403) {
+      return new ProviderBlockedError({ blockType: 'auth', provider: 'gemini', reason });
+    }
+    return null;
+  }
+  // Native REST body path
+  const body = errOrBody;
+  const blockReason = body?.promptFeedback?.blockReason
+    || body?.candidates?.[0]?.finishReason;
+  if (blockReason && /SAFETY|PROHIBITED|BLOCKED/i.test(blockReason)) {
+    return new ProviderBlockedError({
+      blockType: 'provider_policy', provider: 'gemini',
+      reason: `Gemini safety system blocked the request (${blockReason})`,
+    });
+  }
+  return null;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gemini LLM (via OpenAI-compatible API)
@@ -186,6 +233,10 @@ export class GeminiLLM extends BaseLLM {
     try {
       await _doStream(geminiParams);
     } catch (err) {
+      // Policy/quota/auth errors jump out — don't try the thinking_config
+      // fallback on those since the request itself is what's blocked.
+      const blocked = _classifyGeminiError(err);
+      if (blocked) { this._logFail(err.message); throw blocked; }
       // Fallback: if 400 with extra_body, retry without it
       if (geminiParams.extra_body && String(err.status || err.message).includes('400')) {
         channel.log('llm', `${this.model}: 400 with thinking_config — retrying without`);
@@ -194,6 +245,8 @@ export class GeminiLLM extends BaseLLM {
         try {
           await _doStream(geminiParams);
         } catch (retryErr) {
+          const blocked2 = _classifyGeminiError(retryErr);
+          if (blocked2) { this._logFail(retryErr.message); throw blocked2; }
           this._logFail(retryErr.message);
           throw retryErr;
         }
@@ -252,7 +305,21 @@ export class GeminiLLM extends BaseLLM {
         ...(cacheName && { extra_body: { google: { cached_content: cacheName } } }),
       });
       const options = controller ? { signal: controller.signal } : {};
-      const completion = await this.client.chat.completions.create(params, options);
+      let completion;
+      try {
+        completion = await this.client.chat.completions.create(params, options);
+      } catch (err) {
+        const blocked = _classifyGeminiError(err);
+        if (blocked) throw blocked;
+        throw err;
+      }
+      if (completion.choices?.[0]?.finish_reason === 'content_filter'
+          || completion.choices?.[0]?.finish_reason === 'SAFETY') {
+        throw new ProviderBlockedError({
+          blockType: 'provider_policy', provider: 'gemini',
+          reason: 'Gemini safety filter blocked the response',
+        });
+      }
       const text = completion.choices[0].message.content?.trim() || '';
       const usage = {
         input: completion.usage?.prompt_tokens || 0,
@@ -379,10 +446,27 @@ export class GeminiImageGen extends BaseImageGen {
       const res = await fetch(url, fetchOpts);
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
-        throw new Error(`Gemini image API error (${res.status}): ${errBody}`);
+        // Try to parse the body as JSON so we can inspect the structured
+        // safety signals before falling back to a plain message match.
+        let parsedErr = null;
+        try { parsedErr = JSON.parse(errBody); } catch { /* not JSON */ }
+        if (parsedErr) {
+          const blocked = _classifyGeminiError(parsedErr);
+          if (blocked) throw blocked;
+        }
+        const rawErr = new Error(`Gemini image API error (${res.status}): ${errBody}`);
+        rawErr.status = res.status;
+        const blockedFromMessage = _classifyGeminiError(rawErr);
+        if (blockedFromMessage) throw blockedFromMessage;
+        throw rawErr;
       }
 
       const data = await res.json();
+      // 200 OK can still mean "blocked": Gemini returns the candidate with
+      // finishReason: 'SAFETY' and no image parts. Detect and surface.
+      const blockedInBody = _classifyGeminiError(data);
+      if (blockedInBody) throw blockedInBody;
+
       const _elapsed = Date.now() - _t0;
       channel.log('image', `Gemini image generate completed in ${_elapsed}ms`);
 

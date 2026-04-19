@@ -254,9 +254,16 @@ function _resolveSearch(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _resolveImage(req) {
-  const { clients, model: requestedModel } = req;
+  const { clients, model: requestedModel, excludeProviders } = req;
+  // `excluded` is a Set of provider family names the caller has asked us to
+  // skip — used on retry after a ProviderBlockedError surfaces. Empty set
+  // means "no exclusions". Compared against the provider string this
+  // function ultimately returns, so values are: 'openai', 'google',
+  // 'gemini', 'koi-gateway'.
+  const excluded = new Set(excludeProviders || []);
 
-  // Gateway mode
+  // Gateway mode — the gateway itself handles per-model routing; we can't
+  // usefully exclude by family here, so we honor the request as-is.
   if (process.env.KOI_AUTH_TOKEN) {
     const model = requestedModel || 'auto';
     const instance = new GatewayImageGen(model);
@@ -264,25 +271,27 @@ function _resolveImage(req) {
   }
 
   // Priority: Google/NanoBanana2 → OpenAI (gpt-image-1) → Gemini (gemini-2.5-flash-image)
-  // Nano Banana 2 is the fastest and supports up to 14 reference images
-  if (process.env.GEMINI_API_KEY && (!requestedModel || requestedModel.includes('3.1-flash-image') || requestedModel.includes('3-pro-image-preview'))) {
+  // Nano Banana 2 is the fastest and supports up to 14 reference images.
+  if (!excluded.has('google') && process.env.GEMINI_API_KEY
+      && (!requestedModel || requestedModel.includes('3.1-flash-image') || requestedModel.includes('3-pro-image-preview'))) {
     const model = requestedModel || 'gemini-3.1-flash-image-preview';
     if (model.includes('3.1-flash-image') || model.includes('3-pro-image-preview')) {
       const instance = new NanoBanana2ImageGen(null, model);
       return { instance, provider: 'google', model, useThinking: false };
     }
   }
-  if (clients?.openai && process.env.OPENAI_API_KEY) {
+  if (!excluded.has('openai') && clients?.openai && process.env.OPENAI_API_KEY) {
     const model = requestedModel || 'gpt-image-1';
     const instance = new OpenAIImageGen(clients.openai, model);
     return { instance, provider: 'openai', model, useThinking: false };
   }
-  if (process.env.GEMINI_API_KEY) {
+  if (!excluded.has('gemini') && process.env.GEMINI_API_KEY) {
     const model = requestedModel || 'gemini-2.5-flash-image';
     const instance = new GeminiImageGen(null, model);
     return { instance, provider: 'gemini', model, useThinking: false };
   }
-  throw new Error('No image generation provider available (need OPENAI_API_KEY or GEMINI_API_KEY)');
+  const excludedHint = excluded.size ? ` (excluded: ${[...excluded].join(', ')})` : '';
+  throw new Error(`No image generation provider available${excludedHint} (need OPENAI_API_KEY or GEMINI_API_KEY)`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
