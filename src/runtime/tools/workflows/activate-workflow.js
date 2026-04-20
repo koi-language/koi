@@ -190,6 +190,12 @@ export default {
     });
 
     channel.log('workflow', `Workflow activated: ${name} (${createdIds.length} tasks created)`);
+    channel.workflowActivated({
+      name,
+      description: workflow.description,
+      taskCount: createdIds.length,
+      taskIds: createdIds,
+    });
 
     // Fire planner.result so the System transitions into running_plan.
     // Shape mirrors the payload fired by delegate returns (agent.js:2451).

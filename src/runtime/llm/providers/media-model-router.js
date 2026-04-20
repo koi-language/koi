@@ -132,6 +132,10 @@ function _diagnoseImage(models, req) {
  * @param {string} [req.aspectRatio]
  * @param {number} [req.refsCount=0]
  * @param {string} [req.label]
+ * @param {string} [req.operation] - Required semantic category when set:
+ *   'bg-remove' | 'upscale' | 'inpaint' | 'outpaint' | 'generate' | 'edit' | ...
+ *   A model qualifies only if its `operations` array contains this value.
+ *   When unset, the filter is skipped (backwards-compatible for generate).
  */
 export function pickImageModel(models, req = {}) {
   if (!Array.isArray(models) || models.length === 0) {
@@ -141,9 +145,25 @@ export function pickImageModel(models, req = {}) {
   const n = req.n || 1;
   const refsCount = req.refsCount || 0;
   const wantsEdit = refsCount > 0;
+  const wantsOperation = typeof req.operation === 'string' && req.operation.trim()
+    ? req.operation.trim()
+    : null;
 
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
+    // Structured operation filter — the model must explicitly advertise it.
+    // Intentionally strict: if the model has no `operations` array at all we
+    // reject it. Mixing "unknown" with "supports everything" would silently
+    // route BG-removal requests to models that only do raw generation.
+    if (wantsOperation) {
+      if (!Array.isArray(m.operations) || !m.operations.includes(wantsOperation)) return false;
+      // Operation-scoped routing short-circuits the coarse generate/edit
+      // gates. A BG-removal model doesn't need to declare canEdit=true or
+      // populate maxRefImages — the presence of operations[] is the
+      // authoritative signal. Resolution/aspect are typically not
+      // meaningful for these transforms either (output mirrors input).
+      return true;
+    }
     if (wantsEdit && !m.canEdit) return false;
     if (!wantsEdit && !m.canGenerate) return false;
     if (m.maxImages != null && n > m.maxImages) return false;

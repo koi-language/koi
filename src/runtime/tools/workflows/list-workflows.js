@@ -32,6 +32,12 @@ function parseFrontmatter(content) {
     }
     if (key === 'name' || key === 'description' || key === 'compatibility' || key === 'license') {
       result[key] = value;
+    } else if (key === 'requireConfirmation') {
+      // Optional boolean. When true, activating this workflow blocks on
+      // an explicit user confirmation instead of the default
+      // count-down-and-proceed banner. Meant for workflows whose first
+      // step is destructive (deploy, rm -rf, DB migration, etc.).
+      result.requireConfirmation = value === 'true';
     }
   }
 
@@ -61,6 +67,7 @@ function scanWorkflowsDirectory(dirPath) {
             location: wfMdPath,
             directory: path.join(dirPath, entry.name),
             ...(meta.compatibility && { compatibility: meta.compatibility }),
+            ...(meta.requireConfirmation && { requireConfirmation: true }),
           });
         }
       } catch { /* skip unreadable files */ }

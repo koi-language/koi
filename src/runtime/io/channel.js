@@ -124,6 +124,34 @@ class Channel {
   skillActivated(info) {}
   /** Agent deactivated a skill. */
   skillDeactivated(info) {}
+
+  // ── Workflow lifecycle ─────────────────────────────────────────────────
+  // `workflowActivating` fires BEFORE any tasks are created, giving the
+  // GUI a chance to show a banner with a countdown and let the user
+  // cancel. `waitForActivationDecision(activationId, timeoutMs)` resolves
+  // with `'confirm' | 'cancel' | 'timeout'` once the user acts or the
+  // window elapses. `workflowActivated` and `workflowDeactivated` are
+  // fire-and-forget lifecycle broadcasts consumed by the footer chip.
+  /** Announce an imminent workflow activation to the UI. */
+  workflowActivating(info) {}
+  /** Announce that the workflow has been activated (tasks created). */
+  workflowActivated(info) {}
+  /** Announce that the workflow has been deactivated (tasks drained). */
+  workflowDeactivated(info) {}
+  /**
+   * Wait for the user's response to a `workflowActivating` banner.
+   * Channels that don't support UI confirmation should fall through to
+   * `'timeout'` after the window elapses.
+   * @param {string} activationId
+   * @param {number} timeoutMs
+   * @returns {Promise<'confirm'|'cancel'|'timeout'>}
+   */
+  async waitForActivationDecision(activationId, timeoutMs) {
+    if (timeoutMs > 0) {
+      await new Promise(r => setTimeout(r, timeoutMs));
+    }
+    return 'timeout';
+  }
   /** Whether the channel has a streaming UI provider (e.g. Ink) that uses a dynamic area. */
   hasStreamingProvider() { return false; }
 

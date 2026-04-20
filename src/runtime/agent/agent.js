@@ -3963,12 +3963,58 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
    */
   async _autoMatchWorkflow(userMessage) {
     const text = (userMessage || '').trim();
-    // Skip very short inputs (greetings, "ok", "sigue") — workflows only make
-    // sense for real requests. Saves a classifier round-trip on chit-chat.
-    if (text.length < 12) return;
+    // Manual activation override: the GUI's "Run" button on the Workflows
+    // tab sets `_forceWorkflow` and injects a hidden user message to wake
+    // the agent. We recognise the override here and activate that workflow
+    // directly, skipping the LLM classifier entirely. This is why the Run
+    // button works even when the classifier wouldn't have matched the
+    // message on its own.
+    const forced = this._forceWorkflow;
+    if (forced) {
+      this._forceWorkflow = null;
+      try {
+        const listed = await this.callAction('list_workflows', {});
+        const workflows = listed?._fullWorkflows || listed?.workflows || [];
+        const matched = workflows.find(w => w.name === forced);
+        if (!matched) {
+          channel.log('workflow', `${this.name}: forced workflow "${forced}" not found in catalog`);
+          return;
+        }
+        if (matched.requireConfirmation === true) {
+          const activationId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          channel.workflowActivating({
+            activationId,
+            name: forced,
+            description: matched.description,
+            requireConfirmation: true,
+            cancelWindowMs: 0,
+          });
+          const verdict = await channel.waitForActivationDecision(activationId, 0);
+          if (verdict === 'cancel') return;
+        }
+        channel.log('workflow', `${this.name}: Forced workflow "${forced}" — activating`);
+        await this.callAction('activate_workflow', {
+          name: forced,
+          userMessage: text || `Run workflow "${forced}"`,
+        });
+      } catch (e) {
+        channel.log('workflow', `${this.name}: forced workflow activation failed: ${e.message}`);
+      }
+      return;
+    }
+
+    if (!text) return;
 
     // Skip if the agent is already running an active workflow or has pending
-    // tasks — we don't want to overwrite mid-execution state.
+    // tasks — we don't want to overwrite mid-execution state. Previously a
+    // `text.length < 12` shortcut lived here to dodge an LLM round-trip on
+    // "ok"/"sigue"/greetings, but it broke legitimate short requests like
+    // "test patata" and "run tests". The shortcut is redundant anyway: when
+    // no workflows are configured, `list_workflows` below returns an empty
+    // array and we bail at line `if (workflows.length === 0) return;` — at
+    // ZERO cost — so the guard only fired when workflows existed AND the
+    // user message was short, which is exactly the case where the user
+    // likely DID want a match.
     if (this.state?.activeWorkflow) return;
     try {
       const { taskManager } = await import('../state/task-manager.js');
@@ -4025,7 +4071,42 @@ Return ONLY a JSON object, no prose, no markdown fences:
       const name = parsed?.workflow;
 
       if (!name || typeof name !== 'string' || name.toLowerCase() === 'null') return;
-      if (!workflows.some(w => w.name === name)) return;
+      const matched = workflows.find(w => w.name === name);
+      if (!matched) return;
+
+      // Two activation modes:
+      //
+      //   requireConfirmation: false (default) — activate immediately.
+      //     A persistent banner appears the moment tasks are created
+      //     (via the `workflowActivated` event fired inside
+      //     activate_workflow). The user can Cancel AT ANY TIME to
+      //     deactivate the workflow and abort the whole turn; the
+      //     banner stays visible until the workflow completes or is
+      //     cancelled.
+      //
+      //   requireConfirmation: true — block indefinitely waiting for
+      //     explicit Proceed / Cancel. Meant for workflows whose first
+      //     step is destructive (deploy, migration, etc.).
+      //
+      // The no-countdown default matches user expectation: a short
+      // banner that flashes and auto-proceeds doesn't give you time
+      // to read what's being activated.
+      const requireConfirmation = matched.requireConfirmation === true;
+      if (requireConfirmation) {
+        const activationId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        channel.workflowActivating({
+          activationId,
+          name,
+          description: matched.description,
+          requireConfirmation: true,
+          cancelWindowMs: 0,
+        });
+        const verdict = await channel.waitForActivationDecision(activationId, 0);
+        if (verdict === 'cancel') {
+          channel.log('workflow', `${this.name}: workflow "${name}" cancelled by user`);
+          return;
+        }
+      }
 
       channel.log('workflow', `${this.name}: Matched workflow "${name}" — activating`);
       const activateResult = await this.callAction('activate_workflow', { name, userMessage: text });

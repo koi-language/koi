@@ -40,6 +40,7 @@ export default {
 
     await agent.callAction('update_state', { updates: { activeWorkflow: null } });
     channel.log('workflow', `Workflow deactivated: ${active}`);
+    channel.workflowDeactivated({ name: active });
     return { deactivated: true, name: active };
   },
 };

@@ -303,6 +303,19 @@ class TaskManager {
             planKnowledge.clear();
           }
         }).catch(() => {});
+        // Auto-deactivate any active workflow when its task plan drains.
+        // Mirrors the plan-knowledge clear above: when every task reaches
+        // `completed`, the workflow that created them is "done". Without
+        // this the footer chip + `state.activeWorkflow` guard in the
+        // matcher would stick forever, blocking any future workflow
+        // matches in the same session.
+        import('../agent/agent.js').then(({ Agent }) => {
+          const root = Agent._rootAgent;
+          const active = root?.state?.activeWorkflow;
+          if (root && active) {
+            root.callAction('deactivate_workflow', { name: active }).catch(() => {});
+          }
+        }).catch(() => {});
         setTimeout(() => {
           channel.setTaskPanel([]);
           channel.print(`\x1b[32m${t('allTasksCompleted')}\x1b[0m`);

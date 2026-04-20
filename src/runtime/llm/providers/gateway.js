@@ -109,6 +109,10 @@ function _aggregateImage(models) {
   let maxImages = 0;
   let maxRefImages = 0;
   let hasRefImageSupport = false;
+  // Union of per-model `operations: string[]`. Lets the runtime know which
+  // image-edit categories (bg-remove, upscale, inpaint, outpaint, …) are
+  // available so each tool can surface itself only when supported.
+  const operationSet = new Set();
   for (const m of models) {
     if (m?.canGenerate) anyCanGenerate = true;
     if (m?.canEdit) anyCanEdit = true;
@@ -123,6 +127,11 @@ function _aggregateImage(models) {
         maxRefImages = m.maxRefImages;
       }
     }
+    if (Array.isArray(m?.operations)) {
+      for (const op of m.operations) {
+        if (typeof op === 'string' && op.trim()) operationSet.add(op.trim());
+      }
+    }
   }
   return {
     models,
@@ -132,6 +141,7 @@ function _aggregateImage(models) {
     maxImages: maxImages || 1,
     hasRefImageSupport,
     maxRefImages,
+    operations: [...operationSet].sort(),
   };
 }
 
@@ -476,6 +486,56 @@ export class GatewayImageGen extends BaseImageGen {
       revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
     }));
     return { images, usage: data.usage || { input: 0, output: 0 } };
+  }
+
+  /**
+   * Run a semantic image operation (bg-remove, upscale, inpaint, …) against
+   * whichever active model advertises `operations.includes(<op>)`. Unlike
+   * `generate`/`edit`, the shape is minimal: just { model, image, operation }.
+   * The backend forwards to Fal with the slug we picked — no prompt,
+   * aspect_ratio, or resolution (those are generation concerns).
+   */
+  async runOperation(operation, image, opts = {}) {
+    const imgData = typeof image === 'string' ? image : image.toString('base64');
+    const resolvedModel = await _resolveMediaModel('image', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickImageModel, MediaModelRoutingError }) => {
+        try {
+          return pickImageModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { operation },
+    );
+
+    const payload = { model: resolvedModel, image: imgData, operation };
+    if (opts.outputFormat) payload.output_format = opts.outputFormat;
+
+    const res = await fetch(`${getGatewayBase()}/media/image/edit`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(payload),
+      signal: opts.abortSignal,
+    });
+
+    await throwIfQuotaExceeded(res);
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => '');
+      let structured = null;
+      try { structured = JSON.parse(bodyText); } catch {}
+      const err = new Error(structured?.error || `Gateway image ${operation} error (${res.status}): ${bodyText}`);
+      err.status = res.status;
+      if (structured) err.details = structured;
+      throw err;
+    }
+
+    const data = await res.json();
+    const images = (data.images || data.data || []).map(img => ({
+      url: img.url || undefined,
+      b64: img.b64 || img.b64_json || undefined,
+    }));
+    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 
   async edit(prompt, image, opts = {}) {
