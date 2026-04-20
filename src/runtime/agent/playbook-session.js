@@ -228,6 +228,29 @@ export class PlaybookSession {
       //   - web_fetch: needs the complete JSON/HTML to extract data
       // No truncation — results are passed to the LLM in full.
 
+      // LLM self-refusal upgrade (preprocess). When a delegate returns
+      // `{ success: false, reason: "No puedo ayudar con esa solicitud." }`,
+      // that's the delegate's LLM declining in prose before any downstream
+      // API was called — no ProviderBlockedError to catch. Detect the
+      // common refusal patterns (Spanish + English) and stamp the result
+      // as blocked so the rendering branch below treats it uniformly. We
+      // tag `provider: 'delegate_llm'` as a sentinel — the Coordinator
+      // uses it to decide "re-delegate with a different LLM family for
+      // the sub-agent" rather than `excludeProviders` on a single action.
+      if (lastEntry.result
+          && lastEntry.result.success === false
+          && typeof lastEntry.result.reason === 'string'
+          && !lastEntry.result.blocked
+          && _looksLikeLlmRefusal(lastEntry.result.reason)) {
+        lastEntry.result = {
+          ...lastEntry.result,
+          blocked: true,
+          blockType: 'provider_policy',
+          provider: 'delegate_llm',
+          retryable: true,
+        };
+      }
+
       // Detect when user denied an action with feedback (e.g. edit_file "No, but..." option).
       // User feedback is SACRED — it represents explicit user constraints for the next attempt.
       if (lastEntry.result && lastEntry.result.denied && lastEntry.result.feedback) {
@@ -421,4 +444,39 @@ export class PlaybookSession {
     return warnings;
   }
 
+}
+
+/**
+ * Heuristic: does `text` read like an LLM declining to help, rather than a
+ * genuine task failure? Matches the common refusal openings in English and
+ * Spanish. Deliberately strict — we'd rather miss a few refusals than
+ * upgrade a real error into a "blocked" one. The patterns anchor at the
+ * start of the text to avoid matching the word "sorry" embedded in a
+ * legitimate error message like "database reported: sorry, index missing".
+ */
+function _looksLikeLlmRefusal(text) {
+  if (!text || typeof text !== 'string') return false;
+  const s = text.trim().toLowerCase();
+  if (s.length === 0 || s.length > 400) return false; // refusals are short
+  const patterns = [
+    // English
+    /^i can(not|'t| not)\b/,
+    /^i (am|'m) (not able|unable)\b/,
+    /^i (am|'m) sorry,?\b/,
+    /^sorry,?\s+i\b/,
+    /^i (do|don't|don ?´t) (not )?(feel comfortable|want to|wish to)\b/,
+    /^i (won't|will not)\b/,
+    /^i refuse\b/,
+    /^i (can|could) (not )?help with that\b/,
+    /\bunable to (help|assist|comply|provide)\b/,
+    /\b(cannot|can't) (assist|help|comply|provide|generate|create) with\b/,
+    // Spanish
+    /^no puedo\b/,
+    /^lo siento,?\b/,
+    /^no me siento c[óo]modo\b/,
+    /^no voy a\b/,
+    /^no debo\b/,
+    /\bno puedo (ayudar|asistir|generar|crear|proporcionar)\b/,
+  ];
+  return patterns.some((re) => re.test(s));
 }
