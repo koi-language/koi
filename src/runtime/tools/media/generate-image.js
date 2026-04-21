@@ -651,40 +651,6 @@ Recommended prompt shape (adapt wording to the actual task):
         only purpose is positional. Render the final artwork correctly in
         3D perspective matching the canvas."
 
-  5. EXPLICIT MEASUREMENTS — edit models respect percentages far better
-     than vague placement. BEFORE calling the tool, VIEW the placement
-     guide yourself and extract approximate measurements in relative
-     terms, then bake them into the prompt:
-       "The artwork occupies approximately 14% of the visible hull height
-        and 11% of the hull length, positioned ~68% from the bow and
-        centered vertically on the hull side (~52% down from the deck
-        line to the waterline)."
-     Err on the side of over-specifying; ambiguity becomes drift.
-
-  6. SIZE BIAS — edit models tend to OVERSIZE pasted artwork when
-     uncertain. Always append:
-       "If uncertain about size, err SMALLER rather than larger — under
-        by 10% is acceptable, over by 10% is not."
-     Cheap line, meaningful effect.
-
-REFINEMENT LOOP — after the first call, LOOK at the generated image
-(the returned savedTo path) and COMPARE it to the placement guide. If
-the artwork visibly differs in size or position, make a SECOND
-generate_image call with:
-  • referenceImages: [<previous output>, <source asset>]   — note: NOT
-    the clean canvas and NOT the placement guide anymore; the previous
-    output already has the placement, only needs tuning.
-  • prompt phrased as a RELATIVE adjustment, e.g.:
-      "Edit reference #1: the artwork on the hull is ~20% too large and
-       ~15% too far left. Shrink it to about 80% of its current size and
-       shift it ~15% to the right. Keep every other pixel identical —
-       same boat, same background, same artwork, same lighting."
-Edit models handle relative deltas ("shrink 20%", "shift right") far
-more reliably than absolute placement. 1-2 refinement passes typically
-converge; stop once the deviation is within tolerance. Never exceed 3
-iterations — if it hasn't converged by then, the task needs inpainting
-or a different approach.
-
 Typical one-ref openers for simpler cases:
   • "Using the reference image as a STYLE guide, ..."  (style transfer)
   • "Edit the reference image to ..."                   (img2img edit)
