@@ -320,6 +320,53 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
 }
 
 /**
+ * If the chosen model's observed p50 latency is above [SLOW_MS] and the
+ * backend has tagged same-class peers as `fastAlternatives`, swap to the
+ * first alternative that (a) exists in the loaded modelsData, (b) is not
+ * on a cooldown, and (c) matches the requested thinking variant. Returns
+ * the original winner unchanged when no swap applies.
+ *
+ * Why the threshold is 8s and not higher: the user complaint that seeded
+ * this code was an 85s request where the first chunk never arrived within
+ * the usual window. We want to catch that before the user even notices.
+ * Higher thresholds (15-20s) let too many bad requests through; lower ones
+ * (3-4s) would start swapping perfectly-healthy-but-deep-reasoning models.
+ */
+const SLOW_P50_MS = 8000;
+
+function _maybeDegradeForLatency(winner) {
+  if (!winner) return winner;
+  const caps = winner.caps || modelsData[winner.provider]?.[winner.model];
+  const myP50 = caps?.p50LatencyMs;
+  const alts = caps?.fastAlternatives;
+  if (!Array.isArray(alts) || alts.length === 0) return winner;
+  if (typeof myP50 !== 'number' || myP50 < SLOW_P50_MS) return winner;
+
+  for (const altSlug of alts) {
+    // Alternatives can live under any provider — scan modelsData.
+    for (const [altProvider, providerModels] of Object.entries(modelsData)) {
+      if (altProvider.startsWith('_')) continue;
+      const altCaps = providerModels?.[altSlug];
+      if (!altCaps) continue;
+      if (_isProviderOnCooldown(altProvider)) continue;
+      if (_isModelOnCooldown(altProvider, altSlug)) continue;
+      // Keep the thinking variant aligned — a fast alt exists only when
+      // the backend confirmed matching `thinking` flags, but double-check
+      // so the downstream LLM adapter doesn't get a surprise.
+      if (winner.useThinking && !altCaps.thinking) continue;
+      if (process.env.KOI_LOG_FILE) {
+        try {
+          require('fs').appendFileSync(process.env.KOI_LOG_FILE,
+            `[auto-model] degrading ${winner.provider}/${winner.model} (p50=${myP50}ms) → ${altProvider}/${altSlug}\n`);
+        } catch {}
+      }
+      return { provider: altProvider, model: altSlug, useThinking: winner.useThinking, caps: altCaps };
+    }
+  }
+  return winner;
+}
+
+/**
  * Select the cheapest text-output model whose score for taskType >= difficulty.
  * When profile.thinking is true, only thinking candidates are considered (using
  * codeThinking/reasoningThinking scores). Falls back to non-thinking if no
@@ -368,7 +415,7 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
       return b.speed - a.speed;
     });
     const winner = candidates[0];
-    return { provider: winner.provider, model: winner.model, useThinking: winner.useThinking };
+    return _maybeDegradeForLatency({ provider: winner.provider, model: winner.model, useThinking: winner.useThinking, caps: winner.caps });
   }
 
   candidates.sort((a, b) => {
@@ -384,7 +431,7 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   });
 
   const winner = candidates[0];
-  return { provider: winner.provider, model: winner.model, useThinking: winner.useThinking };
+  return _maybeDegradeForLatency({ provider: winner.provider, model: winner.model, useThinking: winner.useThinking, caps: winner.caps });
 }
 
 /**

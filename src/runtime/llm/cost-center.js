@@ -68,6 +68,7 @@ export function getModelCaps(model) {
     noMaxTokens:            info?.noMaxTokens            ?? isOpenAiThinking ?? false,
     api:                    info?.api                    ?? 'chat',
     thinking:               info?.thinking               ?? false,
+    mandatoryThinking:      info?.mandatoryThinking      ?? false,
     maxOutputTokens:        info?.maxOutputTokens        ?? (isOpenAiThinking ? 65536 : 0),
     supportsCaching:        info?.cachedInputPer1M != null,
     supportsThinkingBudget: info?.supportsThinkingBudget ?? false,

@@ -162,8 +162,6 @@ export class GeminiLLM extends BaseLLM {
     const geminiParams = this._cleanParams({
       model: this.model,
       messages: effectiveMessages,
-      temperature: 0,
-      response_format: { type: 'json_object' },
       stream: true
     });
 
@@ -220,14 +218,36 @@ export class GeminiLLM extends BaseLLM {
       else await _iterate();
     };
 
-    // Gemini-specific: if supportsThinkingBudget, send thinking_config to disable thinking
-    // when not explicitly selected (avoids 10-60s streaming silence).
-    // If it fails with 400, retry without it as fallback.
-    if (this.caps.thinking && !this.useThinking && this.caps.supportsThinkingBudget) {
+    // Disable internal "dynamic" thinking whenever we don't explicitly
+    // want it — otherwise Gemini 3.x Pro goes silent for multiple
+    // MINUTES burning internal reasoning tokens before emitting
+    // anything visible (the "85 chars in 8s vs 1067 chars in 3m20s"
+    // gap on near-identical calls). Send BOTH the Gemini-native param
+    // (`thinking_config` in extra_body.google — picked up by the direct
+    // API and by our koi-gateway) AND the OpenRouter-standard top-level
+    // `reasoning` param — so however the client is wired (direct, koi-
+    // gateway, OpenRouter via gateway), at least one of them hits and
+    // reasoning stays at 0. 400-on-unknown-field is caught by the
+    // fallback below.
+    if (this.caps.thinking && !this.useThinking) {
       geminiParams.extra_body = {
         ...(geminiParams.extra_body || {}),
         thinking_config: { thinking_budget: 0 },
+        google: {
+          ...((geminiParams.extra_body || {}).google || {}),
+          thinking_config: { thinking_budget: 0 },
+        },
       };
+      // OpenRouter-compatible top-level reasoning control. Most
+      // reasoning-capable models accept `reasoning: { max_tokens: 0 }`;
+      // a few only accept `enabled: false`. Send both keys — they're
+      // additive and providers ignore unknown ones.
+      geminiParams.reasoning = {
+        max_tokens: 0,
+        enabled: false,
+        exclude: true,
+      };
+      channel.log('llm', `[gemini] reasoning disable requested (thinking_budget=0, reasoning.max_tokens=0)`);
     }
 
     try {
@@ -269,6 +289,22 @@ export class GeminiLLM extends BaseLLM {
     }
     if (!usage.thinking && _thinkChars > 0) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
+    // Diagnostic: when reasoning was supposedly disabled but the model
+    // still spent reasoning tokens, say so loudly. The gateway /
+    // OpenRouter / provider can be silently ignoring `thinking_config`
+    // and `reasoning:{max_tokens:0}` — if that happens we need to
+    // know, not just wait in silence for minutes.
+    if (!this.useThinking && (usage.thinking || 0) > 0) {
+      channel.log(
+        'llm',
+        `[gemini] reasoning disable IGNORED — model burned ${usage.thinking} reasoning tokens (out=${usage.output}, baseURL=${this.client?.baseURL || '?'})`,
+      );
+    } else if (this.useThinking || (usage.thinking || 0) > 0) {
+      channel.log(
+        'llm',
+        `[gemini] usage in=${usage.input} out=${usage.output} thinking=${usage.thinking || 0}`,
+      );
+    }
 
     const text = buffer.trim();
     if (!text) throw new Error('Gemini returned no content');

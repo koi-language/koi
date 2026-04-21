@@ -948,8 +948,17 @@ CRITICAL RULES:
       // Actions have been executed — feed ALL new results as feedback (not just the last).
       // This ensures that when a batch contains multiple prompt_user calls, every
       // question/answer pair is visible to the LLM, not only the final one.
+      //
+      // `_llm_error` entries are internal bookkeeping for consecutive-failure
+      // detection and must NEVER reach the LLM: feeding "the previous call
+      // failed with 400" + "Continue." back as a user turn pollutes context
+      // and primes the next retry with noise instead of the real task.
+      // playbook-session.js already filters these from the prompt's
+      // "Recent Actions" block; do the same here at the feedback pump.
       const fromIdx = session._lastFeedbackIdx ?? 0;
-      const newEntries = session.actionHistory.slice(fromIdx);
+      const newEntries = session.actionHistory
+        .slice(fromIdx)
+        .filter(e => (e.action?.intent || e.action?.type) !== '_llm_error');
       session._lastFeedbackIdx = session.actionHistory.length;
 
       if (newEntries.length > 0) {

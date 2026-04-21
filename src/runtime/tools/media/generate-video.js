@@ -14,8 +14,47 @@ import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
+import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+
+/**
+ * Download a finished video URL to disk. Shared helper used by
+ * generate_video (for synchronous completions) and check_video_status (for
+ * async polling). Returns the absolute saved path, or null if the URL could
+ * not be downloaded. `saveTo` is treated as a DIRECTORY — filename is
+ * auto-generated to match the generate_image convention.
+ */
+export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}) {
+  if (!url) return null;
+  const saveDir = typeof saveTo === 'string' && saveTo.trim()
+    ? path.resolve(saveTo.trim())
+    : path.join(os.homedir(), '.koi', 'videos');
+  try {
+    if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      channel.log('video', `Failed to download ${url}: HTTP ${resp.status}`);
+      return null;
+    }
+    const contentType = resp.headers.get('content-type') || '';
+    const ext = /mp4/i.test(contentType) ? 'mp4'
+      : /webm/i.test(contentType) ? 'webm'
+      : /quicktime/i.test(contentType) ? 'mov'
+      : 'mp4';
+    const tag = (id || 'video').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+    const filename = `video_${Date.now()}_${tag}.${ext}`;
+    const filePath = path.join(saveDir, filename);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    fs.writeFileSync(filePath, buffer);
+    channel.log('video', `Saved: ${filePath} (${(buffer.length / 1024 / 1024).toFixed(1)}MB)${provider ? ` from ${provider}/${model}` : ''}`);
+    return filePath;
+  } catch (err) {
+    channel.log('video', `Failed to save ${url}: ${err.message}`);
+    return null;
+  }
+}
 
 const generateVideoAction = {
   type: 'generate_video',
@@ -36,6 +75,7 @@ const generateVideoAction = {
       endFrame:        { type: 'string',  description: 'File path to last frame image' },
       referenceImages: { type: 'array',   description: 'Array of file paths to reference images for style/subject guidance', items: { type: 'string' } },
       withAudio:       { type: 'boolean', description: 'Generate audio track alongside video (default: false)' },
+      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. If the job finishes synchronously the file is saved immediately. If it needs polling, pass the SAME saveTo to check_video_status when status becomes "completed" so the result is downloaded there. Defaults to ~/.koi/videos/ when omitted.' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' }
     },
     required: ['prompt']
@@ -44,7 +84,8 @@ const generateVideoAction = {
   examples: [
     { intent: 'generate_video', prompt: 'A drone shot flying over a misty forest at sunrise', duration: 10, aspectRatio: '16:9' },
     { intent: 'generate_video', prompt: 'Product rotating on a turntable', startFrame: '/tmp/product.png', duration: 5 },
-    { intent: 'generate_video', prompt: 'Animated character walking', referenceImages: ['/tmp/character.png'], withAudio: true }
+    { intent: 'generate_video', prompt: 'Animated character walking', referenceImages: ['/tmp/character.png'], withAudio: true },
+    { intent: 'generate_video', prompt: 'Cinematic sunset timelapse', duration: 6, saveTo: '/Users/me/project/assets' }
   ],
 
   async execute(action, agent) {
@@ -73,10 +114,12 @@ const generateVideoAction = {
         if (!fs.existsSync(resolvedPath)) {
           return { success: false, error: `Start frame image not found: ${action.startFrame}` };
         }
-        const data = fs.readFileSync(resolvedPath);
-        const ext = path.extname(resolvedPath).toLowerCase();
-        const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
-        startFrame = { data, mimeType: mimeMap[ext] || 'image/png' };
+        const normalized = await normalizeImageForProvider(resolvedPath);
+        if (normalized.converted) {
+          channel.log('video', `Start frame normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
+        }
+        const data = fs.readFileSync(normalized.path);
+        startFrame = { data, mimeType: normalized.mimeType };
       }
     }
 
@@ -90,10 +133,12 @@ const generateVideoAction = {
         if (!fs.existsSync(resolvedPath)) {
           return { success: false, error: `End frame image not found: ${action.endFrame}` };
         }
-        const data = fs.readFileSync(resolvedPath);
-        const ext = path.extname(resolvedPath).toLowerCase();
-        const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
-        endFrame = { data, mimeType: mimeMap[ext] || 'image/png' };
+        const normalized = await normalizeImageForProvider(resolvedPath);
+        if (normalized.converted) {
+          channel.log('video', `End frame normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
+        }
+        const data = fs.readFileSync(normalized.path);
+        endFrame = { data, mimeType: normalized.mimeType };
       }
     }
 
@@ -110,10 +155,12 @@ const generateVideoAction = {
           if (!fs.existsSync(resolvedPath)) {
             return { success: false, error: `Reference image not found: ${filePath}` };
           }
-          const data = fs.readFileSync(resolvedPath);
-          const ext = path.extname(resolvedPath).toLowerCase();
-          const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
-          referenceImages.push({ data, mimeType: mimeMap[ext] || 'image/png' });
+          const normalized = await normalizeImageForProvider(resolvedPath);
+          if (normalized.converted) {
+            channel.log('video', `Reference normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
+          }
+          const data = fs.readFileSync(normalized.path);
+          referenceImages.push({ data, mimeType: normalized.mimeType });
         }
       }
     }
@@ -139,6 +186,19 @@ const generateVideoAction = {
       withAudio: withAudio && caps.withAudio,
     });
 
+    // If the provider returned a ready URL (some models complete
+    // synchronously), try to save it right away. Async providers return
+    // just an id — check_video_status handles the save later.
+    let savedTo = null;
+    if (result.url && (result.status === 'completed' || !result.status)) {
+      savedTo = await saveVideoFromUrl(result.url, {
+        saveTo: action.saveTo,
+        provider: resolved.provider,
+        model: resolved.model,
+        id: result.id,
+      });
+    }
+
     return {
       success: true,
       provider: resolved.provider,
@@ -147,6 +207,7 @@ const generateVideoAction = {
       id: result.id,
       status: result.status,
       url: result.url,
+      ...(savedTo ? { savedTo } : {}),
       usage: result.usage,
     };
   }

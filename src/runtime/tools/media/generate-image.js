@@ -19,6 +19,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
+import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -27,6 +28,37 @@ import { channel } from '../../io/channel.js';
 // models. When the label set is empty (or the fetch fails), the parameter
 // simply does not exist from the agent's point of view. Do not re-add it
 // here.
+
+/**
+ * Pick the closest common aspect ratio (string form, e.g. "16:9") to the
+ * given pixel dimensions. Used to auto-fill aspectRatio from the base
+ * reference image when the agent didn't specify one — providers default
+ * to 1:1 otherwise, which crops most real-world photos. Candidate list
+ * mirrors what every major provider (OpenAI, Google, Replicate, Fal)
+ * accepts.
+ */
+function _closestAspectRatio(width, height) {
+  if (!width || !height) return null;
+  const r = width / height;
+  const candidates = [
+    ['1:1', 1.0],
+    ['16:9', 16 / 9],
+    ['9:16', 9 / 16],
+    ['4:3', 4 / 3],
+    ['3:4', 3 / 4],
+    ['3:2', 3 / 2],
+    ['2:3', 2 / 3],
+    ['21:9', 21 / 9],
+  ];
+  let best = candidates[0];
+  let bestDiff = Math.abs(r - best[1]);
+  for (const c of candidates) {
+    const d = Math.abs(r - c[1]);
+    if (d < bestDiff) { best = c; bestDiff = d; }
+  }
+  return best[0];
+}
+
 const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
@@ -36,18 +68,34 @@ const generateImageAction = {
   // ratios, resolutions, labels, max n, ref image support) pulled from the
   // /gateway/models/image.json catalog. Do NOT add specific values here —
   // they would become stale the moment the catalog changes.
-  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages", optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
+  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (accepts a plain path array OR objects with {alias, path} for named refs you can mention in the prompt), optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
   schema: {
     type: 'object',
     properties: {
-      prompt:          { type: 'string', description: 'Text description of the desired image' },
+      prompt:          { type: 'string', description: 'Text description of the desired image. When you use named reference images, you can refer to them by alias in the prompt (e.g. "Paint the `illustration` onto the `boat`\'s hull, matching `placement_guide`") — far more precise than "FIRST/SECOND/THIRD reference".' },
       aspectRatio:     { type: 'string', description: 'Aspect ratio — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
       resolution:      { type: 'string', description: 'Resolution — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
-      referenceImages: { type: 'array',  description: 'Array of attachment IDs (e.g. "att-1") or file paths for reference images. Annotation attachments are automatically excluded.', items: { type: 'string' } },
+      referenceImages: {
+        type: 'array',
+        description: 'Reference images. Each item is either a string (file path or attachment ID like "att-1") OR an object { alias, path } where `alias` is a short descriptive name you can mention in the prompt. Prefer objects with aliases when you have multiple refs — it lets you say "the boat" or "the style_reference" instead of "the FIRST reference" / "the SECOND reference". Use short, semantic aliases ("boat", "style", "placement_guide"), never generic ones ("ref1", "image1").',
+        items: {
+          oneOf: [
+            { type: 'string' },
+            {
+              type: 'object',
+              properties: {
+                alias: { type: 'string', description: 'Short descriptive name (e.g. "boat", "placement_guide", "style_reference"). Referenced by the prompt.' },
+                path:  { type: 'string', description: 'File path or attachment ID (att-N).' }
+              },
+              required: ['alias', 'path']
+            }
+          ]
+        }
+      },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
       model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should let the backend pick the cheapest capable model).' },
@@ -60,12 +108,43 @@ const generateImageAction = {
     { intent: 'generate_image', prompt: 'A serene mountain lake at sunset, oil painting style' },
     { intent: 'generate_image', prompt: 'Logo for a tech startup' },
     { intent: 'generate_image', prompt: 'Using the reference image as a STYLE guide, create an illustration of a smartphone floating in perspective, in the exact art style of the reference image', referenceImages: ['att-1'] },
-    { intent: 'generate_image', prompt: 'Edit the reference image: change the eye color to red, keep everything else identical', referenceImages: ['/Users/me/.koi/images/kitten.png'] }
+    { intent: 'generate_image', prompt: 'Edit the reference image: change the eye color to red, keep everything else identical', referenceImages: ['/Users/me/.koi/images/kitten.png'] },
+    {
+      intent: 'generate_image',
+      prompt: 'Paint the `illustration` onto the side of the `boat`\'s hull, following the perspective and texture shown in `placement_guide`.',
+      referenceImages: [
+        { alias: 'boat',            path: '/Users/me/.koi/images/boat.png' },
+        { alias: 'placement_guide', path: '/Users/me/.koi/images/snapshot.png' },
+        { alias: 'illustration',    path: '/Users/me/.koi/images/source.png' }
+      ]
+    }
   ],
 
   async execute(action, agent) {
     const prompt = action.prompt;
     if (!prompt) throw new Error('generate_image: "prompt" is required');
+
+    // If the active doc in the working-area store carries a
+    // [DocumentBundle], surface a one-line log — matches the
+    // "[bundle:<id>]" convention used on every other touchpoint
+    // (submit, workingAreaState, read_file) so the full round-trip
+    // is visible in the log without grepping multiple keys.
+    try {
+      const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+      const active = openDocumentsStore.getActive?.();
+      const b = active?.bundle;
+      if (b) {
+        const base = (p) => p ? p.split('/').pop() : '-';
+        const refs = Array.isArray(b.references) ? b.references : [];
+        channel.log(
+          'image',
+          `[bundle:${active.id}] (generate_image) primary=${base(b.primary?.path)} ` +
+          `annotation=${b.annotation?.path ? base(b.annotation.path) : '-'} ` +
+          `refs=${refs.length}` +
+          `${refs.length ? ' [' + refs.map((r) => base(r.path)).join(', ') + ']' : ''}`,
+        );
+      }
+    } catch { /* store unavailable — ignore */ }
 
     // Get clients from the agent's LLM provider
     const clients = agent?.llmProvider?.getClients?.() || {};
@@ -91,40 +170,73 @@ const generateImageAction = {
     // Load reference images from file paths.
     // Each reference image used for generation is saved to the media library
     // (deduplicated by content hash — won't store duplicates).
+    //
+    // Accepts TWO input shapes (both valid on the same request):
+    //   1. Plain path / attachment-id strings:
+    //        referenceImages: ["att-1", "/path/to/pic.png"]
+    //   2. Named objects with { alias, path }:
+    //        referenceImages: [{ alias: "boat", path: "att-1" }, ...]
+    // Aliases are optional; when at least one is present, a compact legend is
+    // prepended to the prompt so the model can map "boat" / "placement_guide"
+    // / "illustration" to ref #1 / #2 / #3. Providers only accept ordered
+    // arrays — the legend is our workaround to let agents write semantic
+    // prompts without losing the position-to-name mapping.
     let referenceImages;
     const _savedRefIds = {}; // filePath → media library ID
+    let _refAliases = []; // aligned with referenceImages order; empty string when unnamed
     if (action.referenceImages?.length) {
       if (!caps.referenceImages) {
         channel.log('image', `Provider ${resolved.provider}/${resolved.model} does not support reference images — ignoring`);
       } else {
         referenceImages = [];
         const maxRef = caps.maxReferenceImages || 1;
-        // Resolve attachment IDs (att-N) to real paths.
+        // Step 1 — normalize to [{ alias, rawPath }]. String items keep alias=''.
+        const _normalized = action.referenceImages.map((item) => {
+          if (typeof item === 'string') return { alias: '', rawPath: item };
+          if (item && typeof item === 'object') {
+            const rawPath = typeof item.path === 'string' ? item.path : '';
+            const alias = typeof item.alias === 'string' ? item.alias.trim() : '';
+            return { alias, rawPath };
+          }
+          return { alias: '', rawPath: '' };
+        }).filter((x) => x.rawPath);
+
+        // Step 2 — resolve attachment IDs (att-N) to real paths.
         const _resolvedRefs = [];
         try {
           const { attachmentRegistry: _ar } = await import('../../state/attachment-registry.js');
-          for (const p of action.referenceImages) {
-            if (typeof p === 'string' && /^att-\d+$/.test(p)) {
-              const entry = _ar.get(p);
+          for (const { alias, rawPath } of _normalized) {
+            if (/^att-\d+$/.test(rawPath)) {
+              const entry = _ar.get(rawPath);
               if (entry?.path) {
-                _resolvedRefs.push(entry.path);
+                _resolvedRefs.push({ alias, filePath: entry.path });
                 continue;
               }
             }
-            _resolvedRefs.push(p);
+            _resolvedRefs.push({ alias, filePath: rawPath });
           }
         } catch {
-          _resolvedRefs.push(...action.referenceImages);
+          for (const { alias, rawPath } of _normalized) {
+            _resolvedRefs.push({ alias, filePath: rawPath });
+          }
         }
-        for (const filePath of _resolvedRefs.slice(0, maxRef)) {
+
+        // Step 3 — load + normalise image bytes, track alias alignment.
+        for (const { alias, filePath } of _resolvedRefs.slice(0, maxRef)) {
           const resolvedPath = path.resolve(filePath);
           if (!fs.existsSync(resolvedPath)) {
             return { success: false, error: `Reference image not found: ${filePath}` };
           }
-          const data = fs.readFileSync(resolvedPath);
-          const ext = path.extname(resolvedPath).toLowerCase();
-          const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
-          referenceImages.push({ data, mimeType: mimeMap[ext] || 'image/png' });
+          // Transcode anything that isn't PNG/JPEG before upload — providers
+          // reject WebP/HEIC/AVIF/TIFF/BMP/GIF inconsistently, and failing
+          // here (rather than silently passing through) would force a retry.
+          const normalized = await normalizeImageForProvider(resolvedPath);
+          if (normalized.converted) {
+            channel.log('image', `Reference normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
+          }
+          const data = fs.readFileSync(normalized.path);
+          referenceImages.push({ data, mimeType: normalized.mimeType });
+          _refAliases.push(alias);
 
           // Save reference image to media library (dedup by hash, non-blocking)
           try {
@@ -132,11 +244,11 @@ const generateImageAction = {
             const lib = MediaLibrary.global();
             const result = await lib.save({
               filePath: resolvedPath,
-              metadata: { source: 'reference', usedForGeneration: true },
-              description: `Reference image: ${path.basename(resolvedPath)}`,
+              metadata: { source: 'reference', usedForGeneration: true, alias: alias || undefined },
+              description: `Reference image${alias ? ` (${alias})` : ''}: ${path.basename(resolvedPath)}`,
             });
             _savedRefIds[resolvedPath] = result.id;
-            channel.log('image', `Reference image ${result.isNew ? 'saved to' : 'already in'} media library: ${result.id}`);
+            channel.log('image', `Reference image ${result.isNew ? 'saved to' : 'already in'} media library: ${result.id}${alias ? ` [${alias}]` : ''}`);
           } catch (mlErr) {
             channel.log('image', `Media library ref save failed (non-fatal): ${mlErr.message}`);
           }
@@ -144,9 +256,55 @@ const generateImageAction = {
       }
     }
 
-    // Log full generation request details
-    const refPaths = action.referenceImages?.length ? action.referenceImages : [];
-    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", aspectRatio=${action.aspectRatio || '-'}, resolution=${action.resolution || '-'}, n=${action.n || 1}, refs=${refPaths.length}${refPaths.length ? ' [' + refPaths.map(p => path.basename(p)).join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
+    // Build the final prompt: if any reference carries an alias, prepend a
+    // short legend so the provider's model can map "boat"/"placement_guide"
+    // to ref #1/#2/... regardless of how the underlying API presents them.
+    let effectivePrompt = prompt;
+    if (_refAliases.some((a) => a && a.length > 0)) {
+      const legendLines = _refAliases.map((alias, i) => {
+        const n = i + 1;
+        return alias ? `  • reference #${n} = "${alias}"` : `  • reference #${n} = (unnamed)`;
+      });
+      effectivePrompt =
+        `Reference images (by position):\n${legendLines.join('\n')}\n\n` +
+        `When the prompt below mentions a name in backticks (e.g. \`boat\`), it is referring to the reference image of that alias.\n\n` +
+        prompt;
+      channel.log('image', `Reference aliases: ${_refAliases.map((a, i) => `${i + 1}=${a || '-'}`).join(', ')}`);
+    }
+
+    // Auto-detect aspectRatio from the FIRST reference (the base image
+    // being edited). Only one of the references is "the canvas" — the
+    // rest are style / placement / source-of-pieces guides. Without a
+    // ratio hint the provider falls back to 1:1 and crops the scene.
+    // In edit mode this is passed through as meta-info; the router
+    // treats it as a SOFT preference (see pickImageModel) because edit
+    // models preserve the base dimensions natively regardless.
+    let autoAspectRatio = null;
+    if (!action.aspectRatio && referenceImages?.length) {
+      try {
+        const sharp = (await import('sharp')).default;
+        const meta = await sharp(referenceImages[0].data).metadata();
+        if (meta?.width && meta?.height) {
+          autoAspectRatio = _closestAspectRatio(meta.width, meta.height);
+          channel.log('image', `Auto-detected aspectRatio=${autoAspectRatio} from base ref (${meta.width}x${meta.height})`);
+        }
+      } catch (err) {
+        channel.log('image', `Aspect ratio auto-detect failed (non-fatal): ${err?.message || err}`);
+      }
+    }
+    const effectiveAspect = action.aspectRatio || autoAspectRatio;
+
+    // Log full generation request details. Ref items can now be strings or
+    // {alias,path} objects — normalise for the summary without re-parsing.
+    const refSummary = (action.referenceImages || []).map((it) => {
+      if (typeof it === 'string') return path.basename(it);
+      if (it && typeof it === 'object') {
+        const base = it.path ? path.basename(it.path) : '?';
+        return it.alias ? `${it.alias}=${base}` : base;
+      }
+      return '?';
+    });
+    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${effectivePrompt.substring(0, 150)}...", aspectRatio=${effectiveAspect || '-'}, resolution=${action.resolution || '-'}, n=${action.n || 1}, refs=${refSummary.length}${refSummary.length ? ' [' + refSummary.join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
 
     // Passthrough: only forward params the agent actually supplied. The
     // client-side router (media-model-router.js) picks a model that accepts
@@ -157,14 +315,21 @@ const generateImageAction = {
       outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
       referenceImages,
     };
-    if (action.aspectRatio) genOpts.aspectRatio = action.aspectRatio;
+    if (effectiveAspect) genOpts.aspectRatio = effectiveAspect;
     if (action.resolution)  genOpts.resolution  = action.resolution;
     if (action.n && action.n > 1) genOpts.n = action.n;
     if (action.label) genOpts.label = action.label;
 
     let result;
     try {
-      result = await instance.generate(prompt, genOpts);
+      result = await instance.generate(effectivePrompt, genOpts);
+      // Log the ACTUAL slug the router picked (e.g. "fal-ai/flux/dev")
+      // instead of the declared "auto" — the user needs to know which
+      // model produced each image, so this hits stdout AND the image
+      // metadata saved to the media library a few lines below.
+      if (result?.model) {
+        channel.log('image', `Model resolved → ${result.model}`);
+      }
     } catch (genErr) {
       // Structured block from the provider: policy refusal, rate limit,
       // auth, quota. This is the happy path for "the provider said no" —
@@ -312,7 +477,12 @@ const generateImageAction = {
           await saveGeneratedImage(img.savedTo, {
             prompt: action.prompt,
             negativePrompt: action.negativePrompt || null,
-            model: resolved.model,
+            // Prefer the slug the router actually resolved to; fall back
+            // to the factory-declared model only when the gateway didn't
+            // report one. The user needs the concrete slug (e.g.
+            // "fal-ai/flux/dev") stored alongside the image — "auto" in
+            // metadata hides the audit trail for billing and reproduction.
+            model: result?.model || resolved.model,
             provider: resolved.provider,
             aspectRatio: action.aspectRatio || null,
             outputFormat: action.outputFormat || 'png',
@@ -333,10 +503,37 @@ const generateImageAction = {
       channel.log('image', `Media library save failed (non-fatal): ${mlErr.message}`);
     }
 
+    // Record provenance so the coordinator can see what has already been
+    // applied to each output file via recall_facts. For generate_image a
+    // non-empty referenceImages[] treats the first reference as the
+    // lineage source (best approximation of "derived from"); plain text-
+    // to-image calls get no source and start a fresh chain.
+    try {
+      const { recordImageOp } = await import('../../state/image-lineage.js');
+      const refPaths = (action.referenceImages || [])
+        .map(r => typeof r === 'string' ? r : r?.filePath)
+        .filter(Boolean);
+      for (const img of savedImages) {
+        if (!img.savedTo) continue;
+        recordImageOp({
+          op: 'generate',
+          outputPath: img.savedTo,
+          sourcePath: refPaths[0] || null,
+          params: {
+            provider: resolved.provider,
+            ...(action.aspectRatio ? { aspectRatio: action.aspectRatio } : {}),
+          },
+          agentName: agent?.name,
+        });
+      }
+    } catch { /* lineage is best-effort — never fail the tool on it */ }
+
     return {
       success: true,
       provider: resolved.provider,
-      model: resolved.model,
+      // Concrete slug the router picked (e.g. "fal-ai/flux/dev") — the
+      // agent sees what actually ran, not the factory-declared "auto".
+      model: result?.model || resolved.model,
       supportedAspectRatios: caps.aspectRatios,
       imageCount: savedImages.length,
       images: savedImages,
@@ -377,7 +574,11 @@ fetchMediaCapabilities('image').then((caps) => {
   } else {
     delete props.n;
   }
-  const refsEnabled = caps.hasRefImageSupport && caps.anyCanEdit;
+  // Reference-image support comes from the fleet: any active model with
+  // maxRefImages != 0 counts. The legacy `anyCanEdit` gate is gone because
+  // "canEdit" was a false dichotomy — if a model accepts input images it
+  // can edit, end of story.
+  const refsEnabled = caps.hasRefImageSupport;
   if (refsEnabled) {
     props.referenceImages = { type: 'array', items: { type: 'string' } };
   } else {
@@ -418,7 +619,76 @@ fetchMediaCapabilities('image').then((caps) => {
 
   const header = 'Generate an image from a text prompt. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const refNote = refsEnabled
-    ? ' IMPORTANT when using "referenceImages": the image model does NOT automatically know what role the reference plays — state it explicitly in "prompt". Start with a directive such as "Using the reference image as a STYLE guide, ..." (style transfer), "Edit the reference image to ..." (img2img edit), or "Use the reference image as the subject and ..." (subject preservation).'
+    ? `
+
+IMPORTANT when using "referenceImages" — edit models see every ref as equally
+authoritative pixels. They do NOT distinguish "this is the canvas" from "this
+is a source asset" from "this is a placement sketch". You MUST state each
+ref's role explicitly in the prompt, AND warn the model off any traits of a
+schematic ref that should not bleed into the output.
+
+Recommended prompt shape (adapt wording to the actual task):
+
+  1. ROLE ASSIGNMENT — one sentence per ref, in order:
+       "Reference #1 is the CANVAS to edit (the boat). Reference #2 is a
+        composite snapshot indicating ONLY the desired location and size of
+        the artwork — its flat pasted rendering MUST NOT be reproduced.
+        Reference #3 is the high-fidelity source to paint."
+
+  2. POSITIVE INSTRUCTIONS — what the output must do:
+       "Apply ref #3 at the position/size shown by ref #2, rendered in the
+        CANVAS's own perspective: wrap to the surface curvature, match the
+        camera angle and foreshortening, blend with ambient lighting (top
+        highlights, bottom shadow), integrate edges so it reads as painted
+        on the material, not as a flat sticker."
+
+  3. PRESERVATION LIST — what must stay untouched:
+       "Leave [list: deck / background / faces / water / any unrelated area]
+        completely unchanged."
+
+  4. NEGATIVE GUARD when a ref is schematic / composite / sketch:
+       "Do NOT reproduce the flat 2D rendering style of reference #N; its
+        only purpose is positional. Render the final artwork correctly in
+        3D perspective matching the canvas."
+
+  5. EXPLICIT MEASUREMENTS — edit models respect percentages far better
+     than vague placement. BEFORE calling the tool, VIEW the placement
+     guide yourself and extract approximate measurements in relative
+     terms, then bake them into the prompt:
+       "The artwork occupies approximately 14% of the visible hull height
+        and 11% of the hull length, positioned ~68% from the bow and
+        centered vertically on the hull side (~52% down from the deck
+        line to the waterline)."
+     Err on the side of over-specifying; ambiguity becomes drift.
+
+  6. SIZE BIAS — edit models tend to OVERSIZE pasted artwork when
+     uncertain. Always append:
+       "If uncertain about size, err SMALLER rather than larger — under
+        by 10% is acceptable, over by 10% is not."
+     Cheap line, meaningful effect.
+
+REFINEMENT LOOP — after the first call, LOOK at the generated image
+(the returned savedTo path) and COMPARE it to the placement guide. If
+the artwork visibly differs in size or position, make a SECOND
+generate_image call with:
+  • referenceImages: [<previous output>, <source asset>]   — note: NOT
+    the clean canvas and NOT the placement guide anymore; the previous
+    output already has the placement, only needs tuning.
+  • prompt phrased as a RELATIVE adjustment, e.g.:
+      "Edit reference #1: the artwork on the hull is ~20% too large and
+       ~15% too far left. Shrink it to about 80% of its current size and
+       shift it ~15% to the right. Keep every other pixel identical —
+       same boat, same background, same artwork, same lighting."
+Edit models handle relative deltas ("shrink 20%", "shift right") far
+more reliably than absolute placement. 1-2 refinement passes typically
+converge; stop once the deviation is within tolerance. Never exceed 3
+iterations — if it hasn't converged by then, the task needs inpainting
+or a different approach.
+
+Typical one-ref openers for simpler cases:
+  • "Using the reference image as a STYLE guide, ..."  (style transfer)
+  • "Edit the reference image to ..."                   (img2img edit)
+  • "Use the reference image as the subject and ..."    (subject preservation)`
     : '';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
   const returns = '\nReturns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }';

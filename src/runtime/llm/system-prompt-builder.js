@@ -266,24 +266,76 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       const docs = openDocumentsStore.getAll();
       const active = openDocumentsStore.getActive();
       const lines = ['', '# WORKING AREA', '', `The user has ${docs.length} document(s) open next to the chat:`];
+      let anyHasComposite = false;
       for (const d of docs) {
         const loc = d.path || d.url || '';
         const isActive = active && d.id === active.id;
-        lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${isActive ? ' **(ACTIVE — what the user is currently looking at)**' : ''}`);
+        const activeTag = isActive ? ' **(ACTIVE — what the user is currently looking at)**' : '';
+        lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${activeTag}`);
+
+        // DocumentBundle — compact rendering. Only the fields the agent
+        // actually needs to route a media action: annotation path (the
+        // visual intent spec), reference paths (forwarded to
+        // generate_image as extra refs). Roles are implicit in the
+        // labels ("composite", "references"); per-resource prose lives
+        // in the code, not in the prompt.
+        const b = d.bundle;
+        if (b && typeof b === 'object') {
+          if (b.annotation?.path) {
+            anyHasComposite = true;
+            lines.push(`    ↳ composite: \`${b.annotation.path}\``);
+          }
+          if (Array.isArray(b.references) && b.references.length > 0) {
+            anyHasComposite = true;
+            const refPaths = b.references
+              .map((r, i) => `        ${i + 1}. \`${r.path}\``)
+              .join('\n');
+            lines.push(`    ↳ references (${b.references.length}):`);
+            lines.push(refPaths);
+          }
+          if (b.primary?.path && b.primary.path !== loc) {
+            lines.push(`    ↳ snapshot: \`${b.primary.path}\``);
+          }
+        }
+      }
+
+      // Crystal-clear routing guidance when the active doc carries any
+      // user-placed spatial guidance (annotations or pasted cutouts).
+      // Without this block the agent keeps calling generate_image with
+      // the reference paths in an unlabelled flat array and the model
+      // has no idea which is base / composite / source — it just
+      // averages them, which is exactly the "model invents things"
+      // failure mode the user was hitting.
+      if (anyHasComposite && active && (active.path || active.url)) {
+        const activeLoc = active.path || active.url;
+        const activeBundle = active.bundle || {};
+        const activeRefs = Array.isArray(activeBundle.references)
+          ? activeBundle.references.map((r) => r.path).filter(Boolean)
+          : [];
+        const activeOverlay = activeBundle.annotation?.path || null;
+        const refList = [activeLoc, activeOverlay, ...activeRefs].filter(Boolean);
+        const refJson = JSON.stringify(refList);
+        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        lines.push('');
+        lines.push('## ⚠ ACTIVE document is a photomontage — act, do not ask');
+        lines.push('');
+        lines.push('The composite IS the spec. Forbidden to ask "qué composición?" / "which composition?"; the answer is the image already attached.');
+        lines.push('');
+        lines.push(`1. **read_file "${activeLoc}"** first. Vision receives the base + composite in order; pasted-cutout sources ride along in the bundle but are NOT auto-attached (they flow into generate_image as refs).`);
+        lines.push('2. Then dispatch the real work: `generate_image` for edits/compositions, `background_removal`, `upscale_image`, etc.');
+        lines.push('3. For `generate_image` use EXACTLY this shape (base → composite → sources):');
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_image", "prompt": "Edit the FIRST reference image. The SECOND is a composite snapshot showing EXACTLY where and at what size/angle the pasted elements land — use as PLACEMENT guide. The REMAINING refs are the high-fidelity sources. Apply: <paraphrase the user's request>.", "referenceImages": ${refJson}, "saveTo": "${saveDir}" }`);
+        lines.push('```');
       }
       lines.push('');
-      lines.push('**The ACTIVE document is what the user is currently looking at on their screen.** Treat it as the default target of every request that does not explicitly name a different file, URL, or project path. Specifically:');
-      lines.push('');
-      lines.push('1. **Implicit references** — "this", "esto", "ves esto?", "aquí", "the document", "the pdf", "the image", or any request that does not name a specific target, ALWAYS mean the ACTIVE document. Never ignore it to go explore the project codebase instead.');
-      lines.push('2. **Read** — call `read_file` with the exact path (for image / pdf / text / word / html tabs) or exact URL (for web tabs) shown above. Never invent paths — only use what is listed here. For images and web pages the content is attached as vision input; if the user has drawn annotations, a second image labeled `[ANNOTATIONS OVERLAY]` follows as visual guidance complementing their prompt.');
-      lines.push('3. **Write / edit / fill** — when the user asks you to add, write, fill, update, replace, rename, continue, or otherwise modify content WITHOUT specifying a different target, apply it to the ACTIVE document if it is a text-like file (text, html). Use `edit_file` or `write_file` with its exact path; the GUI editor reloads from disk automatically. Examples that target the active text doc: "añade una intro", "pon un texto introductorio", "continúa el texto", "escribe aquí", "ponlo en el documento", "fill in the content", "write a title", "replace this section".');
-      lines.push('   - **Do this inline. DO NOT delegate** these edits to SoftwareDeveloper or any other sub-agent. Delegation is only for non-trivial changes spread across the project codebase. The user\'s open working-area document is ALWAYS handled directly by the agent receiving the message — there is nothing to "plan" or "explore" first.');
-      lines.push('   - **Append vs replace**: "continúa", "sigue", "añade al final", "add more" → preserve existing content and `edit_file` after the last line. "replace this", "rewrite this", "start over" → replace the selection (or whole file if there is no selection).');
-      lines.push('   - **Mandatory discipline**: NEVER return `success` on a write request without having actually executed `edit_file` or `write_file` first. Hallucinating completion ("documento actualizado", "texto añadido") without a tool call is a hard failure. If you cannot perform the edit for any reason, say so explicitly with `print` and `prompt_user` — do not fake it.');
-      lines.push('4. **Images / PDFs / web** — if the user asks you to "edit" or "change" a non-text active doc (image, pdf, web page), you cannot modify it directly. Instead: describe what you would do, then ask the user to confirm or provide a destination, OR call the appropriate generation/screenshot tool.');
-      lines.push('5. **Ambiguity** — if there are multiple open text documents and the request could reasonably target more than one, ASK the user with `prompt_user` before writing. Never guess silently when a write could overwrite the wrong file.');
-      lines.push('6. **Never fabricate** — do NOT invent file paths, do NOT go searching the repo when an obvious active document is sitting right in front of the user. The working-area list above is authoritative.');
-      lines.push('7. **Caret & selection** — when you `read_file` the active text document, the result may include an `editor` field with the user\'s caret position or selected range. If present, treat it as the primary anchor for demonstratives: "this", "esto", "here", "change this", "replace this", "move it up", etc. always refer to that caret/selection first. The `editor.summary` already explains it in natural language — read it carefully before deciding what to modify.');
+      lines.push('**ACTIVE doc = default target.** Demonstratives ("this", "esto", "the image", "the pdf", …) always mean the ACTIVE document — never the project codebase. Use only paths / URLs listed above, never invent.');
+      lines.push('- **Read** active doc → `read_file` with its path/URL. Images & web come back as vision; if there\'s a composite, it\'s queued right after as `[ANNOTATIONS OVERLAY]`.');
+      lines.push('- **Write/edit text docs** → `edit_file` / `write_file` directly, inline — never delegate to a sub-agent for working-area edits. "continúa / sigue / añade" = append; "replace / rewrite" = replace. Never report success without a real tool call.');
+      lines.push('- **Non-text active docs** (image/pdf/web) — dispatch to the right media tool (`generate_image`, `background_removal`, …); never claim to have edited in place.');
+      lines.push('- **Ambiguity** between open text docs → `prompt_user` before writing.');
+      lines.push('- **Caret/selection** — if `read_file` returns an `editor.summary`, that selection is the anchor for "this / aquí / change this".');
       if (active && (active.path || active.url)) {
         const activeLoc = active.path || active.url;
         const isText = active.type === 'text' || active.type === 'html';
@@ -416,6 +468,8 @@ export async function buildSmartResourceSection(agent) {
       resources.push({
         type: 'mcp',
         name: mcp.name,
+        description: mcp.description || '',
+        lazy: mcp.lazy !== false,
         intents: mcp.tools.map(t => ({
           name: t.name,
           description: t.description || t.name,
@@ -561,23 +615,47 @@ export function buildExpandedResourceSection(resources, agent) {
     }
   }
 
-  // ── AVAILABLE MCP TOOLS ─────────────────────────────────────────────────
+  // ── AVAILABLE MCP SERVERS ───────────────────────────────────────────────
+  // Lazy by default: advertise the server name + short description + tool
+  // count only. The agent calls open_mcp(name) to see the tool list and
+  // get_mcp_tool_info(mcp, tool) for a specific schema. This keeps the
+  // system prompt small when several MCPs are connected (each can expose
+  // dozens of tools, and the full schemas add up fast).
+  // Opt out per-server via `"lazy": false` in .mcp.json.
   let mcpResources = resources.filter(r => r.type === 'mcp');
   if (Array.isArray(disabledPerms) && disabledPerms.includes('call_mcp')) {
     mcpResources = [];
   }
   if (mcpResources.length > 0) {
-    doc += '## AVAILABLE MCP TOOLS\n\n';
-    for (const resource of mcpResources) {
-      doc += `### ${resource.name}\n`;
-      for (const tool of resource.intents) {
-        doc += ` - ${tool.name}: ${tool.description || tool.name}\n`;
-        if (tool.inputSchema?.properties) {
-          const keys = Object.keys(tool.inputSchema.properties);
-          if (keys.length > 0) doc += `    In: ${keys.map(k => `"${k}"`).join(', ')}\n`;
-        }
+    const lazyResources = mcpResources.filter(r => r.lazy !== false);
+    const eagerResources = mcpResources.filter(r => r.lazy === false);
+
+    if (lazyResources.length > 0) {
+      doc += '## AVAILABLE MCP SERVERS\n\n';
+      doc += 'Call **open_mcp("<server>")** to see the tools exposed by a server, then **get_mcp_tool_info({ mcp, tool })** for the full parameter schema of a specific tool before invoking it with call_mcp.\n\n';
+      doc += '| Server | Tools | Description |\n|---|---|---|\n';
+      for (const resource of lazyResources) {
+        const count = resource.intents.length;
+        const desc = (resource.description || '').trim() || '(no description)';
+        doc += `| ${resource.name} | ${count} | ${desc.replace(/\|/g, '\\|').replace(/\n/g, ' ')} |\n`;
       }
       doc += '\n';
+    }
+
+    if (eagerResources.length > 0) {
+      doc += '## AVAILABLE MCP TOOLS\n\n';
+      for (const resource of eagerResources) {
+        doc += `### ${resource.name}\n`;
+        if (resource.description) doc += `${resource.description}\n`;
+        for (const tool of resource.intents) {
+          doc += ` - ${tool.name}: ${tool.description || tool.name}\n`;
+          if (tool.inputSchema?.properties) {
+            const keys = Object.keys(tool.inputSchema.properties);
+            if (keys.length > 0) doc += `    In: ${keys.map(k => `"${k}"`).join(', ')}\n`;
+          }
+        }
+        doc += '\n';
+      }
     }
   }
 
@@ -595,10 +673,17 @@ export function buildExpandedResourceSection(resources, agent) {
   }
 
   if (mcpResources.length > 0) {
-    const ex = mcpResources[0];
+    // Prefer an eager resource for the example so the sample tool name is
+    // actually visible in the prompt. Fall back to a lazy server with a
+    // placeholder — the agent is expected to call open_mcp first anyway.
+    const eager = mcpResources.find(r => r.lazy === false);
+    const ex = eager ?? mcpResources[0];
     const exTool = ex.intents[0]?.name ?? 'tool_name';
     doc += '\nTo call an MCP tool (ALWAYS use this format — NEVER use delegate for MCP tools):\n';
     doc += `{ "actionType": "direct", "intent": "call_mcp", "mcp": "${ex.name}", "tool": "${exTool}", "input": { ... } }\n`;
+    if (!eager) {
+      doc += 'For lazy servers, first call open_mcp("<server>") to discover tool names, then get_mcp_tool_info for the exact parameter schema.\n';
+    }
   }
 
   return doc;

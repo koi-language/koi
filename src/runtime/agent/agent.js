@@ -1151,7 +1151,14 @@ export class Agent {
     // Fast-start: skip the first LLM call — wait for user input immediately.
     // No greeting, no tokens wasted. Works for new AND restored sessions.
     // Safe because we already awaited GUI connection above.
-    const isFastStart = !isDelegate && !session.mcpErrors;
+    //
+    // NOT a fast-start when the loop is a continuation (post-abort, post-
+    // feedback, or post-error recovery). Those paths already injected a
+    // fresh user/feedback/recovery message into contextMemory before
+    // recursing — firing prompt_user again would swallow that message
+    // silently and make the agent appear frozen until the user types a
+    // SECOND time. See the callers of `_nextSessionIsContinuation = true`.
+    const isFastStart = !isDelegate && !session.mcpErrors && !session._isContinuation;
 
     // Track the active agent so CLI hooks can access its LLM provider
     Agent._lastActiveAgent = this;
@@ -1435,6 +1442,18 @@ export class Agent {
         if (!isDelegate && !this.amnesia && sessionTracker) {
           sessionTracker.saveConversation(this.name, contextMemory.serialize());
         }
+        // Post-response abort check. The LLM may have streamed to completion
+        // *while* the user was pressing cancel (the AbortSignal reached the
+        // transport after the response was already on the wire, or the
+        // provider ignored the signal mid-flight). Without this guard we
+        // would cheerfully execute the stale action batch — e.g. "Understood,
+        // I'll remove the background now" — even though the user explicitly
+        // cancelled. Treat it exactly like an AbortError thrown mid-call.
+        if (Agent._cliHooks?.wasAborted?.() || Agent._cliHooks?.getAbortSignal?.()?.aborted) {
+          exitedOnAbort = true;
+          channel.log('agent', `${this.name}: Cancelled by user (post-response)`);
+          break;
+        }
       } catch (error) {
         channel.clear();
 
@@ -1596,9 +1615,67 @@ export class Agent {
         // the agent toward more expensive models). Only real model failures
         // (bad output, refusal, rate limit, exhausted thinking budget) should
         // trigger the escalation reaction.
+        //
+        // A `ProviderBlockedError` (policy refusal, rate limit, quota, auth)
+        // is ALSO not a capability problem — a smarter model from the same
+        // provider will refuse the same content. Escalating to a pricier
+        // sibling wastes tokens and doesn't change the verdict. Treat it
+        // like a network error w.r.t. profile bumps, but additionally mark
+        // the provider on cooldown and force reclassification immediately
+        // so the auto-selector routes to a different provider family on
+        // the very next iteration instead of waiting for 2 consecutive
+        // failures.
         const { isNetworkError } = await import('../llm/is-network-error.js');
         const _isNetErr = isNetworkError(error);
-        if (!_isNetErr) {
+        const _isBlocked = error?.name === 'ProviderBlockedError';
+        const _isPolicyBlock = _isBlocked && error.blockType === 'provider_policy';
+        // Some 400 Bad Request errors are model-specific hard fails that
+        // cannot be fixed by retrying (e.g. "Reasoning is mandatory for
+        // this endpoint and cannot be disabled" when a model only works
+        // in thinking mode, or "image input not supported"). Retrying
+        // the same model burns quota and pollutes the agent's context
+        // with identical error messages. Detect these at the FIRST
+        // failure, cooldown the model (not the provider — sibling
+        // models from the same provider may work), and force an
+        // immediate reclassify.
+        const _errMsg = String(error?.message || error || '');
+        const _is400 = /\b400\b/.test(_errMsg) || /Bad Request/i.test(_errMsg);
+        const _isModelHardFail = _is400 && (
+          /reasoning is mandatory/i.test(_errMsg) ||
+          /cannot be disabled/i.test(_errMsg) ||
+          /unsupported.*parameter/i.test(_errMsg) ||
+          /not supported.*model/i.test(_errMsg) ||
+          /invalid.*for this (model|endpoint)/i.test(_errMsg)
+        );
+        if (_isModelHardFail) {
+          channel.log('agent', `${this.name}: Model hard-fail (${this.llmProvider?.model}): ${_errMsg.slice(0, 200)} — marking model on cooldown + reclassify`);
+          const _failedProvider = this.llmProvider?.provider;
+          const _failedModel = this.llmProvider?.model;
+          if (_failedProvider && _failedModel) {
+            try {
+              const { markModelTimeout } = await import('../llm/providers/factory.js');
+              markModelTimeout(_failedProvider, _failedModel);
+            } catch {}
+          }
+          session._needsReclassify = true;
+        }
+        if (_isBlocked) {
+          // Skip the error.llm reaction — blocked ≠ stupid model.
+          channel.log('agent', `${this.name}: Provider refusal (${error.blockType}: ${error.providerReason || error.message}) — skipping error.llm reaction, rerouting to a different provider`);
+          // Force the next iteration to reclassify and avoid the refusing
+          // provider. For policy blocks we put the WHOLE provider on
+          // cooldown (sibling models share the same policy); for the
+          // rest (rate_limit / quota / auth) we also mark provider since
+          // those are provider-wide in practice.
+          session._needsReclassify = true;
+          const _failedProvider = this.llmProvider?.provider;
+          if (_failedProvider) {
+            try {
+              const { markProviderTimeout } = await import('../llm/providers/factory.js');
+              markProviderTimeout(_failedProvider);
+            } catch {}
+          }
+        } else if (!_isNetErr) {
           // Fire error.llm reaction so agents can bump profile / change phase
           fireReaction(this, 'error.llm', null, {
             error: {
@@ -1753,6 +1830,15 @@ export class Agent {
       let terminated = false;
       for (const action of actionBatch) {
         if (!session.canContinue()) break;
+        // Same reason as the post-LLM-response guard above: the user can
+        // press cancel *between* actions while we iterate a batch. Don't
+        // keep dispatching side-effects (delegate, shell, edit_file…) once
+        // an abort has been recorded.
+        if (Agent._cliHooks?.wasAborted?.() || Agent._cliHooks?.getAbortSignal?.()?.aborted) {
+          exitedOnAbort = true;
+          terminated = true;
+          break;
+        }
 
         // ── PARALLEL GROUP ──────────────────────────────────────────────────
         if (action.parallel && Array.isArray(action.parallel)) {
@@ -2055,6 +2141,27 @@ export class Agent {
               }
               // Release busy state
               Agent._cliHooks?.onBusy?.(false);
+              // Auto-deactivate one-shot workflows now that the root agent
+              // is back to idle. task-manager.js already handles workflows
+              // whose activation created tasks (fires deactivate_workflow
+              // when every task reaches `completed`). But workflows that
+              // run as a single MCP/tool call — e.g. background_remove —
+              // never populate the task queue, so without this hook the
+              // banner stays stuck in "Borrando fondo… (cancelar)" even
+              // after the image was delivered. Scope: only the root agent
+              // (System), only when no pending/in_progress tasks remain.
+              if (this === Agent._rootAgent) {
+                try {
+                  const { taskManager: _tm2 } = await import('../state/task-manager.js');
+                  const _activeWorkflow = this.state?.activeWorkflow;
+                  const _stillPending = _tm2.list().some(
+                    t => t.status === 'pending' || t.status === 'in_progress'
+                  );
+                  if (_activeWorkflow && !_stillPending) {
+                    await this.callAction('deactivate_workflow', { name: _activeWorkflow });
+                  }
+                } catch { /* non-fatal — banner stays active, no harm */ }
+              }
               this._printTokenSummary(session, contextMemory, { reset: true });
               // Tick memory (age entries)
               await contextMemory.tick();
@@ -4415,6 +4522,28 @@ Return ONLY a JSON object, no prose, no markdown fences:
           let currentData = action.data || action.input || {};
           let result;
 
+          // Surface the active document's [DocumentBundle] at delegation
+          // time — the delegate inherits the full working-area context
+          // via the shared openDocumentsStore singleton, so we log the
+          // bundle shape here so it's easy to audit which composite
+          // piece each task was supposed to operate on.
+          try {
+            const { openDocumentsStore } = await import('../state/open-documents-store.js');
+            const active = openDocumentsStore.getActive?.();
+            const b = active?.bundle;
+            if (b) {
+              const base = (p) => p ? p.split('/').pop() : '-';
+              const refs = Array.isArray(b.references) ? b.references : [];
+              channel.log(
+                'agent',
+                `[bundle:${active.id}] (delegate→${teamMember.agent.name}) primary=${base(b.primary?.path)} ` +
+                `annotation=${b.annotation?.path ? base(b.annotation.path) : '-'} ` +
+                `refs=${refs.length}` +
+                `${refs.length ? ' [' + refs.map((r) => base(r.path)).join(', ') + ']' : ''}`,
+              );
+            }
+          } catch { /* non-fatal */ }
+
           // Unique slot ID so each parallel delegation shows its own spinner row.
           const displayName = teamMember.alias || teamMember.agent.name;
           const _delegateSlot = `${displayName}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -5143,33 +5272,30 @@ Be specific and concise. Never ask the user for things you or the delegate can d
     const summaries = [];
     const seen = new Set();
 
+    const makeSummary = (mcpName, client) => ({
+      name: mcpName,
+      description: client.description || '',
+      lazy: client.lazy !== false,
+      tools: client.tools.map(t => ({
+        name: t.name,
+        description: t.description || '',
+        inputSchema: t.inputSchema
+      }))
+    });
+
     // Agent-specific MCPs (declared with `uses mcp`)
     for (const mcpName of this.usesMCPNames) {
       const client = mcpRegistry.get(mcpName);
       if (client && client.connected && client.tools.length > 0) {
         seen.add(mcpName);
-        summaries.push({
-          name: mcpName,
-          tools: client.tools.map(t => ({
-            name: t.name,
-            description: t.description || '',
-            inputSchema: t.inputSchema
-          }))
-        });
+        summaries.push(makeSummary(mcpName, client));
       }
     }
 
     // Global MCPs (from .mcp.json / KOI_GLOBAL_MCP_SERVERS) — available to all agents
     for (const [mcpName, client] of mcpRegistry.entries()) {
       if (!seen.has(mcpName) && mcpRegistry.isGlobal(mcpName) && client.connected && client.tools.length > 0) {
-        summaries.push({
-          name: mcpName,
-          tools: client.tools.map(t => ({
-            name: t.name,
-            description: t.description || '',
-            inputSchema: t.inputSchema
-          }))
-        });
+        summaries.push(makeSummary(mcpName, client));
       }
     }
 

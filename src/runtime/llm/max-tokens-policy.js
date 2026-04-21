@@ -12,9 +12,29 @@
  *      phase declaration, e.g.
  *          phases { writing { code: high, maxOutputTokens: 8000 } }
  *
- * Thinking models get the budget doubled because `max_output_tokens` on them
- * covers reasoning + visible content: half goes to thinking, half to output.
+ * Reasoning models get a multiplicative top-up that SCALES WITH EFFORT —
+ * because `max_output_tokens` covers reasoning + visible content on those
+ * models, and each effort step burns ~2-3× more reasoning tokens than the
+ * previous one. A flat ×2 (the old rule) was enough for effort=low but
+ * routinely exhausted the budget on effort=medium/high, producing the
+ * notorious "0 chars streamed — exhausted max_tokens on reasoning" failure.
  */
+
+import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH } from './constants.js';
+
+/** Effort → multiplier applied to the base budget for reasoning models.
+ *  NONE  → 1× (no reasoning tokens spent internally).
+ *  LOW   → 3× (mild reasoning, leaves ~2× base for visible content).
+ *  MEDIUM→ 5× (moderate reasoning, ~4× base for visible content).
+ *  HIGH  → 8× (heavy reasoning, ~7× base for visible content).
+ *  Numbers chosen empirically from OpenAI's published guidance for gpt-5.x
+ *  / codex models, which recommend ≥25K tokens at high effort. */
+const REASONING_EFFORT_MULTIPLIER = {
+  [EFFORT_NONE]:   1,
+  [EFFORT_LOW]:    3,
+  [EFFORT_MEDIUM]: 5,
+  [EFFORT_HIGH]:   8,
+};
 
 /** Non-thinking base caps by task kind. */
 export const MAX_OUTPUT_TOKENS_BASE = {
@@ -78,13 +98,17 @@ export function resolveMaxOutputTokens({ profile, useThinking, phaseOverride, ca
   }
 
   // Reasoning models share the budget between reasoning and visible content.
-  // Double so the visible portion matches the non-thinking baseline.
-  // This applies both when thinking is explicitly enabled AND when the model
-  // always reasons internally (codex, o1, etc.) — indicated by caps.thinking.
+  // Scale by EFFORT so mid/high effort runs have enough reasoning headroom
+  // to also emit visible content — a flat 2× routinely left 0 visible
+  // tokens at effort=medium on gpt-5.x/codex. This applies both when
+  // thinking is explicitly enabled AND when the model always reasons
+  // internally (codex, o1, etc.) — indicated by caps.thinking.
   const alwaysReasons = caps?.thinking === true;
   if (useThinking || alwaysReasons) {
-    value = value * 2;
-    source += alwaysReasons ? ' +reasoning-model' : ' +thinking';
+    const effort = profile?.reasoningEffort || EFFORT_LOW;
+    const mult = REASONING_EFFORT_MULTIPLIER[effort] ?? 3;
+    value = value * mult;
+    source += alwaysReasons ? ` +reasoning-model(×${mult}@${effort})` : ` +thinking(×${mult}@${effort})`;
   }
 
   // Clamp to what the model actually supports.

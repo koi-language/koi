@@ -156,18 +156,36 @@ export class MediaLibrary {
     const buffer = fs.readFileSync(filePath);
     const hash = contentHash(buffer);
 
-    // Check for existing entry with same hash (deduplication)
+    // Dedup: content_hash is the primary identity — same bytes == same asset.
+    // When a caller re-saves an existing file (most commonly: an image that
+    // was generated, then later reused as a reference) we MUST NOT create a
+    // second row. Doing so caused metadata loss: the original generation
+    // metadata (prompt, model, sampler…) would be shadowed by the newer
+    // "source: reference" entry because list() keeps the newest per hash.
+    //
+    // Historically this used `table.search(zeroVec).where(...)` which is
+    // unreliable — LanceDB's vector search + where can return empty when
+    // the stored embedding is the zero placeholder. `table.filter()` is
+    // purely metadata-driven and always sees the row.
+    const escHash = String(hash).replace(/'/g, "''");
     try {
-      const existing = await table.search(new Array(EMBEDDING_DIM).fill(0))
-        .where(`content_hash = '${hash}'`)
-        .limit(1)
-        .toArray();
-      if (existing.length > 0) {
-        return { id: existing[0].id, isNew: false };
+      const byHash = await table.filter(`content_hash = '${escHash}'`).limit(1).toArray();
+      if (byHash.length > 0) {
+        return { id: byHash[0].id, isNew: false };
       }
-    } catch {
-      // Table might be empty — ignore search errors
-    }
+    } catch { /* table empty or filter unsupported — fall through */ }
+
+    // Secondary dedup: same file_path. Defends against the rare case where
+    // the file was re-encoded identically (same pixels, new bytes → new
+    // hash) between the original save and this one. Still preserves the
+    // original row and its metadata.
+    const escPath = String(filePath).replace(/'/g, "''");
+    try {
+      const byPath = await table.filter(`file_path = '${escPath}'`).limit(1).toArray();
+      if (byPath.length > 0) {
+        return { id: byPath[0].id, isNew: false };
+      }
+    } catch { /* ignore */ }
 
     const dims = await getImageDimensions(filePath);
     const id = `media-${Date.now()}-${hash.substring(0, 8)}`;

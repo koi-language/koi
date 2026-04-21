@@ -212,24 +212,34 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
     };
   }
 
-  const sourcePath = doc.sourcePath || doc.path;
-  if (!sourcePath || !fs.existsSync(sourcePath)) {
+  // New contract: the document carries a [DocumentBundle] — one primary
+  // resource, an optional composite-snapshot annotation, and a list of
+  // references. We queue PRIMARY + ANNOTATION to vision (those are the
+  // two images the agent needs to see to understand intent). References
+  // are NOT auto-queued: they're listed in the bundle so downstream
+  // tools (generate_image) can forward them to the image model, but the
+  // agent doesn't need to inspect each cutout source visually to act on
+  // the user's request. If it ever needs to, it can `read_file` the
+  // specific reference path explicitly.
+  const bundle = doc.bundle || null;
+  const primaryPath = bundle?.primary?.path || doc.path;
+  if (!primaryPath || !fs.existsSync(primaryPath)) {
     return {
       success: false,
-      error: `Active document has no readable source on disk (looked for: ${sourcePath || 'none'}).`,
+      error: `Active document has no readable primary on disk (looked for: ${primaryPath || 'none'}).`,
     };
   }
 
-  const srcExt = path.extname(sourcePath).toLowerCase().slice(1);
+  const srcExt = path.extname(primaryPath).toLowerCase().slice(1);
   const srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
-  const srcB64 = fs.readFileSync(sourcePath).toString('base64');
+  const srcB64 = fs.readFileSync(primaryPath).toString('base64');
 
   if (!session._pendingMcpImages) session._pendingMcpImages = [];
-  session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: sourcePath });
-  channel.log('read_file', `Active ${doc.type} queued for vision: ${sourcePath}`);
+  session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: primaryPath });
+  channel.log('read_file', `[bundle:${doc.id}] primary queued for vision: ${primaryPath}`);
 
   let annotationNote = '';
-  const overlayPath = doc.annotationOverlayPath;
+  const overlayPath = bundle?.annotation?.path || null;
   if (overlayPath && fs.existsSync(overlayPath)) {
     const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
     const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
@@ -237,11 +247,14 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
     const caption =
       '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
       'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
-      'painted on top of the exact same image you just saw. Use it as a visual guide ' +
-      'that complements the text prompt: the shapes and their positions indicate what ' +
-      'the user is referring to. The colors themselves are meaningless — only the ' +
-      'regions and the shapes\' intent matter. Do not treat the markup as part of the ' +
-      'design or copy its colors into your output.';
+      'AND any reference cutouts they have pasted, both painted on top of the exact ' +
+      'same image you just saw. Use it as a visual guide that complements the text ' +
+      'prompt: the shapes and their positions indicate what the user is referring to. ' +
+      'Drawn-colour markup itself is meaningless — only the regions and the shapes\' ' +
+      'intent matter. Do not treat the markup as part of the design or copy its ' +
+      'colours into your output. Pasted cutouts ARE content, but you do NOT need to ' +
+      'inspect their full-quality sources here — they are listed in the bundle and ' +
+      'will be forwarded by generate_image as referenceImages when the edit runs.';
     session._pendingMcpImages.push({
       mimeType: ovMime,
       data: ovB64,
@@ -249,14 +262,28 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
       caption,
       role: 'annotation_overlay',
     });
-    channel.log('read_file', `Annotation overlay queued for vision: ${overlayPath}`);
-    annotationNote = ' The user has drawn annotations over it — a second image labeled "ANNOTATIONS OVERLAY" follows, marking which areas they are pointing at.';
+    channel.log('read_file', `[bundle:${doc.id}] annotation queued for vision: ${overlayPath}`);
+    annotationNote = ' The user has drawn/composed on top of it — a second image labeled "ANNOTATIONS OVERLAY" follows: THAT is the visual intent spec.';
+  }
+
+  // Reference paths — surface them in the return message so the agent
+  // can forward the paths to generate_image without having to inspect
+  // each image visually. Intentionally NOT queued to vision.
+  const refs = Array.isArray(bundle?.references) ? bundle.references : [];
+  if (refs.length > 0) {
+    const refList = refs.map((r, i) => `  ${i + 1}. ${r.path}`).join('\n');
+    annotationNote += ` ${refs.length} reference source(s) available in the bundle for downstream tools:\n${refList}`;
+    channel.log(
+      'read_file',
+      `[bundle:${doc.id}] ${refs.length} reference(s) listed (not vision-queued): ${refs.map((r) => path.basename(r.path)).join(', ')}`,
+    );
   }
 
   return {
     success: true,
     path: originalRequestPath,
     type: doc.url ? 'web' : 'image',
+    bundle: bundle || undefined,
     message:
       `Active working-area ${doc.url ? 'web page' : 'image'} attached for visual analysis.` +
       annotationNote,
@@ -395,15 +422,22 @@ export default {
         session._pendingMcpImages.push({ mimeType: mime, data: b64, _debugPath: filePath });
         channel.log('read_file', `Image queued for vision: ${filePath}`);
 
-        // If this image is also the active working-area document and the
-        // user has drawn annotations over it, queue the annotated composite
-        // right after the original so the LLM sees them as a pair.
+        // If this image is also the active working-area document AND the
+        // tab carries a [DocumentBundle] (annotation / references), queue
+        // the annotation right after the primary so the LLM sees them as
+        // a pair. References are listed in the return message but NOT
+        // queued to vision — generate_image forwards them separately as
+        // referenceImages, so the agent doesn't need to inspect each
+        // cutout source visually to reason about the edit.
         let annotationNote = '';
+        let matchedDoc = null;
         try {
           const { openDocumentsStore } = await import('../../state/open-documents-store.js');
           const doc = openDocumentsStore.findByPathOrUrl(resolvedPath) ||
                       openDocumentsStore.findByPathOrUrl(filePath);
-          const overlayPath = doc?.annotationOverlayPath;
+          matchedDoc = doc;
+          const bundle = doc?.bundle || null;
+          const overlayPath = bundle?.annotation?.path || null;
           if (overlayPath && fs.existsSync(overlayPath)) {
             const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
             const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
@@ -411,11 +445,14 @@ export default {
             const caption =
               '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
               'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
-              'painted on top of the exact same image you just saw. Use it as a visual guide ' +
-              'that complements the text prompt: the shapes and their positions indicate what ' +
-              'the user is referring to. The colors themselves are meaningless — only the ' +
-              'regions and the shapes\' intent matter. Do not treat the markup as part of the ' +
-              'design or copy its colors into your output.';
+              'AND any reference cutouts they have pasted, both painted on top of the exact ' +
+              'same image you just saw. Use it as a visual guide that complements the text ' +
+              'prompt: the shapes and their positions indicate what the user is referring to. ' +
+              'Drawn-colour markup itself is meaningless — only the regions and the shapes\' ' +
+              'intent matter. Do not treat the markup as part of the design or copy its ' +
+              'colours into your output. Pasted cutouts ARE content, but you do NOT need to ' +
+              'inspect their full-quality sources here — they are listed in the bundle and ' +
+              'will be forwarded by generate_image as referenceImages when the edit runs.';
             session._pendingMcpImages.push({
               mimeType: ovMime,
               data: ovB64,
@@ -423,8 +460,17 @@ export default {
               caption,
               role: 'annotation_overlay',
             });
-            channel.log('read_file', `Annotation overlay queued for vision: ${overlayPath}`);
-            annotationNote = ' The user has drawn annotations over it — a second image labeled "ANNOTATIONS OVERLAY" follows, marking which areas they are pointing at.';
+            channel.log('read_file', `[bundle:${doc.id}] annotation queued for vision: ${overlayPath}`);
+            annotationNote = ' The user has drawn/composed on top of it — a second image labeled "ANNOTATIONS OVERLAY" follows: THAT is the visual intent spec.';
+          }
+          const refs = Array.isArray(bundle?.references) ? bundle.references : [];
+          if (refs.length > 0) {
+            const refList = refs.map((r, i) => `  ${i + 1}. ${r.path}`).join('\n');
+            annotationNote += ` ${refs.length} reference source(s) available in the bundle for downstream tools:\n${refList}`;
+            channel.log(
+              'read_file',
+              `[bundle:${doc?.id}] ${refs.length} reference(s) listed (not vision-queued): ${refs.map((r) => path.basename(r.path)).join(', ')}`,
+            );
           }
         } catch { /* store unavailable — ignore */ }
 
@@ -432,6 +478,7 @@ export default {
           success: true,
           path: filePath,
           type: 'image',
+          bundle: matchedDoc?.bundle || undefined,
           message: `Image loaded and attached for visual analysis. You will see the image on your next response.${annotationNote}`
         };
       }

@@ -10,7 +10,7 @@
  *      No resolution logic lives in the backend — just validation.
  *
  * Hard filters depend on the media kind and the request:
- *   - image: canGenerate|canEdit, maxImages, maxRefImages, CSV resolutions /
+ *   - image: maxImages, maxRefImages, CSV resolutions /
  *            aspect ratios.
  *   - video: textToVideo|imageToVideo|videoToVideo, frameControl (if start/
  *            end frame), hasAudio (if withAudio), CSV resolutions / aspect
@@ -42,13 +42,27 @@ const _csvSupports = (csv, requested) => {
 
 const _rankSort = (eligible, req) => {
   const wantLabel = req.label || null;
+  const wantAspect = req.aspectRatio || null;
+  const wantRes = req.resolution || null;
   const rankOf = (m) => {
     const labelRank = wantLabel
       ? (Array.isArray(m.labels) && m.labels.includes(wantLabel) ? 0 : 1)
       : 0;
+    // Soft preferences: a model that advertises the requested
+    // aspect/resolution is preferred over one that doesn't, but both
+    // still compete. For edits, the output inherits the base
+    // dimensions anyway, so the non-match is harmless as a fallback.
+    // Listing order = importance: aspect first (visible cropping),
+    // then resolution (quality tier).
+    const aspectRank = wantAspect
+      ? (_csvSupports(m.aspectRatios, wantAspect) ? 0 : 1)
+      : 0;
+    const resRank = wantRes
+      ? (_csvSupports(m.resolutions, wantRes) ? 0 : 1)
+      : 0;
     const fallbackRank = m.isFallback ? 0 : 1;
     const priceRank = m.pricePerUnit ?? Number.POSITIVE_INFINITY;
-    return [labelRank, fallbackRank, priceRank];
+    return [labelRank, aspectRank, resRank, fallbackRank, priceRank];
   };
   eligible.sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
@@ -75,13 +89,37 @@ const _throwIfEmpty = (eligible, kind, req, total) => {
  */
 const _imageCard = (m) => ({
   slug: m.slug,
-  canGenerate: !!m.canGenerate,
-  canEdit: !!m.canEdit,
   maxImages: m.maxImages ?? null,
   maxRefImages: m.maxRefImages ?? null,
   resolutions: m.resolutions || '',
   aspectRatios: m.aspectRatios || '',
+  // Surfaced so the agent (and the dev reading the log) can tell when a
+  // model was rejected because it carries a label the request didn't ask
+  // for — otherwise the diagnostic looks like "but this model matches!"
+  // while the picker silently drops it for the labels filter.
+  labels: Array.isArray(m.labels) ? m.labels : [],
+  operations: Array.isArray(m.operations) ? m.operations : [],
 });
+
+/**
+ * A model accepts reference images only when its OpenAPI schema declares
+ * an input-image field — recorded as `refField` during the Fal sync
+ * (`image_urls` / `reference_images` / `image_url` / `image`). If
+ * `refField` is absent, the model is text-to-image only and any
+ * `image_urls[]` we ship would be silently dropped by Fal (the exact
+ * failure mode that sent edit requests to fal-ai/nano-banana-2 instead
+ * of fal-ai/nano-banana-2/edit and produced hallucinated outputs).
+ *
+ * `maxRefImages` is a secondary guard when the schema declares an upper
+ * bound: `> 0` means "cap at N", while `=== 0` means "no cap advertised"
+ * (unlimited) and `null` means "not probed yet". Only `> 0 && refsCount
+ * > N` rejects.
+ */
+const _acceptsRefs = (m, refsCount) => {
+  if (!m.refField) return false;
+  if (typeof m.maxRefImages === 'number' && m.maxRefImages > 0 && refsCount > m.maxRefImages) return false;
+  return true;
+};
 
 /**
  * When the hard filters leave zero candidates, build a per-dimension
@@ -94,7 +132,6 @@ function _diagnoseImage(models, req) {
   const out = {};
   const n = req.n || 1;
   const refsCount = req.refsCount || 0;
-  const wantsEdit = refsCount > 0;
 
   if (req.resolution) {
     out[`resolution=${req.resolution}`] = models
@@ -111,13 +148,10 @@ function _diagnoseImage(models, req) {
       .filter((m) => m.maxImages == null || n <= m.maxImages)
       .map(_imageCard);
   }
-  if (wantsEdit) {
+  if (refsCount > 0) {
     out[`refsCount=${refsCount}`] = models
-      .filter((m) => m.canEdit && m.maxRefImages != null
-        && (m.maxRefImages === 0 || refsCount <= m.maxRefImages))
+      .filter((m) => _acceptsRefs(m, refsCount))
       .map(_imageCard);
-  } else {
-    out['canGenerate'] = models.filter((m) => m.canGenerate).map(_imageCard);
   }
   return out;
 }
@@ -144,41 +178,74 @@ export function pickImageModel(models, req = {}) {
 
   const n = req.n || 1;
   const refsCount = req.refsCount || 0;
-  const wantsEdit = refsCount > 0;
   const wantsOperation = typeof req.operation === 'string' && req.operation.trim()
     ? req.operation.trim()
     : null;
 
+  const wantLabel = req.label || null;
+  const modelHasLabels = (m) => Array.isArray(m.labels) && m.labels.length > 0;
+
+  // Philosophy: the router is an AUTOMATIC PICKER. The agent supplies the
+  // parameters it cares about (aspectRatio, resolution, refsCount, …) and
+  // the picker returns the *closest matching active model* — it never
+  // errors out because "no model advertises the exact combination". The
+  // agent has no way to enumerate the catalog, so a "no_model_matches"
+  // error is a router failure, not a user error.
+  //
+  // Hard filters (reject) are limited to things the model categorically
+  // CAN'T do:
+  //   • maxRefImages — the only reference-image gate. 0 = text-only, N>0 =
+  //     cap, null = unlimited. The legacy canEdit/canGenerate booleans
+  //     were a false dichotomy: all "image models" generate images, and
+  //     whether they take references is already captured here.
+  //   • operations[op] when op is requested — hard "can this do the
+  //     requested semantic task?" gate.
+  //   • labels mismatch — labels carve out specialised variants; when no
+  //     label is requested we pin to non-labelled models, and when one is
+  //     requested the model must carry it.
+  //   • n exceeds maxImages — explicit numeric cap.
+  //   • price must be set (only rules out inactive rows).
+  //
+  // Everything else (resolution, aspectRatio, maxRefImages==null with no
+  // refs requested) is a SOFT preference used by _rankSort to pick the
+  // best match among categorical survivors.
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
-    // Structured operation filter — the model must explicitly advertise it.
-    // Intentionally strict: if the model has no `operations` array at all we
-    // reject it. Mixing "unknown" with "supports everything" would silently
-    // route BG-removal requests to models that only do raw generation.
+
+    if (wantLabel) {
+      if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
+    } else {
+      if (modelHasLabels(m)) return false;
+    }
+
     if (wantsOperation) {
       if (!Array.isArray(m.operations) || !m.operations.includes(wantsOperation)) return false;
-      // Operation-scoped routing short-circuits the coarse generate/edit
-      // gates. A BG-removal model doesn't need to declare canEdit=true or
-      // populate maxRefImages — the presence of operations[] is the
-      // authoritative signal. Resolution/aspect are typically not
-      // meaningful for these transforms either (output mirrors input).
+      // Operation-scoped routing short-circuits the soft preferences below
+      // (BG-removal / upscale outputs mirror the input dimensions
+      // regardless of requested aspect/resolution).
       return true;
     }
-    if (wantsEdit && !m.canEdit) return false;
-    if (!wantsEdit && !m.canGenerate) return false;
-    if (m.maxImages != null && n > m.maxImages) return false;
-    if (wantsEdit) {
-      if (m.maxRefImages == null) return false;
-      if (m.maxRefImages > 0 && refsCount > m.maxRefImages) return false;
+
+    // Specialist exclusion — when no operation requested, skip models
+    // whose `operations` array is non-empty and doesn't include a general
+    // image op (e.g. bg-remove / upscale only).
+    if (Array.isArray(m.operations) && m.operations.length > 0) {
+      const hasGeneralCap =
+        m.operations.includes('generate') ||
+        m.operations.includes('edit') ||
+        m.operations.includes('text-to-image') ||
+        m.operations.includes('image-to-image');
+      if (!hasGeneralCap) return false;
     }
-    if (!_csvSupports(m.resolutions, req.resolution)) return false;
-    if (!_csvSupports(m.aspectRatios, req.aspectRatio)) return false;
+
+    if (m.maxImages != null && n > m.maxImages) return false;
+    if (refsCount > 0 && !_acceptsRefs(m, refsCount)) return false;
     return true;
   });
 
   if (eligible.length === 0) {
     throw new MediaModelRoutingError(
-      `No active image model matches every requested capability at once`,
+      'No active image model matches the requested constraints (refsCount, operation, label, maxImages)',
       {
         requirements: req,
         candidates: models.length,

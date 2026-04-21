@@ -2,8 +2,8 @@
  * Background Removal Action — removes the background from an image.
  *
  * Routes to a Fal model whose catalog entry advertises
- * `operations.includes('bg-remove')`. Model selection happens client-side
- * via pickImageModel (operation: 'bg-remove') and the concrete slug is sent
+ * `operations.includes('background-removal')`. Model selection happens client-side
+ * via pickImageModel (operation: 'background-removal') and the concrete slug is sent
  * to the gateway — the backend never decides.
  *
  * Permission: 'generate_image' (reused — background removal is a form of
@@ -15,6 +15,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
+import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -27,7 +28,7 @@ const IMAGE_EXT_TO_MIME = {
 export default {
   type: 'background_removal',
   intent: 'background_removal',
-  description: 'Remove the background from an existing image. Returns a new PNG with transparent background. In: "image" (path or attachment id, required), optional "outputFormat" (png|webp). Returns: { success, provider, model, images: [{ savedTo }] }.',
+  description: 'Remove the background from an existing image. Returns a new PNG with transparent background. In: "image" (path or attachment id, required), optional "outputFormat" (png|webp), optional "saveTo" (directory path). Returns: { success, provider, model, images: [{ savedTo }] }.',
   thinkingHint: 'Removing background',
   permission: 'generate_image',
 
@@ -42,6 +43,10 @@ export default {
         type: 'string',
         description: 'Output format — png (default, preserves alpha) or webp.',
       },
+      saveTo: {
+        type: 'string',
+        description: 'Directory path where the result should be saved. Mirrors generate_image. If omitted, the image lands in ~/.koi/images/ (shared with generate_image). Filename is auto-generated (bgremove_<timestamp>_<i>.<ext>).',
+      },
     },
     required: ['image'],
   },
@@ -49,6 +54,7 @@ export default {
   examples: [
     { intent: 'background_removal', image: '/Users/me/.koi/images/product_photo.png' },
     { intent: 'background_removal', image: 'att-1', outputFormat: 'webp' },
+    { intent: 'background_removal', image: 'att-1', saveTo: '/Users/me/project/assets' },
   ],
 
   async execute(action, agent) {
@@ -99,18 +105,21 @@ export default {
       };
     }
 
-    const ext = path.extname(resolvedPath).toLowerCase();
-    const mimeType = IMAGE_EXT_TO_MIME[ext] || 'image/png';
-    const imgBuf = fs.readFileSync(resolvedPath);
-    const imgB64 = `data:${mimeType};base64,${imgBuf.toString('base64')}`;
+    const normalized = await normalizeImageForProvider(resolvedPath);
+    if (normalized.converted) {
+      channel.log('image', `Input normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
+    }
+    const imgBuf = fs.readFileSync(normalized.path);
+    const imgB64 = `data:${normalized.mimeType};base64,${imgBuf.toString('base64')}`;
 
     channel.log('image', `background_removal: ${resolved.provider} (auto-select), input=${path.basename(resolvedPath)} (${(imgBuf.length / 1024).toFixed(0)}KB)`);
 
     let result;
     try {
-      result = await instance.runOperation('bg-remove', imgB64, {
+      result = await instance.runOperation('background-removal', imgB64, {
         outputFormat: action.outputFormat || 'png',
       });
+      if (result?.model) channel.log('image', `Model resolved → ${result.model}`);
     } catch (err) {
       const errMsg = err.message || String(err);
       const details = err.details || null;
@@ -119,18 +128,22 @@ export default {
           success: false,
           errorType: 'no_model_matches',
           error: errMsg,
-          hint: 'No active image model advertises operations.includes("bg-remove"). Ask the backend admin to tag at least one background-removal model (e.g. bria-rmbg-2.0) with operations: ["bg-remove"].',
+          hint: 'No active image model advertises operations.includes("background-removal"). Ask the backend admin to tag at least one background-removal model (e.g. bria-rmbg-2.0) with operations: ["background-removal"].',
         };
       }
       return { success: false, provider: resolved.provider, error: errMsg };
     }
 
-    // Persist output to ~/.koi/images/ — same convention as generate_image.
+    // Persist output — honor saveTo when provided (mirrors generate_image).
+    // Default lives in ~/.koi/images/ so new results still feed the global
+    // media library without the agent having to specify a directory.
     if (!result.images?.length) {
       return { success: false, provider: resolved.provider, model: result.model, error: 'Background removal returned no images.' };
     }
 
-    const saveDir = path.join(os.homedir(), '.koi', 'images');
+    const saveDir = typeof action.saveTo === 'string' && action.saveTo.trim()
+      ? path.resolve(action.saveTo.trim())
+      : path.join(os.homedir(), '.koi', 'images');
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = action.outputFormat === 'webp' ? 'webp' : 'png';
@@ -174,7 +187,7 @@ export default {
             prompt: null,
             model: result.model,
             provider: resolved.provider,
-            operation: 'bg-remove',
+            operation: 'background-removal',
             sourceImage: resolvedPath,
             outputFormat: outExt,
           });
@@ -184,11 +197,25 @@ export default {
       channel.log('image', `Media library save failed (non-fatal): ${mlErr.message}`);
     }
 
+    // Record provenance for the coordinator's recall_facts view.
+    try {
+      const { recordImageOp } = await import('../../state/image-lineage.js');
+      for (const img of saved) {
+        if (!img.savedTo) continue;
+        recordImageOp({
+          op: 'bg-remove',
+          outputPath: img.savedTo,
+          sourcePath: resolvedPath,
+          agentName: agent?.name,
+        });
+      }
+    } catch { /* lineage is best-effort */ }
+
     return {
       success: true,
       provider: resolved.provider,
       model: result.model,
-      operation: 'bg-remove',
+      operation: 'background-removal',
       imageCount: saved.length,
       images: saved,
       usage: result.usage,

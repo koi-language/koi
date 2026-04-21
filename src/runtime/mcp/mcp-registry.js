@@ -36,6 +36,12 @@ class MCPRegistry {
         console.error(`[MCPRegistry] Registered MCP: ${name} (${config.command} ${(config.args || []).join(' ')})`);
       }
     }
+
+    // Optional hints shown in the compact system-prompt listing. Avoids
+    // re-reading .mcp.json at prompt-build time.
+    client.description = typeof config.description === 'string' ? config.description : '';
+    client.lazy = config.lazy === false ? false : true;
+
     this.clients.set(name, client);
   }
 
@@ -126,6 +132,26 @@ class MCPRegistry {
     }
 
     return await client.callTool(toolName, args);
+  }
+
+  /**
+   * Get compact server summaries for all registered MCPs.
+   * Used by the system prompt builder in lazy mode — returns only the
+   * server name, a short description and the tool count (no schemas).
+   * @returns {Array<{name: string, description: string, lazy: boolean, toolCount: number, connected: boolean}>}
+   */
+  getServerSummaries() {
+    const summaries = [];
+    for (const [name, client] of this.clients) {
+      summaries.push({
+        name,
+        description: client.description || '',
+        lazy: client.lazy !== false,
+        toolCount: Array.isArray(client.tools) ? client.tools.length : 0,
+        connected: !!client.connected,
+      });
+    }
+    return summaries;
   }
 
   /**

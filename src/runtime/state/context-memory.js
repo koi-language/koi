@@ -271,7 +271,28 @@ export function classifyFeedback(action, result, error) {
       ? (result.error.length > 3000 ? result.error.substring(0, 3000) + '...[truncated]' : result.error)
       : String(result.error);
     const stdoutPart = result.stdout ? `\nOutput:\n${result.stdout.substring(0, 3000)}` : '';
-    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${errText}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}`;
+    // Rich tool errors (generate_image/upscale_image/etc.) already come with
+    // actionable fields — errorType, requirements, alternatives, hint. The
+    // old classifier only surfaced `error`, so the LLM got "FAILED: No
+    // active image model matches…" with no way to recover. Now we also
+    // serialise the diagnostic payload so the LLM can cross-reference the
+    // alternatives list and retry with a compatible request. Kept compact
+    // (5kb cap) to avoid ballooning context.
+    const diagParts = [];
+    if (result.errorType) diagParts.push(`errorType: ${result.errorType}`);
+    if (result.hint) diagParts.push(`hint: ${result.hint}`);
+    if (result.requirements) {
+      try { diagParts.push(`requirements: ${JSON.stringify(result.requirements)}`); } catch { /* ignore */ }
+    }
+    if (result.alternatives) {
+      try {
+        let alt = JSON.stringify(result.alternatives);
+        if (alt.length > 5000) alt = alt.substring(0, 5000) + '...[truncated]';
+        diagParts.push(`alternatives: ${alt}`);
+      } catch { /* ignore */ }
+    }
+    const diagBlock = diagParts.length > 0 ? `\n${diagParts.join('\n')}` : '';
+    const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${errText}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}${diagBlock}`;
     return {
       immediate,
       shortTerm: `❌ ${intent} FAILED${exitCodeStr}: ${errText.substring(0, 200)}`,

@@ -485,18 +485,38 @@ export class GatewayImageGen extends BaseImageGen {
       b64: img.b64 || img.b64_json || undefined,
       revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
     }));
-    return { images, usage: data.usage || { input: 0, output: 0 } };
+    // `resolvedModel` is the concrete slug the client-side router picked.
+    // Surface it so callers can log the real model and tag metadata with
+    // it — "auto" / declared `this.model` hides which one actually ran.
+    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 
   /**
    * Run a semantic image operation (bg-remove, upscale, inpaint, …) against
    * whichever active model advertises `operations.includes(<op>)`. Unlike
-   * `generate`/`edit`, the shape is minimal: just { model, image, operation }.
-   * The backend forwards to Fal with the slug we picked — no prompt,
-   * aspect_ratio, or resolution (those are generation concerns).
+   * `generate`, the input shape depends on the concrete Fal model — most
+   * take just `image_url` (no prompt, no aspect ratio). We post through
+   * /gateway/fal/raw which uploads a base64 data URI to Fal storage and
+   * forwards the call verbatim.
+   *
+   * @param {string} operation - e.g. 'background-removal', 'upscale'
+   * @param {string|Buffer} image - data URI ("data:image/png;base64,...")
+   *   or raw base64 string or Buffer. A plain base64 string is wrapped in
+   *   a data URI before posting.
    */
   async runOperation(operation, image, opts = {}) {
-    const imgData = typeof image === 'string' ? image : image.toString('base64');
+    // Normalize to a base64 data URI so /fal/raw can upload it to Fal.
+    let dataUri;
+    if (Buffer.isBuffer(image)) {
+      dataUri = `data:image/png;base64,${image.toString('base64')}`;
+    } else if (typeof image === 'string') {
+      dataUri = image.startsWith('data:')
+        ? image
+        : `data:image/png;base64,${image}`;
+    } else {
+      throw new Error('runOperation: image must be a data URI, base64 string, or Buffer');
+    }
+
     const resolvedModel = await _resolveMediaModel('image', this.model, opts, (models, req) =>
       import('./media-model-router.js').then(({ pickImageModel, MediaModelRoutingError }) => {
         try {
@@ -509,10 +529,45 @@ export class GatewayImageGen extends BaseImageGen {
       { operation },
     );
 
-    const payload = { model: resolvedModel, image: imgData, operation };
+    // /fal/raw expects { model, ...passthroughInput }. Most BG-remove /
+    // upscaler models take `image_url`; we set it here and let Fal-side
+    // input validation reject if a model needs a different field (rare).
+    const payload = { model: resolvedModel, image_url: dataUri };
     if (opts.outputFormat) payload.output_format = opts.outputFormat;
 
-    const res = await fetch(`${getGatewayBase()}/media/image/edit`, {
+    // Upscaler options — map the provider-neutral contract (see
+    // tools/media/upscale-image.js) to Fal field names. Unknown-to-Fal
+    // fields are harmless (Fal's input validation rejects extras only
+    // when strictInput is on, which the upscaler schemas don't use).
+    if (operation === 'upscale') {
+      if (typeof opts.upscaleFactor === 'number') {
+        payload.upscale_factor = opts.upscaleFactor;
+      }
+      if (typeof opts.prompt === 'string' && opts.prompt.length > 0) {
+        payload.prompt = opts.prompt;
+      }
+      if (typeof opts.creativity === 'number') {
+        // Normalize 0–1 → Topaz's 1–6 integer scale. Other upscalers
+        // that accept a 0–1 creativity field also get the raw value as
+        // a fallback key so they see it too.
+        const topazCreativity = Math.max(1, Math.min(6, Math.round(1 + opts.creativity * 5)));
+        payload.creativity = topazCreativity;
+        payload.creativity_level = opts.creativity; // generic 0–1 fallback
+      }
+      if (typeof opts.faceEnhancement === 'boolean') {
+        payload.face_enhancement = opts.faceEnhancement;
+      }
+      // Escape hatch for model-specific fields (Topaz model variant,
+      // texture, subject_detection, denoise, …). Object.assign after the
+      // normalized keys so callers can override if they really mean to.
+      if (opts.extra && typeof opts.extra === 'object') {
+        for (const [k, v] of Object.entries(opts.extra)) {
+          if (v !== undefined) payload[k] = v;
+        }
+      }
+    }
+
+    const res = await fetch(`${getGatewayBase()}/fal/raw`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(payload),
@@ -524,17 +579,30 @@ export class GatewayImageGen extends BaseImageGen {
       const bodyText = await res.text().catch(() => '');
       let structured = null;
       try { structured = JSON.parse(bodyText); } catch {}
-      const err = new Error(structured?.error || `Gateway image ${operation} error (${res.status}): ${bodyText}`);
+      const err = new Error(structured?.error || `Gateway ${operation} error (${res.status}): ${bodyText}`);
       err.status = res.status;
       if (structured) err.details = structured;
       throw err;
     }
 
     const data = await res.json();
-    const images = (data.images || data.data || []).map(img => ({
-      url: img.url || undefined,
-      b64: img.b64 || img.b64_json || undefined,
-    }));
+    // Fal rembg/upscaler/etc payloads use several field names for the
+    // output: { image: { url } }, { images: [{ url }] }, { image_url }.
+    // Collect them into a normalized shape the tool can iterate over.
+    const images = [];
+    if (Array.isArray(data.images)) {
+      for (const img of data.images) {
+        images.push({ url: img?.url || img?.image_url, b64: img?.b64 || img?.b64_json });
+      }
+    } else if (data.image && typeof data.image === 'object') {
+      images.push({ url: data.image.url, b64: data.image.b64 || data.image.b64_json });
+    } else if (typeof data.image_url === 'string') {
+      images.push({ url: data.image_url });
+    } else if (Array.isArray(data.data)) {
+      for (const img of data.data) {
+        images.push({ url: img?.url, b64: img?.b64 || img?.b64_json });
+      }
+    }
     return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 
@@ -572,7 +640,10 @@ export class GatewayImageGen extends BaseImageGen {
       b64: img.b64 || img.b64_json || undefined,
       revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
     }));
-    return { images, usage: data.usage || { input: 0, output: 0 } };
+    // `resolvedModel` is the concrete slug the client-side router picked.
+    // Surface it so callers can log the real model and tag metadata with
+    // it — "auto" / declared `this.model` hides which one actually ran.
+    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 }
 

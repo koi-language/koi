@@ -95,11 +95,17 @@ export default {
           channel.log('image', `segment_image: client=${client ? 'OK' : 'NULL (no KOI_AUTH_TOKEN)'}, base=${base}`);
           if (client) {
             const llm = createLLM('openai', client, selected.model, { temperature: 0, maxTokens: 500, useThinking: false });
+            // IMPORTANT: the OpenAI `json_object` response format FORBIDS
+            // returning a bare array. If you ask the model for "a JSON
+            // array" under that format it protests by emitting something
+            // like `{"image":"requires_json_array_only"}` — valid JSON,
+            // totally useless as a concept list. Mirror the constraint
+            // in the prompt: ask for an object with an `items` array.
             const { text: content } = await llm.complete([{
               role: 'user',
               content: [
                 { type: 'image_url', image_url: { url: imageUrl } },
-                { type: 'text', text: 'List every distinct object, person, animal, or element visible in this image. If there are MULTIPLE instances of the same type, list each separately with a short spatial qualifier (2-4 words max per item). Return ONLY a JSON array, e.g. ["person left","person right","red chair","table","small dog"]. Max 20 items. No explanation.' },
+                { type: 'text', text: 'List every distinct object, person, animal, or element visible in this image. If there are MULTIPLE instances of the same type, list each separately with a short spatial qualifier (2-4 words max per item). Return ONLY a JSON object of the form {"items": ["person left","person right","red chair","table","small dog"]}. Max 20 items in the array. No explanation, no extra keys.' },
               ],
             }], { timeoutMs: 15000, responseFormat: 'json_object' });
 
@@ -112,17 +118,29 @@ export default {
               const parsed = JSON.parse(clean);
               channel.log('image', `segment_image: parsed type=${typeof parsed}, isArray=${Array.isArray(parsed)}, keys=${typeof parsed === 'object' && parsed ? Object.keys(parsed).length : 'N/A'}`);
 
+              // Preferred shape (matches the prompt we just sent):
+              //   { "items": ["person left", "red chair", ...] }
+              // Everything else is a fallback for older/weaker models
+              // that emit arbitrary JSON shapes.
+              const looksLikeModelProtest = (s) => {
+                const t = s.toLowerCase();
+                // Catches the "requires_json_array_only" / "must_return_array"
+                // / "expected_array" family — the model's way of refusing
+                // when the prompt and the response_format disagree.
+                return /requires?_|must_|expected_|response_format|json[_-]?(array|object)/.test(t)
+                    || t.includes('_only');
+              };
+
               // Recursively collect all string values from any structure
               const collectStrings = (obj) => {
                 const result = [];
                 if (typeof obj === 'string') {
-                  // Try to parse strings that look like embedded JSON (double-encoded)
                   const trimmed = obj.trim();
                   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
                     try { return collectStrings(JSON.parse(trimmed)); } catch {}
                   }
-                  // Valid concept: short, no JSON chars
-                  if (obj.length > 1 && !obj.includes('{') && !obj.includes('[')) {
+                  if (obj.length > 1 && !obj.includes('{') && !obj.includes('[')
+                      && !looksLikeModelProtest(obj)) {
                     result.push(obj);
                   }
                 } else if (Array.isArray(obj)) {
@@ -133,7 +151,13 @@ export default {
                 return result;
               };
 
-              concepts = [...new Set(collectStrings(parsed))]; // deduplicate
+              // Prefer the canonical shape when present, otherwise fall
+              // back to the recursive collector (covers model quirks).
+              if (parsed && Array.isArray(parsed.items)) {
+                concepts = [...new Set(parsed.items.filter(x => typeof x === 'string' && !looksLikeModelProtest(x)))];
+              } else {
+                concepts = [...new Set(collectStrings(parsed))];
+              }
               channel.log('image', `segment_image: collected ${concepts.length} concepts: ${JSON.stringify(concepts).substring(0, 200)}`);
             } catch (parseErr) {
               channel.log('image', `segment_image: JSON parse failed: ${parseErr.message}, attempting recovery...`);

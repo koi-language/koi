@@ -25,9 +25,17 @@ function _classifyOpenAIError(err) {
   const status = err?.status || err?.statusCode || err?.response?.status || 0;
   const reason = err?.message || err?.error?.message || 'Unknown provider error';
 
-  // Policy / moderation
+  // Policy / moderation.
+  // `PROHIBITED_CONTENT` / `SAFETY` / `RECITATION` / `BLOCKLIST` come from
+  // Gemini (and other OpenAI-compat providers) when the finish_reason is a
+  // policy refusal — the OpenAI SDK surfaces the literal finish_reason as
+  // an error message. We match them here so agent.js can see a
+  // ProviderBlockedError and route to a different provider instead of
+  // treating the refusal as a capability failure and bumping scores.
   if (code === 'content_policy_violation' || type === 'content_policy_violation'
-      || code === 'moderation_blocked' || /safety system|content policy|moderation/i.test(reason)) {
+      || code === 'moderation_blocked'
+      || /safety system|content policy|moderation/i.test(reason)
+      || /^(PROHIBITED_CONTENT|SAFETY|RECITATION|BLOCKLIST|IMAGE_SAFETY|SPII)$/i.test(reason.trim())) {
     return new ProviderBlockedError({
       blockType: 'provider_policy', provider: 'openai', reason,
     });
@@ -72,21 +80,49 @@ export class OpenAIChatLLM extends BaseLLM {
     let _finishReason = null;
 
     try {
+      // Send reasoning_effort ONLY when we actually want reasoning. Even
+      // effort='low' on reasoning-capable models burns the entire
+      // max_tokens budget on internal thinking (the "3 minute silent
+      // stream" pattern on Gemini via OpenRouter).
+      const wantsReasoning = this.useThinking && this.caps.thinking;
+
       const params = this._cleanParams({
         model: this.model,
         messages,
-        temperature: 0,
         max_completion_tokens: this.maxTokens,
-        response_format: { type: 'json_object' },
         stream: true,
         stream_options: { include_usage: true },
-        // Only send reasoning_effort when we actually WANT reasoning.
-        // Sending 'low' or 'none' still triggers internal reasoning on
-        // some models (Gemini), burning the entire max_tokens budget.
-        // Omitting the field entirely disables reasoning.
-        ...(this.caps.thinking && this.reasoningEffort && this.reasoningEffort !== 'none' && { reasoning_effort: this.reasoningEffort }),
+        ...(wantsReasoning && this.reasoningEffort && this.reasoningEffort !== 'none'
+          ? { reasoning_effort: this.reasoningEffort }
+          : {}),
       });
-      channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens} reasoning_effort=${params.reasoning_effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature}`);
+
+      // When the model CAN think but we don't want it to, behaviour splits
+      // by the model's DEFAULT thinking level (what it does when no
+      // `reasoning` param is sent):
+      //   • default = OFF (e.g. gemini-3-flash-preview): send NOTHING.
+      //     Sending `effort:'minimal'` here would force a positive
+      //     thinkingLevel and increase latency 10x+.
+      //   • default = medium/high (e.g. gpt-5.x reasoning models like
+      //     gpt-5.1-codex, gpt-5-pro, AND gemini-3.1-pro-preview which is
+      //     mandatory): send `effort:'minimal'` to disable/minimize
+      //     reasoning. Not sending anything would burn the full max_tokens
+      //     budget on internal reasoning and return 0 chars of content.
+      // Per OpenRouter docs (guides/best-practices/reasoning-tokens),
+      // `effort` and `max_tokens` are mutually exclusive. Enum:
+      // xhigh|high|medium|low|minimal|none.
+      //
+      // Heuristic for "default = off": currently only Gemini *-flash-*
+      // preview models. Everything else that can think defaults to on.
+      if (this.caps.thinking && !this.useThinking) {
+        const isFlashDefaultOff = /gemini[-\s.]?\d+.*flash/i.test(this.model);
+        if (!isFlashDefaultOff) {
+          params.reasoning = { effort: 'minimal', exclude: true };
+          channel.log('llm', `[reasoning-min] ${params.model}: effort=minimal${this.caps.mandatoryThinking ? ' (mandatory)' : ''}`);
+        }
+      }
+
+      channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens} reasoning_effort=${params.reasoning_effort ?? params.reasoning?.effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature ?? '(default)'}`);
       const options = abortSignal ? { signal: abortSignal } : {};
       const stream = await this.client.chat.completions.create(params, options);
 
@@ -182,6 +218,17 @@ export class OpenAIChatLLM extends BaseLLM {
     // Fall back to character-based estimate for thinking tokens if provider didn't report them
     if (!usage.thinking && _thinkChars > 0) usage.thinking = Math.ceil(_thinkChars / 4);
     this._logEnd(outChars);
+    // Diagnostic: when we explicitly asked the model NOT to reason but
+    // it still burned reasoning tokens, say so loudly. Means the disable
+    // signals were ignored somewhere in the chain (gateway / OpenRouter /
+    // upstream) and we can't fix it from the client — the fix has to
+    // live in the hop that's dropping the hint.
+    if (this.caps.thinking && !this.useThinking && (usage.thinking || 0) > 0) {
+      channel.log(
+        'llm',
+        `[reasoning-off-IGNORED] ${this.model}: burned ${usage.thinking} reasoning tokens (out=${usage.output}) — disable signal dropped somewhere in the chain`,
+      );
+    }
 
     const text = buffer.trim();
     if (!text) {
