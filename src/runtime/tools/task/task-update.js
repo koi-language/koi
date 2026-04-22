@@ -59,7 +59,7 @@ export default {
     { actionType: 'direct', intent: 'task_update', taskId: '4', addBlockedBy: ['2', '3'] },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     const { taskId, ...updates } = action;
     // Strip non-update fields
     delete updates.actionType;
@@ -68,6 +68,26 @@ export default {
 
     try {
       const task = taskManager.update(taskId, updates);
+
+      // Release skills tied to this task when it terminates. Paired with
+      // the activation in `task_create`: whatever was activated because
+      // the task entered the queue gets deactivated now so it doesn't
+      // bloat the system prompt for unrelated work. If the calling agent
+      // isn't the one that activated the skill (e.g. System created the
+      // task and a delegate finishes it), we try the calling agent's
+      // state as a best-effort — the deactivate action itself no-ops
+      // when the skill isn't active.
+      if (updates.status === 'completed' || updates.status === 'deleted') {
+        const scoped = taskManager.popScopedSkills(taskId);
+        if (scoped.length > 0 && agent && typeof agent.callAction === 'function') {
+          for (const { skillName } of scoped) {
+            try {
+              await agent.callAction('deactivate_skill', { name: skillName });
+            } catch { /* non-fatal */ }
+          }
+        }
+      }
+
       return task;
     } catch (err) {
       return { error: err.message };

@@ -1659,6 +1659,12 @@ export class Agent {
           }
           session._needsReclassify = true;
         }
+        // Detect "exhausted thinking budget" style errors (model spent all
+        // max_tokens on reasoning and emitted no content). Two recovery levers:
+        // lower the reasoning effort, or raise the max_tokens budget so the
+        // model has room for actual content.
+        const _isThinkingExhaustion = /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(error.message || '');
+
         if (_isBlocked) {
           // Skip the error.llm reaction — blocked ≠ stupid model.
           channel.log('agent', `${this.name}: Provider refusal (${error.blockType}: ${error.providerReason || error.message}) — skipping error.llm reaction, rerouting to a different provider`);
@@ -1675,6 +1681,31 @@ export class Agent {
               markProviderTimeout(_failedProvider);
             } catch {}
           }
+        } else if (_isThinkingExhaustion) {
+          // "returned no content" is NOT a capability problem — the model
+          // happily accepted the request, reasoned, and emitted nothing.
+          // Bumping code/reasoning via error.llm only makes things worse:
+          // it drives the selector to the highest-tier model, which is
+          // usually the same one that just failed, creating an infinite
+          // retry loop (the exact symptom the user reported: same
+          // gemini-3.1-pro-preview picked over and over after 5 "no
+          // content" errors).
+          //
+          // Instead: blacklist THIS specific model (not the whole
+          // provider — sibling models may work fine) and force a
+          // reclassify so the next iteration picks something else. The
+          // effort/maxTokens adjustments below still run as secondary
+          // recovery levers.
+          const _failedProvider = this.llmProvider?.provider;
+          const _failedModel = this.llmProvider?.model;
+          channel.log('agent', `${this.name}: "No content" from ${_failedProvider}/${_failedModel} — skipping error.llm reaction, blacklisting model + reclassify`);
+          if (_failedProvider && _failedModel) {
+            try {
+              const { markModelTimeout } = await import('../llm/providers/factory.js');
+              markModelTimeout(_failedProvider, _failedModel);
+            } catch {}
+          }
+          session._needsReclassify = true;
         } else if (!_isNetErr) {
           // Fire error.llm reaction so agents can bump profile / change phase
           fireReaction(this, 'error.llm', null, {
@@ -1688,12 +1719,6 @@ export class Agent {
         } else {
           channel.log('agent', `${this.name}: Network/transient error — skipping error.llm reaction (no profile bump)`);
         }
-
-        // Detect "exhausted thinking budget" style errors (model spent all
-        // max_tokens on reasoning and emitted no content). Two recovery levers:
-        // lower the reasoning effort, or raise the max_tokens budget so the
-        // model has room for actual content.
-        const _isThinkingExhaustion = /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(error.message || '');
         if (_isThinkingExhaustion && this.llmProvider?._activeSession) {
           const _sess = this.llmProvider._activeSession;
           if (!_sess._phaseProfile) _sess._phaseProfile = {};
@@ -2523,6 +2548,21 @@ export class Agent {
                 await this._autoMatchWorkflow(this._lastUserMessage);
               } catch (e) {
                 channel.log('workflow', `${this.name}: Auto-match workflow failed: ${e.message}`);
+              }
+
+              // ── AUTO-ACTIVATE SKILLS (root coordinator) ──────────────────
+              // Delegates run _autoActivateSkills once at start (see the
+              // `isDelegate && !skills.length` branch earlier in handle()),
+              // using their task args. The root coordinator has no task args
+              // — its context is the user's message itself — so the same
+              // hook has to fire here, once per fresh user turn, with the
+              // user text as taskText. Without this the Skills tab never
+              // lights up when System decides to answer directly instead
+              // of delegating (exactly what the user reported).
+              try {
+                await this._autoActivateSkills({ userRequest: this._lastUserMessage });
+              } catch (e) {
+                channel.log('skills', `${this.name}: Auto-activate skills failed: ${e.message}`);
               }
             }
 

@@ -40,8 +40,18 @@ export default {
 
     const newSkills = currentSkills.filter(s => s !== skillName);
 
+    // Also drop the skill's markdown content from `_skillContents` — that
+    // map is what llm-provider injects into the system prompt. Without
+    // this the instructions for a "deactivated" skill keep leaking into
+    // every future turn and the prompt grows unbounded across long
+    // sessions.
+    const currentContents = { ...(agent.state?._skillContents || {}) };
+    if (currentContents[skillName]) {
+      delete currentContents[skillName];
+    }
+
     // Update agent state via agent.callAction (avoids circular import)
-    await agent.callAction('update_state', { updates: { skills: newSkills } });
+    await agent.callAction('update_state', { updates: { skills: newSkills, _skillContents: currentContents } });
 
     channel.print(`\x1b[33m✗\x1b[0m \x1b[2mSkill deactivated: \x1b[1m${skillName}\x1b[0m`);
     channel.skillDeactivated?.({ agent: agent.name, skill: skillName });

@@ -238,6 +238,26 @@ export function pickImageModel(models, req = {}) {
       if (!hasGeneralCap) return false;
     }
 
+    // Edit-only exclusion — when NO reference images are provided, reject
+    // models that only advertise `edit` / `image-to-image` (and no pure
+    // text-to-image cap). Fal rejects these calls with `body.image_url:
+    // Field required` because the model's OpenAPI marks the ref field as
+    // required. Without this filter a text-only prompt can get routed to
+    // an edit-only model and fail at provider time with no local signal.
+    if (refsCount === 0 && Array.isArray(m.operations) && m.operations.length > 0) {
+      const hasTextToImage =
+        m.operations.includes('generate') ||
+        m.operations.includes('text-to-image');
+      const isEditOnly =
+        !hasTextToImage && (
+          m.operations.includes('edit') ||
+          m.operations.includes('image-to-image') ||
+          m.operations.includes('inpaint') ||
+          m.operations.includes('outpaint')
+        );
+      if (isEditOnly) return false;
+    }
+
     if (m.maxImages != null && n > m.maxImages) return false;
     if (refsCount > 0 && !_acceptsRefs(m, refsCount)) return false;
     return true;

@@ -412,6 +412,44 @@ export default {
 
       const filePath = saveTo || _deriveFilename(url, fetchRes.headers);
       const resolvedPath = path.resolve(filePath);
+
+      // Image sanity check — when the download looks like an image (by
+      // Content-Type OR by saveTo extension), decode the buffer with sharp
+      // BEFORE writing to disk. Catches: 0-byte files, truncated downloads,
+      // HTML/JSON served with an image Content-Type, CDN placeholders, and
+      // anti-hotlink tracking pixels. Without this the bad image lands in
+      // downstream tools (generate_image referenceImages, OCR, thumbnails)
+      // and fails there with a generic provider error — exactly the loop
+      // we hit with the Artemis refs.
+      const isImageDownload =
+        /^image\//i.test(finalCT) ||
+        /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(resolvedPath);
+      if (isImageDownload) {
+        try {
+          const sharp = (await import('sharp')).default;
+          const meta = await sharp(bodyBuf).metadata();
+          if (!meta?.width || !meta?.height || !meta?.format) {
+            return {
+              success: false,
+              url: fetchRes.url,
+              contentType: finalCT,
+              via,
+              fileSize: bodyBuf.length,
+              error: `Downloaded ${bodyBuf.length} bytes but the response is not a decodable image. Content-Type=${finalCT || 'unknown'}. The server likely returned an error/placeholder page. Try a different URL.`,
+            };
+          }
+        } catch (decodeErr) {
+          return {
+            success: false,
+            url: fetchRes.url,
+            contentType: finalCT,
+            via,
+            fileSize: bodyBuf.length,
+            error: `Response is not a valid image (${decodeErr.message}). Content-Type=${finalCT || 'unknown'}, size=${bodyBuf.length}B. Try a different URL.`,
+          };
+        }
+      }
+
       const dir = path.dirname(resolvedPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(resolvedPath, bodyBuf);

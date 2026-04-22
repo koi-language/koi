@@ -277,6 +277,29 @@ const generateImageAction = {
             channel.log('image', `Reference normalized ${path.extname(resolvedPath)} → png: ${path.basename(resolvedPath)}`);
           }
           const data = fs.readFileSync(normalized.path);
+          // Decode-validate the ref locally with sharp so we fail fast and
+          // actionably (e.g. "not a real image", "truncated", "0 bytes")
+          // instead of round-tripping to Fal and getting back a generic
+          // "Could not generate images with the given prompts and images".
+          try {
+            const sharp = (await import('sharp')).default;
+            const meta = await sharp(data).metadata();
+            if (!meta?.width || !meta?.height || !meta?.format) {
+              return {
+                success: false,
+                errorType: 'reference_image_invalid',
+                error: `Reference image could not be decoded (${path.basename(resolvedPath)}). The file exists but is not a valid image — check the download, file size, and magic bytes.`,
+                referencePath: resolvedPath,
+              };
+            }
+          } catch (decodeErr) {
+            return {
+              success: false,
+              errorType: 'reference_image_invalid',
+              error: `Reference image is not a valid image (${path.basename(resolvedPath)}): ${decodeErr.message}`,
+              referencePath: resolvedPath,
+            };
+          }
           referenceImages.push({ data, mimeType: normalized.mimeType });
           _refAliases.push(alias);
 

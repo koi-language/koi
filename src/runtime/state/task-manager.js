@@ -39,6 +39,33 @@ class TaskManager {
     this._restoredFromDisk = false;
     // Guard: prevents "All tasks completed" from firing more than once per batch.
     this._allCompletedNotified = false;
+    // Task-scoped skill activations. Map<taskId, Array<{agentName, skillName}>>.
+    // Populated when `task_create` auto-activates skills for the creator;
+    // consumed when `task_update` transitions the task to completed/deleted
+    // so every skill activated *because of* the task is released. In-memory
+    // only — skill state lives on the agent, this is just the index that
+    // ties them to a task's lifecycle.
+    this._scopedSkills = new Map();
+  }
+
+  /** Record which skills were activated for a task. See `_scopedSkills` doc. */
+  recordScopedSkills(taskId, entries) {
+    if (!taskId || !Array.isArray(entries) || entries.length === 0) return;
+    const key = String(taskId);
+    const list = this._scopedSkills.get(key) || [];
+    for (const e of entries) {
+      if (e?.agentName && e?.skillName) list.push({ agentName: e.agentName, skillName: e.skillName });
+    }
+    if (list.length > 0) this._scopedSkills.set(key, list);
+  }
+
+  /** Pop and return all skills scoped to a task (clears the entry). */
+  popScopedSkills(taskId) {
+    if (!taskId) return [];
+    const key = String(taskId);
+    const list = this._scopedSkills.get(key) || [];
+    this._scopedSkills.delete(key);
+    return list;
   }
 
   _getFilePath() {
@@ -289,11 +316,21 @@ class TaskManager {
 
     this._save();
 
-    // When the last task is marked completed, clear the task panel and notify.
-    // Guard with _allCompletedNotified so parallel completions only fire once.
-    if (updates.status === 'completed' && !this._allCompletedNotified) {
-      const nonDeleted = Object.values(this._tasks).filter(t => t.status !== 'deleted');
-      if (nonDeleted.length > 0 && nonDeleted.every(t => t.status === 'completed')) {
+    // When the last active task terminates (completed OR deleted) and
+    // nothing is left pending/in_progress, clear the plan and notify.
+    // Terminal set: completed + deleted (cancelled). The original guard
+    // only fired on `completed` — a fully-cancelled plan (status=deleted
+    // on every task) left skills activated forever because this sweep
+    // never ran.
+    const _isTerminal = updates.status === 'completed' || updates.status === 'deleted';
+    if (_isTerminal && !this._allCompletedNotified) {
+      const all = Object.values(this._tasks);
+      const hasActive = all.some(t => t.status !== 'completed' && t.status !== 'deleted');
+      const hasAnyCompleted = all.some(t => t.status === 'completed');
+      // Fire when the queue has fully drained (no pending/in_progress).
+      // Require at least one completed task so an empty manager doesn't
+      // keep firing on no-op updates.
+      if (!hasActive && (hasAnyCompleted || all.length > 0)) {
         this._allCompletedNotified = true;
         // Clear plan-scoped knowledge — it was useful while tasks
         // were executing but is no longer needed once the plan is done.
@@ -315,6 +352,33 @@ class TaskManager {
           if (root && active) {
             root.callAction('deactivate_workflow', { name: active }).catch(() => {});
           }
+          // Hard-sweep: when the task plan drains, every agent's skill
+          // set goes back to empty — no exceptions. Catches skills that
+          // were activated outside of `task_create` (manual activate,
+          // legacy delegate-start auto-activate, etc.) AND covers the
+          // per-agent mismatch case where the task was completed by a
+          // different agent than the one that activated the skill (so
+          // the per-task pop-and-deactivate in `task_update` couldn't
+          // reach it). Rule from user: "no pending tasks → no active
+          // skills, always".
+          try {
+            const agents = [];
+            if (root) agents.push(root);
+            for (const team of (root?.usesTeams || [])) {
+              for (const member of Object.values(team?.members || {})) {
+                if (member && !agents.includes(member)) agents.push(member);
+              }
+            }
+            for (const a of agents) {
+              const skills = Array.isArray(a.state?.skills) ? a.state.skills : [];
+              if (skills.length === 0) continue;
+              // Preferred path: deactivate_skill per name so the channel
+              // event fires (UI badge drops) and any side-effects run.
+              for (const name of skills) {
+                a.callAction?.('deactivate_skill', { name }).catch(() => {});
+              }
+            }
+          } catch { /* non-fatal — sweep is best-effort */ }
         }).catch(() => {});
         setTimeout(() => {
           channel.setTaskPanel([]);
