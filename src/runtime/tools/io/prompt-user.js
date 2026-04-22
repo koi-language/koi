@@ -80,8 +80,40 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     const message = action.message || action.data?.message || '';
     const question = action.question || action.data?.question || '';
     const options = action.options || action.data?.options || null;
+    // `prompt` on the action is the ONLY legitimate INLINE-mode trigger
+    // (shell-style "$ " input). It is provided BY THE AGENT explicitly
+    // and is separate from the visual prompt below. Without all three
+    // of {question, options, prompt} the call is malformed — see guard
+    // immediately below.
+    const explicitInlinePrompt = action.prompt || action.data?.prompt || null;
     // Always use the default prompt — the LLM must not change the visual prompt
     const promptText = '❯ ';
+
+    // Reject LLM-emitted malformed calls fast: an LLM batch that emits
+    // `prompt_user` with NONE of {question, options, inline prompt}
+    // falls through silently to INLINE mode, which only updates the
+    // input-box placeholder and shows the user no visible question.
+    // The user sees nothing to answer, the delegate hangs forever on
+    // `channel.prompt`, and the parent blocks on that delegate — hit
+    // in app-kitchen session 0d34ia where the Worker described "voy
+    // a componer las opciones" in a `print` but then called
+    // prompt_user empty. Erroring here teaches the LLM to retry with
+    // the missing field instead of silently deadlocking the task graph.
+    //
+    // Internal runtime call sites (abort recovery, feedback merge,
+    // post-return idle wait — see agent.js:1387, 1576, 2929, 3057) use
+    // genuine INLINE mode intentionally — no specific question, just
+    // "park here until the user types again". They pass `_runtime:
+    // true` to bypass the guard; without this the guard would crash
+    // the engine on every Stop press (return {} → process.exit(0)).
+    if (!action._runtime && !action.data?._runtime
+      && !question
+      && (!options || !Array.isArray(options) || options.length === 0)
+      && !explicitInlinePrompt) {
+      return {
+        error: "prompt_user requires at least one of: 'question' (text bubble), 'options' (select menu), or 'prompt' (explicit inline shell-style prompt). You called it with none of them — the user would see no visible question and the call would hang silently. Retry with a clear 'question' (and 'options' if the answer is a choice between known values).",
+      };
+    }
 
     // --exit mode: allow consuming the initial prompt from the queue,
     // but block any subsequent prompt_user calls (no user to answer).

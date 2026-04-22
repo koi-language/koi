@@ -64,6 +64,7 @@
     "croner": "^10.0.1",
     "crypto-js": "^4.2.0",
     "dotenv": "^17.2.3",
+    "got-scraping": "^4.2.1",
     "keyv": "^5.1.1",
     "linkedom": "^0.18.12",
     "lodash": "^4.17.23",

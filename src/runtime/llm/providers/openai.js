@@ -117,8 +117,30 @@ export class OpenAIChatLLM extends BaseLLM {
       if (this.caps.thinking && !this.useThinking) {
         const isFlashDefaultOff = /gemini[-\s.]?\d+.*flash/i.test(this.model);
         if (!isFlashDefaultOff) {
-          params.reasoning = { effort: 'minimal', exclude: true };
-          channel.log('llm', `[reasoning-min] ${params.model}: effort=minimal${this.caps.mandatoryThinking ? ' (mandatory)' : ''}`);
+          // Pick the LOWEST effort string this model's upstream will
+          // actually accept. Only OpenAI's gpt-5.x reasoning family
+          // (gpt-5, gpt-5-mini, gpt-5-nano, gpt-5-pro, gpt-5.1,
+          // gpt-5.1-codex, gpt-5.1-pro) exposes `minimal` as a valid
+          // enum — that's their "barely think" setting. Every other
+          // reasoning provider we currently route through this path
+          // (Gemini 3.x pro/preview, older OpenAI o1/o3/o4 series, any
+          // future model) rejects `minimal` with a 400 and accepts only
+          // `low | medium | high`; for them `low` is the closest. Wrong
+          // enum is worse than no enum because the 400 kills the whole
+          // request.
+          const supportsMinimal = /\bgpt/i.test(this.model);
+          const minEffort = supportsMinimal ? 'minimal' : 'low';
+          // Send the disable signal via BOTH surfaces. Chat Completions
+          // (direct OpenAI) reads `reasoning_effort` at the top level
+          // and ignores the nested `reasoning` object; OpenRouter / koi
+          // gateway reads the nested form (with `exclude: true` to hide
+          // the reasoning content from the response). Sending only one
+          // lets the other default slip through and burn the whole
+          // max_tokens budget on reasoning — the `[reasoning-off-IGNORED]`
+          // failure pattern we hit on gpt-5.1-codex. Belt-and-suspenders.
+          params.reasoning_effort = minEffort;
+          params.reasoning = { effort: minEffort, exclude: true };
+          channel.log('llm', `[reasoning-min] ${params.model}: effort=${minEffort}${this.caps.mandatoryThinking ? ' (mandatory)' : ''}`);
         }
       }
 
@@ -249,7 +271,18 @@ export class OpenAIChatLLM extends BaseLLM {
       if (_thinkChars > 0) {
         parts.push(`${_thinkChars} reasoning chars consumed`);
       }
-      parts.push(`effort=${this.reasoningEffort || 'default'}`);
+      // Report the effort that was ACTUALLY sent in the request, not the
+      // instance's configured one — those diverge when we send the
+      // disable signal (instance still carries its profile-assigned
+      // 'medium'/'low'/etc). Misleading logs lead to misleading fixes.
+      // Mirrors the model-aware minEffort logic in the request builder.
+      const _sentEffort =
+        this.caps.thinking && !this.useThinking && !/gemini[-\s.]?\d+.*flash/i.test(this.model)
+          ? (/\bgpt/i.test(this.model) ? 'minimal' : 'low')
+          : (this.useThinking && this.reasoningEffort && this.reasoningEffort !== 'none')
+            ? this.reasoningEffort
+            : 'default';
+      parts.push(`effort=${_sentEffort}`);
       throw new Error(`OpenAI returned no content (${parts.join(', ')})`);
     }
     // Validate that the response is complete JSON — if the stream was cut short

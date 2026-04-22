@@ -59,6 +59,45 @@ function _closestAspectRatio(width, height) {
   return best[0];
 }
 
+// Resolution buckets, expressed as the pixel ceiling on the longest edge.
+// The runtime catalog can advertise buckets under either naming scheme
+// (symbolic low/medium/high/ultra or explicit 512/1K/2K/4K), so both sets
+// map to the same pixel anchor — we pick whichever form is actually in
+// `caps.resolutions` at call time.
+const _RES_TO_PX = {
+  low: 512, medium: 1024, high: 2048, ultra: 4096,
+  '512': 512, '0.5k': 512,
+  '1k': 1024, '1024': 1024,
+  '2k': 2048, '2048': 2048,
+  '4k': 4096, '4096': 4096,
+};
+
+/**
+ * Pick the smallest catalog resolution whose pixel ceiling is >= the
+ * longest edge of the base image. Used to auto-fill `resolution` from
+ * the base reference: if the user hands us a 2K photo to edit, returning
+ * a 1K downsample is a quality regression — aspect ratio preservation
+ * without resolution preservation is half the job.
+ *
+ * Falls back to the largest available bucket when the source exceeds
+ * every catalog option, and returns null when the catalog doesn't use
+ * a bucket name we can score (unknown → leave the field unset and let
+ * the provider pick its default).
+ */
+function _closestResolution(pixelMax, available) {
+  if (!pixelMax || !Array.isArray(available) || available.length === 0) return null;
+  const scored = available
+    .map((r) => {
+      const k = String(r).toLowerCase();
+      return { name: r, px: _RES_TO_PX[k] ?? null };
+    })
+    .filter((x) => x.px != null)
+    .sort((a, b) => a.px - b.px);
+  if (scored.length === 0) return null;
+  for (const x of scored) if (x.px >= pixelMax) return x.name;
+  return scored[scored.length - 1].name;
+}
+
 const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
@@ -201,7 +240,10 @@ const generateImageAction = {
           return { alias: '', rawPath: '' };
         }).filter((x) => x.rawPath);
 
-        // Step 2 — resolve attachment IDs (att-N) to real paths.
+        // Step 2 — resolve attachment IDs (att-N) to real paths. Any
+        // other value is passed through verbatim; Step 3 calls
+        // `path.resolve()` which absolutizes relative paths against
+        // cwd and checks existence, so this stays permissive.
         const _resolvedRefs = [];
         try {
           const { attachmentRegistry: _ar } = await import('../../state/attachment-registry.js');
@@ -272,27 +314,37 @@ const generateImageAction = {
       channel.log('image', `Reference aliases: ${_refAliases.map((a, i) => `${i + 1}=${a || '-'}`).join(', ')}`);
     }
 
-    // Auto-detect aspectRatio from the FIRST reference (the base image
-    // being edited). Only one of the references is "the canvas" — the
-    // rest are style / placement / source-of-pieces guides. Without a
-    // ratio hint the provider falls back to 1:1 and crops the scene.
-    // In edit mode this is passed through as meta-info; the router
-    // treats it as a SOFT preference (see pickImageModel) because edit
-    // models preserve the base dimensions natively regardless.
+    // Auto-detect aspectRatio AND resolution from the FIRST reference (the
+    // base image being edited). Only one of the references is "the canvas" —
+    // the rest are style / placement / source-of-pieces guides. Without these
+    // hints the provider falls back to 1:1 (crops the scene) and its default
+    // resolution (frequently a step down from the source → silent quality
+    // regression on a 2K/4K input). Both are passed as soft preferences;
+    // edit models preserve the base dimensions natively regardless.
     let autoAspectRatio = null;
-    if (!action.aspectRatio && referenceImages?.length) {
+    let autoResolution = null;
+    if ((!action.aspectRatio || !action.resolution) && referenceImages?.length) {
       try {
         const sharp = (await import('sharp')).default;
         const meta = await sharp(referenceImages[0].data).metadata();
         if (meta?.width && meta?.height) {
-          autoAspectRatio = _closestAspectRatio(meta.width, meta.height);
-          channel.log('image', `Auto-detected aspectRatio=${autoAspectRatio} from base ref (${meta.width}x${meta.height})`);
+          if (!action.aspectRatio) {
+            autoAspectRatio = _closestAspectRatio(meta.width, meta.height);
+            channel.log('image', `Auto-detected aspectRatio=${autoAspectRatio} from base ref (${meta.width}x${meta.height})`);
+          }
+          if (!action.resolution) {
+            autoResolution = _closestResolution(Math.max(meta.width, meta.height), caps.resolutions);
+            if (autoResolution) {
+              channel.log('image', `Auto-detected resolution=${autoResolution} from base ref (max=${Math.max(meta.width, meta.height)}px)`);
+            }
+          }
         }
       } catch (err) {
-        channel.log('image', `Aspect ratio auto-detect failed (non-fatal): ${err?.message || err}`);
+        channel.log('image', `Aspect/resolution auto-detect failed (non-fatal): ${err?.message || err}`);
       }
     }
     const effectiveAspect = action.aspectRatio || autoAspectRatio;
+    const effectiveResolution = action.resolution || autoResolution;
 
     // Log full generation request details. Ref items can now be strings or
     // {alias,path} objects — normalise for the summary without re-parsing.
@@ -304,7 +356,7 @@ const generateImageAction = {
       }
       return '?';
     });
-    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${effectivePrompt.substring(0, 150)}...", aspectRatio=${effectiveAspect || '-'}, resolution=${action.resolution || '-'}, n=${action.n || 1}, refs=${refSummary.length}${refSummary.length ? ' [' + refSummary.join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
+    channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${effectivePrompt.substring(0, 150)}...", aspectRatio=${effectiveAspect || '-'}, resolution=${effectiveResolution || '-'}, n=${action.n || 1}, refs=${refSummary.length}${refSummary.length ? ' [' + refSummary.join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
 
     // Passthrough: only forward params the agent actually supplied. The
     // client-side router (media-model-router.js) picks a model that accepts
@@ -316,7 +368,7 @@ const generateImageAction = {
       referenceImages,
     };
     if (effectiveAspect) genOpts.aspectRatio = effectiveAspect;
-    if (action.resolution)  genOpts.resolution  = action.resolution;
+    if (effectiveResolution) genOpts.resolution = effectiveResolution;
     if (action.n && action.n > 1) genOpts.n = action.n;
     if (action.label) genOpts.label = action.label;
 
@@ -450,11 +502,42 @@ const generateImageAction = {
     const images = result.images || [];
     const hasImages = images.length > 0 && images.some(img => img.url || img.b64 || img.savedTo);
     if (!hasImages) {
+      // Mine the raw provider response for a real reason. Different providers
+      // use different shapes; pull whatever's there without trusting any one.
+      const raw = result.raw || result.providerRaw || {};
+      const hints = [];
+      // Fal-specific NSFW flag (per-image boolean array)
+      if (Array.isArray(raw.has_nsfw_concepts) && raw.has_nsfw_concepts.some(Boolean)) {
+        hints.push('NSFW/safety filter triggered (has_nsfw_concepts=true)');
+      }
+      // Fal / generic error fields
+      if (raw.detail) hints.push(`detail: ${typeof raw.detail === 'string' ? raw.detail : JSON.stringify(raw.detail).slice(0, 200)}`);
+      if (raw.error && !hints.length) hints.push(`error: ${typeof raw.error === 'string' ? raw.error : JSON.stringify(raw.error).slice(0, 200)}`);
+      if (raw.message && raw.message !== raw.error) hints.push(`message: ${raw.message}`);
+      // Gemini / Nano Banana shape when wrapped
+      const cand = Array.isArray(raw.candidates) ? raw.candidates[0] : null;
+      if (cand?.finishReason && cand.finishReason !== 'STOP') hints.push(`finishReason: ${cand.finishReason}`);
+      if (Array.isArray(cand?.safetyRatings)) {
+        const blocked = cand.safetyRatings.filter(r => r.blocked || /HIGH|MEDIUM/i.test(r.probability || ''));
+        if (blocked.length) hints.push(`safetyRatings: ${blocked.map(r => `${r.category}=${r.probability}`).join(', ')}`);
+      }
+      if (raw.promptFeedback?.blockReason) hints.push(`blockReason: ${raw.promptFeedback.blockReason}`);
+      // Revised prompt (some models silently refuse and return just a rewrite)
+      if (raw.revised_prompt && !raw.images?.length) hints.push(`revisedPrompt: ${String(raw.revised_prompt).slice(0, 200)}`);
+
+      const rawSnippet = Object.keys(raw).length
+        ? ` | raw: ${JSON.stringify(raw).slice(0, 500)}`
+        : '';
+      const baseMsg = result.error || result.message
+        || 'Image generation returned no images. The model likely rejected the prompt (content policy) or timed out.';
+
       return {
         success: false,
         provider: resolved.provider,
         model: resolved.model,
-        error: result.error || result.message || 'Image generation returned no images. The model may have rejected the prompt (content policy) or timed out.',
+        error: hints.length ? `${baseMsg} (${hints.join(' | ')})` : `${baseMsg}${rawSnippet}`,
+        diagnostics: hints.length ? hints : undefined,
+        raw: Object.keys(raw).length ? raw : undefined,
         capabilities: caps,
       };
     }

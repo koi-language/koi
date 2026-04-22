@@ -324,6 +324,19 @@ class ActionRegistry {
     }
     doc += '\n';
 
+    // Full schemas for every tool this agent has already asked about
+    // via get_tool_info — pinned into every subsequent prompt so the
+    // model doesn't forget and guess parameters. Scoped to this agent
+    // instance only.
+    if (agent?._expandedTools instanceof Set && agent._expandedTools.size > 0) {
+      const expandedList = actions.filter((a) =>
+        agent._expandedTools.has(a.intent || a.type),
+      );
+      for (const action of expandedList) {
+        doc += this._formatActionEntry(action) + '\n';
+      }
+    }
+
     return doc;
   }
 

@@ -408,12 +408,31 @@ export default {
     }
 
     // --- Image support (vision) ---
-    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'];
+    // Keep .bmp/.svg/etc in the accepted-extensions list so the agent
+    // can point read_file at them — normalizeImageForProvider transcodes
+    // to PNG before the bytes reach the LLM. Vision endpoints
+    // (OpenAI/Azure, Gemini) only accept jpeg/png/gif/webp and reject
+    // anything else with a cryptic 400; sharp decoding also acts as a
+    // validity check, catching the common "web_fetch saved an HTML
+    // error page with a .jpg extension" trap that otherwise explodes as
+    // "The image data you provided does not represent a valid image".
+    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.heic', '.heif', '.tif', '.tiff', '.avif'];
     if (IMAGE_EXTS.includes(path.extname(resolvedPath).toLowerCase())) {
-      // Read image and convert to base64 for the vision pipeline.
-      const b64 = fs.readFileSync(resolvedPath).toString('base64');
-      const ext = path.extname(resolvedPath).toLowerCase().slice(1);
-      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+      const { normalizeImageForProvider } = await import('../media/_normalize-image-for-provider.js');
+      let normalized;
+      try {
+        normalized = await normalizeImageForProvider(resolvedPath);
+      } catch (err) {
+        return {
+          success: false,
+          error: `Could not read "${filePath}" as an image: ${err.message || err}. Common causes: the file is actually HTML (e.g. web_fetch saved an error page), the file is corrupt, or the format is unsupported. Inspect it with shell (\`file <path>\` / \`wc -c <path>\`) before retrying.`,
+        };
+      }
+      const b64 = fs.readFileSync(normalized.path).toString('base64');
+      const mime = normalized.mimeType;
+      if (normalized.converted) {
+        channel.log('read_file', `Image transcoded to PNG for vision: ${filePath}`);
+      }
 
       // Queue the image for the next LLM turn as a vision input.
       const session = agent?._activeSession;

@@ -174,8 +174,20 @@ class PluginManager {
       } catch {}
     }
 
-    // MCP
-    for (const mcpPath of [path.join(dir, 'mcp', '.mcp.json'), path.join(dir, '.mcp.json')]) {
+    // MCP — Claude Code plugins ship the config as `mcp.json` at the
+    // plugin root (no leading dot). Koi's original convention was
+    // `.mcp.json`. Accept both forms (+ the `mcp/` subfolder variant)
+    // so plugins from either ecosystem install without editing.
+    // Without this, the MCP server silently never registers and the
+    // plugin's agents fall back to generic tools (or hallucinate) —
+    // exactly what we saw with the Nimble plugin's nimble-mcp-server.
+    const _mcpCandidates = [
+      path.join(dir, 'mcp', '.mcp.json'),
+      path.join(dir, 'mcp', 'mcp.json'),
+      path.join(dir, '.mcp.json'),
+      path.join(dir, 'mcp.json'),
+    ];
+    for (const mcpPath of _mcpCandidates) {
       if (fs.existsSync(mcpPath)) {
         try {
           caps.mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
@@ -620,6 +632,122 @@ class PluginManager {
     }
     return scripts;
   }
+
+  /**
+   * Register every active plugin's MCP servers into the provided
+   * MCP registry as global servers. Idempotent — re-registering an
+   * already-registered name is a no-op on the registry side.
+   *
+   * Env var substitution (`${NIMBLE_API_KEY}` → actual value) is
+   * applied by default via an internal helper that covers the same
+   * fields as koi-cli's `resolveMcpEnvVars` (env, headers, args, url).
+   * Callers can pass an `resolveEnvVars` override if they need custom
+   * behaviour (e.g. OAuth token injection for remote HTTP servers).
+   *
+   * @param {object} mcpRegistry - The global MCP registry instance.
+   * @param {(servers: object) => object} [resolveEnvVars] - Optional.
+   * @returns {Array<{ pluginId: string, serverName: string, registryKey: string }>}
+   */
+  attachPluginMcps(mcpRegistry, resolveEnvVars) {
+    if (!mcpRegistry || typeof mcpRegistry.registerGlobal !== 'function') return [];
+    const resolver = typeof resolveEnvVars === 'function' ? resolveEnvVars : _defaultResolveMcpEnvVars;
+    const attached = [];
+    for (const [id, entry] of this._plugins) {
+      if (!this._activePlugins.has(id)) continue;
+      const mcpConfig = entry.capabilities?.mcp;
+      if (!mcpConfig) continue;
+      const rawServers = mcpConfig.mcpServers || mcpConfig.servers || mcpConfig;
+      if (typeof rawServers !== 'object') continue;
+      const servers = resolver(rawServers);
+      for (const [name, config] of Object.entries(servers)) {
+        // Prefix with plugin id to avoid name clashes between plugins.
+        const registryKey = `${id}/${name}`;
+        try {
+          mcpRegistry.registerGlobal(registryKey, { ...config, _pluginId: id });
+          attached.push({ pluginId: id, serverName: name, registryKey });
+          // Remember the concrete registry keys on the plugin entry so
+          // detachPluginMcps can remove them cleanly without having to
+          // re-resolve the config.
+          entry._mcpRegistryKeys = entry._mcpRegistryKeys || new Set();
+          entry._mcpRegistryKeys.add(registryKey);
+        } catch (err) {
+          if (process.env.KOI_DEBUG_LLM) {
+            console.error(`[PluginManager] Failed to attach MCP ${registryKey}: ${err.message}`);
+          }
+        }
+      }
+    }
+    return attached;
+  }
+
+  /**
+   * Detach (disconnect + unregister) every MCP server contributed by a
+   * specific plugin. Called from install/uninstall/deactivate flows so
+   * the MCP stops running the moment the plugin is gone.
+   *
+   * @param {string} pluginId
+   * @param {object} mcpRegistry
+   * @returns {Promise<string[]>} list of registry keys removed
+   */
+  async detachPluginMcps(pluginId, mcpRegistry) {
+    if (!mcpRegistry || typeof mcpRegistry.unregister !== 'function') return [];
+    const entry = this._plugins.get(pluginId);
+    const removed = [];
+    // Primary path: use the explicit set we recorded during attach.
+    if (entry?._mcpRegistryKeys instanceof Set) {
+      for (const key of entry._mcpRegistryKeys) {
+        try {
+          const ok = await mcpRegistry.unregister(key);
+          if (ok) removed.push(key);
+        } catch { /* best-effort */ }
+      }
+      entry._mcpRegistryKeys.clear();
+    }
+    // Fallback: scan the registry for any `<pluginId>/...` name that
+    // slipped through (registered before we started tracking, or from
+    // a previous run). Keeps uninstall deterministic even across
+    // upgrades that changed the tracking scheme.
+    if (typeof mcpRegistry.entries === 'function') {
+      const prefix = `${pluginId}/`;
+      for (const [name] of Array.from(mcpRegistry.entries())) {
+        if (!name.startsWith(prefix)) continue;
+        if (removed.includes(name)) continue;
+        try {
+          const ok = await mcpRegistry.unregister(name);
+          if (ok) removed.push(name);
+        } catch { /* best-effort */ }
+      }
+    }
+    return removed;
+  }
+}
+
+/**
+ * Default `${VAR}` substitution for MCP configs pulled from plugins.
+ * Mirrors `koi-cli/src/cli/mcp-manager.js#resolveMcpEnvVars` so plugins
+ * work identically whether the env-var-resolver lives in the CLI layer
+ * (installPlugin handler passes it in) or the runtime layer (startup
+ * auto-attach uses this default).
+ */
+function _defaultResolveMcpEnvVars(servers) {
+  const substitute = (s) => typeof s === 'string'
+    ? s.replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? '')
+    : s;
+  const resolveDict = (dict) => {
+    const out = {};
+    for (const [k, v] of Object.entries(dict)) out[k] = substitute(v);
+    return out;
+  };
+  const resolved = {};
+  for (const [name, server] of Object.entries(servers)) {
+    const entry = { ...server };
+    if (entry.env && typeof entry.env === 'object') entry.env = resolveDict(entry.env);
+    if (entry.headers && typeof entry.headers === 'object') entry.headers = resolveDict(entry.headers);
+    if (Array.isArray(entry.args)) entry.args = entry.args.map(substitute);
+    if (typeof entry.url === 'string') entry.url = substitute(entry.url);
+    resolved[name] = entry;
+  }
+  return resolved;
 }
 
 // Singleton

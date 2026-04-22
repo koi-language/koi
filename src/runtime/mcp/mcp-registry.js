@@ -177,6 +177,29 @@ class MCPRegistry {
   }
 
   /**
+   * Unregister a specific MCP server — disconnects if connected, then
+   * drops it from the client map. Used by plugin uninstall/deactivate
+   * so the per-plugin MCP doesn't linger in the registry after the
+   * plugin files are gone.
+   * @param {string} name
+   */
+  async unregister(name) {
+    const client = this.clients.get(name);
+    if (!client) return false;
+    if (client.initialized) {
+      try { await client.disconnect(); }
+      catch (err) {
+        if (process.env.KOI_DEBUG_LLM) {
+          console.error(`[MCPRegistry] disconnect on unregister failed for ${name}: ${err.message}`);
+        }
+      }
+    }
+    this.clients.delete(name);
+    this._globalNames.delete(name);
+    return true;
+  }
+
+  /**
    * Disconnect all MCP clients gracefully.
    */
   async disconnectAll() {
@@ -205,23 +228,38 @@ export const mcpRegistry = new MCPRegistry();
 // Make available globally for transpiled code
 globalThis.mcpRegistry = mcpRegistry;
 
-// Load global MCP servers from KOI_GLOBAL_MCP_SERVERS env var (set by koi-cli.js).
-// Store the connect promise so prompt builders can await it before listing tools.
-if (process.env.KOI_GLOBAL_MCP_SERVERS) {
-  try {
-    const globalServers = JSON.parse(process.env.KOI_GLOBAL_MCP_SERVERS);
-    for (const [name, config] of Object.entries(globalServers)) {
-      mcpRegistry.registerGlobal(name, config);
+// Load global MCP servers from KOI_GLOBAL_MCP_SERVERS env var (set by koi-cli.js)
+// AND from every active plugin's mcp.json. Store the connect promise so prompt
+// builders can await it before listing tools.
+mcpRegistry.globalReady = (async () => {
+  if (process.env.KOI_GLOBAL_MCP_SERVERS) {
+    try {
+      const globalServers = JSON.parse(process.env.KOI_GLOBAL_MCP_SERVERS);
+      for (const [name, config] of Object.entries(globalServers)) {
+        mcpRegistry.registerGlobal(name, config);
+      }
+      if (process.env.KOI_DEBUG_LLM) {
+        console.error(`[MCPRegistry] Loaded ${Object.keys(globalServers).length} global MCP server(s) from KOI_GLOBAL_MCP_SERVERS`);
+      }
+    } catch (err) {
+      console.error(`[MCPRegistry] Failed to parse KOI_GLOBAL_MCP_SERVERS: ${err.message}`);
     }
-    if (process.env.KOI_DEBUG_LLM) {
-      console.error(`[MCPRegistry] Loaded ${Object.keys(globalServers).length} global MCP server(s) from KOI_GLOBAL_MCP_SERVERS`);
-    }
-    // Connect eagerly — store the promise so the prompt builder can await it
-    mcpRegistry.globalReady = mcpRegistry.connectAll();
-  } catch (err) {
-    console.error(`[MCPRegistry] Failed to parse KOI_GLOBAL_MCP_SERVERS: ${err.message}`);
-    mcpRegistry.globalReady = Promise.resolve();
   }
-} else {
-  mcpRegistry.globalReady = Promise.resolve();
-}
+  // Auto-attach MCPs from every active plugin. Without this, plugins
+  // declared mcp.json files are detected but never register — the
+  // nimble-researcher agent would then fall back to generic tools or
+  // hallucinate (the bug that motivated this hook).
+  try {
+    const { pluginManager } = await import('../plugins/plugin-manager.js');
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    pluginManager.load(projectRoot);
+    const attached = pluginManager.attachPluginMcps(mcpRegistry);
+    if (attached.length > 0 && process.env.KOI_DEBUG_LLM) {
+      console.error(`[MCPRegistry] Attached ${attached.length} plugin MCP(s): ${attached.map(a => a.registryKey).join(', ')}`);
+    }
+  } catch (err) {
+    console.error(`[MCPRegistry] Plugin MCP attach failed: ${err.message}`);
+  }
+  // Connect eagerly so the prompt builder sees tools on first render.
+  await mcpRegistry.connectAll();
+})();

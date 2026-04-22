@@ -291,6 +291,20 @@ export function classifyFeedback(action, result, error) {
         diagParts.push(`alternatives: ${alt}`);
       } catch { /* ignore */ }
     }
+    // `capabilities` is what the media tools (generate_image, upscale_image,
+    // generate_video, …) emit on upstream 4xx/5xx — it enumerates every
+    // aspect_ratio, resolution, quality and output_format the model
+    // actually accepts. Without it in the immediate message, the LLM
+    // sees a bare "Unprocessable Entity" and re-emits the same invalid
+    // parameter on its retry (we hit this on `resolution: "2K"` vs a
+    // fleet that only advertised ["low","medium","high","ultra"]).
+    if (result.capabilities) {
+      try {
+        let caps = JSON.stringify(result.capabilities);
+        if (caps.length > 2000) caps = caps.substring(0, 2000) + '...[truncated]';
+        diagParts.push(`capabilities: ${caps}`);
+      } catch { /* ignore */ }
+    }
     const diagBlock = diagParts.length > 0 ? `\n${diagParts.join('\n')}` : '';
     const immediate = `❌${id} ${intent} FAILED${exitCodeStr}: ${errText}${stdoutPart}${result.fix ? '\nFIX: ' + result.fix : ''}${diagBlock}`;
     return {

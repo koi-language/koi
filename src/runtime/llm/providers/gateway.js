@@ -488,7 +488,12 @@ export class GatewayImageGen extends BaseImageGen {
     // `resolvedModel` is the concrete slug the client-side router picked.
     // Surface it so callers can log the real model and tag metadata with
     // it — "auto" / declared `this.model` hides which one actually ran.
-    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+    // When no images came back, pass the raw provider body so the caller
+    // can extract a useful reason (NSFW flag, finishReason, blockReason…)
+    // instead of a generic "no images" message.
+    const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+    if (images.length === 0) ret.raw = data;
+    return ret;
   }
 
   /**
@@ -579,7 +584,19 @@ export class GatewayImageGen extends BaseImageGen {
       const bodyText = await res.text().catch(() => '');
       let structured = null;
       try { structured = JSON.parse(bodyText); } catch {}
-      const err = new Error(structured?.error || `Gateway ${operation} error (${res.status}): ${bodyText}`);
+      // Pick the most specific message available. Fastify's default error
+      // formatter returns `{ statusCode, error: "Unprocessable Entity",
+      // message: "..." }` where the useful text lives in `message` — if
+      // we prefer `error` we end up with a meaningless "Unprocessable
+      // Entity" label. The backend's handleError was updated to emit
+      // `{error, provider, upstreamStatus, upstreamBody}` for upstream
+      // provider failures so `structured.error` is now informative; fall
+      // back to `message` for legacy shapes, then the raw text.
+      const msg =
+        structured?.error ||
+        structured?.message ||
+        `Gateway ${operation} error (${res.status}): ${bodyText}`;
+      const err = new Error(msg);
       err.status = res.status;
       if (structured) err.details = structured;
       throw err;

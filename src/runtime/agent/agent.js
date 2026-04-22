@@ -1384,7 +1384,7 @@ export class Agent {
         channel.log('agent', `${this.name}: Fast-start (waiting for user input)`);
         if (!isDelegate) Agent._cliHooks?.onBusy?.(false);
         response = [
-          { actionType: 'direct', intent: 'prompt_user' }
+          { actionType: 'direct', intent: 'prompt_user', _runtime: true }
         ];
         isFirstCall = false;
       } else {
@@ -1573,8 +1573,8 @@ export class Agent {
             Agent._cliHooks?.onBusy?.(false);
             try {
               const { result: _r } = await this._executeAction(
-                { intent: 'prompt_user' },
-                { intent: 'prompt_user' },
+                { intent: 'prompt_user', _runtime: true },
+                { intent: 'prompt_user', _runtime: true },
                 session.actionContext
               );
               // If the user typed something, track it and continue the loop
@@ -2926,8 +2926,8 @@ export class Agent {
               }
             }
             const { result } = await this._executeAction(
-              { intent: 'prompt_user' },
-              { intent: 'prompt_user' },
+              { intent: 'prompt_user', _runtime: true },
+              { intent: 'prompt_user', _runtime: true },
               session.actionContext
             );
             if (result?.answer) {
@@ -3054,8 +3054,8 @@ export class Agent {
 
           if (!promptResult) {
             const { result } = await this._executeAction(
-              { intent: 'prompt_user' },
-              { intent: 'prompt_user' },
+              { intent: 'prompt_user', _runtime: true },
+              { intent: 'prompt_user', _runtime: true },
               session.actionContext
             );
             promptResult = result;
@@ -5283,18 +5283,24 @@ Be specific and concise. Never ask the user for things you or the delegate can d
       }))
     });
 
-    // Agent-specific MCPs (declared with `uses mcp`)
+    // Agent-specific MCPs (declared with `uses mcp`). The stdio and http
+    // clients expose readiness via `initialized`, not `connected` — the
+    // earlier `client.connected` check was always falsy, which is why
+    // the AVAILABLE MCP SERVERS section never rendered even after a
+    // successful handshake.
+    const _ready = (c) => !!c && (c.initialized || c.connected);
     for (const mcpName of this.usesMCPNames) {
       const client = mcpRegistry.get(mcpName);
-      if (client && client.connected && client.tools.length > 0) {
+      if (_ready(client) && client.tools.length > 0) {
         seen.add(mcpName);
         summaries.push(makeSummary(mcpName, client));
       }
     }
 
-    // Global MCPs (from .mcp.json / KOI_GLOBAL_MCP_SERVERS) — available to all agents
+    // Global MCPs (from .mcp.json / KOI_GLOBAL_MCP_SERVERS / plugin mcp.json)
+    // — available to all agents.
     for (const [mcpName, client] of mcpRegistry.entries()) {
-      if (!seen.has(mcpName) && mcpRegistry.isGlobal(mcpName) && client.connected && client.tools.length > 0) {
+      if (!seen.has(mcpName) && mcpRegistry.isGlobal(mcpName) && _ready(client) && client.tools.length > 0) {
         summaries.push(makeSummary(mcpName, client));
       }
     }
