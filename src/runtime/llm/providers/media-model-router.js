@@ -34,6 +34,33 @@ export class MediaModelRoutingError extends Error {
   }
 }
 
+// Operations that mark a model as a SPECIALIST (bg-remove, upscale, inpaint,
+// segmentation, …). When no explicit `operation` is requested, models
+// advertising any of these are excluded from the general-purpose pool —
+// their schemas diverge from the canonical generate/edit request (e.g.
+// `output_format: rgba|alpha|zip` on bg-removers) and Fal rejects a normal
+// payload with a body-validation error. This list is matched against the
+// OP_CANONICAL values the backend sync produces in admin.routes.ts.
+const _SPECIALIST_OPS = new Set([
+  'background-removal',
+  'rembg',
+  'upscale',
+  'upscaling',
+  'inpainting',
+  'outpainting',
+  'face-swap',
+  'faceswap',
+  'relighting',
+  'relight',
+  'denoise',
+  'denoising',
+  'colorize',
+  'colorization',
+  'segmentation',
+  'restoration',
+  'deblur',
+]);
+
 const _csvSupports = (csv, requested) => {
   if (!requested) return true;
   if (!csv) return true;
@@ -227,9 +254,18 @@ export function pickImageModel(models, req = {}) {
     }
 
     // Specialist exclusion — when no operation requested, skip models
-    // whose `operations` array is non-empty and doesn't include a general
-    // image op (e.g. bg-remove / upscale only).
+    // whose operations include any specialist op (bg-remove, upscale,
+    // inpainting, outpainting, segmentation, etc.). The Fal sync attaches
+    // the generic `image-to-image` category to every ref-accepting model,
+    // so a naïve "does it include image-to-image?" check lets specialist
+    // models through — a bg-remove model would then be picked for an edit
+    // request and Fal would reject it with its specialist schema (e.g.
+    // `output_format: rgba|alpha|zip`). The explicit specialist list below
+    // is the authoritative gate; operation-scoped routing still works via
+    // the `wantsOperation` branch above.
     if (Array.isArray(m.operations) && m.operations.length > 0) {
+      const hasSpecialistOp = m.operations.some((op) => _SPECIALIST_OPS.has(op));
+      if (hasSpecialistOp) return false;
       const hasGeneralCap =
         m.operations.includes('generate') ||
         m.operations.includes('edit') ||

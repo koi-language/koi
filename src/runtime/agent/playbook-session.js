@@ -98,6 +98,7 @@ export class PlaybookSession {
     } else {
       this.lastError = null;
       this.consecutiveErrors = 0;
+      this._consecutiveNetworkErrors = 0;
 
       // This action+target succeeded — clear any previous failure for it
       this._errorLog.delete(errorKey);

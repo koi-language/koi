@@ -1716,8 +1716,48 @@ export class Agent {
             },
             state: this.state,
           });
+          // Non-network error resets the pure-network streak — pivots are
+          // useful here.
+          session._consecutiveNetworkErrors = 0;
         } else {
           channel.log('agent', `${this.name}: Network/transient error — skipping error.llm reaction (no profile bump)`);
+          session._consecutiveNetworkErrors = (session._consecutiveNetworkErrors || 0) + 1;
+          // After 3 consecutive pure-network failures the gateway is almost
+          // certainly down or unreachable. Pivots, reclassifications and
+          // model escalations are all useless (they still need the network
+          // to reach a provider), so stop burning time. In interactive mode
+          // fall through to prompt_user — the outer NO_PROVIDER branch
+          // already owns the "wait for user, then retry" dance and expects
+          // session.consecutiveErrors to be 0 after the user types; mirror
+          // that contract here. In non-interactive mode just break out.
+          if (session._consecutiveNetworkErrors >= 3) {
+            channel.log('agent', `${this.name}: Gateway unreachable (${session._consecutiveNetworkErrors} consecutive network failures) — asking user instead of retrying`);
+            const _s = globalThis.__koiStrings || {};
+            channel.print(`\x1b[33m⚠ ${_s.networkDown || 'Network or gateway appears to be down. Check your connection or try again later.'}\x1b[0m`);
+            const _hasPromptUser = typeof Agent._cliHooks?.onBusy === 'function';
+            if (_hasPromptUser) {
+              Agent._cliHooks?.onBusy?.(false);
+              try {
+                const { result: _r } = await this._executeAction(
+                  { intent: 'prompt_user', _runtime: true },
+                  { intent: 'prompt_user', _runtime: true },
+                  session.actionContext
+                );
+                if (_r?.answer) {
+                  this._lastUserMessage = _r.answer;
+                  contextMemory.add('user', _r.answer, _r.answer, null);
+                  this.contextMemoryState = contextMemory.serialize();
+                }
+                session.consecutiveErrors = 0;
+                session._consecutiveNetworkErrors = 0;
+                Agent._cliHooks?.onBusy?.(true);
+                continue;
+              } catch {
+                break;
+              }
+            }
+            break;
+          }
         }
         if (_isThinkingExhaustion && this.llmProvider?._activeSession) {
           const _sess = this.llmProvider._activeSession;
