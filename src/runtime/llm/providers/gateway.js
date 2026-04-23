@@ -248,6 +248,36 @@ function _toNoMatchError(routingErr) {
   return err;
 }
 
+// Normalize the handful of shapes Fal / OpenAI / Google / custom proxies
+// use when returning image results. Handles, in priority order:
+//   - `data.images: [{url|b64|b64_json, revised_prompt?}]` — OpenAI / Flux
+//   - `data.data:   [{url|b64|b64_json, revised_prompt?}]` — DALL·E style
+//   - `data.image:  {url|b64|b64_json}`                    — Fal nano-banana/edit, rembg
+//   - `data.image_url: "https://…"`                        — Fal upscaler legacy
+// Silently ignores shapes without an image payload so callers can still
+// surface the raw body (NSFW flag, finishReason, blockReason…) in the
+// "no images" branch rather than crashing on parse.
+function _collectImages(data) {
+  const images = [];
+  if (!data || typeof data !== 'object') return images;
+  const push = (img) => {
+    if (!img || typeof img !== 'object') return;
+    const url = img.url || img.image_url || undefined;
+    const b64 = img.b64 || img.b64_json || undefined;
+    if (!url && !b64) return;
+    images.push({
+      url,
+      b64,
+      revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
+    });
+  };
+  if (Array.isArray(data.images)) data.images.forEach(push);
+  else if (Array.isArray(data.data)) data.data.forEach(push);
+  else if (data.image && typeof data.image === 'object') push(data.image);
+  else if (typeof data.image_url === 'string') push({ url: data.image_url });
+  return images;
+}
+
 async function _resolveMediaModel(kind, explicit, opts, pickFn, req) {
   if (explicit && explicit !== 'auto') return explicit;
   const caps = await fetchMediaCapabilities(kind);
@@ -480,11 +510,7 @@ export class GatewayImageGen extends BaseImageGen {
     }
 
     const data = await res.json();
-    const images = (data.images || data.data || []).map(img => ({
-      url: img.url || undefined,
-      b64: img.b64 || img.b64_json || undefined,
-      revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
-    }));
+    const images = _collectImages(data);
     // `resolvedModel` is the concrete slug the client-side router picked.
     // Surface it so callers can log the real model and tag metadata with
     // it — "auto" / declared `this.model` hides which one actually ran.
@@ -603,23 +629,7 @@ export class GatewayImageGen extends BaseImageGen {
     }
 
     const data = await res.json();
-    // Fal rembg/upscaler/etc payloads use several field names for the
-    // output: { image: { url } }, { images: [{ url }] }, { image_url }.
-    // Collect them into a normalized shape the tool can iterate over.
-    const images = [];
-    if (Array.isArray(data.images)) {
-      for (const img of data.images) {
-        images.push({ url: img?.url || img?.image_url, b64: img?.b64 || img?.b64_json });
-      }
-    } else if (data.image && typeof data.image === 'object') {
-      images.push({ url: data.image.url, b64: data.image.b64 || data.image.b64_json });
-    } else if (typeof data.image_url === 'string') {
-      images.push({ url: data.image_url });
-    } else if (Array.isArray(data.data)) {
-      for (const img of data.data) {
-        images.push({ url: img?.url, b64: img?.b64 || img?.b64_json });
-      }
-    }
+    const images = _collectImages(data);
     return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 
@@ -652,11 +662,7 @@ export class GatewayImageGen extends BaseImageGen {
     }
 
     const data = await res.json();
-    const images = (data.images || data.data || []).map(img => ({
-      url: img.url || undefined,
-      b64: img.b64 || img.b64_json || undefined,
-      revisedPrompt: img.revised_prompt || img.revisedPrompt || undefined,
-    }));
+    const images = _collectImages(data);
     // `resolvedModel` is the concrete slug the client-side router picked.
     // Surface it so callers can log the real model and tag metadata with
     // it — "auto" / declared `this.model` hides which one actually ran.

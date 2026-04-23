@@ -136,9 +136,18 @@ const generateImageAction = {
         }
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
-      saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
-      model:           { type: 'string', description: 'Specific model slug to force (optional — normally you should let the backend pick the cheapest capable model).' },
-      excludeProviders:{ type: 'array',  description: 'Retry hint: skip these provider families when picking a model. Use on retry after a previous call returned blocked:true — pass the blocked provider here so the next attempt uses a different family. Examples: ["openai"], ["openai","google"].', items: { type: 'string' } }
+      saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' }
+      // `model` and `excludeProviders` are intentionally NOT declared here.
+      // Model selection is the auto-picker's job — the agent should describe
+      // what it wants (aspectRatio, resolution, referenceImages, label) and
+      // let the client-side router pick the cheapest capable model from the
+      // active catalog. `excludeProviders` is a retry-hint set by the
+      // Coordinator after a BlockedResult; it is forwarded on `action.*` by
+      // playbook-session.js and read in execute() below. Declaring them in
+      // the schema would leak them into `get_tool_info` / AVAILABLE ACTIONS
+      // and invite the agent to invent a slug (e.g. "gemini-3-pro-image-
+      // preview") that the backend catalog may not even have active — a
+      // failure mode that can't happen when the picker is the only chooser.
     },
     required: ['prompt']
   },
@@ -188,15 +197,20 @@ const generateImageAction = {
     // Get clients from the agent's LLM provider
     const clients = agent?.llmProvider?.getClients?.() || {};
 
-    // Resolve image provider. `excludeProviders` is populated by the
-    // Coordinator on retry — it passes the provider family from the
-    // previous BlockedResult so the factory picks a different one.
+    // Resolve image provider. The picker is the sole decider: it chooses the
+    // concrete model from the active catalog based on the agent's parameters
+    // (aspectRatio, resolution, refsCount, label). `action.model`, even if an
+    // agent sneaks it into the JSON, is intentionally NOT forwarded — an
+    // agent-invented slug can be inactive, unavailable to the user, or
+    // mispriced, and the catalog is the only authoritative source.
+    // `excludeProviders` IS forwarded because it is set by the Coordinator on
+    // retry (not by the agent) after a BlockedResult — it tells the picker
+    // which provider family just failed so a different one is picked next.
     let resolved;
     try {
       resolved = resolveModel({
         type: 'image',
         clients,
-        model: action.model,
         excludeProviders: Array.isArray(action.excludeProviders) ? action.excludeProviders : undefined,
       });
     } catch (err) {
