@@ -98,6 +98,41 @@ export default {
 
       const item = queue.update(id, updates);
 
+      // ── Skill lifecycle tied to queue item transitions ─────────────
+      // The queue item is the authoritative unit of work for an agent.
+      // When it moves to in_progress, skills matching the item's
+      // subject/description should activate on the executing agent.
+      // When it moves to completed/deleted, those skills should drop.
+      // Mirrors the task-update hook but on the per-agent workQueue —
+      // relevant to the queue-ownership model where each agent processes
+      // its own queue items directly.
+      if (status === 'in_progress' && agent && typeof agent._autoActivateSkills === 'function') {
+        try {
+          const _before = new Set(Array.isArray(agent.state?.skills) ? agent.state.skills : []);
+          await agent._autoActivateSkills({
+            subject: item.subject,
+            description: item.description,
+          });
+          const _after = Array.isArray(agent.state?.skills) ? agent.state.skills : [];
+          const _added = _after.filter(s => !_before.has(s));
+          if (_added.length > 0 && agent._queueScopedSkills == null) {
+            agent._queueScopedSkills = new Map();
+          }
+          if (_added.length > 0) {
+            agent._queueScopedSkills.set(String(id), _added);
+          }
+        } catch { /* non-fatal */ }
+      }
+      if ((status === 'completed' || status === 'deleted') && agent?._queueScopedSkills) {
+        const _scoped = agent._queueScopedSkills.get(String(id));
+        if (Array.isArray(_scoped) && _scoped.length > 0) {
+          agent._queueScopedSkills.delete(String(id));
+          for (const _sk of _scoped) {
+            try { await agent.callAction('deactivate_skill', { name: _sk }); } catch { /* non-fatal */ }
+          }
+        }
+      }
+
       return {
         success: true,
         id: item.id,

@@ -332,16 +332,23 @@ export function pickVideoModel(models, req = {}) {
   }
 
   const refsCount = req.refsCount || 0;
-  const wantsFrameControl = !!(req.hasStartFrame || req.hasEndFrame);
+  // Frame-control is the model feature that lets the caller pin BOTH ends
+  // of a clip (start + end frame) for precise pacing. A single start
+  // frame is just plain image-to-video — any `imageToVideo` model can
+  // handle it. The old rule required `frameControl` for ANY start/end
+  // frame, which wrongly rejected every plain image-to-video model and
+  // left generate_video({ startFrame }) with zero candidates.
+  const wantsFrameControl = !!req.hasEndFrame;
+  const wantsImageToVideo = !!(req.hasStartFrame || refsCount > 0);
 
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
     // At least one video generation capability.
     const videoCap = m.textToVideo || m.imageToVideo || m.videoToVideo;
     if (!videoCap) return false;
-    // If caller is supplying reference frames/images, the model must accept them.
-    if (refsCount > 0 && !m.imageToVideo && !m.videoToVideo) return false;
-    // Start/end frame control is a hard requirement when the caller uses it.
+    // Start frame OR reference images → the model must accept image input.
+    if (wantsImageToVideo && !m.imageToVideo && !m.videoToVideo) return false;
+    // End-frame control (with or without start frame) needs frameControl.
     if (wantsFrameControl && !m.frameControl) return false;
     // Audio track generation is a hard requirement when withAudio=true.
     if (req.withAudio && !m.hasAudio) return false;

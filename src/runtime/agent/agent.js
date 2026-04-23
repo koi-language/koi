@@ -1131,10 +1131,44 @@ export class Agent {
     }
 
     // ── AUTO-ACTIVATE SKILLS ────────────────────────────────────────────────
-    // At the start of a delegate's lifecycle, check available skills and use
-    // the cheap classifier model to decide which (if any) to activate.
-    // This is deterministic and doesn't depend on the LLM choosing to call tools.
-    if (isDelegate && !this.state?.skills?.length) {
+    // At the start of a delegate's lifecycle, wipe any stale skills from a
+    // previous invocation on this shared agent instance and re-run the
+    // classifier against the current task args. Delegate agents are SHARED
+    // (the same `teamMember.agent` is reused across tasks), so
+    // `state.skills` still held the set from the previous delegation —
+    // the old `!state.skills.length` guard therefore skipped activation
+    // for every invocation after the first, leaving whichever skills
+    // matched Task #1 pinned for Tasks #2…#N regardless of topic. Clear
+    // first, then activate fresh for THIS task. Also drop the matching
+    // markdown in `_skillContents` so the system prompt doesn't leak
+    // the prior skill's instructions into the new turn.
+    if (isDelegate) {
+      // Notify the UI that the previous skills are going away so the
+      // footer chip + Skills tab drop them, then clear state. Direct
+      // assignment would silently desync the UI.
+      const _priorSkills = Array.isArray(this.state?.skills) ? [...this.state.skills] : [];
+      for (const _sk of _priorSkills) {
+        try { channel.skillDeactivated?.({ agent: this.name, skill: _sk }); } catch { /* non-fatal */ }
+      }
+      this.state.skills = [];
+      this.state._skillContents = {};
+
+      // Skill activation — domain skills for this task's subject +
+      // description. Workflow matching is intentionally NOT called here:
+      // workflows in this codebase are designed as templates for whole
+      // USER REQUESTS (e.g. "infographic" = "generate an infographic
+      // about X", "generate-article" = "write an article about X"),
+      // not as sub-patterns to re-apply inside a plan. When a delegate
+      // receives a sub-task description, the classifier LLM has no way
+      // to tell "this is sub-task #3 of workflow 'infographic'" from
+      // "this is a brand-new request for generate-article", and picks
+      // whichever sounds vaguely similar — exactly what produced the
+      // 25-task explosion of mixed infographic + generate-article work.
+      // Workflow matching stays at the root-on-user-message level (see
+      // `_autoMatchWorkflow` call at the root loop). If a use-case
+      // appears for delegate-level workflow activation, gate it with
+      // explicit metadata on the workflow (e.g. `scope: task` in
+      // WORKFLOW.md frontmatter) rather than heuristics.
       try {
         await this._autoActivateSkills(args);
       } catch (e) {
@@ -2590,20 +2624,16 @@ export class Agent {
                 channel.log('workflow', `${this.name}: Auto-match workflow failed: ${e.message}`);
               }
 
-              // ── AUTO-ACTIVATE SKILLS (root coordinator) ──────────────────
-              // Delegates run _autoActivateSkills once at start (see the
-              // `isDelegate && !skills.length` branch earlier in handle()),
-              // using their task args. The root coordinator has no task args
-              // — its context is the user's message itself — so the same
-              // hook has to fire here, once per fresh user turn, with the
-              // user text as taskText. Without this the Skills tab never
-              // lights up when System decides to answer directly instead
-              // of delegating (exactly what the user reported).
-              try {
-                await this._autoActivateSkills({ userRequest: this._lastUserMessage });
-              } catch (e) {
-                channel.log('skills', `${this.name}: Auto-activate skills failed: ${e.message}`);
-              }
+              // NOTE: the root coordinator (System) does NOT auto-activate
+              // skills here. System's role is to route, not to execute —
+              // and domain skills (mobile-development, docx, …) would
+              // pollute System's routing prompt without ever being used,
+              // because delegates get their own skills at delegate-start
+              // via the `isDelegate` branch earlier in handle(). Skills
+              // live on the executor, not the router. If System falls
+              // through to direct execution (whitelist cases only — pure
+              // lookups with no state change), it doesn't need skills
+              // either.
             }
 
             // Clear completed tasks on new user input (keeps the slate clean).
@@ -3661,6 +3691,83 @@ export class Agent {
         } catch { /* non-fatal */ }
       }
 
+      // ── QUEUE TRANSFER ────────────────────────────────────────────────
+      // Delegation = ownership transfer in the queue model: the work item
+      // leaves the caller's queue and appears in the delegate's queue
+      // already in_progress (the delegate is about to run it). This is
+      // what keeps System's queue clean after routing — it never "started"
+      // the item, so System never activated skills for it. The delegate,
+      // when its `isDelegate` branch runs, finds the item in its own queue
+      // and uses its subject/description to drive workflow match + skill
+      // activation.
+      //
+      // Match priority:
+      //   1. Explicit `queueItemId` on the action — unambiguous.
+      //   2. Subject match (normalised, fuzzy) against caller's pending
+      //      items — covers the common case where the LLM doesn't wire
+      //      the id but uses the same subject that was queued.
+      //   3. No match → skip silently. Not every delegation maps to a
+      //      queue item (sub-agents creating sub-tasks, workflow-expanded
+      //      tasks, etc.). In those cases the delegate still receives
+      //      subject/description via args and runs normally.
+      if (_intentAgentName) {
+        try {
+          const { WorkQueue } = await import('../state/work-queue.js');
+          const callerQueue = this._workQueue;
+          if (callerQueue) {
+            let _qItem = null;
+            const _explicitQid = action.queueItemId
+              ?? resolvedAction.data?.queueItemId
+              ?? action.data?.queueItemId;
+            if (_explicitQid) {
+              _qItem = callerQueue.get(String(_explicitQid));
+            } else {
+              const _sub = action.data?.subject ?? resolvedAction.data?.subject;
+              if (_sub) {
+                const _norm = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+                const _ns = _norm(_sub);
+                const _list = callerQueue.list({ status: 'pending' });
+                _qItem = _list.find(i =>
+                  _norm(i.subject) === _ns
+                  || _ns.includes(_norm(i.subject))
+                  || _norm(i.subject).includes(_ns)
+                );
+              }
+            }
+            if (_qItem && _qItem.status !== 'deleted' && _qItem.status !== 'completed') {
+              // Mark caller's item as `deleted` with a feedback trail —
+              // semantically: it left the caller's active queue, but the
+              // audit trail survives. Using `completed` would falsely
+              // imply the caller did the work; introducing a new status
+              // would leak through every status check. `deleted` with a
+              // feedback note is the pragmatic compromise.
+              callerQueue.update(_qItem.id, {
+                status: 'deleted',
+                feedback: `Transferred to ${_intentAgentName}`,
+              });
+              // Drop into the delegate's queue in_progress. The delegate
+              // isn't instantiated yet here — we write to disk via a
+              // fresh WorkQueue(delegateName). The delegate's Agent
+              // instance lazy-inits `_workQueue` on next queue_* action
+              // and reads the same file, so it'll see this item.
+              const delegateQueue = new WorkQueue(_intentAgentName);
+              const _newItem = delegateQueue.add({
+                subject: _qItem.subject,
+                description: _qItem.description || '',
+                owner: _intentAgentName,
+              });
+              delegateQueue.update(_newItem.id, { status: 'in_progress' });
+              channel.log(
+                'queue',
+                `${this.name}: Transferred queue item #${_qItem.id} "${_qItem.subject}" → ${_intentAgentName} (#${_newItem.id})`,
+              );
+            }
+          }
+        } catch (err) {
+          channel.log('queue', `${this.name}: Queue transfer failed: ${err.message}`);
+        }
+      }
+
       try {
         result = await this.resolveAction(resolvedAction, context);
       } catch (err) {
@@ -4148,7 +4255,7 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
    * Best-effort: any failure here falls through silently — the System then
    * handles the request via normal routing / delegation.
    */
-  async _autoMatchWorkflow(userMessage) {
+  async _autoMatchWorkflow(userMessage, options = {}) {
     const text = (userMessage || '').trim();
     // Manual activation override: the GUI's "Run" button on the Workflows
     // tab sets `_forceWorkflow` and injects a hidden user message to wake
@@ -4203,11 +4310,36 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
     // user message was short, which is exactly the case where the user
     // likely DID want a match.
     if (this.state?.activeWorkflow) return;
-    try {
-      const { taskManager } = await import('../state/task-manager.js');
-      const pending = taskManager.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
-      if (pending.length > 0) return;
-    } catch { /* non-fatal */ }
+    // Mutual exclusion at PLAN level: if the root coordinator already
+    // activated a workflow for this user request, delegates MUST NOT
+    // match another. Without this, a nested delegate (Planner, Worker)
+    // sees a task description that fits a DIFFERENT workflow, activates
+    // it, and the two workflows' tasks collide in the task list —
+    // exactly the "infographic + generate-article" mix that shipped 25
+    // tangled tasks in the UI. Workflow match is a USER-REQUEST-level
+    // decision; only one workflow per request regardless of who routes
+    // what.
+    if (options._forDelegate) {
+      try {
+        const _root = Agent._rootAgent;
+        if (_root && _root !== this && _root.state?.activeWorkflow) {
+          channel.log('workflow', `${this.name}: skip delegate workflow match — root already activated "${_root.state.activeWorkflow}"`);
+          return;
+        }
+      } catch { /* non-fatal */ }
+    }
+    // Pending-tasks guard only applies to the root coordinator. Delegates
+    // ARE inside a running plan (their own delegation is the pending
+    // task), so this guard would block them from ever matching a
+    // workflow on their own in-flight work. The `_forDelegate` option is
+    // set by the task-start hook in handle() to bypass this check.
+    if (!options._forDelegate) {
+      try {
+        const { taskManager } = await import('../state/task-manager.js');
+        const pending = taskManager.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
+        if (pending.length > 0) return;
+      } catch { /* non-fatal */ }
+    }
 
     let workflows;
     try {

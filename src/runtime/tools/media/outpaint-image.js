@@ -227,6 +227,31 @@ export default {
       };
     }
 
+    // Pixel-identical preservation of the original: edit models (GPT-Image,
+    // Gemini 2.5 Flash Image, etc.) do not guarantee that a source region
+    // survives the round-trip — in practice they redraw everything, which
+    // surfaces as "the outpaint output looks similar but NOT the same".
+    // Here we force the guarantee: resize the generated canvas to the exact
+    // target dimensions, then composite the ORIGINAL image on top at the
+    // requested offset. Result: original pixels verbatim; model-invented
+    // content only in the margins.
+    try {
+      const sharp = (await import('sharp')).default;
+      for (const img of result.images || []) {
+        if (!img.savedTo || !fs.existsSync(img.savedTo)) continue;
+        const resized = await sharp(img.savedTo)
+          .resize(newWidth, newHeight, { fit: 'fill' })
+          .toBuffer();
+        const stamped = await sharp(resized)
+          .composite([{ input: resolvedPath, left: pads.left, top: pads.top }])
+          .toFormat(action.outputFormat || 'png')
+          .toBuffer();
+        fs.writeFileSync(img.savedTo, stamped);
+      }
+    } catch (err) {
+      channel.log('image', `outpaint_image: original composite step failed: ${err.message}`);
+    }
+
     // Record provenance so `recall_facts` knows where each pixel came from.
     try {
       const { recordImageOp } = await import('../../state/image-lineage.js');
