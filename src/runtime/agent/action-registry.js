@@ -324,19 +324,39 @@ class ActionRegistry {
     }
     doc += '\n';
 
-    // Full schemas for every tool this agent has already asked about
-    // via get_tool_info — pinned into every subsequent prompt so the
-    // model doesn't forget and guess parameters. Scoped to this agent
-    // instance only.
-    if (agent?._expandedTools instanceof Set && agent._expandedTools.size > 0) {
-      const expandedList = actions.filter((a) =>
-        agent._expandedTools.has(a.intent || a.type),
-      );
-      for (const action of expandedList) {
-        doc += this._formatActionEntry(action) + '\n';
-      }
-    }
+    // NOTE: expanded tool schemas (from `get_tool_info`) used to live here.
+    // They've been moved OUT of this static-cached output into
+    // `generateExpandedToolsBlock(agent)` which is interpolated by the
+    // system-prompt-builder into the DYNAMIC section of the prompt.
+    // Keeping them here grew the static prefix every time the agent
+    // called `get_tool_info`, busting the prompt cache on every turn.
+    // See system-prompt-builder.js for where the dynamic block lands.
 
+    return doc;
+  }
+
+  /**
+   * Dynamic block: full schemas for every tool this agent has already
+   * expanded via `get_tool_info`. Returns an empty string when the
+   * agent hasn't expanded anything. Called by the system-prompt
+   * builder to splice the schemas into the DYNAMIC part of the system
+   * prompt — keeping the static/cacheable prefix stable across turns
+   * even as the agent asks for more tool details mid-conversation.
+   */
+  generateExpandedToolsBlock(agent) {
+    if (!(agent?._expandedTools instanceof Set) || agent._expandedTools.size === 0) {
+      return '';
+    }
+    const actions = this._filterActions(agent);
+    const expandedList = actions.filter(
+      (a) => agent._expandedTools.has(a.intent || a.type),
+    );
+    if (expandedList.length === 0) return '';
+    let doc = '\n## Tool schemas you recently requested\n\n';
+    doc += 'These are the full schemas you already asked for via `get_tool_info` — pinned here so you don\'t have to look them up again. Do NOT call `get_tool_info` again for any of these.\n\n';
+    for (const action of expandedList) {
+      doc += this._formatActionEntry(action) + '\n';
+    }
     return doc;
   }
 

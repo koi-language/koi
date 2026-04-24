@@ -329,6 +329,30 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push(`{ "intent": "generate_image", "prompt": "Edit the FIRST reference image. The SECOND is a composite snapshot showing EXACTLY where and at what size/angle the pasted elements land — use as PLACEMENT guide. The REMAINING refs are the high-fidelity sources. Apply: <paraphrase the user's request>.", "referenceImages": ${refJson}, "saveTo": "${saveDir}" }`);
         lines.push('```');
       }
+
+      // When the ACTIVE doc is a video and the user asks for an edit /
+      // restyle / motion change, the video itself is the subject — pass
+      // its path as `referenceVideos` so the router can pick a v2v model.
+      // Without this block the agent routinely calls generate_video with
+      // only `prompt` set (no refs) → the router classifies it as pure
+      // text-to-video and rejects any video-to-video specialist, even
+      // when the user clearly meant "edit this video".
+      if (active && active.type === 'video' && active.path) {
+        const activeLoc = active.path;
+        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        lines.push('');
+        lines.push('## 🎬 ACTIVE document is a video — route edits via video-to-video');
+        lines.push('');
+        lines.push('The video IS the subject. "Cambia el color", "make it slow-motion", "apply cinematic grading", "remove the watermark", "extend", "restyle", "add audio", etc. → the ACTIVE video is the input.');
+        lines.push('');
+        lines.push(`For **any edit / restyle / transformation** of the active video, call \`generate_video\` with its path in \`referenceVideos\`. The router uses that to pick a video-to-video model; omitting it forces text-to-video routing and the call will be rejected.`);
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_video", "prompt": "<paraphrase the user's request, describing the desired result>", "referenceVideos": ["${activeLoc}"], "saveTo": "${saveDir}" }`);
+        lines.push('```');
+        lines.push('');
+        lines.push('Only skip `referenceVideos` if the user is asking for a brand-new clip that does NOT reference the active video (e.g. "generate a video of a sunset" while a different video is open).');
+      }
       lines.push('');
       lines.push('**ACTIVE doc = default target.** Demonstratives ("this", "esto", "the image", "the pdf", …) always mean the ACTIVE document — never the project codebase. Use only paths / URLs listed above, never invent.');
       lines.push('- **Read** active doc → `read_file` with its path/URL. Images & web come back as vision; if there\'s a composite, it\'s queued right after as `[ANNOTATIONS OVERLAY]`.');
@@ -356,6 +380,14 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
     }
   } catch { /* store not available — skip */ }
 
+  // Expanded tool schemas: full docs for every tool the agent has
+  // already requested via `get_tool_info` this session. Lives in the
+  // DYNAMIC section (not static) — the static prefix must stay stable
+  // across turns so the prompt cache hits; if we put this here it
+  // would change every time the agent asked for a new tool and every
+  // subsequent call would re-tokenise the entire prefix.
+  const expandedToolsBlock = actionRegistry.generateExpandedToolsBlock(agent);
+
   // ── Dynamic section: runtime context, project map, language, non-interactive ──
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
@@ -369,7 +401,7 @@ ${phaseSystemBlock}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
-${openDocumentsBlock}${nonInteractiveBlock}
+${openDocumentsBlock}${nonInteractiveBlock}${expandedToolsBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 
   return { static: staticPart, dynamic, koiMd };

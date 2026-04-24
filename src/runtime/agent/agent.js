@@ -293,6 +293,86 @@ export class Agent {
 
     // Initialize LLM provider if needed
     this.llmProvider = null;
+
+    // ── Per-agent AbortController ──────────────────────────────────────
+    // Each agent owns its own controller. LLM calls made by this agent's
+    // reactive loop listen to `this._abortController.signal` instead of
+    // the global `uiBridge.abortSignal`. This lets one agent be aborted
+    // (e.g. Worker when the user modifies its in-flight task) without
+    // cascading to siblings (e.g. System awaiting the delegate return).
+    //
+    // The global abort (Stop button, Ctrl+C) still fans out to every
+    // per-agent controller through a one-shot listener installed in
+    // `_resetAbortController` — so "Stop" semantics remain unchanged.
+    //
+    // `_abortReason` carries the reason passed to .abort(...) so the
+    // reactive loop can distinguish between:
+    //   - 'modify' (cross-agent modify_task) → continue the loop with
+    //      the updated task/inbox state on the next iteration
+    //   - 'user-stop' / undefined            → exit the loop as before
+    this._abortController = null;
+    this._abortReason = null;
+    this._globalAbortListener = null;
+    this._resetAbortController();
+  }
+
+  /**
+   * Create a fresh AbortController for this agent and wire the global
+   * `uiBridge.abortSignal` to it, so Stop button / Ctrl+C still aborts
+   * every agent at once. Safe to call between loop iterations (cleans
+   * up the previous listener first).
+   */
+  _resetAbortController() {
+    // Clean up previous listener if any — prevents EventEmitter leak
+    // warnings over hundreds of iterations.
+    if (this._globalAbortListener) {
+      try {
+        const prev = Agent._cliHooks?.getAbortSignal?.();
+        prev?.removeEventListener?.('abort', this._globalAbortListener);
+      } catch { /* non-fatal */ }
+      this._globalAbortListener = null;
+    }
+
+    this._abortController = new AbortController();
+    this._abortReason = null;
+
+    // Chain global → per-agent. When Stop fires, everyone's controller
+    // aborts with reason 'user-stop' so the per-agent loop knows it
+    // should EXIT (not re-enter like it would for 'modify').
+    const globalSignal = Agent._cliHooks?.getAbortSignal?.();
+    if (globalSignal && typeof globalSignal.addEventListener === 'function') {
+      if (globalSignal.aborted) {
+        this._abortController.abort(globalSignal.reason || 'user-stop');
+        this._abortReason = globalSignal.reason || 'user-stop';
+      } else {
+        const listener = () => {
+          const reason = globalSignal.reason || 'user-stop';
+          this._abortReason = reason;
+          try { this._abortController.abort(reason); } catch { /* non-fatal */ }
+        };
+        this._globalAbortListener = listener;
+        globalSignal.addEventListener('abort', listener, { once: true });
+      }
+    }
+  }
+
+  /**
+   * Abort this agent's current LLM stream / reactive iteration.
+   *
+   * `reason` is stored so the reactive loop catch-path can decide
+   * whether to exit or continue:
+   *   - 'modify'     → continue (re-read the updated task and re-enter)
+   *   - 'user-stop'  → exit (same as the global Stop button)
+   *   - anything else → treated like 'user-stop'
+   *
+   * This does NOT cascade to other agents — unlike the global
+   * `uiBridge.abort()` which disconnects every in-flight stream.
+   */
+  abort(reason = 'user-stop') {
+    if (!this._abortController) return;
+    if (this._abortController.signal.aborted) return;
+    this._abortReason = reason;
+    try { this._abortController.abort(reason); } catch { /* non-fatal */ }
   }
 
   /** Get this agent's work queue (lazy-initialized). */
@@ -492,65 +572,128 @@ export class Agent {
         null,  // No medium-term summary — expires after short-term
         null
       );
-    } else if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask && queue) {
-      const existing = queue.get(result.targetTaskId);
-      if (!existing) {
-        // Fallback: classifier thought the id existed but it was completed/deleted
-        // between classification and drain. Treat as new_task.
-        channel.log('inbox', `${this.name}: modify_task target #${result.targetTaskId} vanished — falling back to new_task`);
-        const added = queue.add({
-          subject: result.rewrittenTask.subject,
-          description: result.rewrittenTask.description || msg.text,
-          owner: this.name,
-        });
-        contextMemory.add('user',
-          `[INBOX] Message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
-          null, null);
-      } else {
-        // Rewrite subject/description. We REPLACE description (not append)
-        // because the classifier has already produced a merged version.
-        queue.update(result.targetTaskId, {
-          subject: result.rewrittenTask.subject,
-          description: result.rewrittenTask.description || existing.description,
-          replaceDescription: true,
-        });
+    } else if (kind === 'modify_task' && result.targetTaskId && result.rewrittenTask) {
+      // Source-aware modification. The global classifier tells us
+      // exactly where the target lives (taskManager plan vs some
+      // agent's workQueue) via `result.target.source`. Fallback path
+      // for legacy local-classifier results (no `target` object): the
+      // target is assumed to live in this agent's own workQueue.
+      const _source = result.target?.source || `workqueue:${this.name}`;
 
-        // If the task is in_progress and an activeForm was provided, also
-        // update the live panel so the user sees the change in the UI.
-        if (existing.status === 'in_progress' && result.rewrittenTask.activeForm) {
-          try {
-            const { taskManager } = await import('../state/task-manager.js');
-            const tmTasks = taskManager.list();
-            const match = tmTasks.find(t =>
-              t.status === 'in_progress' &&
-              (t.subject === existing.subject || t.subject === result.rewrittenTask.subject)
-            );
-            if (match) {
-              taskManager.update(match.id, {
-                subject: result.rewrittenTask.subject,
-                activeForm: result.rewrittenTask.activeForm,
-              });
-            }
-          } catch (err) {
-            channel.log('inbox', `${this.name}: panel update failed: ${err.message}`);
+      // When MessageInbox._applyCrossAgentModifyIfNeeded already did the
+      // queue rewrite, inbox push, and abort-in-flight from the
+      // background (so System didn't have to drain first while blocked
+      // in a delegate await), skip the duplicate work. We still need to
+      // record the [INBOX] note into THIS agent's contextMemory so its
+      // next LLM turn has a trace of what happened.
+      if (result._crossAgentApplied) {
+        contextMemory.add(
+          'user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to ${_source}#${result.targetTaskId}: ${result.rewrittenTask.subject}`,
+          null,
+          null,
+        );
+      } else {
+        const _applied = await this._applyTargetedModify({
+          msg,
+          source: _source,
+          targetId: result.targetTaskId,
+          rewrite: result.rewrittenTask,
+          contextMemory,
+          localQueue: queue,
+        });
+        if (!_applied) {
+          // Fallback: target vanished or source unresolvable → downgrade
+          // to new_task on the root's own workQueue.
+          channel.log('inbox', `${this.name}: modify_task target ${_source}#${result.targetTaskId} unresolved — falling back to new_task`);
+          if (queue) {
+            const added = queue.add({
+              subject: result.rewrittenTask.subject,
+              description: result.rewrittenTask.description || msg.text,
+              owner: this.name,
+            });
+            contextMemory.add('user',
+              `[INBOX] New message from ${msg.from}: "${msg.text}"\nQueued as task #${added.id}: ${added.subject}`,
+              null, null);
           }
         }
 
-        channel.log('inbox', `${this.name}: modified task #${result.targetTaskId} "${result.rewrittenTask.subject}"`);
-        contextMemory.add(
-          'user',
-          `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to task #${existing.id}: ${result.rewrittenTask.subject}`,
-          null,
-          null
-        );
-
-        // Broadcast to delegates working on subtasks derived from this
-        // one. Only if the task is in_progress — if it's still pending
-        // there's no running delegate to notify.
-        if (existing.status === 'in_progress') {
-          this._broadcastToDelegatesOfTask(existing.id, msg);
+        // Abort-in-flight: the global classifier flagged that a delegate
+        // is actively executing this task AND the change is urgent
+        // enough to interrupt. Each agent now owns its own
+        // AbortController, so the abort is SCOPED to the target
+        // delegate — System (usually awaiting the delegate's return)
+        // is not collaterally cancelled. The reason 'modify' tells
+        // the delegate's reactive loop to resume with the updated
+        // task instead of exiting on abort.
+        if (result.abortInFlight && result.targetDelegateAgent) {
+          try {
+            const _target = Agent._inboxRegistry?.get(String(result.targetDelegateAgent).toLowerCase());
+            if (_target && typeof _target.abort === 'function') {
+              _target.abort('modify');
+              channel.log('inbox', `${this.name}: aborted ${result.targetDelegateAgent}'s in-flight LLM (reason=modify) so it re-reads the updated task`);
+            } else {
+              channel.log('inbox', `${this.name}: abort requested but target ${result.targetDelegateAgent} not resolvable — message waits for next iteration`);
+            }
+          } catch (err) {
+            channel.log('inbox', `${this.name}: abort failed: ${err?.message || err}`);
+          }
         }
       }
+    } else if (kind === 'cancel_task' && result.targetTaskId) {
+      // Cancel a specific task. The cross-agent immediate-apply path in
+      // MessageInbox handles the workqueue deletion + inbox push +
+      // abort(reason='cancel'); here we just write the bookkeeping note
+      // into THIS agent's contextMemory. When the target lives in the
+      // global taskManager (or the cross-agent apply couldn't find the
+      // workqueue), fall through and do it here.
+      const _source = result.target?.source || `workqueue:${this.name}`;
+      const _subject = result.rewrittenTask?.subject || '(task)';
+      if (result._crossAgentApplied) {
+        contextMemory.add(
+          'user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\nCancelled ${_source}#${result.targetTaskId}.`,
+          null,
+          null,
+        );
+      } else {
+        const _cancelled = await this._applyTargetedCancel({
+          source: _source,
+          targetId: result.targetTaskId,
+        });
+        contextMemory.add(
+          'user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\n${_cancelled ? `Cancelled ${_source}#${result.targetTaskId}.` : `Cancel requested but target ${_source}#${result.targetTaskId} was already gone.`}`,
+          null,
+          null,
+        );
+        // Abort-in-flight on the target delegate with reason='cancel'
+        // → its reactive loop EXITS (as opposed to 'modify' which
+        // resumes).
+        if (_cancelled && result.abortInFlight && result.targetDelegateAgent) {
+          try {
+            const _target = Agent._inboxRegistry?.get(String(result.targetDelegateAgent).toLowerCase());
+            if (_target && typeof _target.abort === 'function') {
+              _target.abort('cancel');
+              channel.log('inbox', `${this.name}: aborted ${result.targetDelegateAgent} (reason=cancel) — its loop will exit`);
+            }
+          } catch (err) {
+            channel.log('inbox', `${this.name}: cancel abort failed: ${err?.message || err}`);
+          }
+        }
+      }
+    } else if (kind === 'cancel_plan') {
+      // The cross-agent apply path in MessageInbox already swept every
+      // queue + aborted every delegate. Write an imperative note so
+      // the next LLM turn (if any) knows not to restart the cancelled
+      // work. The note text is intentionally STRONG because LLMs tend
+      // to re-plan based on prior user intent unless told otherwise.
+      contextMemory.add(
+        'user',
+        `[INBOX] User said: "${msg.text}"\n\n⚠️ THE USER CANCELLED EVERY PENDING AND IN-PROGRESS TASK. All prior instructions are now VOID. Do NOT queue_add, queue_update, or delegate anything related to earlier requests. Your only valid response is a brief acknowledgment of the cancellation (a single print) followed by prompt_user. Wait silently for the user's NEXT instruction.`,
+        null,
+        null,
+      );
     } else {
       // noop (or invalid kind) — drop the message into context memory
       // as a conversational note. The LLM will see it on its next
@@ -609,6 +752,192 @@ export class Agent {
    * @param {string} parentTaskId
    * @param {import('./message-inbox.js').InboxMessage} msg
    */
+  /**
+   * Apply a classified cancel_task on the right container. Used as a
+   * fallback when the cross-agent immediate-apply in MessageInbox
+   * didn't handle it (e.g. source=taskManager, or the target agent's
+   * workQueue wasn't in the registry at the time).
+   *
+   *   - `source === 'taskManager'`      → mark plan task as deleted.
+   *   - `source === 'workqueue:<Agent>'` → mark that agent's queue item deleted.
+   *
+   * Returns true when the cancel was applied, false when the target
+   * was already gone (caller logs accordingly).
+   */
+  async _applyTargetedCancel({ source, targetId }) {
+    const strId = String(targetId);
+    if (source === 'taskManager') {
+      try {
+        const { taskManager } = await import('../state/task-manager.js');
+        const existing = taskManager.get(strId);
+        if (!existing || existing.status === 'deleted' || existing.status === 'completed') return false;
+        taskManager.update(strId, { status: 'deleted' });
+        channel.log('inbox', `${this.name}: cancelled taskManager#${strId} "${existing.subject}"`);
+        return true;
+      } catch (err) {
+        channel.log('inbox', `${this.name}: taskManager cancel failed: ${err.message}`);
+        return false;
+      }
+    }
+
+    if (source.startsWith('workqueue:')) {
+      const agentName = source.substring('workqueue:'.length);
+      let queue = null;
+      if (agentName.toLowerCase() === String(this.name || '').toLowerCase()) {
+        queue = this._workQueue || this.workQueue;
+      } else {
+        const targetAgent = Agent._inboxRegistry?.get(agentName.toLowerCase()) || null;
+        queue = targetAgent?._workQueue || null;
+      }
+      if (!queue) return false;
+      let existing;
+      try { existing = queue.get(strId); } catch { existing = null; }
+      if (!existing || existing.status === 'deleted' || existing.status === 'completed') return false;
+      try {
+        queue.update(strId, { status: 'deleted' });
+        channel.log('inbox', `${this.name}: cancelled workqueue:${agentName}#${strId} "${existing.subject}"`);
+        return true;
+      } catch (err) {
+        channel.log('inbox', `${this.name}: workqueue cancel failed: ${err.message}`);
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Apply a classified modify_task on the right container.
+   *
+   *   - `source === 'taskManager'`      → edit the plan task globally.
+   *   - `source === 'workqueue:<Agent>'` → edit that agent's work queue.
+   *
+   * Returns true when the modification was applied, false when the
+   * target vanished (caller should fall back to new_task).
+   */
+  async _applyTargetedModify({ msg, source, targetId, rewrite, contextMemory, localQueue }) {
+    if (source === 'taskManager') {
+      try {
+        const { taskManager } = await import('../state/task-manager.js');
+        const existing = taskManager.get(String(targetId));
+        if (!existing || existing.status === 'deleted') return false;
+        taskManager.update(String(targetId), {
+          subject: rewrite.subject,
+          description: rewrite.description || existing.description,
+          ...(rewrite.activeForm ? { activeForm: rewrite.activeForm } : {}),
+        });
+        channel.log('inbox', `${this.name}: modified taskManager#${targetId} "${rewrite.subject}"`);
+        contextMemory.add(
+          'user',
+          `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to plan task #${targetId}: ${rewrite.subject}`,
+          null,
+          null,
+        );
+        if (existing.status === 'in_progress') {
+          this._broadcastToDelegatesOfTask(String(targetId), msg);
+        }
+        return true;
+      } catch (err) {
+        channel.log('inbox', `${this.name}: taskManager modify failed: ${err.message}`);
+        return false;
+      }
+    }
+
+    if (source.startsWith('workqueue:')) {
+      const agentName = source.substring('workqueue:'.length);
+      // Find the target agent instance (for inbox push) AND its
+      // workQueue (for the update). When the target IS this agent,
+      // reuse the already-resolved `localQueue` to avoid double lookup.
+      let queue = null;
+      let targetAgent = null;
+      if (agentName.toLowerCase() === String(this.name || '').toLowerCase()) {
+        queue = localQueue || this._workQueue || this.workQueue;
+        targetAgent = this;
+      } else {
+        targetAgent = Agent._inboxRegistry?.get(agentName.toLowerCase()) || null;
+        queue = targetAgent?._workQueue || null;
+      }
+      if (!queue) return false;
+      let existing;
+      try { existing = queue.get(String(targetId)); } catch { existing = null; }
+      if (!existing || existing.status === 'deleted') return false;
+
+      queue.update(String(targetId), {
+        subject: rewrite.subject,
+        description: rewrite.description || existing.description,
+        replaceDescription: true,
+      });
+
+      // Mirror the subject/activeForm into the taskManager's UI panel
+      // if a plan task with the same subject is in_progress — keeps
+      // the live task chip in sync with the user's rewording.
+      if (existing.status === 'in_progress' && rewrite.activeForm) {
+        try {
+          const { taskManager } = await import('../state/task-manager.js');
+          const tmTasks = taskManager.list();
+          const match = tmTasks.find(t =>
+            t.status === 'in_progress' &&
+            (t.subject === existing.subject || t.subject === rewrite.subject)
+          );
+          if (match) {
+            taskManager.update(match.id, {
+              subject: rewrite.subject,
+              activeForm: rewrite.activeForm,
+            });
+          }
+        } catch (err) {
+          channel.log('inbox', `${this.name}: panel update failed: ${err.message}`);
+        }
+      }
+
+      channel.log('inbox', `${this.name}: modified workqueue:${agentName}#${targetId} "${rewrite.subject}"`);
+      contextMemory.add(
+        'user',
+        `[INBOX] Message from ${msg.from}: "${msg.text}"\nApplied as modification to ${agentName}'s task #${targetId}: ${rewrite.subject}`,
+        null,
+        null,
+      );
+
+      // Deliver an IMPERATIVE update note to the target agent's inbox
+      // when it's not ourselves. Same reason as in MessageInbox's
+      // cross-agent helper: a one-liner "[INBOX] user said X" gets
+      // outweighed by the original task spec the delegate received at
+      // boot. Restate the new subject/description explicitly so the
+      // LLM knows to switch.
+      if (targetAgent && targetAgent !== this && typeof targetAgent._inbox?.push === 'function') {
+        try {
+          const _newSubject = rewrite.subject || existing.subject;
+          const _newDesc = rewrite.description || existing.description || '';
+          const _noteText =
+            `⚠️ TASK UPDATED by user mid-execution.\n\n` +
+            `User said: "${msg.text}"\n\n` +
+            `Your new task supersedes the original task spec you received at boot. Use THIS as your authoritative instruction going forward:\n\n` +
+            `  NEW SUBJECT: ${_newSubject}\n` +
+            `  NEW DESCRIPTION: ${_newDesc}\n\n` +
+            `Do NOT continue with the previous subject. Discard any work-in-progress specific to the old task. Re-plan from here.`;
+          targetAgent._inbox.push({
+            from: this.name,
+            text: _noteText,
+            attachments: msg.attachments,
+            correlationId: msg.correlationId,
+            parentTaskId: String(targetId),
+          });
+          channel.log('inbox', `${this.name}: pushed modification note to ${agentName}'s inbox (task #${targetId}, new subject="${_newSubject}")`);
+        } catch (err) {
+          channel.log('inbox', `${this.name}: inbox push to ${agentName} failed: ${err?.message || err}`);
+        }
+      } else if (existing.status === 'in_progress') {
+        // Fallback: couldn't find agent instance — try parentTaskKey
+        // broadcast in case some delegate's key happens to match.
+        this._broadcastToDelegatesOfTask(String(targetId), msg);
+      }
+      return true;
+    }
+
+    // Unknown source shape — signal fallback to new_task.
+    return false;
+  }
+
   _broadcastToDelegatesOfTask(parentTaskId, msg) {
     let count = 0;
     for (const [, agent] of Agent._inboxRegistry) {
@@ -1115,6 +1444,12 @@ export class Agent {
     }
     channel.log('agent', `${this.name}: Starting reactive loop${isDelegate ? ' [delegate]' : ''}`);
 
+    // Fresh AbortController per invocation. Delegates are shared instances
+    // across repeated invocations, so a previous run's aborted state must
+    // NOT carry over into this one (would cause an instant exit on the
+    // first iteration's abort check).
+    this._resetAbortController();
+
     // Fire `invoked` on every handler entry — this is the right event for
     // delegate agents that want to set their initial phase whenever their
     // parent invokes them. The root agent ALSO receives `invoked`, so it
@@ -1401,10 +1736,20 @@ export class Agent {
         );
       }
 
-      // Check if user cancelled via Ctrl+C.
-      // Check both the signal (while controller exists) and wasAborted flag
-      // (persists after uiBridge nulls the controller on abort).
-      if (Agent._cliHooks?.getAbortSignal?.()?.aborted || Agent._cliHooks?.wasAborted?.()) {
+      // Check if this agent was aborted. The per-agent controller
+      // covers both the global abort path (cascaded via the listener
+      // installed in _resetAbortController) and targeted per-agent
+      // aborts like cross-agent modify_task. The reason decides
+      // whether to EXIT ('user-stop') or CONTINUE ('modify' — fall
+      // through so the next iteration drains the updated inbox /
+      // queue). Reset the controller on 'modify' so the next LLM
+      // call has a fresh, un-aborted signal.
+      if (this._abortController?.signal?.aborted) {
+        if (this._abortReason === 'modify') {
+          channel.log('agent', `${this.name}: resuming after modify abort — re-reading task state`);
+          this._resetAbortController();
+          continue;
+        }
         exitedOnAbort = true;
         break;
       }
@@ -1464,7 +1809,7 @@ export class Agent {
           isFirstCall,
           thinkingHint,
           isDelegate,
-          abortSignal: Agent._cliHooks?.getAbortSignal?.()
+          abortSignal: this._abortController?.signal
         });
         isFirstCall = false;
         this._llmErrorShown = false; // Reset warning flag on successful call
@@ -1483,7 +1828,16 @@ export class Agent {
         // would cheerfully execute the stale action batch — e.g. "Understood,
         // I'll remove the background now" — even though the user explicitly
         // cancelled. Treat it exactly like an AbortError thrown mid-call.
-        if (Agent._cliHooks?.wasAborted?.() || Agent._cliHooks?.getAbortSignal?.()?.aborted) {
+        //
+        // Distinguish 'modify' aborts (cross-agent task rewrite) from
+        // 'user-stop' aborts: on 'modify' we CONTINUE so the next iteration
+        // sees the updated queue / inbox without restarting the loop.
+        if (this._abortController?.signal?.aborted) {
+          if (this._abortReason === 'modify') {
+            channel.log('agent', `${this.name}: post-response modify abort — re-reading task state`);
+            this._resetAbortController();
+            continue;
+          }
           exitedOnAbort = true;
           channel.log('agent', `${this.name}: Cancelled by user (post-response)`);
           break;
@@ -1491,14 +1845,20 @@ export class Agent {
       } catch (error) {
         channel.clear();
 
-        // AbortError = user pressed Ctrl+C → break out of loop immediately.
-        // Use wasAborted() hook (UIBridge flag set on user Ctrl+C) as the primary
-        // signal — avoids false positives from network errors like ECONNABORTED.
-        // Fall back to error.name check for non-CLI mode (no hooks).
-        const isAbort = Agent._cliHooks?.wasAborted?.()
-          || error.name === 'AbortError'
-          || Agent._cliHooks?.getAbortSignal?.()?.aborted;
+        // AbortError = user pressed Ctrl+C, Stop button, or a cross-agent
+        // modify_task. The per-agent controller tells us which: if reason
+        // is 'modify', CONTINUE the loop so the next iteration picks up
+        // the rewritten queue item. Otherwise EXIT as before.
+        const perAgentAborted = this._abortController?.signal?.aborted;
+        const isAbort = perAgentAborted
+          || Agent._cliHooks?.wasAborted?.()
+          || error.name === 'AbortError';
         if (isAbort) {
+          if (perAgentAborted && this._abortReason === 'modify') {
+            channel.log('agent', `${this.name}: aborted for modify — resuming with updated task`);
+            this._resetAbortController();
+            continue;
+          }
           exitedOnAbort = true;
           channel.log('agent', `${this.name}: Cancelled by user`);
           break;
@@ -1932,10 +2292,13 @@ export class Agent {
         // Same reason as the post-LLM-response guard above: the user can
         // press cancel *between* actions while we iterate a batch. Don't
         // keep dispatching side-effects (delegate, shell, edit_file…) once
-        // an abort has been recorded.
-        if (Agent._cliHooks?.wasAborted?.() || Agent._cliHooks?.getAbortSignal?.()?.aborted) {
-          exitedOnAbort = true;
+        // an abort has been recorded. On 'modify' abort we break out so
+        // the outer loop can reset the controller and re-enter with the
+        // updated task — we do NOT set exitedOnAbort because that would
+        // terminate the agent; the outer guard handles the restart.
+        if (this._abortController?.signal?.aborted) {
           terminated = true;
+          if (this._abortReason !== 'modify') exitedOnAbort = true;
           break;
         }
 
@@ -2341,6 +2704,15 @@ export class Agent {
 
           if (isDelegate) {
             channel.log('agent', `${this.name}: Delegate task completed, returning to caller`);
+            // Fire-and-forget: harvest durable artifacts (URLs visited,
+            // files touched) from this delegate's session into the
+            // shared session-knowledge store so sibling / follow-up
+            // tasks can recall_facts them instead of re-running the
+            // same web searches. Kept off the return path — any
+            // failure is swallowed by the harvester and logged.
+            import('./delegate-artifact-harvester.js')
+              .then(({ harvestAndPersist }) => harvestAndPersist(this, session))
+              .catch(() => { /* non-fatal */ });
           }
           session.terminate(returnData);
           terminated = true;
@@ -2953,7 +3325,20 @@ export class Agent {
         }
       }
 
-      if (terminated) break;
+      if (terminated) {
+        // Action batch was interrupted. Three possibilities:
+        //   1. Explicit early-exit from the handler (stay gone).
+        //   2. User-stop / error abort (exitedOnAbort set, stay gone).
+        //   3. Cross-agent modify abort — RESUME the outer loop so the
+        //      next iteration drains the updated inbox / queue instead
+        //      of bailing out of the agent entirely.
+        if (this._abortController?.signal?.aborted && this._abortReason === 'modify') {
+          channel.log('agent', `${this.name}: mid-batch modify abort — resuming loop`);
+          this._resetAbortController();
+          continue;
+        }
+        break;
+      }
     }
 
     // Clean up per-slot context memory reference
@@ -3145,6 +3530,26 @@ export class Agent {
             // doesn't inject "SESSION RESUMED" and reset the conversation.
             this._nextSessionIsContinuation = true;
             return await this._executePlaybookReactive(eventName, freshPlaybook, args, context, this.contextMemoryState, false, false, playbookResolver);
+          }
+        }
+
+        // If the loop exited while a classified inbox message is still
+        // undrained (classic case: cancel_task / cancel_plan aborted
+        // the loop mid-batch, before the next top-of-loop drain could
+        // run), drain it NOW so:
+        //   1. the cancel note is written into contextMemory
+        //   2. `deliverClassifiedInput` queues the user's text for
+        //      the prompt_user below, so the agent doesn't wait
+        //      silently with no visible ACK.
+        if (this._inbox?.hasWork?.()) {
+          try {
+            const processed = this._inbox.drainProcessed();
+            for (const entry of processed) {
+              await this._applyInboxResult(entry.message, entry.result, contextMemory);
+            }
+            channel.log('inbox', `${this.name}: drained ${processed.length} pending inbox result(s) in recovery path`);
+          } catch (err) {
+            channel.log('inbox', `${this.name}: recovery drain error: ${err?.message || err}`);
           }
         }
 
@@ -4184,19 +4589,27 @@ Many commands are inherently slow and produce little or no output for extended p
 
     const skillList = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
 
-    const prompt = `You are a skill selector. An AI agent is about to start a task. Your job is to decide which specialized skills (if any) should be activated to help it.
+    const prompt = `You are a skill selector for an AI agent. Your job is to activate skills ONLY when the agent's task is a direct instance of the skill's described use case.
 
-Each skill provides a domain-specific workflow with detailed instructions, reference materials, and best practices. Activating a relevant skill significantly improves the quality of the output.
+STRICT RULES:
+1. A skill matches ONLY when the task is precisely what the skill's description says to use it for. Keyword overlap is NOT enough.
+2. If a skill's description mentions a specific context / platform / output format (e.g. "for Slack", "with p5.js", "for YouTube transcripts", "mobile apps"), the task MUST match that context. Do not match if the task only shares a generic word with the description.
+3. Prefer returning [] over loose matches. An unnecessary skill pollutes the agent's prompt with irrelevant instructions and degrades its output.
+4. Never activate more than one skill unless the task truly spans multiple distinct domains — then cite the specific parts of the task that each skill addresses in your reasoning (mental only, don't output it).
 
-TASK THE AGENT WILL PERFORM:
-${taskText.substring(0, 500)}
+TASK:
+${taskText}
 
 AVAILABLE SKILLS:
 ${skillList}
 
-Which skills should be activated for this task? Consider whether the task's domain, subject matter, or required techniques overlap with any skill's area of expertise.
+Examples of correct behavior:
+- Task "translate this paragraph" + skills [mobile-development, frontend-design] → [] (no skill matches)
+- Task "animate this photo" + skill "slack-gif-creator: animated GIFs for Slack" → [] (the task is not about Slack GIFs)
+- Task "build a mobile app called X" + skill "mobile-development: Building mobile apps with …" → ["mobile-development"] (direct match)
+- Task "research the Artemis II mission" + skill "generate-article: Turn a YouTube video into an article" → [] (no YouTube video involved)
 
-Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["api-development", "database-development"]. Return [] if no skill is relevant.`;
+Return ONLY a JSON array of skill names to activate, e.g. ["mobile-development"] or []. Return [] when no skill is a precise match — this is the common case and the correct answer.`;
 
     try {
       const { getAllCandidates } = await import('../llm/providers/factory.js');
@@ -4352,18 +4765,32 @@ Return ONLY a JSON array of skill names to activate, e.g. ["infographic"] or ["a
     if (!workflows || workflows.length === 0) return;
 
     const catalog = workflows.map(w => `- ${w.name}: ${w.description}`).join('\n');
-    const prompt = `You are a workflow matcher. The user just sent a request. Decide whether any of the pre-approved workflows below clearly matches the request type.
+    const prompt = `You are a workflow matcher. A workflow is a pre-approved plan template for a SPECIFIC type of user request. Your job is to activate one ONLY when the request is precisely an instance of that workflow's described use case.
 
-A workflow matches ONLY when the user's request is clearly an instance of the task type described in its description. If in doubt, prefer null — normal routing will handle it.
+STRICT RULES:
+1. A workflow matches ONLY when the user's request is a direct, unambiguous instance of what the workflow description says to use it for. Keyword overlap is NOT enough.
+2. If a workflow description mentions a specific input / context / platform (e.g. "a YouTube video URL", "a Slack message", "a Figma design file", "a product image"), the user's request MUST explicitly provide that exact input. If the input is absent, do NOT match.
+3. Activating a workflow creates a fixed task plan. A wrong match corrupts the agent's plan with tasks that don't belong. Prefer "null" over a loose match — normal routing / delegation can always handle the request afterwards.
+4. NEVER match just because the request is vaguely in the same domain as a workflow. Domain overlap is not instance match.
+5. Only one workflow can match at most. Pick the single best fit, or null.
 
 USER REQUEST:
-${text.substring(0, 1000)}
+${text}
 
 AVAILABLE WORKFLOWS:
 ${catalog}
 
+Examples of correct behavior:
+- Request "write an article from https://youtube.com/..." + workflow "generate-article: Turn a YouTube video into an article" → "generate-article" (request explicitly provides the YouTube URL the workflow requires)
+- Request "research the Artemis II mission" + same workflow → null (no YouTube URL — the workflow's required input is missing)
+- Request "animate this image" + workflow "slack-gif-creator: animated GIFs for Slack" → null (request is not about Slack)
+- Request "make an infographic about Artemis II" + workflow "infographic: infographics/data posters with factual research" → "infographic" (direct instance)
+- Request "hello" / "thanks" / "what time is it?" + any workflow → null (trivial requests never match workflows)
+
 Return ONLY a JSON object, no prose, no markdown fences:
-{ "workflow": "<workflow-name-or-null>" }`;
+{ "workflow": "<workflow-name-or-null>" }
+
+Remember: null is the default and correct answer in ambiguous cases. A false positive here derails the entire plan.`;
 
     try {
       const { getAllCandidates, createLLM, getAvailableProviders } = await import('../llm/providers/factory.js');

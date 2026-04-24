@@ -86,6 +86,7 @@ function _collectCommon(models) {
   const labelSet = new Set();
   const resolutionSet = new Set();
   const aspectRatioSet = new Set();
+  const durationSet = new Set();
   for (const m of models) {
     if (Array.isArray(m?.labels)) {
       for (const l of m.labels) {
@@ -94,11 +95,16 @@ function _collectCommon(models) {
     }
     for (const r of _splitCsv(m?.resolutions)) resolutionSet.add(r);
     for (const a of _splitCsv(m?.aspectRatios)) aspectRatioSet.add(a);
+    for (const d of _splitCsv(m?.durations)) {
+      const n = Number(d);
+      if (Number.isFinite(n) && n > 0) durationSet.add(n);
+    }
   }
   return {
     labels:       [...labelSet].sort(),
     resolutions:  [...resolutionSet],
     aspectRatios: [...aspectRatioSet],
+    durations:    [...durationSet].sort((a, b) => a - b),
   };
 }
 
@@ -152,12 +158,24 @@ function _aggregateVideo(models) {
   let anyVideoToVideo = false;
   let anyFrameControl = false;
   let anyAudio = false;
+  let maxShots = 1;
+  const cameraMovementSet = new Set();
   for (const m of models) {
     if (m?.textToVideo) anyTextToVideo = true;
     if (m?.imageToVideo) anyImageToVideo = true;
     if (m?.videoToVideo) anyVideoToVideo = true;
     if (m?.frameControl) anyFrameControl = true;
     if (m?.hasAudio) anyAudio = true;
+    // Per-model `cameraMovements`: CSV of supported tokens like
+    // "static,pan_left,zoom_in". Union across active models — tools then
+    // expose the superset as an enum.
+    for (const c of _splitCsv(m?.cameraMovements)) cameraMovementSet.add(c);
+    // `maxShots`: how many independent clips the provider can emit in a
+    // single call. Multishot-capable models (Runway Gen-3, some Kling
+    // variants, Sora multishot) set this > 1; default 1 is "single clip".
+    if (typeof m?.maxShots === 'number' && m.maxShots > maxShots) {
+      maxShots = m.maxShots;
+    }
   }
   return {
     models,
@@ -168,6 +186,8 @@ function _aggregateVideo(models) {
     anyFrameControl,
     anyAudio,
     hasRefImageSupport: anyImageToVideo || anyVideoToVideo,
+    cameraMovements: [...cameraMovementSet].sort(),
+    maxShots,
   };
 }
 
@@ -245,6 +265,14 @@ export function fetchMediaCapabilities(kind) {
 function _toNoMatchError(routingErr) {
   const err = new Error(routingErr.message);
   err.details = { code: 'no_model_matches', ...(routingErr.details || {}) };
+  try {
+    const summary = {
+      requirements: err.details.requirements,
+      candidates: err.details.candidates,
+      rejections: err.details.rejections,
+    };
+    console.error('[media-router] no_model_matches', JSON.stringify(summary, null, 2));
+  } catch { /* non-fatal */ }
   return err;
 }
 
@@ -785,24 +813,39 @@ export class GatewayVideoGen extends BaseVideoGen {
         qualities: mc.qualities || ['auto'],
         durations: mc.durations || [5],
         maxDuration: mc.maxDuration ?? 5,
+        cameraMovements: mc.cameraMovements || [],
+        maxShots: mc.maxShots ?? 1,
       };
     }
-    // Fallback: generous defaults
+    // Fallback: generous defaults (model='auto' — the real picker lives
+    // in media-model-router.js, so claim broad support here and let the
+    // router pick the right specialist based on refs actually provided).
     return {
       startFrame: true,
       endFrame: true,
       referenceImages: true,
       maxReferenceImages: 4,
+      imageToVideo: true,
+      videoToVideo: true,
       withAudio: true,
       aspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4'],
       resolutions: ['480p', '720p', '1080p', '4k'],
       qualities: ['auto', 'low', 'medium', 'high'],
       durations: [4, 5, 6, 8, 10, 15, 20],
       maxDuration: 20,
+      cameraMovements: [],
+      maxShots: 1,
     };
   }
 
   async generate(prompt, opts = {}) {
+    // When shots[] is explicit, the shot count becomes a hard filter —
+    // the router must pick a model with `maxShots >= shots.length`.
+    // Otherwise we only send shotCount=1 (the default) so existing
+    // single-clip requests keep selecting from the full pool.
+    const shots = Array.isArray(opts.shots) && opts.shots.length > 0 ? opts.shots : null;
+    const shotCount = shots ? shots.length : 1;
+
     const resolvedModel = await _resolveMediaModel('video', this.model, opts, (models, req) =>
       import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
         try {
@@ -815,10 +858,12 @@ export class GatewayVideoGen extends BaseVideoGen {
       {
         resolution: opts.resolution,
         aspectRatio: opts.aspectRatio,
-        hasStartFrame: !!opts.startFrame?.data,
-        hasEndFrame: !!opts.endFrame?.data,
+        hasStartFrame: !!opts.startFrame?.data || (shots ? shots.some((s) => s.startFrame?.data) : false),
+        hasEndFrame:   !!opts.endFrame?.data   || (shots ? shots.some((s) => s.endFrame?.data)   : false),
         withAudio: !!opts.withAudio,
         refsCount: opts.referenceImages?.length || 0,
+        videoRefsCount: Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0,
+        shotCount,
         label: opts.label,
       },
     );
@@ -832,6 +877,21 @@ export class GatewayVideoGen extends BaseVideoGen {
       quality: opts.quality || 'auto',
       with_audio: opts.withAudio || false,
     };
+
+    // Camera movement + multishot fallback. Both are forwarded to the
+    // backend as-is; provider-specific adapters on the gateway side
+    // (fal Kling `camera_control`, Runway multi-clip `num_videos`, …)
+    // translate these to whatever the underlying model expects. Unknown
+    // keys are ignored by fal, so pass-through is safe when the
+    // provider doesn't recognize them.
+    if (typeof opts.cameraMovement === 'string' && opts.cameraMovement.trim()) {
+      payload.camera_control = opts.cameraMovement.trim();
+    }
+    // numShots: legacy scalar path, only honoured when no explicit
+    // shots[] array is present.
+    if (!shots && typeof opts.numShots === 'number' && opts.numShots > 1) {
+      payload.num_shots = opts.numShots;
+    }
 
     if (opts.startFrame?.data) {
       payload.start_frame = {
@@ -850,6 +910,52 @@ export class GatewayVideoGen extends BaseVideoGen {
         data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
         mime_type: ref.mimeType || 'image/png',
       }));
+    }
+    // referenceVideos are ALREADY URLs at this point — the client
+    // uploaded them to the gateway via /uploads/video before calling
+    // this method. We just pass the URL array through; the backend
+    // wires them into the provider-specific field (video_url /
+    // video_urls) when building the fal input.
+    if (Array.isArray(opts.referenceVideos) && opts.referenceVideos.length > 0) {
+      payload.reference_videos = opts.referenceVideos.slice();
+    }
+    // Per-shot overrides. Each entry mirrors the top-level fields;
+    // binary media (frames, ref images) is base64-encoded here, ref
+    // videos stay as URLs (already uploaded). The backend iterates this
+    // array and emits one fal submission per shot (for providers that
+    // don't natively multishot) — see handleVideoGenerate.
+    if (shots) {
+      payload.shots = shots.map((s) => {
+        const shotPayload = {};
+        if (typeof s.prompt === 'string' && s.prompt.trim()) shotPayload.prompt = s.prompt;
+        if (typeof s.duration === 'number') shotPayload.duration = s.duration;
+        if (typeof s.aspectRatio === 'string') shotPayload.aspect_ratio = s.aspectRatio;
+        if (typeof s.cameraMovement === 'string' && s.cameraMovement.trim()) {
+          shotPayload.camera_control = s.cameraMovement.trim();
+        }
+        if (s.startFrame?.data) {
+          shotPayload.start_frame = {
+            data: typeof s.startFrame.data === 'string' ? s.startFrame.data : s.startFrame.data.toString('base64'),
+            mime_type: s.startFrame.mimeType || 'image/png',
+          };
+        }
+        if (s.endFrame?.data) {
+          shotPayload.end_frame = {
+            data: typeof s.endFrame.data === 'string' ? s.endFrame.data : s.endFrame.data.toString('base64'),
+            mime_type: s.endFrame.mimeType || 'image/png',
+          };
+        }
+        if (Array.isArray(s.referenceImages) && s.referenceImages.length > 0) {
+          shotPayload.reference_images = s.referenceImages.map((ref) => ({
+            data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
+            mime_type: ref.mimeType || 'image/png',
+          }));
+        }
+        if (Array.isArray(s.referenceVideos) && s.referenceVideos.length > 0) {
+          shotPayload.reference_videos = s.referenceVideos.slice();
+        }
+        return shotPayload;
+      });
     }
 
     const res = await fetch(`${getGatewayBase()}/media/video/generate`, {
@@ -875,7 +981,10 @@ export class GatewayVideoGen extends BaseVideoGen {
   }
 
   async getStatus(jobId, opts = {}) {
-    const res = await fetch(`${getGatewayBase()}/media/video/status/${jobId}`, {
+    // Query param (not path param) because the backend encodes the id as
+    // `<model>|<falRequestId>` and fal model slugs contain slashes.
+    const url = `${getGatewayBase()}/media/video/status?id=${encodeURIComponent(jobId)}`;
+    const res = await fetch(url, {
       method: 'GET',
       headers: getAuthHeaders(),
       signal: opts.abortSignal,
@@ -888,12 +997,26 @@ export class GatewayVideoGen extends BaseVideoGen {
     }
 
     const data = await res.json();
-    return {
+    const out = {
       id: jobId,
       status: _mapGatewayVideoStatus(data.status),
       url: data.url || undefined,
       error: data.error || undefined,
     };
+    // Multishot: surface each shot's status so the tool can save every
+    // URL as it completes. Each entry follows the same shape as the
+    // top-level (id/status/url) but with an `index` so callers keep
+    // shot ordering. Absent when the job was single-shot.
+    if (Array.isArray(data.shots) && data.shots.length > 0) {
+      out.shots = data.shots.map((s) => ({
+        index: s.index,
+        id: s.id,
+        status: _mapGatewayVideoStatus(s.status),
+        url: s.url || undefined,
+        error: s.error || undefined,
+      }));
+    }
+    return out;
   }
 }
 

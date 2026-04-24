@@ -13,7 +13,22 @@ import { saveVideoFromUrl } from './generate-video.js';
 export default {
   type: 'check_video_status',
   intent: 'check_video_status',
-  description: 'Check the status of an async video generation job. Use the job ID returned by generate_video. Fields: "id" (required, job ID), optional "provider" (if known), optional "model" (if known), optional "saveTo" (directory — when status becomes completed the video is downloaded there). Returns: { success, id, status: pending|processing|completed|failed, url?, savedTo?, error? }',
+  description:
+    'Check the status of an async video generation job. Use the job ID returned by generate_video.\n' +
+    '\n' +
+    'Fields:\n' +
+    '  - "id" (required) — job ID from generate_video\n' +
+    '  - optional "provider" / "model" — pass them through if generate_video returned them\n' +
+    '  - optional "saveTo" — directory; when status becomes "completed" the video is downloaded there. Pass the same value you gave generate_video.\n' +
+    '\n' +
+    'Returns: { success, id, status: pending|processing|completed|failed, url?, savedTo?, error? }\n' +
+    '\n' +
+    'HANDLING `status: "failed"` (MANDATORY):\n' +
+    '  Do NOT silently retry or pretend the job succeeded. Read the `error` string — it is the verbatim provider message (fal / ByteDance / Google / etc.) — and decide:\n' +
+    '    - If it describes a provider-side content/policy rejection (safety filter, real-person / celebrity detector, NSFW, copyrighted subject, partner validation, …): STOP polling and tell the user what the provider rejected and why, using the provider\'s own wording. Then suggest concrete alternatives (use a different image, drop `startFrame`/`referenceImages` so the router picks a more permissive model, rephrase the prompt, …). These rejections are NOT bypassable by retrying.\n' +
+    '    - If it describes a payload/validation problem the caller can fix (missing field, wrong enum value, bad format): report the error to the user, then retry once with the fix if the correction is unambiguous.\n' +
+    '    - If it is transient (timeout, rate limit, "try again later"): wait briefly and retry.\n' +
+    '    - Otherwise: surface the `error` to the user verbatim without inventing a cause.',
   thinkingHint: 'Checking video status',
   permission: 'generate_video',
 
@@ -61,6 +76,35 @@ export default {
       });
     }
 
+    // Multishot: save each shot's URL that has completed. The
+    // per-shot file lands in the same saveTo directory, tagged with
+    // its index so the caller can reassemble the sequence. Still-
+    // pending shots are reported with url=null; the caller can poll
+    // again later.
+    let savedShots;
+    if (Array.isArray(result.shots) && result.shots.length > 0) {
+      savedShots = [];
+      for (const shot of result.shots) {
+        let shotSavedTo = null;
+        if (shot.status === 'completed' && shot.url) {
+          shotSavedTo = await saveVideoFromUrl(shot.url, {
+            saveTo: action.saveTo,
+            provider: resolved.provider,
+            model: resolved.model,
+            id: `shot${shot.index}-${shot.id || ''}`,
+          });
+        }
+        savedShots.push({
+          index: shot.index,
+          id: shot.id,
+          status: shot.status,
+          url: shot.url,
+          ...(shotSavedTo ? { savedTo: shotSavedTo } : {}),
+          error: shot.error,
+        });
+      }
+    }
+
     return {
       success: true,
       provider: resolved.provider,
@@ -69,6 +113,7 @@ export default {
       status: result.status,
       url: result.url,
       ...(savedTo ? { savedTo } : {}),
+      ...(savedShots ? { shots: savedShots } : {}),
       error: result.error,
     };
   }

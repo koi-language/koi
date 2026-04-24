@@ -315,6 +315,78 @@ export function pickImageModel(models, req = {}) {
 
 // ── Video ───────────────────────────────────────────────────────────────────
 
+const _videoCard = (m) => ({
+  slug: m.slug,
+  textToVideo: !!m.textToVideo,
+  imageToVideo: !!m.imageToVideo,
+  videoToVideo: !!m.videoToVideo,
+  frameControl: !!m.frameControl,
+  hasAudio: !!m.hasAudio,
+  resolutions: m.resolutions || '',
+  aspectRatios: m.aspectRatios || '',
+  durations: m.durations || '',
+  labels: Array.isArray(m.labels) ? m.labels : [],
+  pricePerUnit: m.pricePerUnit ?? null,
+});
+
+/**
+ * Build per-dimension alternatives for the agent when hard filters zero the
+ * candidate list. Mirrors `_diagnoseImage`: for each requirement, show the
+ * subset of models that would have matched IF that single dimension were the
+ * only constraint. Lets the agent see which combinations are viable and
+ * pivot instead of giving up.
+ */
+function _diagnoseVideo(models, req) {
+  const out = {};
+  const refsCount = req.refsCount || 0;
+  const videoRefsCount = req.videoRefsCount || 0;
+  const shotCount = typeof req.shotCount === 'number' && req.shotCount > 0 ? req.shotCount : 1;
+  const wantsImageToVideo = !!(req.hasStartFrame || refsCount > 0);
+  const wantsFrameControl = !!req.hasEndFrame;
+  const wantsVideoToVideo = videoRefsCount > 0;
+  const wantsMultishot = shotCount > 1;
+
+  if (wantsVideoToVideo) {
+    out['videoRefsCount>0'] = models
+      .filter((m) => !!m.videoToVideo)
+      .map(_videoCard);
+  }
+  if (wantsImageToVideo) {
+    out['hasStartFrame|refsCount>0'] = models
+      .filter((m) => !!m.imageToVideo)
+      .map(_videoCard);
+  }
+  if (wantsFrameControl) {
+    out['hasEndFrame'] = models
+      .filter((m) => !!m.frameControl)
+      .map(_videoCard);
+  }
+  if (wantsMultishot) {
+    out[`shotCount>=${shotCount}`] = models
+      .filter((m) => (typeof m.maxShots === 'number' ? m.maxShots : 1) >= shotCount)
+      .map(_videoCard);
+  }
+  if (req.withAudio) {
+    out['withAudio'] = models.filter((m) => !!m.hasAudio).map(_videoCard);
+  }
+  if (req.resolution) {
+    out[`resolution=${req.resolution}`] = models
+      .filter((m) => _csvSupports(m.resolutions, req.resolution))
+      .map(_videoCard);
+  }
+  if (req.aspectRatio) {
+    out[`aspectRatio=${req.aspectRatio}`] = models
+      .filter((m) => _csvSupports(m.aspectRatios, req.aspectRatio))
+      .map(_videoCard);
+  }
+  if (req.label) {
+    out[`label=${req.label}`] = models
+      .filter((m) => Array.isArray(m.labels) && m.labels.includes(req.label))
+      .map(_videoCard);
+  }
+  return out;
+}
+
 /**
  * @param {Array<object>} models — /gateway/models/video.json rows
  * @param {object} req
@@ -323,15 +395,32 @@ export function pickImageModel(models, req = {}) {
  * @param {boolean} [req.hasStartFrame]
  * @param {boolean} [req.hasEndFrame]
  * @param {boolean} [req.withAudio]
- * @param {number}  [req.refsCount=0]
+ * @param {number}  [req.refsCount=0]          image references
+ * @param {number}  [req.videoRefsCount=0]     video references (video-to-video)
+ * @param {number}  [req.shotCount=1]          explicit shots[].length (>1 needs multishot)
  * @param {string}  [req.label]
  */
 export function pickVideoModel(models, req = {}) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new MediaModelRoutingError('No active video models available', { requirements: req });
   }
+  if (process.env.KOI_DEBUG_MEDIA_ROUTER) {
+    try {
+      const dump = models.map((m) => ({
+        slug: m.slug,
+        textToVideo: !!m.textToVideo,
+        imageToVideo: !!m.imageToVideo,
+        videoToVideo: !!m.videoToVideo,
+        labels: m.labels,
+        pricePerUnit: m.pricePerUnit,
+      }));
+      console.error('[media-router] pickVideoModel candidates', JSON.stringify({ req, models: dump }, null, 2));
+    } catch { /* non-fatal */ }
+  }
 
   const refsCount = req.refsCount || 0;
+  const videoRefsCount = req.videoRefsCount || 0;
+  const shotCount = typeof req.shotCount === 'number' && req.shotCount > 0 ? req.shotCount : 1;
   // Frame-control is the model feature that lets the caller pin BOTH ends
   // of a clip (start + end frame) for precise pacing. A single start
   // frame is just plain image-to-video — any `imageToVideo` model can
@@ -340,24 +429,98 @@ export function pickVideoModel(models, req = {}) {
   // left generate_video({ startFrame }) with zero candidates.
   const wantsFrameControl = !!req.hasEndFrame;
   const wantsImageToVideo = !!(req.hasStartFrame || refsCount > 0);
+  const wantsVideoToVideo = videoRefsCount > 0;
+  const wantsMultishot = shotCount > 1;
+  const wantLabel = req.label || null;
+  const modelHasLabels = (m) => Array.isArray(m.labels) && m.labels.length > 0;
 
+  // Philosophy (same as pickImageModel): the router is an AUTOMATIC PICKER.
+  // Hard filters only reject models that categorically CAN'T do the task:
+  //   • imageToVideo required when start-frame or ref-images are supplied
+  //     (videoToVideo ≠ imageToVideo — extend-video accepts videoToVideo but
+  //     cannot turn an image into a video; selecting it leads to a 422
+  //     `video_url: Field required` at execution time).
+  //   • frameControl required for end-frame pinning.
+  //   • hasAudio required when withAudio=true.
+  //   • labels enforced: no label requested ⇒ pin to non-labelled models,
+  //     label requested ⇒ model must carry it (matches image logic so
+  //     specialised variants don't leak into general requests).
+  //   • price must be set (inactive rows).
+  // `resolution` and `aspectRatio` are SOFT preferences via _rankSort —
+  // rejecting hard on them used to leave zero candidates for aspect ratios
+  // like 3:2 that no fal video model advertises, even though the output
+  // dimension is usually dictated by the start_frame anyway.
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
+
+    if (wantLabel) {
+      if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
+    } else {
+      if (modelHasLabels(m)) return false;
+    }
+
     // At least one video generation capability.
     const videoCap = m.textToVideo || m.imageToVideo || m.videoToVideo;
     if (!videoCap) return false;
-    // Start frame OR reference images → the model must accept image input.
-    if (wantsImageToVideo && !m.imageToVideo && !m.videoToVideo) return false;
-    // End-frame control (with or without start frame) needs frameControl.
+
+    if (wantsVideoToVideo) {
+      // Reference videos → the model must explicitly advertise v2v.
+      // Frame / ref-image requirements on top still apply.
+      if (!m.videoToVideo) return false;
+    } else if (wantsImageToVideo) {
+      if (!m.imageToVideo) return false;
+    } else {
+      // Text-to-video request: reject pure videoToVideo specialists
+      // (extend-video, video-to-video restyle, lipsync, …) that don't do
+      // text-to-video on their own.
+      if (!m.textToVideo) return false;
+    }
     if (wantsFrameControl && !m.frameControl) return false;
-    // Audio track generation is a hard requirement when withAudio=true.
     if (req.withAudio && !m.hasAudio) return false;
-    if (!_csvSupports(m.resolutions, req.resolution)) return false;
-    if (!_csvSupports(m.aspectRatios, req.aspectRatio)) return false;
+    if (wantsMultishot) {
+      const cap = typeof m.maxShots === 'number' ? m.maxShots : 1;
+      if (cap < shotCount) return false;
+    }
     return true;
   });
 
-  _throwIfEmpty(eligible, 'video', req, models.length);
+  if (eligible.length === 0) {
+    // Per-model rejection reason, so the agent (and logs) can see why a
+    // model that "looks" compatible was filtered out. Mirrors the filter
+    // block above: first matching rule wins.
+    const rejections = models.map((m) => {
+      const reasons = [];
+      if (m.pricePerUnit == null) reasons.push('pricePerUnit=null');
+      if (wantLabel) {
+        if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) {
+          reasons.push(`label!=${wantLabel}`);
+        }
+      } else if (modelHasLabels(m)) {
+        reasons.push(`has labels=[${m.labels.join(',')}] but request has none`);
+      }
+      const videoCap = m.textToVideo || m.imageToVideo || m.videoToVideo;
+      if (!videoCap) reasons.push('no video capability');
+      if (wantsVideoToVideo && !m.videoToVideo) reasons.push('videoToVideo=false');
+      else if (!wantsVideoToVideo && wantsImageToVideo && !m.imageToVideo) reasons.push('imageToVideo=false');
+      else if (!wantsVideoToVideo && !wantsImageToVideo && !m.textToVideo) reasons.push('textToVideo=false (pure v2v specialist)');
+      if (wantsFrameControl && !m.frameControl) reasons.push('frameControl=false');
+      if (req.withAudio && !m.hasAudio) reasons.push('hasAudio=false');
+      if (wantsMultishot) {
+        const cap = typeof m.maxShots === 'number' ? m.maxShots : 1;
+        if (cap < shotCount) reasons.push(`maxShots=${cap}<${shotCount}`);
+      }
+      return { slug: m.slug, videoToVideo: !!m.videoToVideo, textToVideo: !!m.textToVideo, imageToVideo: !!m.imageToVideo, labels: m.labels, reasons };
+    });
+    throw new MediaModelRoutingError(
+      'No active video model matches the requested capabilities',
+      {
+        requirements: req,
+        candidates: models.length,
+        rejections,
+        alternatives: _diagnoseVideo(models, req),
+      },
+    );
+  }
   _rankSort(eligible, req);
   return eligible[0].slug;
 }
