@@ -111,6 +111,21 @@ export default {
       return { success: false, error: `Input image not found: ${resolvedPath}` };
     }
 
+    // Most upscalers (Recraft, Topaz, Clarity, AuraSR, …) reject inputs
+    // smaller than 256px on either side. Catching this client-side gives a
+    // clear, actionable error in the same turn instead of burning a gateway
+    // round-trip on a model-internal "image too small" rejection.
+    try {
+      const sharp = (await import('sharp')).default;
+      const meta = await sharp(resolvedPath).metadata();
+      if (meta.width && meta.height && (meta.width < 256 || meta.height < 256)) {
+        return {
+          success: false,
+          error: `Input image is too small (${meta.width}×${meta.height}). Upscalers require at least 256px on each side. Use a larger source image, or generate a new one at higher resolution instead of upscaling.`,
+        };
+      }
+    } catch { /* dimension probe is best-effort — fall through and let the gateway decide */ }
+
     // Clamp upscaleFactor to the generic 1–4 window. Individual models may
     // only support a subset (2x/4x fixed); the gateway/adapter is responsible
     // for rounding to the nearest supported value.

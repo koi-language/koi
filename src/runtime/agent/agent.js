@@ -4589,13 +4589,13 @@ Many commands are inherently slow and produce little or no output for extended p
 
     const skillList = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
 
-    const prompt = `You are a skill selector for an AI agent. Your job is to activate skills ONLY when the agent's task is a direct instance of the skill's described use case.
+    const prompt = `You are a skill selector for an AI agent. Activate skills whose described domain clearly fits the task. A skill provides a specialised workflow that improves the agent's output when the task lives in its domain — so do activate it when there is a real domain match, but skip it when the overlap is only a shared keyword.
 
-STRICT RULES:
-1. A skill matches ONLY when the task is precisely what the skill's description says to use it for. Keyword overlap is NOT enough.
-2. If a skill's description mentions a specific context / platform / output format (e.g. "for Slack", "with p5.js", "for YouTube transcripts", "mobile apps"), the task MUST match that context. Do not match if the task only shares a generic word with the description.
-3. Prefer returning [] over loose matches. An unnecessary skill pollutes the agent's prompt with irrelevant instructions and degrades its output.
-4. Never activate more than one skill unless the task truly spans multiple distinct domains — then cite the specific parts of the task that each skill addresses in your reasoning (mental only, don't output it).
+RULES:
+1. Activate a skill when the task clearly falls within its described area of expertise (subject, technique, or output type). Exact wording is not required, but the domain must genuinely match — not just share a generic word.
+2. If a skill's description names a specific context / platform / output format (e.g. "for Slack", "with p5.js", "from YouTube transcripts", "mobile apps"), the task MUST match that context. A skill scoped to one platform does not apply to a generic version of the task.
+3. Default to one skill. Activate two or more only when the task genuinely spans distinct domains that different skills cover.
+4. When unsure between a skill and no skill, prefer activating it if its domain plausibly helps. When unsure between two similar skills, pick the one whose description fits more precisely.
 
 TASK:
 ${taskText}
@@ -4603,13 +4603,14 @@ ${taskText}
 AVAILABLE SKILLS:
 ${skillList}
 
-Examples of correct behavior:
-- Task "translate this paragraph" + skills [mobile-development, frontend-design] → [] (no skill matches)
-- Task "animate this photo" + skill "slack-gif-creator: animated GIFs for Slack" → [] (the task is not about Slack GIFs)
-- Task "build a mobile app called X" + skill "mobile-development: Building mobile apps with …" → ["mobile-development"] (direct match)
-- Task "research the Artemis II mission" + skill "generate-article: Turn a YouTube video into an article" → [] (no YouTube video involved)
+Examples:
+- Task "build a mobile app called X" + skill "mobile-development: Building mobile apps with React Native" → ["mobile-development"]
+- Task "write an article about the Artemis II mission" + skill "long-form-writing: Researching and drafting long-form articles" → ["long-form-writing"]
+- Task "create an infographic about climate change" + skill "create-infographic: Designing infographics" → ["create-infographic"]
+- Task "animate this photo" + skill "slack-gif-creator: animated GIFs for Slack" → [] (task is not Slack-specific)
+- Task "translate this paragraph" + skills [mobile-development, frontend-design] → [] (no skill domain matches)
 
-Return ONLY a JSON array of skill names to activate, e.g. ["mobile-development"] or []. Return [] when no skill is a precise match — this is the common case and the correct answer.`;
+Return ONLY a JSON array of skill names to activate, e.g. ["mobile-development"], or [] if no skill's domain fits the task.`;
 
     try {
       const { getAllCandidates } = await import('../llm/providers/factory.js');

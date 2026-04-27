@@ -425,7 +425,10 @@ export default {
 
     if (!permitted) {
       if (channel.updateDiff) await channel.updateDiff({ diffId: _diffPayload.diffId, applied: false });
-      channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
+      // No "Skipped" chip in the chat — the user already SAID no, the
+      // refusal speaks for itself. The agent still sees `denied: true`
+      // in the result and replans without printing anything to the
+      // user-facing surface.
       return { success: false, denied: true, message: 'User denied file change' };
     }
 

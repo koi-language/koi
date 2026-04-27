@@ -8,6 +8,203 @@ import { getUserAgentsTeam } from '../agent/md-agent-loader.js';
 // SYSTEM PROMPT BUILDER — standalone functions extracted from LLMProvider
 // =========================================================================
 
+/** Push the shared "TRANSCRIBE every annotation BEFORE acting" step into
+ *  [lines]. The single most common failure mode is the agent looking at
+ *  a mark, guessing the subject, and getting it wrong because the mark
+ *  sits near multiple candidates. Forcing an explicit transcription with
+ *  candidate-subjects + resolved-subject + resolution-reason as plain
+ *  text in a `print` action BEFORE the real generation surfaces the
+ *  agent\'s reasoning to the user (so they catch wrong picks before a
+ *  generation is wasted) and reduces hallucinated subject mappings. */
+function _pushAnnotationTranscribeGuide(lines) {
+  lines.push('**TRANSCRIBE every annotation as INTERNAL reasoning BEFORE acting.** The single most common failure mode is the agent looking at a mark, guessing which subject it refers to, and getting it wrong because the mark sat near multiple candidates. To prevent that, walk through the transcription IN YOUR HEAD (thinking tokens if the model supports them, otherwise just as careful internal reasoning before writing the action JSON). For EACH distinct mark, mentally fill out:');
+  lines.push('');
+  lines.push('   - mark type — X / arrow / scribble / circle / text-label / freehand');
+  lines.push('   - position of the mark on the frame');
+  lines.push('   - text-on-mark — verbatim, in the original language ("(none)" if absent)');
+  lines.push('   - candidate-subjects-near-mark — every subject the mark could plausibly refer to');
+  lines.push('   - resolved-subject — the SINGLE subject after disambiguation');
+  lines.push('   - resolution-reason — why you picked it');
+  lines.push('');
+  lines.push('   **Critical disambiguation rules**:');
+  lines.push('   - **User-written text on the annotation OVERRIDES your visual guess.** If the text says *"esta chica"* (female), the subject is female — even if the mark is geometrically closer to a male character. The user wrote what they meant; trust it.');
+  lines.push('   - **Language matters**: read the text in its native language. Spanish *"chica"* = girl/woman, *"chico"* = boy/man, *"esta mano"* = this hand (gendered demonstrative). Don\'t translate sloppily — extract gender, role, body part, action verb.');
+  lines.push('   - **If the mark sits between two subjects AND the text doesn\'t disambiguate, STOP and `prompt_user`** asking which subject the user meant. Better to ask one question than to ship a generation editing the wrong person.');
+  lines.push('   - **An X with text near a body part = constraint on that body part of the SUBJECT WHO OWNS IT, not the body part itself in space.** "que no suba esta mano" near a hand → constrain the woman whose hand it is, not the nearest visually salient figure.');
+  lines.push('');
+  lines.push('   **DO NOT dump this transcription in a `print` action.** It\'s internal reasoning — the user doesn\'t want to see structured `[transcribe @ ...]` blocks polluting the chat. Keep it in your head; only the final user-facing summary belongs in `print`.');
+  lines.push('');
+  lines.push('   **What the user DOES see in `print`**: a SHORT human sentence summarising what you understood, in the user\'s language, e.g. *"Entendido — voy a quitar a la chica rubia del asiento trasero derecho y haré que la morena del medio gire la cabeza hacia la derecha sin levantar la mano."* That\'s it. One sentence. No structured reasoning blocks, no candidate lists, no resolution reasons — just a clear restatement of intent.');
+}
+
+/** Push the structured-directives format into [lines]. Each user-drawn
+ *  mark becomes one numbered, classified, time-anchored directive — the
+ *  diffusion model loses anchoring when instructions are merged into a
+ *  paragraph. The four categories (PERSISTENT REMOVAL / CONSTRAINT /
+ *  TEMPORAL TRANSITION / POINT-IN-TIME) cover every plausible mark
+ *  semantics. Use mode="video" when there are explicit per-frame
+ *  timestamps; use mode="image" when there\'s only one source frame and
+ *  timing is "throughout the clip" / "by end of clip". */
+function _pushStructuredDirectivesGuide(lines, mode = 'video') {
+  const ts = mode === 'video' ? '<timestamp>' : '<"throughout" | "by end of clip">';
+  lines.push('**Decompose intent per individual mark, then classify it.** Treat EACH stroke / X / arrow / text label as ONE atomic instruction. For every distinct mark, identify which of these four temporal categories it belongs to:');
+  lines.push('');
+  lines.push('   - **PERSISTENT REMOVAL** — a subject is crossed out / X-ed / scribbled over → that subject is GONE from EVERY frame of the output, replaced by what would be behind it (background, scenery, interior). Phrasing: *"Throughout the entire clip, the [hair color + length + clothing + spatial position] is absent — the area where she sat shows [interior/background visible behind]."*');
+  lines.push('');
+  lines.push('   - **PERSISTENT CONSTRAINT** — an X / strikeout over a body part or gesture, with text like "no", "don\'t", "que no" → that gesture/movement does NOT happen at any moment. Phrasing: *"Throughout the entire clip, the [subject description] keeps her [body part] [described static state]; she does NOT raise/move it at any point."*');
+  lines.push('');
+  if (mode === 'video') {
+    lines.push('   - **TEMPORAL TRANSITION** — an arrow or curve showing motion from state A to state B → describe as a smooth motion that COMPLETES by the marked timestamp, starting from the natural state in earlier frames. Phrasing: *"Between the start of the clip and {marked timestamp}, the [subject] smoothly [described motion]. By {marked timestamp} the rotation has completed."*');
+  } else {
+    lines.push('   - **TEMPORAL TRANSITION** — an arrow or curve showing motion from state A to state B → describe as a smooth motion that COMPLETES by the end of the generated clip, starting from the still photo\'s state at t=0. Phrasing: *"Starting from the still image and over the duration of the clip, the [subject] smoothly [described motion]. By the end of the clip the motion has completed."*');
+  }
+  lines.push('');
+  lines.push(`   - **POINT-IN-TIME STATE** — a static pose marker pinning the subject\'s state at a specific instant → "At ${mode === 'video' ? '{timestamp}' : 'the end of the clip'}, the [subject] is [described state]." Use sparingly; most marks are one of the three above.`);
+  lines.push('');
+  lines.push('**Build the prompt as a numbered list with EXPLICIT time anchors**, never as a single paragraph. The diffusion model loses temporal anchoring when instructions are merged. Each directive must reference its `resolved-subject` from the transcribe step verbatim — do not paraphrase the subject description across directives, the model must see the same noun phrase to know it\'s the same person. Strict format:');
+  lines.push('');
+  lines.push('   ```');
+  lines.push(mode === 'video'
+    ? '   Edit the source video with these per-instruction directives:'
+    : '   Animate the source image with these per-instruction directives:');
+  lines.push(`   1. [PERSISTENT REMOVAL @ ${ts}] <one full sentence naming subject by physical attributes + spatial position + what fills the empty space>.`);
+  lines.push(`   2. [PERSISTENT CONSTRAINT @ ${ts}] <one full sentence>.`);
+  lines.push(`   3. [TEMPORAL TRANSITION @ ${ts}] <one full sentence with motion arc and completion ${mode === 'video' ? 'timestamp' : 'point'}>.`);
+  lines.push('');
+  lines.push('   Static elements to preserve unchanged across the entire clip: <explicit comma-separated list of every other subject and the background — driver, other passengers, vehicle, exterior, lighting, camera framing>.');
+  lines.push('   ```');
+  lines.push('');
+  lines.push('   **Why this format works**: the model parses each numbered line as a separate constraint with an attached time anchor. A single paragraph blends them and the diffusion averages them across the clip — which is exactly what produced wrong outputs in earlier tests (subject X removed instead of Y, gesture happening at the wrong moment, etc.).');
+}
+
+/** Push the shared "describe the marked subject surgically" guidance
+ *  into [lines]. Used by the image-photomontage block and the per-frame
+ *  video-annotations block — both rely on the agent translating drawn
+ *  marks into a prompt detailed enough that a model which never saw
+ *  the annotation can pick out the right subject. The instructions are
+ *  identical across image / video; what differs is the wrapping
+ *  workflow, so we factor the inner block once and call it from both
+ *  places. */
+function _pushSurgicalAnnotationGuide(lines) {
+  lines.push('**Interpret the marks**:');
+  lines.push('   - red X / cross-out / scribble over a subject → remove that subject.');
+  lines.push('   - arrow → motion direction or trajectory ("move from A to B", "swerve left", "accelerate forward").');
+  lines.push('   - circle / rectangle → focus region, or "this is what I mean".');
+  lines.push('   - freehand outline → the area to change.');
+  lines.push('   - text label → literal instruction.');
+  lines.push('');
+  lines.push('**Two distinct uses of the marks — separate them carefully:**');
+  lines.push('');
+  lines.push('**(A) IDENTITY pointer — DO use the mark.** The annotation composite ships as a referenceImage; the model\'s vision encoder SEES the red X / red scribble / red circle overlaid on top of a specific face or object. That makes the mark a **perfect visual pointer to WHO/WHAT** the user is referring to. Reference it explicitly as your primary disambiguator:');
+  lines.push('   - ✓ *"the subject identified by the prominent red X mark visible in the reference image labelled `[ANNOTATIONS @ 00:03.042]` — the person on whom the X is overlaid"*');
+  lines.push('   - ✓ *"the subject covered by the red scribble in the second reference image"*');
+  lines.push('   - ✓ *"the figure inside the red circle drawn at 00:04.250"*');
+  lines.push('   This is by far the strongest disambiguator available because it bypasses every ambiguity in prose (colour, ordinals, geometry) — the model directly sees which pixels are marked and locks onto the subject under those pixels.');
+  lines.push('');
+  lines.push('**(B) ACTION semantics — do NOT use the mark.** The model sees the mark visually, but it does NOT interpret what the mark MEANS as an instruction. *"Follow the red arrow"* is meaningless to the model — it sees an arrow, but doesn\'t know "arrow = motion vector to follow". You translate the action into PROSE; the prose is what conditions the generation:');
+  lines.push('   - ❌ *"follow the red arrow"* — model sees the arrow but doesn\'t know what to do with it');
+  lines.push('   - ✓ *"the subject under the red arrow accelerates diagonally toward the centre-left, overtaking the black car"* — uses the arrow as identity pointer, but encodes the motion in prose');
+  lines.push('');
+  lines.push('Action-prose templates (paired with mark-as-pointer for identity):');
+  lines.push('   - **Arrow → motion language.** Direction (left → right, top-down, foreground-to-background, diagonal sweep), speed (slow drift, accelerate, sudden burst), trajectory shape (straight line, arc, curve, zigzag), magnitude (just slightly, halfway across the frame, exits frame).');
+  lines.push('   - **X / cross-out → "remove" + identity pointer.** Example: *"Remove the subject identified by the prominent red X mark visible in `[ANNOTATIONS @ 00:03.042]` — she should not appear in any frame of the output."*');
+  lines.push('   - **Circle / rectangle → "focus on" + identity pointer + what to do.** *"The figure circled in red in the reference image — turn her head smoothly to the right."*');
+  lines.push('');
+  lines.push('**Identify the marked SUBJECT with HYPER-PRECISE, CONTRASTIVE detail.** Before writing the prompt you MUST describe the marked subject so unambiguously that a model which has never seen the annotation can pick it out from the rest of the source. Vague descriptions like "the woman" or "the blonde" are routing failures — there are typically multiple women / blondes / similar subjects in frame and the model picks the wrong one half the time.');
+  lines.push('');
+  lines.push('A precise description STACKS multiple disambiguators until exactly one subject in the scene fits. Provide ALL of these:');
+  lines.push('');
+  lines.push('**THE UNIVERSAL DISAMBIGUATION FORMULA — ALWAYS use anchor #0 + the 3 spatial anchors below, IN THIS ORDER, for EVERY subject reference. Colour/clothing/age go LAST as tie-breakers ONLY.**');
+  lines.push('');
+  lines.push('⏱ **CRITICAL — every spatial anchor is TEMPORAL**, because video subjects move (camera pans, people walk, cars drive). A position description without a timestamp is meaningless: the woman who is "in the right 18% of the frame" at t=0 may be at the centre at t=2 and out of frame at t=4. ALWAYS anchor every position description to the EXACT timestamp of the source frame the user marked. The temporal anchor is what lets the video model lock onto the right pixel region in the source and follow it through time.');
+  lines.push('');
+  lines.push('**0. MARK-AS-IDENTITY-POINTER (PRIMARY — strongest possible anchor)** — the user\'s mark itself is visible in the annotation composite that ships as `referenceImages[i]`. Use it as a visual pointer with the GENERIC placeholder syntax `@ref1`, `@ref2`, … (1-indexed). `@ref1` refers to `referenceImages[0]`, `@ref2` refers to `referenceImages[1]`, etc.');
+  lines.push('   - *"the subject identified by the prominent red X mark visible in @ref1 (the annotated frame at 00:03.042) — the person on whom the red X is overlaid"*');
+  lines.push('   - *"the figure covered by the red scribble in @ref2 (annotated frame at 00:04.250)"*');
+  lines.push('   This bypasses every prose ambiguity (colour, ordinals, geometry) because the model\'s vision encoder DIRECTLY SEES which pixels are marked and locks onto the subject under those pixels. Anchors 1-3 below act as REINFORCEMENTS in case the model under-weights the visual mark.');
+  lines.push('');
+  lines.push('   **Don\'t hard-code provider-specific reference syntax** (`@Image1`, `<image>`, `[image-1]`, etc.). Always use `@refN`. The gateway translates `@refN` to whatever syntax the resolved model expects (e.g. `@ImageN` for Kling family, descriptive prose for models that don\'t support explicit refs). You don\'t know which model will be picked at write time — let the runtime handle the dialect.');
+  lines.push('');
+  lines.push('   **Hard limit: max 4 reference images total** (some video adapters cap at 4; safer ceiling for the rest). If the user marked more than 4 frames, prioritise the frames with the most distinct subjects/instructions and drop the rest.');
+  lines.push('');
+  lines.push('⏱ **TIMESTAMPED + TRACKED** — every spatial description anchors to the EXACT timestamp of the marked frame, plus a tracking clause so the model carries identity through subject/camera motion across the rest of the clip.');
+  lines.push('');
+  lines.push('1. **One natural-language landmark (mandatory, TIMESTAMPED)** — on top of the @ref1 mark, give the model ONE simple human-language description that any human caption-writer would write spontaneously, NOT engineering pseudo-coordinates. Diffusion models were trained on natural image captions, not on UI percent bands.');
+  lines.push('');
+  lines.push('   ❌ Pseudo-coordinate jargon (the model handles these badly):');
+  lines.push('       *"the rightmost 18% of the camera frame"*');
+  lines.push('       *"frame-right of the other woman"*');
+  lines.push('       *"upper-right quadrant"*');
+  lines.push('       *"rightmost in frame of the two women"*');
+  lines.push('   ❌ Vehicle / 3D-scene coordinates (introduce LHD/RHD ambiguity):');
+  lines.push('       *"the far-right window of the car"*');
+  lines.push('       *"on the passenger side"*');
+  lines.push('       *"behind the driver"*');
+  lines.push('   ✓ Natural-language anchors (model resolves these well):');
+  lines.push('       *"the woman closest to the camera"*');
+  lines.push('       *"the woman seated nearest the back of the vehicle"*');
+  lines.push('       *"the woman whose face is partly cropped by the edge of the shot"*');
+  lines.push('       *"the woman next to the open window"*');
+  lines.push('       *"the woman seated in the very last seat row"*');
+  lines.push('       *"the woman immediately behind the man with green-and-orange face paint"* (use UNIQUE landmarks the model can\'t miss — face paint, a distinctive hat, the steering wheel, etc.)');
+  lines.push('');
+  lines.push('   Pick **ONE** such anchor — not five. More anchors compete for attention and the model averages them, often landing on the wrong subject. The @ref1 mark is the primary signal; one simple natural-language landmark reinforces it.');
+  lines.push('');
+  lines.push('2. **What to KEEP — the OTHER subject(s) by their own natural anchor.** Mirror the same single-landmark style for the subjects that must remain unchanged. Don\'t describe them by what they\'re NOT (negative anchors confuse diffusion); describe them positively by their OWN landmark:');
+  lines.push('   ✓ *"keep the OTHER woman in the back of the vehicle, the one seated closer to the driver, exactly as she appears in the source"*');
+  lines.push('   ✓ *"keep the man with green-and-orange face paint in the driver\'s seat"*');
+  lines.push('   ✓ *"keep the boy in the front leaning out of the window"*');
+  lines.push('   ❌ *"keep the woman who is NOT in the rightmost 18% of the frame"* — pure negative, hard for diffusion');
+  lines.push('');
+  lines.push('3. **Tracking clause (mandatory, ONCE per subject reference)** — because models don\'t implicitly assume a static frame description carries through time:');
+  lines.push('   - *"Track this same subject across every frame of the source video — even when motion (camera tracking, vehicle movement, the subject\'s own movement) changes her on-screen position"*');
+  lines.push('   - This signals the model to maintain identity correspondence rather than re-resolving the description per-frame.');
+  lines.push('');
+  lines.push('**Tie-breakers ONLY (use sparingly, after the 4 anchors above):**');
+  lines.push('   - Physical attributes — hair length & style ("long straight hair past shoulders" vs "short bob"), distinctive accessories (glasses, hat, face paint, visible tattoo), pose AT THE MARKED TIMESTAMP (hand raised, looking left, sitting upright vs slouched).');
+  lines.push('   - Clothing — only when the colour contrast is unmistakable (black vs white, red vs blue).');
+  lines.push('');
+  lines.push('**FORBIDDEN as primary disambiguators** (cause wrong-subject errors):');
+  lines.push('   - ❌ Hair colour adjectives ("blonde", "brunette", "redhead") — diffusion models conflate light-brown / blonde / dirty-blonde under variable lighting.');
+  lines.push('   - ❌ Clothing colour without high contrast — "navy" vs "black" vs "dark grey" all look the same in shadow.');
+  lines.push('   - ❌ Subjective traits ("the older one", "the prettier one") — model can\'t resolve.');
+  lines.push('   - ❌ Window-count or seat-count as the primary anchor — depends on whether you include pillar/quarter/sunroof windows.');
+  lines.push('');
+  lines.push('   ✓ Example for the ambiguous SUV-with-two-women-in-back case (user marked frame at 00:03.042 with a red X; that composite ships as `referenceImages[0]` ↔ `@ref1`):');
+  lines.push('     *"The female passenger identified by the prominent red X mark visible in @ref1 (the annotated frame at 00:03.042 — the person on whom the red X is overlaid). She is the woman seated nearest the back of the vehicle, the one whose face is partly cropped by the edge of the shot at 00:03.042. Track this same subject across every frame of the source clip — her position on screen will shift as the camera tracks the moving vehicle, but identity stays locked to whoever the red X in @ref1 marks. Throughout the entire output she is absent, replaced by the vehicle\'s interior visible behind her seat. Keep the OTHER woman in the back of the vehicle (the one seated closer to the driver) unchanged across every frame, and keep the man with green-and-orange face paint, the boy leaning out of the front window, the wood-panel exterior, the desert background, and the camera framing exactly as in the source."*');
+  lines.push('     Notice: ONE strong identity pointer (red X in @ref1) + ONE natural-language anchor ("seated nearest the back of the vehicle / face partly cropped by the edge"). The OTHER woman is described positively by her OWN landmark ("seated closer to the driver"), not negatively as "not the rightmost". Tracking clause. No engineering jargon ("rightmost 18% of frame", "frame-right of"), no vehicle 3D reasoning ("passenger side", "far-right window"), no colour adjectives. Less prose, less competition for attention, stronger signal.');
+  lines.push('');
+  lines.push('3. **Pose / action / framing at the marked moment** — what is the subject DOING right now (sitting still, looking out the window, hand on the door, eating, talking), which way is she/he facing (toward camera, profile-left, profile-right, three-quarter back), what part of the body is visible (face only, head and shoulders, full body cropped at chest).');
+  lines.push('');
+  lines.push('4. **CONTRASTIVE callout — name the OTHER subjects you are NOT referring to.** This is the single highest-leverage trick. After describing the target, immediately list every other similar subject in frame and explicitly say "NOT" them:');
+  lines.push('   ✓ *"The blonde long-haired woman in the rear-right window seat (the rightmost passenger, leaning slightly toward the door, only her head and right shoulder visible above the window line) — NOT the brunette woman seated immediately to her left, NOT the man with green-and-orange face paint in the front passenger seat, NOT the young man behind the driver."*');
+  lines.push('   ✗ *"The blonde woman in the back."* ← ambiguous when there are multiple women in the back.');
+  lines.push('');
+  lines.push('5. **What to keep static — full inventory.** List EVERY other subject AND the background AND camera AND lighting AND vehicle / setting elements, all explicitly preserved. This is one of the highest-leverage sentences in the prompt because diffusion models default to changing things you didn\'t pin down.');
+  lines.push('   ✓ *"Keep ALL of the following completely unchanged across every frame: the driver with the green-and-orange face paint, the young man in the front passenger seat, the OTHER woman in the rear seat (the one closer to the centre of the back row), the SUV\'s wood-panel exterior and chrome trim, the desert highway background with sparse vegetation, the dust kicked up behind the vehicle, the mid-day sunlight, the steady tracking-shot camera framing."*');
+  lines.push('');
+  lines.push('6. **Add a numeric OUTCOME-VERIFICATION sentence.** Diffusion models are bad at counting and at the "remove A but keep B" task when A and B are similar adjacent subjects. They tend to "average" and remove both, or remove neither, or hallucinate a hybrid. Force the model to commit to a count by adding an explicit expected-count clause at the end of the prompt:');
+  lines.push('   ✓ *"After this edit, the rear of the car must show EXACTLY ONE woman: the one previously seated in the middle of the back row (NOT two women, NOT zero women). The rear-right window where the removed woman was sitting now shows the SUV\'s interior upholstery and the desert visible through the glass — no human figure occupies that space at any frame."*');
+  lines.push('   This kind of explicit count sentence acts as a self-check signal that even mid-tier video models can latch onto, reducing the "remove both" failure mode.');
+  lines.push('');
+  lines.push('Generic prompts ("edit this", "remove the woman", "the marked one", "animate this") will not produce the right output — the user took the time to draw, the prompt MUST reflect what they drew at the level of detail above, expressed in **frame-coordinate + visual-ordinal + relative-anchor** language. Colour and clothing are tie-breakers only.');
+}
+
+/** Format a millisecond playhead position as MM:SS.ms (zero-padded). Used
+ *  to label per-frame video annotations in the WORKING AREA block so the
+ *  agent can correlate marks to the source timeline. */
+function _formatVideoTs(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '00:00.000';
+  const totalSec = Math.floor(ms / 1000);
+  const millis = Math.round(ms - totalSec * 1000);
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec - minutes * 60;
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(seconds).padStart(2, '0');
+  const mmm = String(millis).padStart(3, '0');
+  return `${mm}:${ss}.${mmm}`;
+}
+
 /**
  * Build the system prompt for all agents.
  * Single unified prompt — only the available intents change per agent.
@@ -262,9 +459,56 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
   let openDocumentsBlock = '';
   try {
     const { openDocumentsStore } = await import('../state/open-documents-store.js');
-    if (openDocumentsStore.hasAny()) {
-      const docs = openDocumentsStore.getAll();
-      const active = openDocumentsStore.getActive();
+    // Diagnostic: log the working-area state at every prompt build so we
+    // can tell, when the # WORKING AREA block is mysteriously absent,
+    // whether the store was empty (GUI never pushed / pushed empty),
+    // populated correctly, or populated then cleared. Also surfaces the
+    // hash of doc ids so repeated empty pushes are visible.
+    try {
+      // Read from the TURN SNAPSHOT, not the LIVE store. The snapshot is
+      // pinned when a user input arrives and stays immutable for the
+      // rest of the turn — so the agent's WORKING AREA view stays
+      // anchored to what the user saw at submit time, regardless of
+      // tabs the agent or GUI auto-opens mid-turn.
+      const _docs = openDocumentsStore.getSnapshotAll();
+      const _active = openDocumentsStore.getSnapshotActive();
+      const _pinnedAt = openDocumentsStore.snapshotPinnedAt();
+      const { channel: _ch } = await import('../io/channel.js');
+      _ch.log(
+        'prompt',
+        `[working-area] turn-snapshot has ${_docs.length} doc(s)` +
+        (_docs.length > 0
+          ? ` [${_docs.map((d) => `${d.type}:${d.title || d.id}`).join(', ')}]` +
+            (_active ? ` active=${_active.id}` : ' active=(none)')
+          : ' — # WORKING AREA block will be omitted from the system prompt') +
+        (_pinnedAt ? ` (pinned ${Math.round((Date.now() - _pinnedAt) / 1000)}s ago)` : ' (no snapshot yet, falling back to live)'),
+      );
+      // Per-doc bundle inventory — tells us whether each doc carries
+      // annotations / references when the prompt is built. The WORKING
+      // AREA section only renders annotation composites when a bundle
+      // is present and bundle.annotations[].length > 0; if the GUI
+      // failed to attach the bundle the agent never sees the marks.
+      for (const _d of _docs) {
+        const _b = _d.bundle;
+        if (!_b) {
+          _ch.log('prompt', `[working-area] doc ${_d.type}:${_d.title || _d.id} → bundle=NONE (annotations will NOT appear in prompt)`);
+          continue;
+        }
+        const _anns = Array.isArray(_b.annotations) ? _b.annotations : [];
+        const _refs = Array.isArray(_b.references) ? _b.references : [];
+        _ch.log(
+          'prompt',
+          `[working-area] doc ${_d.type}:${_d.title || _d.id} → ` +
+          `bundle annotations=${_anns.length}` +
+          (_anns.length > 0 ? ` [${_anns.map((a) => a.role || 'unknown').join(', ')}]` : '') +
+          ` refs=${_refs.length}` +
+          ` primary=${_b.primary?.path ? _b.primary.path.split('/').pop() : '(none)'}`,
+        );
+      }
+    } catch { /* best-effort logging */ }
+    if (openDocumentsStore.hasAnyInSnapshot()) {
+      const docs = openDocumentsStore.getSnapshotAll();
+      const active = openDocumentsStore.getSnapshotActive();
       const lines = ['', '# WORKING AREA', '', `The user has ${docs.length} document(s) open next to the chat:`];
       let anyHasComposite = false;
       for (const d of docs) {
@@ -274,16 +518,30 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${activeTag}`);
 
         // DocumentBundle — compact rendering. Only the fields the agent
-        // actually needs to route a media action: annotation path (the
-        // visual intent spec), reference paths (forwarded to
-        // generate_image as extra refs). Roles are implicit in the
-        // labels ("composite", "references"); per-resource prose lives
-        // in the code, not in the prompt.
+        // actually needs to route a media action: annotation paths (the
+        // visual intent spec — one for images, one-per-frame for videos),
+        // reference paths (forwarded to generate_image as extra refs).
+        // Roles are implicit in the labels ("composite" / "frame
+        // composites" / "references"); per-resource prose lives in the
+        // code, not in the prompt.
         const b = d.bundle;
         if (b && typeof b === 'object') {
-          if (b.annotation?.path) {
+          const anns = Array.isArray(b.annotations) ? b.annotations : [];
+          if (anns.length > 0) {
             anyHasComposite = true;
-            lines.push(`    ↳ composite: \`${b.annotation.path}\``);
+            const isVideo = anns.some((a) => a && a.role === 'video-frame-composite');
+            if (isVideo) {
+              lines.push(`    ↳ frame composites (${anns.length}):`);
+              for (const a of anns) {
+                const tsMs = typeof a.frameTimestampMs === 'number' ? a.frameTimestampMs : null;
+                const tsLabel = tsMs != null ? _formatVideoTs(tsMs) : '?';
+                const idxLabel = typeof a.frameIndex === 'number' ? ` (frame ${a.frameIndex})` : '';
+                lines.push(`        @ ${tsLabel}${idxLabel}: \`${a.path}\``);
+              }
+            } else {
+              // Image case — single composite snapshot.
+              lines.push(`    ↳ composite: \`${anns[0].path}\``);
+            }
           }
           if (Array.isArray(b.references) && b.references.length > 0) {
             anyHasComposite = true;
@@ -306,15 +564,29 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       // has no idea which is base / composite / source — it just
       // averages them, which is exactly the "model invents things"
       // failure mode the user was hitting.
-      if (anyHasComposite && active && (active.path || active.url)) {
+      // Image photomontage routing — only fires for image-type active
+      // docs with at least one composite-snapshot annotation. Video docs
+      // with annotations are handled in the video-to-video block below.
+      const activeIsImage = active && active.type !== 'video';
+      const activeAnnsForBlock = activeIsImage && active.bundle?.annotations
+        ? active.bundle.annotations.filter((a) => a?.role === 'composite-snapshot')
+        : [];
+      if (anyHasComposite && activeIsImage && active && (active.path || active.url) && (activeAnnsForBlock.length > 0 || (active.bundle?.references?.length ?? 0) > 0)) {
         const activeLoc = active.path || active.url;
         const activeBundle = active.bundle || {};
         const activeRefs = Array.isArray(activeBundle.references)
           ? activeBundle.references.map((r) => r.path).filter(Boolean)
           : [];
-        const activeOverlay = activeBundle.annotation?.path || null;
+        const activeOverlay = activeAnnsForBlock[0]?.path || null;
+        const hasDrawnMarks = activeOverlay !== null;
         const refList = [activeLoc, activeOverlay, ...activeRefs].filter(Boolean);
         const refJson = JSON.stringify(refList);
+        // Animation references: ONLY the composite — the base image goes
+        // to `startFrame` (image-to-video conditioning), not to
+        // `referenceImages`. Putting the base in both is redundant and
+        // some adapters reject duplicates.
+        const animRefList = [activeOverlay].filter(Boolean);
+        const animRefJson = JSON.stringify(animRefList);
         const saveDir = activeLoc.replace(/\/[^/]+$/, '');
         lines.push('');
         lines.push('## ⚠ ACTIVE document is a photomontage — act, do not ask');
@@ -322,12 +594,39 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('The composite IS the spec. Forbidden to ask "qué composición?" / "which composition?"; the answer is the image already attached.');
         lines.push('');
         lines.push(`1. **read_file "${activeLoc}"** first. Vision receives the base + composite in order; pasted-cutout sources ride along in the bundle but are NOT auto-attached (they flow into generate_image as refs).`);
-        lines.push('2. Then dispatch the real work: `generate_image` for edits/compositions, `background_removal`, `upscale_image`, etc.');
+        lines.push('2. Then dispatch the real work: `generate_image` for edits/compositions, `background_removal`, `upscale_image`, or — when the user asks to animate / move / "give it life" / make a video out of it — `generate_video`.');
         lines.push('3. For `generate_image` use EXACTLY this shape (base → composite → sources):');
         lines.push('');
         lines.push('```json');
         lines.push(`{ "intent": "generate_image", "prompt": "Edit the FIRST reference image. The SECOND is a composite snapshot showing EXACTLY where and at what size/angle the pasted elements land — use as PLACEMENT guide. The REMAINING refs are the high-fidelity sources. Apply: <paraphrase the user's request>.", "referenceImages": ${refJson}, "saveTo": "${saveDir}" }`);
         lines.push('```');
+        lines.push('');
+        lines.push('4. For `generate_video` (animate the marked image) — image-to-video models REQUIRE the source image as `startFrame` (the first frame of the animation). The annotated composite goes in `referenceImages` as supplementary visual context — DO NOT put the base image in both fields, that\'s redundant and some adapters reject duplicates.');
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_video", "prompt": "<detailed brief — describe the marked subject by physical attributes + position + pose, name what should move/change, then explicitly list what to keep static/intact>", "startFrame": "${activeLoc}", "referenceImages": ${animRefJson}, "saveTo": "${saveDir}" }`);
+        lines.push('```');
+        lines.push('');
+        lines.push('**Critical**: `startFrame` is mandatory for image-to-video. Omitting it causes the call to fail with `body.image_url: Field required` because the gateway only sets `image_url` when a `startFrame` is provided (see `gateway.service.ts`).');
+        if (hasDrawnMarks) {
+          lines.push('');
+          lines.push('**Sketch-guided routing**: when `label: "sketch-guided"` appears in the `generate_video` schema enum, ADD it to the call. That label selects a model variant trained to interpret drawn marks (arrows, crosses, scribbles) as motion / edit hints visually — not just from prose. Without the label the router picks a generic image-to-video model that only sees the clean source frame + your prompt, which is why complex trajectories (swerve, overtake, multi-segment paths) often come out wrong. Example with the label:');
+          lines.push('');
+          lines.push('```json');
+          lines.push(`{ "intent": "generate_video", "label": "sketch-guided", "prompt": "<...>", "startFrame": "${activeLoc}", "referenceImages": ${animRefJson}, "saveTo": "${saveDir}" }`);
+          lines.push('```');
+          lines.push('');
+          lines.push('**Required workflow when annotations carry drawn marks (whether you call `generate_image` OR `generate_video`):**');
+          lines.push('');
+          lines.push('5. ');
+          _pushAnnotationTranscribeGuide(lines);
+          lines.push('');
+          lines.push('6. For `generate_video` specifically, structure the prompt as numbered directives (the diffusion model loses anchoring when you merge instructions into a paragraph):');
+          lines.push('');
+          _pushStructuredDirectivesGuide(lines, 'image');
+          lines.push('');
+          _pushSurgicalAnnotationGuide(lines);
+        }
       }
 
       // When the ACTIVE doc is a video and the user asks for an edit /
@@ -340,6 +639,9 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       if (active && active.type === 'video' && active.path) {
         const activeLoc = active.path;
         const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        const videoAnns = Array.isArray(active.bundle?.annotations)
+          ? active.bundle.annotations.filter((a) => a?.role === 'video-frame-composite')
+          : [];
         lines.push('');
         lines.push('## 🎬 ACTIVE document is a video — route edits via video-to-video');
         lines.push('');
@@ -352,10 +654,47 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('```');
         lines.push('');
         lines.push('Only skip `referenceVideos` if the user is asking for a brand-new clip that does NOT reference the active video (e.g. "generate a video of a sunset" while a different video is open).');
+
+        // Per-frame annotations published with the video — read them as
+        // vision before writing the prompt so the marks become a SPECIFIC
+        // editing brief, not a vague "edit the video".
+        if (videoAnns.length > 0) {
+          const stamps = videoAnns
+            .map((a) => typeof a.frameTimestampMs === 'number' ? _formatVideoTs(a.frameTimestampMs) : '?')
+            .join(', ');
+          const annPaths = videoAnns.map((a) => a.path).filter(Boolean);
+          const refImagesJson = JSON.stringify(annPaths);
+          lines.push('');
+          lines.push(`## 🎥 The user has marked ${videoAnns.length} frame(s) of this video`);
+          lines.push('');
+          lines.push(`Annotated frames at: ${stamps}.`);
+          lines.push('');
+          lines.push('**Required workflow before calling `generate_video`:**');
+          lines.push('');
+          lines.push(`1. Call \`read_file\` on \`${activeLoc}\` — vision will receive each annotated frame as \`[ANNOTATIONS @ MM:SS.ms]\` in chronological order.`);
+          lines.push('');
+          lines.push('2. ');
+          _pushAnnotationTranscribeGuide(lines);
+          lines.push('');
+          lines.push('3. ');
+          _pushStructuredDirectivesGuide(lines, 'video');
+          lines.push('');
+          lines.push('4. **Identify the marked SUBJECT in surgical detail** (per the rules below): physical attributes (hair colour & length, complexion, clothing colour & type, accessories), spatial location (specific seat, side of frame, foreground/background), pose. Without this level of detail the model picks the wrong person — there are typically 3-5 subjects in frame and "the woman" is ambiguous. Reuse the EXACT same description across all directives that reference the same subject so the model knows it\'s the same person.');
+          lines.push('');
+          lines.push('5. **Write the `generate_video` call.** Include the source video AND every annotation composite as references (the composites let the model VISUALLY locate the marked subjects — the red mark itself is part of the reference image; combined with the timestamp-anchored prose this makes the intent unambiguous):');
+          lines.push('');
+          lines.push('```json');
+          lines.push(`{ "intent": "generate_video", "prompt": "<numbered, timestamp-anchored directives per step 3>", "referenceVideos": ["${activeLoc}"], "referenceImages": ${refImagesJson}, "saveTo": "${saveDir}" }`);
+          lines.push('```');
+          lines.push('');
+          lines.push('**Sketch-guided routing**: when `label: "sketch-guided"` appears in the `generate_video` schema enum, ADD it. That label selects a model variant trained to read drawn marks visually (arrows = motion vectors, crosses = removal regions) instead of relying purely on prose. Without it the router picks a generic v2v / i2v model that only sees the source + your prompt, and complex per-frame intent gets lost.');
+          lines.push('');
+          _pushSurgicalAnnotationGuide(lines);
+        }
       }
       lines.push('');
       lines.push('**ACTIVE doc = default target.** Demonstratives ("this", "esto", "the image", "the pdf", …) always mean the ACTIVE document — never the project codebase. Use only paths / URLs listed above, never invent.');
-      lines.push('- **Read** active doc → `read_file` with its path/URL. Images & web come back as vision; if there\'s a composite, it\'s queued right after as `[ANNOTATIONS OVERLAY]`.');
+      lines.push('- **Read** active doc → `read_file` with its path/URL. Images & web come back as vision; if there\'s a composite, it\'s queued right after as `[ANNOTATIONS OVERLAY]` (image) or `[ANNOTATIONS @ MM:SS.ms]` (video — one per annotated frame, chronological).');
       lines.push('- **Write/edit text docs** → `edit_file` / `write_file` directly, inline — never delegate to a sub-agent for working-area edits. "continúa / sigue / añade" = append; "replace / rewrite" = replace. Never report success without a real tool call.');
       lines.push('- **Non-text active docs** (image/pdf/web) — dispatch to the right media tool (`generate_image`, `background_removal`, …); never claim to have edited in place.');
       lines.push('- **Ambiguity** between open text docs → `prompt_user` before writing.');
@@ -378,7 +717,20 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       }
       openDocumentsBlock = lines.join('\n') + '\n';
     }
-  } catch { /* store not available — skip */ }
+  } catch (err) {
+    // Loud catch: previously this was silent (`catch {}`), which meant any
+    // runtime error inside the WORKING AREA build (a helper throwing, a
+    // bad reference, etc.) was swallowed and the block silently vanished
+    // from the prompt — exactly the kind of bug that took an hour to
+    // diagnose. Log it so it screams.
+    try {
+      const { channel: _ch } = await import('../io/channel.js');
+      _ch.log('prompt', `[working-area] ERROR building block — block omitted: ${err?.stack || err?.message || err}`);
+    } catch {
+      // eslint-disable-next-line no-console
+      console.error('[prompt] [working-area] ERROR building block — block omitted:', err);
+    }
+  }
 
   // Expanded tool schemas: full docs for every tool the agent has
   // already requested via `get_tool_info` this session. Lives in the

@@ -195,55 +195,83 @@ async function _loadPdfjsFromCache() {
   return _pdfjsCached;
 }
 
-/**
- * Queue the active working-area document (image or web screenshot) for the
- * next LLM turn as a vision input, and — if the user has drawn annotations on
- * it — also queue the annotated composite as a second image preceded by a
- * text caption marking it as user markup. This is used both for the URL
- * branch (web tabs) and as a follow-up after reading an image file that
- * happens to be the active working-area document.
- */
-async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
-  const session = agent?._activeSession;
-  if (!session) {
+/** Format a millisecond playhead position as MM:SS.ms (zero-padded).
+ *  Mirrors the format used by the system prompt builder for the
+ *  WORKING AREA video annotations block. */
+function _formatVideoTs(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '00:00.000';
+  const totalSec = Math.floor(ms / 1000);
+  const millis = Math.round(ms - totalSec * 1000);
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec - minutes * 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
+}
+
+const _VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mpeg', '.mpg']);
+const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.opus', '.oga', '.weba']);
+
+/** Render seconds as MM:SS or HH:MM:SS. Used by the audio metadata
+ *  branch so the agent sees a human-readable duration alongside the
+ *  raw `durationSec` number. */
+function _formatDuration(sec) {
+  if (typeof sec !== 'number' || !Number.isFinite(sec) || sec < 0) return null;
+  const total = Math.round(sec);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+/** Best-effort metadata probe via ffprobe. Returns null when ffprobe
+ *  isn't installed or the file is unreadable — caller falls back to
+ *  basic file-stat info. The 2-second timeout protects against a
+ *  hanging probe on a corrupt file. */
+async function _probeAudioMetadata(filePath) {
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      'ffprobe',
+      ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath],
+      { timeout: 2000 },
+    );
+    const data = JSON.parse(stdout);
+    const stream = (data.streams || []).find((s) => s.codec_type === 'audio') || {};
+    const fmt = data.format || {};
     return {
-      success: false,
-      error: 'No active session — cannot queue document for vision.',
+      durationSec: fmt.duration ? Number(fmt.duration) : null,
+      bitRateKbps: fmt.bit_rate ? Math.round(Number(fmt.bit_rate) / 1000) : null,
+      codec: stream.codec_name || null,
+      sampleRateHz: stream.sample_rate ? Number(stream.sample_rate) : null,
+      channels: stream.channels || null,
+      formatName: fmt.format_long_name || fmt.format_name || null,
     };
+  } catch {
+    return null;
   }
+}
 
-  // New contract: the document carries a [DocumentBundle] — one primary
-  // resource, an optional composite-snapshot annotation, and a list of
-  // references. We queue PRIMARY + ANNOTATION to vision (those are the
-  // two images the agent needs to see to understand intent). References
-  // are NOT auto-queued: they're listed in the bundle so downstream
-  // tools (generate_image) can forward them to the image model, but the
-  // agent doesn't need to inspect each cutout source visually to act on
-  // the user's request. If it ever needs to, it can `read_file` the
-  // specific reference path explicitly.
-  const bundle = doc.bundle || null;
-  const primaryPath = bundle?.primary?.path || doc.path;
-  if (!primaryPath || !fs.existsSync(primaryPath)) {
-    return {
-      success: false,
-      error: `Active document has no readable primary on disk (looked for: ${primaryPath || 'none'}).`,
-    };
-  }
+/** Queue every annotation in the bundle as a vision input, with the
+ *  appropriate caption per kind. Returns a text fragment to splice into
+ *  the read_file return message. Pasted-cutout references are listed in
+ *  the message but NEVER queued — they flow to generate_image as
+ *  `referenceImages` separately, so the agent doesn't have to inspect
+ *  each cutout source visually to reason about the edit. */
+function _queueAnnotationsForVision(bundle, doc, session) {
+  const anns = Array.isArray(bundle?.annotations) ? bundle.annotations : [];
+  let note = '';
 
-  const srcExt = path.extname(primaryPath).toLowerCase().slice(1);
-  const srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
-  const srcB64 = fs.readFileSync(primaryPath).toString('base64');
-
-  if (!session._pendingMcpImages) session._pendingMcpImages = [];
-  session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: primaryPath });
-  channel.log('read_file', `[bundle:${doc.id}] primary queued for vision: ${primaryPath}`);
-
-  let annotationNote = '';
-  const overlayPath = bundle?.annotation?.path || null;
-  if (overlayPath && fs.existsSync(overlayPath)) {
-    const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
-    const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
-    const ovB64 = fs.readFileSync(overlayPath).toString('base64');
+  // Image annotations — single composite-snapshot at most. Use the
+  // legacy `[ANNOTATIONS OVERLAY]` caption so existing image-flow
+  // behaviour is preserved verbatim.
+  const imageAnns = anns.filter((a) => a && a.role !== 'video-frame-composite');
+  for (const a of imageAnns) {
+    if (!a.path || !fs.existsSync(a.path)) continue;
+    const ext = path.extname(a.path).toLowerCase().slice(1);
+    const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+    const b64 = fs.readFileSync(a.path).toString('base64');
     const caption =
       '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
       'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
@@ -256,14 +284,62 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
       'inspect their full-quality sources here — they are listed in the bundle and ' +
       'will be forwarded by generate_image as referenceImages when the edit runs.';
     session._pendingMcpImages.push({
-      mimeType: ovMime,
-      data: ovB64,
-      _debugPath: overlayPath,
+      mimeType: mime,
+      data: b64,
+      _debugPath: a.path,
       caption,
       role: 'annotation_overlay',
     });
-    channel.log('read_file', `[bundle:${doc.id}] annotation queued for vision: ${overlayPath}`);
-    annotationNote = ' The user has drawn/composed on top of it — a second image labeled "ANNOTATIONS OVERLAY" follows: THAT is the visual intent spec.';
+    channel.log('read_file', `[bundle:${doc.id}] annotation queued for vision: ${a.path}`);
+    note = ' The user has drawn/composed on top of it — a second image labeled "ANNOTATIONS OVERLAY" follows: THAT is the visual intent spec.';
+  }
+
+  // Video frame composites — one per annotated frame, chronological.
+  // Each gets a `[ANNOTATIONS @ MM:SS.ms]` caption with frame index so
+  // the agent can correlate to the source timeline. Caption asks the
+  // agent to interpret marks (red X = remove; arrow = motion; etc.) and
+  // write a SPECIFIC `generate_video` prompt that names what changes.
+  const videoAnns = anns.filter((a) => a && a.role === 'video-frame-composite');
+  if (videoAnns.length > 0) {
+    const sorted = [...videoAnns].sort(
+      (a, b) => (a.frameTimestampMs ?? 0) - (b.frameTimestampMs ?? 0),
+    );
+    for (const a of sorted) {
+      if (!a.path || !fs.existsSync(a.path)) continue;
+      const ext = path.extname(a.path).toLowerCase().slice(1);
+      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+      const b64 = fs.readFileSync(a.path).toString('base64');
+      const tsLabel = typeof a.frameTimestampMs === 'number'
+        ? _formatVideoTs(a.frameTimestampMs)
+        : '?';
+      const idxLabel = typeof a.frameIndex === 'number' ? ` (frame ${a.frameIndex})` : '';
+      const caption =
+        `[ANNOTATIONS @ ${tsLabel}]${idxLabel} A composite PNG of the video frame at ${tsLabel} ` +
+        'with the user\'s drawn marks (arrows, crosses, circles, freehand, text) on top. ' +
+        'Interpret the marks: red X / cross-out = remove that subject; arrow = motion direction ' +
+        'or "move from A to B"; circle / rectangle = focus area; freehand = the area to change; ' +
+        'text = literal instruction. Use the timestamp to refer to specific moments in the source ' +
+        'video when writing the `generate_video` prompt — drawn-colour markup itself is meaningless, ' +
+        'only the regions and the shapes\' intent matter.';
+      session._pendingMcpImages.push({
+        mimeType: mime,
+        data: b64,
+        _debugPath: a.path,
+        caption,
+        role: 'video_frame_annotation',
+      });
+      channel.log(
+        'read_file',
+        `[bundle:${doc.id}] video annotation queued for vision: ${a.path} @ ${tsLabel}`,
+      );
+    }
+    const stamps = sorted
+      .map((a) => typeof a.frameTimestampMs === 'number' ? _formatVideoTs(a.frameTimestampMs) : '?')
+      .join(', ');
+    note = ` ${sorted.length} per-frame annotation${sorted.length === 1 ? '' : 's'} queued ` +
+      `(timestamps: ${stamps}). Each is a composite labelled "[ANNOTATIONS @ MM:SS.ms]" — ` +
+      'interpret the marks and translate them into a SPECIFIC generate_video prompt that ' +
+      'names what to keep, what to remove, and what to change at each marked region.';
   }
 
   // Reference paths — surface them in the return message so the agent
@@ -272,21 +348,82 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
   const refs = Array.isArray(bundle?.references) ? bundle.references : [];
   if (refs.length > 0) {
     const refList = refs.map((r, i) => `  ${i + 1}. ${r.path}`).join('\n');
-    annotationNote += ` ${refs.length} reference source(s) available in the bundle for downstream tools:\n${refList}`;
+    note += ` ${refs.length} reference source(s) available in the bundle for downstream tools:\n${refList}`;
     channel.log(
       'read_file',
-      `[bundle:${doc.id}] ${refs.length} reference(s) listed (not vision-queued): ${refs.map((r) => path.basename(r.path)).join(', ')}`,
+      `[bundle:${doc?.id}] ${refs.length} reference(s) listed (not vision-queued): ${refs.map((r) => path.basename(r.path)).join(', ')}`,
     );
   }
+
+  return note;
+}
+
+/**
+ * Queue the active working-area document (image, web screenshot, or
+ * video) for the next LLM turn as a vision input, and queue every
+ * annotation in the bundle as additional vision inputs preceded by
+ * captions marking them as user markup. This is used both for the URL
+ * branch (web tabs) and as a follow-up after reading a file that happens
+ * to be the active working-area document.
+ */
+async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
+  const session = agent?._activeSession;
+  if (!session) {
+    return {
+      success: false,
+      error: 'No active session — cannot queue document for vision.',
+    };
+  }
+
+  // New contract: the document carries a [DocumentBundle] — one primary
+  // resource, a list of annotations (one composite for images, one per
+  // marked frame for videos), and a list of references. We queue PRIMARY
+  // + ANNOTATIONS to vision (those are the images the agent needs to see
+  // to understand intent). References are NOT auto-queued.
+  const bundle = doc.bundle || null;
+  const primaryPath = bundle?.primary?.path || doc.path;
+  if (!primaryPath || !fs.existsSync(primaryPath)) {
+    return {
+      success: false,
+      error: `Active document has no readable primary on disk (looked for: ${primaryPath || 'none'}).`,
+    };
+  }
+
+  if (!session._pendingMcpImages) session._pendingMcpImages = [];
+
+  // Skip pushing the primary to vision when it's a video file — vision
+  // endpoints can't decode mp4/mov/etc., and the per-frame composites
+  // already convey what the user is pointing at on the timeline.
+  const primaryExt = path.extname(primaryPath).toLowerCase();
+  const primaryIsVideo = _VIDEO_EXTS.has(primaryExt);
+  if (!primaryIsVideo) {
+    const srcExt = primaryExt.slice(1);
+    const srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
+    const srcB64 = fs.readFileSync(primaryPath).toString('base64');
+    session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: primaryPath });
+    channel.log('read_file', `[bundle:${doc.id}] primary queued for vision: ${primaryPath}`);
+  } else {
+    channel.log(
+      'read_file',
+      `[bundle:${doc.id}] primary is video (${primaryExt}) — only annotation composites will be queued for vision`,
+    );
+  }
+
+  const annotationNote = _queueAnnotationsForVision(bundle, doc, session);
+
+  const docKind = doc.url ? 'web' : (primaryIsVideo ? 'video' : 'image');
+  const baseMsg = doc.url
+    ? 'Active working-area web page attached for visual analysis.'
+    : (primaryIsVideo
+        ? 'Active working-area video — per-frame annotation composites attached for visual analysis.'
+        : 'Active working-area image attached for visual analysis.');
 
   return {
     success: true,
     path: originalRequestPath,
-    type: doc.url ? 'web' : 'image',
+    type: docKind,
     bundle: bundle || undefined,
-    message:
-      `Active working-area ${doc.url ? 'web page' : 'image'} attached for visual analysis.` +
-      annotationNote,
+    message: baseMsg + annotationNote,
   };
 }
 
@@ -335,7 +472,7 @@ export default {
     if (/^https?:\/\//i.test(filePath)) {
       try {
         const { openDocumentsStore } = await import('../../state/open-documents-store.js');
-        const doc = openDocumentsStore.findByPathOrUrl(filePath);
+        const doc = openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
         if (!doc) {
           return {
             success: false,
@@ -407,6 +544,69 @@ export default {
       return { success: true, path: filePath, type: 'directory', entries: listing };
     }
 
+    // --- Video support (vision via per-frame annotation composites) ---
+    // The video file itself can't be sent to vision, but if it's the
+    // active working-area document AND has annotations published in its
+    // bundle, route through the active-doc helper so the LLM gets each
+    // annotated frame as a `[ANNOTATIONS @ MM:SS.ms]` composite.
+    if (_VIDEO_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
+      try {
+        const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+        const doc = openDocumentsStore.findInSnapshotByPathOrUrl(resolvedPath) ||
+                    openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
+        if (doc) {
+          return await _queueActiveDocumentForVision(doc, agent, filePath);
+        }
+      } catch { /* store unavailable — fall through to "unsupported" */ }
+      return {
+        success: false,
+        error: `Cannot read "${filePath}" as text and it is not the active working-area video. Open the video in the GUI working area to inspect it; for offline analysis use a video-specific tool.`,
+      };
+    }
+
+    // --- Audio support (metadata only — never raw bytes) ---
+    // Audio files are binary; dumping them as "text" produces a wall of
+    // garbage that wastes the agent's tokens AND confuses it. Instead
+    // we return structured metadata (size, duration, codec, sample
+    // rate, …) so the agent can reason about the file without ever
+    // touching the raw bytes. If the agent needs the actual content
+    // (transcription, lipsync driving, …) it should call the dedicated
+    // tool (generate_audio mode=transcribe, generate_avatar_video, …).
+    if (_AUDIO_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
+      const stat = fs.statSync(resolvedPath);
+      const ext = path.extname(resolvedPath).slice(1).toLowerCase();
+      const meta = await _probeAudioMetadata(resolvedPath);
+      const sizeKb = Math.round(stat.size / 1024);
+      return {
+        success: true,
+        path: filePath,
+        type: 'audio',
+        format: ext,
+        sizeBytes: stat.size,
+        sizeKb,
+        modified: stat.mtime.toISOString(),
+        ...(meta ? {
+          durationSec: meta.durationSec,
+          durationFormatted: meta.durationSec != null
+            ? _formatDuration(meta.durationSec)
+            : null,
+          bitRateKbps: meta.bitRateKbps,
+          codec: meta.codec,
+          sampleRateHz: meta.sampleRateHz,
+          channels: meta.channels,
+          channelLayout: meta.channels === 1 ? 'mono'
+            : meta.channels === 2 ? 'stereo'
+            : meta.channels ? `${meta.channels}-channel`
+            : null,
+          formatName: meta.formatName,
+        } : {
+          probe: 'unavailable',
+          probeHint: 'ffprobe not found — install ffmpeg locally to surface duration / codec / sample rate; the file itself is fine.',
+        }),
+        hint: 'This is an audio file — the runtime returns metadata, never the raw bytes. To transcribe, call generate_audio with mode="transcribe". To drive an avatar video, pass the path to generate_avatar_video.',
+      };
+    }
+
     // --- Image support (vision) ---
     // Keep .bmp/.svg/etc in the accepted-extensions list so the agent
     // can point read_file at them — normalizeImageForProvider transcodes
@@ -442,9 +642,9 @@ export default {
         channel.log('read_file', `Image queued for vision: ${filePath}`);
 
         // If this image is also the active working-area document AND the
-        // tab carries a [DocumentBundle] (annotation / references), queue
-        // the annotation right after the primary so the LLM sees them as
-        // a pair. References are listed in the return message but NOT
+        // tab carries a [DocumentBundle] (annotations / references), queue
+        // each annotation right after the primary so the LLM sees them as
+        // a sequence. References are listed in the return message but NOT
         // queued to vision — generate_image forwards them separately as
         // referenceImages, so the agent doesn't need to inspect each
         // cutout source visually to reason about the edit.
@@ -452,44 +652,11 @@ export default {
         let matchedDoc = null;
         try {
           const { openDocumentsStore } = await import('../../state/open-documents-store.js');
-          const doc = openDocumentsStore.findByPathOrUrl(resolvedPath) ||
-                      openDocumentsStore.findByPathOrUrl(filePath);
+          const doc = openDocumentsStore.findInSnapshotByPathOrUrl(resolvedPath) ||
+                      openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
           matchedDoc = doc;
-          const bundle = doc?.bundle || null;
-          const overlayPath = bundle?.annotation?.path || null;
-          if (overlayPath && fs.existsSync(overlayPath)) {
-            const ovExt = path.extname(overlayPath).toLowerCase().slice(1);
-            const ovMime = ovExt === 'jpg' ? 'image/jpeg' : `image/${ovExt}`;
-            const ovB64 = fs.readFileSync(overlayPath).toString('base64');
-            const caption =
-              '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
-              'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
-              'AND any reference cutouts they have pasted, both painted on top of the exact ' +
-              'same image you just saw. Use it as a visual guide that complements the text ' +
-              'prompt: the shapes and their positions indicate what the user is referring to. ' +
-              'Drawn-colour markup itself is meaningless — only the regions and the shapes\' ' +
-              'intent matter. Do not treat the markup as part of the design or copy its ' +
-              'colours into your output. Pasted cutouts ARE content, but you do NOT need to ' +
-              'inspect their full-quality sources here — they are listed in the bundle and ' +
-              'will be forwarded by generate_image as referenceImages when the edit runs.';
-            session._pendingMcpImages.push({
-              mimeType: ovMime,
-              data: ovB64,
-              _debugPath: overlayPath,
-              caption,
-              role: 'annotation_overlay',
-            });
-            channel.log('read_file', `[bundle:${doc.id}] annotation queued for vision: ${overlayPath}`);
-            annotationNote = ' The user has drawn/composed on top of it — a second image labeled "ANNOTATIONS OVERLAY" follows: THAT is the visual intent spec.';
-          }
-          const refs = Array.isArray(bundle?.references) ? bundle.references : [];
-          if (refs.length > 0) {
-            const refList = refs.map((r, i) => `  ${i + 1}. ${r.path}`).join('\n');
-            annotationNote += ` ${refs.length} reference source(s) available in the bundle for downstream tools:\n${refList}`;
-            channel.log(
-              'read_file',
-              `[bundle:${doc?.id}] ${refs.length} reference(s) listed (not vision-queued): ${refs.map((r) => path.basename(r.path)).join(', ')}`,
-            );
+          if (doc) {
+            annotationNote = _queueAnnotationsForVision(doc.bundle || null, doc, session);
           }
         } catch { /* store unavailable — ignore */ }
 
@@ -742,8 +909,8 @@ export default {
     let editor = null;
     try {
       const { openDocumentsStore } = await import('../../state/open-documents-store.js');
-      const doc = openDocumentsStore.findByPathOrUrl(resolvedPath) ||
-                  openDocumentsStore.findByPathOrUrl(filePath);
+      const doc = openDocumentsStore.findInSnapshotByPathOrUrl(resolvedPath) ||
+                  openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
       if (doc && (doc.selectionStart != null || doc.selectionEnd != null)) {
         editor = _describeEditorSelection(content, doc.selectionStart, doc.selectionEnd);
       }

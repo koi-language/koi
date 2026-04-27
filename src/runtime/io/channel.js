@@ -94,7 +94,7 @@ class Channel {
 
   /**
    * Present a resource to the user (open/preview it). No-op in plain CLI.
-   * @param {Object} spec - { type: 'file'|'url'|'image', path?, url?, title? }
+   * @param {Object} spec - { type: 'file'|'url'|'image'|'video', path?, url?, title? }
    */
   presentResource(spec) { /* no-op in non-UI channels */ }
   /** Whether this channel can present resources (open files/URLs visually). */

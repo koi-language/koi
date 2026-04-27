@@ -727,10 +727,15 @@ export class GatewayAudioGen extends BaseAudioGen {
       headers: getAuthHeaders(),
       body: JSON.stringify({
         model: resolvedModel,
-        input: text,
-        voice: opts.voice || 'alloy',
-        response_format: opts.outputFormat || 'mp3',
-        speed: opts.speed || 1.0,
+        text,
+        ...(opts.voice ? { voice: opts.voice } : {}),
+        outputFormat: opts.outputFormat || 'mp3',
+        ...(typeof opts.speed === 'number' ? { speed: opts.speed } : {}),
+        ...(opts.language ? { language: opts.language } : {}),
+        ...(opts.emotion ? { emotion: opts.emotion } : {}),
+        ...(typeof opts.pitch === 'number' ? { pitch: opts.pitch } : {}),
+        ...(typeof opts.volume === 'number' ? { volume: opts.volume } : {}),
+        ...(opts.extra ? { extra: opts.extra } : {}),
       }),
       signal: opts.abortSignal,
     });
@@ -745,6 +750,19 @@ export class GatewayAudioGen extends BaseAudioGen {
     return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: text.length } };
   }
 
+  /** Transcribe a speech sample. Two-step: upload bytes to fal storage,
+   *  then call /media/audio/transcribe with the resulting URL.
+   *
+   *  `audio` is the canonical input — accepts either a Buffer (raw bytes,
+   *  the common case from a tool reading a local file) or an `https://` URL
+   *  (skip the upload, send straight). `opts.audioUrl` is honoured the
+   *  same way for callers that already have a hosted sample.
+   *
+   *  Returns: { text, language?, segments?, usage }. `language` is the
+   *  detected language code when the provider reports one — Whisper sets
+   *  it via `inferred_languages[0]`, Scribe via `language_code`. The
+   *  agent uses it to localise the voice-clone preview text.
+   */
   async transcribe(audio, opts = {}) {
     const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
       import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
@@ -758,13 +776,46 @@ export class GatewayAudioGen extends BaseAudioGen {
       { kind: 'transcribe', label: opts.label },
     );
 
+    // Resolve audio → URL. Bypass the upload when the caller already
+    // gave us a URL (e.g. a fal preview from a previous step).
+    let audioUrl = opts.audioUrl;
+    if (!audioUrl && typeof audio === 'string' && /^https?:\/\//i.test(audio)) {
+      audioUrl = audio;
+    }
+    if (!audioUrl) {
+      if (!Buffer.isBuffer(audio)) {
+        throw new Error('transcribe: pass a Buffer of audio bytes or opts.audioUrl');
+      }
+      const filename = opts.sampleFilename || 'audio.mp3';
+      const mime = opts.sampleMimeType || _audioMimeFromFilename(filename);
+      const uploadHeaders = { ...getAuthHeaders() };
+      delete uploadHeaders['content-type'];
+      delete uploadHeaders['Content-Type'];
+      uploadHeaders['Content-Type'] = mime;
+      const uploadRes = await fetch(
+        `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(filename)}`,
+        { method: 'POST', headers: uploadHeaders, body: audio, signal: opts.abortSignal },
+      );
+      await throwIfQuotaExceeded(uploadRes);
+      if (!uploadRes.ok) {
+        const body = await uploadRes.text().catch(() => '');
+        throw new Error(`Gateway audio upload error (${uploadRes.status}): ${body}`);
+      }
+      const uploaded = await uploadRes.json();
+      audioUrl = uploaded.url;
+    }
+
     const res = await fetch(`${getGatewayBase()}/media/audio/transcribe`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({
         model: resolvedModel,
-        language: opts.language,
-        response_format: opts.format || 'json',
+        audio_url: audioUrl,
+        ...(opts.language ? { language: opts.language } : {}),
+        ...(opts.task ? { task: opts.task } : {}), // 'transcribe' (default) or 'translate'
+        ...(opts.prompt ? { prompt: opts.prompt } : {}),
+        ...(opts.diarize ? { diarize: true } : {}),
+        ...(opts.numSpeakers ? { num_speakers: opts.numSpeakers } : {}),
       }),
       signal: opts.abortSignal,
     });
@@ -776,8 +827,115 @@ export class GatewayAudioGen extends BaseAudioGen {
     }
 
     const data = await res.json();
-    return { text: data.text, segments: data.segments, usage: { duration: data.duration || 0 } };
+    return {
+      text: data.text || '',
+      language: data.language || undefined,
+      segments: data.segments || data.chunks || undefined,
+      model: data.model || resolvedModel,
+      usage: { duration: data.duration || 0 },
+    };
   }
+
+  /** Clone a voice from a sample. Two-step: upload the sample bytes to
+   *  fal storage via /uploads/audio, then call /media/audio/voice-clone
+   *  with the canonical request. The backend resolves the per-model
+   *  adapter (ElevenLabs / PlayAI / generic) and normalises the
+   *  response, so this method is provider-agnostic.
+   *
+   *  Returns: { voiceId, model, name?, sampleUrl?, provider }.
+   */
+  async cloneVoice(audioBuffer, opts = {}) {
+    if (!Buffer.isBuffer(audioBuffer)) {
+      throw new Error('cloneVoice: audioBuffer must be a Buffer');
+    }
+    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+        try {
+          return pickAudioModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'voice-clone', label: opts.label },
+    );
+
+    // Step 1: upload the sample to fal storage so the actual clone call
+    // can reference it by URL (cheaper, and fal models expect URLs not
+    // base64 for audio inputs above ~1 MB).
+    const filename = opts.sampleFilename || 'sample.mp3';
+    const mime = opts.sampleMimeType || _audioMimeFromFilename(filename);
+    const uploadHeaders = { ...getAuthHeaders() };
+    delete uploadHeaders['content-type'];
+    delete uploadHeaders['Content-Type'];
+    uploadHeaders['Content-Type'] = mime;
+    const uploadRes = await fetch(
+      `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(filename)}`,
+      { method: 'POST', headers: uploadHeaders, body: audioBuffer, signal: opts.abortSignal },
+    );
+    await throwIfQuotaExceeded(uploadRes);
+    if (!uploadRes.ok) {
+      const body = await uploadRes.text().catch(() => '');
+      throw new Error(`Gateway audio upload error (${uploadRes.status}): ${body}`);
+    }
+    const { url: sampleUrl } = await uploadRes.json();
+
+    // Step 2: trigger the clone. Backend handleVoiceClone runs the
+    // canonical request through the right per-model adapter.
+    const cloneRes = await fetch(`${getGatewayBase()}/media/audio/voice-clone`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        model: resolvedModel,
+        sample_url: sampleUrl,
+        ...(opts.name ? { name: opts.name } : {}),
+        ...(opts.description ? { description: opts.description } : {}),
+        ...(opts.language ? { language: opts.language } : {}),
+        ...(opts.labels ? { labels: opts.labels } : {}),
+        ...(opts.extra ? { extra: opts.extra } : {}),
+      }),
+      signal: opts.abortSignal,
+    });
+    await throwIfQuotaExceeded(cloneRes);
+    if (!cloneRes.ok) {
+      const body = await cloneRes.text().catch(() => '');
+      throw new Error(`Gateway voice-clone error (${cloneRes.status}): ${body}`);
+    }
+    const data = await cloneRes.json();
+    return {
+      voiceId: data.voiceId,
+      model: data.model || resolvedModel,
+      name: data.name,
+      sampleUrl: data.sampleUrl || sampleUrl,
+      provider: _voiceCloneProviderFromSlug(data.model || resolvedModel),
+    };
+  }
+}
+
+/** Best-effort mime guess from extension when the caller didn't pass
+ *  one explicitly. Mirrors the backend's /uploads/audio default. */
+function _audioMimeFromFilename(name) {
+  const ext = name.toLowerCase();
+  if (ext.endsWith('.mp3')) return 'audio/mpeg';
+  if (ext.endsWith('.wav')) return 'audio/wav';
+  if (ext.endsWith('.ogg')) return 'audio/ogg';
+  if (ext.endsWith('.flac')) return 'audio/flac';
+  if (ext.endsWith('.aac')) return 'audio/aac';
+  if (ext.endsWith('.m4a')) return 'audio/mp4';
+  if (ext.endsWith('.webm')) return 'audio/webm';
+  return 'audio/mpeg';
+}
+
+/** Extract a friendly provider tag from the resolved fal slug. Used
+ *  purely for logging / GUI display — generate_audio's voice resolution
+ *  uses the model slug directly, so a wrong-but-readable tag here is
+ *  harmless. */
+function _voiceCloneProviderFromSlug(slug) {
+  if (typeof slug !== 'string') return 'fal';
+  if (/elevenlabs/i.test(slug)) return 'elevenlabs';
+  if (/playai/i.test(slug)) return 'playai';
+  if (/openai/i.test(slug)) return 'openai';
+  return 'fal';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -887,6 +1045,16 @@ export class GatewayVideoGen extends BaseVideoGen {
     if (typeof opts.cameraMovement === 'string' && opts.cameraMovement.trim()) {
       payload.camera_control = opts.cameraMovement.trim();
     }
+    // Kling V3 motion-control specific knobs. Pass-through to the backend
+    // adapter; ignored by every other model. character_orientation tells
+    // the model whether to keep the still's pose ("image") or reorient
+    // the character to match the reference video's pose ("video").
+    if (opts.characterOrientation === 'image' || opts.characterOrientation === 'video') {
+      payload.character_orientation = opts.characterOrientation;
+    }
+    if (typeof opts.keepOriginalSound === 'boolean') {
+      payload.keep_original_sound = opts.keepOriginalSound;
+    }
     // numShots: legacy scalar path, only honoured when no explicit
     // shots[] array is present.
     if (!shots && typeof opts.numShots === 'number' && opts.numShots > 1) {
@@ -972,10 +1140,18 @@ export class GatewayVideoGen extends BaseVideoGen {
     }
 
     const data = await res.json();
+    // The gateway encodes the resolved fal model into the composite id as
+    // `<model>|<request_id>` — surface it explicitly here when present so
+    // the caller doesn't have to pattern-match on the id string. Falls
+    // back to data.model (newer backends ship it as a top-level field).
+    const id = data.id || data.request_id || data.name;
+    const finalModel = data.model
+      || (typeof id === 'string' && id.includes('|') ? id.split('|', 1)[0] : resolvedModel);
     return {
-      id: data.id || data.request_id || data.name,
+      id,
       status: _mapGatewayVideoStatus(data.status),
       url: data.url || undefined,
+      model: finalModel,
       usage: { durationSec: opts.duration || 5 },
     };
   }
@@ -997,10 +1173,16 @@ export class GatewayVideoGen extends BaseVideoGen {
     }
 
     const data = await res.json();
+    // jobId is `<resolvedModel>|<falRequestId>` (composite). Surface the
+    // model so the caller can persist the actual model used instead of
+    // the literal "auto" the user passed at submit time.
+    const finalModel = data.model
+      || (typeof jobId === 'string' && jobId.includes('|') ? jobId.split('|', 1)[0] : undefined);
     const out = {
       id: jobId,
       status: _mapGatewayVideoStatus(data.status),
       url: data.url || undefined,
+      model: finalModel,
       error: data.error || undefined,
     };
     // Multishot: surface each shot's status so the tool can save every
@@ -1018,6 +1200,114 @@ export class GatewayVideoGen extends BaseVideoGen {
     }
     return out;
   }
+
+  /** Drive a still face image with an audio track to produce a
+   *  talking-avatar video. Three steps:
+   *    1. Pick the cheapest avatar-capable model via pickVideoModel
+   *       (req.kind = 'avatar').
+   *    2. Upload audio bytes to fal storage via /uploads/audio so the
+   *       backend gets a URL — same path voice-clone uses.
+   *    3. POST canonical {model, image_url, audio_url, ...} to
+   *       /media/video/avatar; backend resolves the per-model adapter
+   *       and queues the fal job.
+   *
+   *  The returned jobId is the same composite shape (`<slug>|<reqId>`)
+   *  as plain text-to-video, so `await_video_generation` polls without
+   *  any new code path. */
+  async generateAvatar(imageBuffer, audioBuffer, opts = {}) {
+    if (!Buffer.isBuffer(imageBuffer)) {
+      throw new Error('generateAvatar: imageBuffer must be a Buffer');
+    }
+    if (!Buffer.isBuffer(audioBuffer)) {
+      throw new Error('generateAvatar: audioBuffer must be a Buffer');
+    }
+    const resolvedModel = await _resolveMediaModel('video', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
+        try {
+          return pickVideoModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'avatar', label: opts.label },
+    );
+
+    // Upload audio.
+    const audioFilename = opts.audioFilename || 'audio.mp3';
+    const audioMime = opts.audioMimeType || _audioMimeFromFilename(audioFilename);
+    const aHeaders = { ...getAuthHeaders() };
+    delete aHeaders['content-type'];
+    delete aHeaders['Content-Type'];
+    aHeaders['Content-Type'] = audioMime;
+    const audioRes = await fetch(
+      `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(audioFilename)}`,
+      { method: 'POST', headers: aHeaders, body: audioBuffer, signal: opts.abortSignal },
+    );
+    await throwIfQuotaExceeded(audioRes);
+    if (!audioRes.ok) {
+      const body = await audioRes.text().catch(() => '');
+      throw new Error(`Gateway audio upload error (${audioRes.status}): ${body}`);
+    }
+    const { url: audioUrl } = await audioRes.json();
+
+    // Upload image — reuses /uploads/video, which is just a fal-storage
+    // wrapper and accepts any mime. Avoids adding /uploads/image just
+    // for this one consumer.
+    const imageFilename = opts.imageFilename || 'image.png';
+    const imageMime = opts.imageMimeType || _imageMimeFromFilename(imageFilename);
+    const iHeaders = { ...getAuthHeaders() };
+    delete iHeaders['content-type'];
+    delete iHeaders['Content-Type'];
+    iHeaders['Content-Type'] = imageMime;
+    const imgRes = await fetch(
+      `${getGatewayBase()}/uploads/video?filename=${encodeURIComponent(imageFilename)}`,
+      { method: 'POST', headers: iHeaders, body: imageBuffer, signal: opts.abortSignal },
+    );
+    await throwIfQuotaExceeded(imgRes);
+    if (!imgRes.ok) {
+      const body = await imgRes.text().catch(() => '');
+      throw new Error(`Gateway image upload error (${imgRes.status}): ${body}`);
+    }
+    const { url: imageUrl } = await imgRes.json();
+
+    // Submit the avatar job.
+    const submitRes = await fetch(`${getGatewayBase()}/media/video/avatar`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        model: resolvedModel,
+        image_url: imageUrl,
+        audio_url: audioUrl,
+        ...(opts.prompt ? { prompt: opts.prompt } : {}),
+        ...(opts.aspectRatio ? { aspect_ratio: opts.aspectRatio } : {}),
+        ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+        ...(opts.extra ? { extra: opts.extra } : {}),
+      }),
+      signal: opts.abortSignal,
+    });
+    await throwIfQuotaExceeded(submitRes);
+    if (!submitRes.ok) {
+      const body = await submitRes.text().catch(() => '');
+      throw new Error(`Gateway avatar error (${submitRes.status}): ${body}`);
+    }
+    const data = await submitRes.json();
+    return {
+      id: data.id,
+      status: _mapGatewayVideoStatus(data.status),
+      model: data.model || resolvedModel,
+      provider: 'koi-gateway',
+    };
+  }
+}
+
+function _imageMimeFromFilename(name) {
+  const ext = name.toLowerCase();
+  if (ext.endsWith('.png')) return 'image/png';
+  if (ext.endsWith('.jpg') || ext.endsWith('.jpeg')) return 'image/jpeg';
+  if (ext.endsWith('.webp')) return 'image/webp';
+  if (ext.endsWith('.gif')) return 'image/gif';
+  return 'image/png';
 }
 
 /** Map gateway/fal-style statuses to our standard enum. */

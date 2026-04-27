@@ -475,3 +475,22 @@ export async function saveGeneratedImage(filePath, generationParams, llmProvider
     embedding,
   });
 }
+
+/**
+ * Save a generated video to the media library with full generation params.
+ *
+ * Thin alias over [saveGeneratedImage] — `MediaLibrary.save()` already
+ * detects media type from the file extension via `detectMediaType()`,
+ * so the underlying row gets `media_type: 'video'` automatically. This
+ * wrapper exists for callers that want a name matching their intent
+ * and so the doc-comment can list video-specific generation fields
+ * (prompt, model, duration, aspectRatio, resolution, cameraMovement,
+ * referenceVideos, referenceImages, startFrame, endFrame, shots, …).
+ *
+ * @param {string} filePath - Path to generated video on disk.
+ * @param {Object} generationParams - All parameters used for generation.
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider] - For description embedding.
+ */
+export async function saveGeneratedVideo(filePath, generationParams, llmProvider) {
+  return saveGeneratedImage(filePath, generationParams, llmProvider);
+}

@@ -10,11 +10,12 @@ import fs from 'fs';
 export default {
   type: 'show_result',
   intent: 'show_result',
-  description: 'Present a result to the user — a file, image, or URL. The UI opens it in the most appropriate way (new tab, preview, etc). Use when you want to proactively surface a result instead of waiting for the user to click.',
-  instructions: `Use show_result when the main output of a task is a file, image, or URL that the user should see immediately.
+  description: 'Present a result to the user — a file, image, video, or URL. The UI opens it in the most appropriate way (new tab, preview, etc). Use when you want to proactively surface a result instead of waiting for the user to click.',
+  instructions: `Use show_result when the main output of a task is a file, image, video, or URL that the user should see immediately.
 
 Examples:
 - After generating an image: show_result with resourceType=image and the path
+- After generating a video: show_result with resourceType=video and the path
 - After creating/modifying a file: show_result with resourceType=file and the path
 - When presenting a webpage as a result: show_result with resourceType=url
 
@@ -28,12 +29,12 @@ Do NOT use for every file path mentioned in a response — only for the primary 
     properties: {
       resourceType: {
         type: 'string',
-        enum: ['file', 'image', 'url'],
-        description: 'Type of resource: "file" for text/code, "image" for images, "url" for web pages',
+        enum: ['file', 'image', 'video', 'url'],
+        description: 'Type of resource: "file" for text/code, "image" for images, "video" for videos, "url" for web pages',
       },
       path: {
         type: 'string',
-        description: 'Absolute file path (required when resourceType is "file" or "image")',
+        description: 'Absolute file path (required when resourceType is "file", "image" or "video")',
       },
       url: {
         type: 'string',
@@ -49,6 +50,7 @@ Do NOT use for every file path mentioned in a response — only for the primary 
 
   examples: [
     { type: 'show_result', resourceType: 'image', path: '/tmp/braxil-images/generated-123.png' },
+    { type: 'show_result', resourceType: 'video', path: '/Users/me/.koi/videos/video_1234_abc.mp4' },
     { type: 'show_result', resourceType: 'file', path: '/Users/me/project/src/config.ts' },
     { type: 'show_result', resourceType: 'url', url: 'https://example.com/article' },
   ],
@@ -61,18 +63,19 @@ Do NOT use for every file path mentioned in a response — only for the primary 
     const title = action.title;
 
     if (!resourceType) {
-      return { success: false, error: 'Missing "resourceType" field (file|image|url)' };
+      return { success: false, error: 'Missing "resourceType" field (file|image|video|url)' };
     }
 
-    if ((resourceType === 'file' || resourceType === 'image') && !path) {
+    const needsPath = resourceType === 'file' || resourceType === 'image' || resourceType === 'video';
+    if (needsPath && !path) {
       return { success: false, error: `resourceType=${resourceType} requires "path"` };
     }
     if (resourceType === 'url' && !url) {
       return { success: false, error: 'resourceType=url requires "url"' };
     }
 
-    // Verify file exists for file/image types
-    if ((resourceType === 'file' || resourceType === 'image') && !fs.existsSync(path)) {
+    // Verify file exists for file/image/video types
+    if (needsPath && !fs.existsSync(path)) {
       return { success: false, error: `File not found: ${path}` };
     }
 

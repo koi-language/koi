@@ -22,7 +22,7 @@ import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
 import { costCenter, getModelCaps } from './cost-center.js';
 import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_RANK, THINKING_INACTIVITY_MS, DEFAULT_INACTIVITY_MS } from './constants.js';
 
-import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, markProviderTimeout, markModelTimeout, clearProviderCooldown } from './providers/factory.js';
+import { resolve as resolveModel, createLLM, createEmbedding, getEmbeddingDimension, DEFAULT_TASK_PROFILE, getAvailableProviders, getAllCandidates, loadRemoteModels, forceRefreshRemoteModels, markProviderTimeout, markModelTimeout, clearProviderCooldown } from './providers/factory.js';
 import { resolveMaxOutputTokens } from './max-tokens-policy.js';
 import { channel } from '../io/channel.js';
 
@@ -1283,17 +1283,50 @@ CRITICAL RULES:
       // that can actually understand images. Coordinators also need vision to
       // look at images before deciding who to delegate to.
       if (_requiresImage) {
-        const _minVisionDifficulty = 55;
+        // Detect graphical annotations (user-drawn marks on top of an image
+        // or per-frame video composites). These demand fine-grained spatial
+        // reasoning — locating specific marks, reading short text labels in
+        // any language, disambiguating between similar adjacent subjects —
+        // which cheap-tier vision models (m-lite, mini, flash) consistently
+        // get wrong. Force a much higher floor so the auto-selector picks a
+        // top-tier model (Claude Opus / Sonnet, Gemini Pro, GPT-5) that has
+        // the visual-reasoning headroom for this task. Triggers on the
+        // explicit role tags we set when queueing annotation composites in
+        // read-file.js — pure user attachments or MCP screenshots are NOT
+        // affected by this stricter floor.
+        const _hasGraphicalAnnotations = !!session._pendingMcpImages?.some(
+          (img) => img && (
+            img.role === 'annotation_overlay' ||
+            img.role === 'video_frame_annotation'
+          )
+        );
+
+        const _minVisionDifficulty = _hasGraphicalAnnotations ? 85 : 55;
         if (profile.difficulty < _minVisionDifficulty || profile.code < _minVisionDifficulty) {
           profile = {
             ...profile,
             code: Math.max(profile.code || 0, _minVisionDifficulty),
             reasoning: Math.max(profile.reasoning || 0, _minVisionDifficulty),
             difficulty: Math.max(profile.difficulty || 0, _minVisionDifficulty),
+            // Keep effort high too — visual disambiguation benefits from a
+            // longer think on the part of reasoning models. EFFORT_HIGH lets
+            // models like Claude Opus / GPT-5 spend extra tokens in their
+            // hidden reasoning before returning the answer.
+            ...(_hasGraphicalAnnotations ? { reasoningEffort: 'high' } : {}),
           };
-          channel.log('llm', `[auto] Images detected — boosted to min difficulty ${_minVisionDifficulty} for vision quality`);
+          channel.log(
+            'llm',
+            _hasGraphicalAnnotations
+              ? `[auto] Graphical annotations (${session._pendingMcpImages.filter(i => i?.role === 'annotation_overlay' || i?.role === 'video_frame_annotation').length} composite(s)) detected — boosted to min difficulty ${_minVisionDifficulty} + effort=high (annotations need precise spatial vision)`
+              : `[auto] Images detected — boosted to min difficulty ${_minVisionDifficulty} for vision quality`,
+          );
         } else {
-          channel.log('llm', `[auto] Images detected — requiring vision-capable model (inputImage:true)`);
+          channel.log(
+            'llm',
+            _hasGraphicalAnnotations
+              ? `[auto] Graphical annotations detected — already meeting min difficulty ${_minVisionDifficulty}; requiring vision-capable model`
+              : `[auto] Images detected — requiring vision-capable model (inputImage:true)`,
+          );
         }
       }
 
@@ -1507,6 +1540,24 @@ CRITICAL RULES:
             if (process.env.KOI_DEBUG_LLM) {
               _debugAttachPaths.push(..._visualImages.map(p => p._debugPath || `[${p.mimeType || 'image'}]`));
             }
+            // Always-on confirmation log: how many images, what sizes, what
+            // captions/roles. Without this the user sees `[image_url]` in
+            // the debug prompt and (reasonably) wonders whether the bytes
+            // actually reach the LLM. The placeholder is purely a console
+            // readability device (see debug-logger.js:17); the real API
+            // POST carries the full base64 — this log proves it.
+            try {
+              const _attachReport = _visualImages.map((p, i) => {
+                const kb = Math.round(((p.data?.length || 0) * 3 / 4) / 1024); // base64 → bytes
+                const file = (p._debugPath || '').split('/').pop() || `img-${i}`;
+                const role = p.role || 'image';
+                return `${file} (${role}, ${kb}KB)`;
+              }).join(', ');
+              channel.log(
+                'llm',
+                `[vision] attaching ${_visualImages.length} image(s) to ${this.provider} request → ${_attachReport}`,
+              );
+            } catch { /* logging is best-effort */ }
           }
         }
         // Save ALL images (including annotations) for propagation to delegates —
@@ -1960,6 +2011,13 @@ CRITICAL RULES:
         if (this._autoMode) {
           markModelTimeout(_effProvider, _effModel);
           markProviderTimeout(_effProvider);
+          // The backend's circuit breaker very likely just hid this model
+          // from /gateway/models (we recorded a failure on its end too).
+          // Force-refresh the local model list NOW — bypassing the 60s
+          // poll gate — so the next retry doesn't reselect the same dead
+          // model based on a stale cache. ETag-conditional + in-flight
+          // coalescing keeps this cheap.
+          forceRefreshRemoteModels().catch(() => { /* non-fatal */ });
         }
         throw new Error(`LLM stream ${_timeoutKind} timeout after ${_timeoutLabel} (no chunks received)`);
       }
@@ -1974,6 +2032,10 @@ CRITICAL RULES:
       if (_isTimeout && !_isConnError && this._autoMode) {
         markModelTimeout(_effProvider, _effModel);
         markProviderTimeout(_effProvider);
+        // Same reasoning as the inactivity-abort branch above: pull the
+        // fresh model list so the auto-selector reflects whatever the
+        // backend just decided about this model's health.
+        forceRefreshRemoteModels().catch(() => { /* non-fatal */ });
       } else if (!_isConnError && this._autoMode) {
         // Generic provider error mid-stream (e.g. "Provider returned error").
         // Sideline just this model so the retry picks a different one.

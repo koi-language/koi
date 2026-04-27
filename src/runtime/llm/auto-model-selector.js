@@ -124,6 +124,27 @@ async function _doLoadRemoteModels() {
 }
 
 /**
+ * Force an immediate refresh of the remote models list, bypassing the
+ * 60s rate-limit gate. Called when an LLM request times out — the
+ * backend's circuit breaker probably just hid the offending model from
+ * /gateway/models, and we want to pick up that change NOW so the next
+ * retry doesn't reselect the same dead model.
+ *
+ * The ETag-conditional GET still applies, so when nothing has changed
+ * the backend responds 304 and we don't waste tokens or cycles. If the
+ * model set DID change, we update modelsData immediately and the very
+ * next auto-model decision sees the fresh list.
+ *
+ * Coalesces with any in-flight load to avoid two concurrent fetches.
+ */
+export function forceRefreshRemoteModels() {
+  if (_inflightLoad) return _inflightLoad;
+  _remoteLastAttempt = Date.now();
+  _inflightLoad = _doLoadRemoteModels().finally(() => { _inflightLoad = null; });
+  return _inflightLoad;
+}
+
+/**
  * Look up a model in the remote/active models data.
  * Returns { provider, ...modelInfo } or null if not found.
  * Used by cost-center.js as a fallback when model isn't in the local models.json.

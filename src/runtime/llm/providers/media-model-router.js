@@ -236,12 +236,21 @@ export function pickImageModel(models, req = {}) {
   // Everything else (resolution, aspectRatio, maxRefImages==null with no
   // refs requested) is a SOFT preference used by _rankSort to pick the
   // best match among categorical survivors.
-  const eligible = models.filter((m) => {
+  // Two-pass filter: first try with the label constraint (when one was
+  // requested), and if that leaves zero candidates fall back to the
+  // non-labelled pool. The fallback covers the case where the agent
+  // asked for a specialised label (e.g. "sketch-guided") that exists for
+  // a DIFFERENT operation (e.g. only on i2v models, none for the
+  // requested edit op) — without it the call dies with no_model_matches
+  // even though a perfectly fine generic model is sitting right there.
+  const _filterImage = (useLabel) => models.filter((m) => {
     if (m.pricePerUnit == null) return false;
 
-    if (wantLabel) {
+    if (useLabel && wantLabel) {
       if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
     } else {
+      // Fallback path OR no label requested: pin to non-labelled models so
+      // unrelated specialised variants (lipsync, etc.) never leak in.
       if (modelHasLabels(m)) return false;
     }
 
@@ -298,6 +307,21 @@ export function pickImageModel(models, req = {}) {
     if (refsCount > 0 && !_acceptsRefs(m, refsCount)) return false;
     return true;
   });
+
+  let eligible = _filterImage(/* useLabel */ true);
+  let labelDropped = false;
+  if (eligible.length === 0 && wantLabel) {
+    eligible = _filterImage(/* useLabel */ false);
+    labelDropped = eligible.length > 0;
+  }
+  if (labelDropped) {
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[media-router] No image model carries label="${wantLabel}" matching the other constraints — falling back to non-labelled models.`,
+      );
+    } catch { /* logging is best-effort */ }
+  }
 
   if (eligible.length === 0) {
     throw new MediaModelRoutingError(
@@ -450,13 +474,46 @@ export function pickVideoModel(models, req = {}) {
   // rejecting hard on them used to leave zero candidates for aspect ratios
   // like 3:2 that no fal video model advertises, even though the output
   // dimension is usually dictated by the start_frame anyway.
-  const eligible = models.filter((m) => {
+  // Two-pass filter (mirror of pickImageModel): try with the label
+  // constraint first; if that leaves zero candidates AND a label was
+  // requested, retry without the label so the agent's intent (e.g.
+  // "sketch-guided") doesn't dead-end the routing when the labelled
+  // capability simply doesn't exist for the requested operation
+  // (t2v / i2v / v2v). Without this fallback an agent picking
+  // `label: "sketch-guided"` for a v2v request fails with
+  // no_model_matches even though a generic v2v model would do the job.
+  // `kind: 'avatar'` switches the picker into a separate filter mode:
+  // the model row must advertise the `avatar` operation tag (or a
+  // dedicated `m.avatar` flag, mirrored on the upscale gating). When
+  // it's set, the t2v / i2v / v2v / multishot gates DON'T apply —
+  // avatar models specifically take an image + audio and produce a
+  // talking video, which doesn't fit the textToVideo/imageToVideo
+  // taxonomy cleanly.
+  const wantsAvatar = req.kind === 'avatar';
+
+  const _filterVideo = (useLabel) => models.filter((m) => {
     if (m.pricePerUnit == null) return false;
 
-    if (wantLabel) {
+    if (useLabel && wantLabel) {
       if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
     } else {
+      // Fallback path OR no label requested: pin to non-labelled models so
+      // unrelated specialised variants (lipsync, etc.) never leak in.
       if (modelHasLabels(m)) return false;
+    }
+
+    if (wantsAvatar) {
+      const hasOp = Array.isArray(m.operations) && m.operations.includes('avatar');
+      // Slug-pattern fallback: many catalogs ship Kling / Hedra / Sieve
+      // avatar models tagged only as `image-to-video` because the
+      // backend's auto-tagger doesn't know "avatar" yet. The slug itself
+      // is unambiguous when it includes "ai-avatar" or ends in "/avatar"
+      // — admit those without requiring a manual op-tag in the catalog.
+      const slugLooksLikeAvatar = typeof m.slug === 'string'
+        && /(?:^|[\/\-_])ai[-_]?avatar(?:$|[\/\-_])|(?:^|\/)avatar(?:$|\/)/i.test(m.slug);
+      if (!m.avatar && !hasOp && !slugLooksLikeAvatar) return false;
+      // Avatar models bypass the regular video-mode gates — return early.
+      return true;
     }
 
     // At least one video generation capability.
@@ -483,6 +540,22 @@ export function pickVideoModel(models, req = {}) {
     }
     return true;
   });
+
+  let eligible = _filterVideo(/* useLabel */ true);
+  let labelDropped = false;
+  if (eligible.length === 0 && wantLabel) {
+    eligible = _filterVideo(/* useLabel */ false);
+    labelDropped = eligible.length > 0;
+  }
+  if (labelDropped) {
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[media-router] No video model carries label="${wantLabel}" matching the requested operation (` +
+        `${wantsVideoToVideo ? 'v2v' : wantsImageToVideo ? 'i2v' : 't2v'}) — falling back to non-labelled models.`,
+      );
+    } catch { /* logging is best-effort */ }
+  }
 
   if (eligible.length === 0) {
     // Per-model rejection reason, so the agent (and logs) can see why a
@@ -530,7 +603,7 @@ export function pickVideoModel(models, req = {}) {
 /**
  * @param {Array<object>} models — /gateway/models/audio.json rows
  * @param {object} req
- * @param {'tts'|'transcribe'|'music'|'sfx'} req.kind — what the caller wants to do
+ * @param {'tts'|'transcribe'|'music'|'sfx'|'voice-clone'} req.kind — what the caller wants to do
  * @param {string} [req.label]
  */
 export function pickAudioModel(models, req = {}) {
@@ -545,6 +618,14 @@ export function pickAudioModel(models, req = {}) {
     if (kind === 'transcribe' && !m.transcribe) return false;
     if (kind === 'music'      && !m.music) return false;
     if (kind === 'sfx'        && !m.sfx) return false;
+    // voice-clone: model row must advertise it via either a dedicated
+    // boolean (m.voiceClone) OR by carrying 'voice-clone' in operations[].
+    // The boolean route mirrors tts/transcribe; the operations route lets
+    // us tag fal models without adding a column for every new capability.
+    if (kind === 'voice-clone') {
+      const hasOp = Array.isArray(m.operations) && m.operations.includes('voice-clone');
+      if (!m.voiceClone && !hasOp) return false;
+    }
     return true;
   });
 

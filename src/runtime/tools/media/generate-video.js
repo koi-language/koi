@@ -4,7 +4,8 @@
  * Delegates to the provider factory which auto-selects the best available
  * video provider: Kling → Seedance → OpenAI (Sora) → Gemini (Veo) → Google (Nano Banana).
  *
- * Video generation is ASYNC — returns a job ID that can be polled with check_video_status.
+ * Video generation is ASYNC — returns a job ID. Pass that id to await_video_generation
+ * to block internally until the job finishes; do NOT poll manually.
  * All parameters use NORMALIZED values (aspect ratios, resolutions, etc.)
  *
  * Permission: 'generate_video' (individual permission for video generation)
@@ -16,8 +17,43 @@ import { fetchMediaCapabilities, getGatewayBase, getAuthHeaders } from '../../ll
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+
+/**
+ * In-process job-id → generation-params cache for the async path.
+ *
+ * Sync providers complete inside `execute()` and we can call
+ * `saveGeneratedVideo()` immediately. Async providers return only a
+ * job id; the actual download happens later inside
+ * `await-video-generation.js`, which has none of the call-site context
+ * (prompt, model, references, …). We stash the metadata here at
+ * job-creation time and `getJobMetadata()` reads it back on completion
+ * so the saved row carries the same fields as a sync save.
+ *
+ * Map is in-process, not persisted — if the engine restarts before
+ * the job completes the metadata is lost (best-effort: the video file
+ * still saves, just without prompt/model details). Acceptable trade-off
+ * for the common case where sessions outlive jobs.
+ */
+const _pendingJobMetadata = new Map();
+
+export function _stashJobMetadata(jobId, params) {
+  if (!jobId) return;
+  _pendingJobMetadata.set(String(jobId), params);
+}
+
+export function getJobMetadata(jobId) {
+  if (!jobId) return null;
+  return _pendingJobMetadata.get(String(jobId)) || null;
+}
+
+export function clearJobMetadata(jobId) {
+  if (!jobId) return;
+  _pendingJobMetadata.delete(String(jobId));
+}
 
 /** Upload a local video file to the gateway and return a provider-hosted
  *  URL. URL inputs pass through unchanged. Used for `referenceVideos` —
@@ -71,39 +107,68 @@ async function _uploadVideoRef(ref) {
 
 /**
  * Download a finished video URL to disk. Shared helper used by
- * generate_video (for synchronous completions) and check_video_status (for
- * async polling). Returns the absolute saved path, or null if the URL could
- * not be downloaded. `saveTo` is treated as a DIRECTORY — filename is
- * auto-generated to match the generate_image convention.
+ * generate_video (for synchronous completions) and await_video_generation
+ * (for async jobs). Returns { path, error } — `path` is the absolute saved
+ * path on success, `error` is a human-readable message on failure (path is
+ * null in that case). `saveTo` is treated as a DIRECTORY.
+ *
+ * Streams the response body straight to disk via stream pipeline + retries
+ * on transient `terminated` / network resets — `arrayBuffer()` was unreliable
+ * for the 10-15MB outputs typical of Kling/Veo: undici aborts mid-body and
+ * the call returned null silently with no signal to the agent.
  */
 export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}) {
-  if (!url) return null;
+  if (!url) return { path: null, error: 'No video URL returned by provider.' };
   const saveDir = typeof saveTo === 'string' && saveTo.trim()
     ? path.resolve(saveTo.trim())
     : path.join(os.homedir(), '.koi', 'videos');
+
   try {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      channel.log('video', `Failed to download ${url}: HTTP ${resp.status}`);
-      return null;
-    }
-    const contentType = resp.headers.get('content-type') || '';
-    const ext = /mp4/i.test(contentType) ? 'mp4'
-      : /webm/i.test(contentType) ? 'webm'
-      : /quicktime/i.test(contentType) ? 'mov'
-      : 'mp4';
-    const tag = (id || 'video').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
-    const filename = `video_${Date.now()}_${tag}.${ext}`;
-    const filePath = path.join(saveDir, filename);
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    fs.writeFileSync(filePath, buffer);
-    channel.log('video', `Saved: ${filePath} (${(buffer.length / 1024 / 1024).toFixed(1)}MB)${provider ? ` from ${provider}/${model}` : ''}`);
-    return filePath;
   } catch (err) {
-    channel.log('video', `Failed to save ${url}: ${err.message}`);
-    return null;
+    const msg = `Cannot create save directory ${saveDir}: ${err.message}`;
+    channel.log('video', msg);
+    return { path: null, error: msg };
   }
+
+  const MAX_ATTEMPTS = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let filePath = null;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        const msg = `HTTP ${resp.status} ${resp.statusText}`;
+        channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg}`);
+        lastErr = msg;
+        if (resp.status >= 400 && resp.status < 500) break; // 4xx won't recover
+        continue;
+      }
+      const contentType = resp.headers.get('content-type') || '';
+      const ext = /mp4/i.test(contentType) ? 'mp4'
+        : /webm/i.test(contentType) ? 'webm'
+        : /quicktime/i.test(contentType) ? 'mov'
+        : 'mp4';
+      const tag = (id || 'video').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+      const filename = `video_${Date.now()}_${tag}.${ext}`;
+      filePath = path.join(saveDir, filename);
+
+      await pipeline(Readable.fromWeb(resp.body), fs.createWriteStream(filePath));
+
+      const { size } = fs.statSync(filePath);
+      channel.log('video', `Saved: ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)${provider ? ` from ${provider}/${model}` : ''}`);
+      return { path: filePath, error: null };
+    } catch (err) {
+      lastErr = err.message || String(err);
+      channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${lastErr}`);
+      if (filePath) { try { fs.unlinkSync(filePath); } catch { /* ignore */ } }
+      // Brief backoff before retry; common cause is mid-stream socket reset.
+      if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, 500 * attempt));
+    }
+  }
+
+  return { path: null, error: `Could not download video after ${MAX_ATTEMPTS} attempts: ${lastErr || 'unknown'}` };
 }
 
 const generateVideoAction = {
@@ -114,7 +179,7 @@ const generateVideoAction = {
   // the real, catalog-driven description is rebuilt at the bottom of this
   // file by the fetchMediaCapabilities('video') block and replaces both
   // the description AND the schema enums in place.
-  description: 'Generate a video from a text prompt. Async — returns a job ID to poll with check_video_status. Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog.',
+  description: 'Generate a video from a text prompt. Async — returns a job ID; pass it to await_video_generation to block until the video is ready (no manual polling). Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog.',
   thinkingHint: 'Generating video',
   permission: 'generate_video',
 
@@ -132,6 +197,8 @@ const generateVideoAction = {
       referenceVideos: { type: 'array',   description: 'Array of local video paths OR https URLs for video-to-video guidance (style/motion transfer, continuation). Local paths are uploaded to the gateway transparently. Only honored when the selected model advertises videoToVideo.', items: { type: 'string' } },
       withAudio:       { type: 'boolean', description: 'Generate audio track alongside video (default: false)' },
       cameraMovement:  { type: 'string',  description: 'Camera movement / shot type, e.g. "static", "pan_left", "zoom_in", "dolly_in", "orbit_right". Provider-dependent — unknown values are ignored.' },
+      characterOrientation: { type: 'string', enum: ['image', 'video'], description: 'Motion-transfer models only (label="motion-transfer"): "image" preserves the still photo\'s character pose/orientation while inheriting motion from the reference video (default — natural for "make my character do that"); "video" reorients the character to match the reference video\'s pose (use for dance / body-mimicry where the reference body shape is the target). Ignored by every other model.' },
+      keepOriginalSound: { type: 'boolean', description: 'Motion-transfer models only (label="motion-transfer"): when true (default) preserves the audio track of the reference video in the output. Ignored by every other model.' },
       numShots:        { type: 'number',  description: 'Number of independent clips to emit in a single call (multishot). Default 1. Only models with maxShots > 1 honor it. Ignored when "shots" is present.' },
       shots:           {
         type: 'array',
@@ -150,7 +217,7 @@ const generateVideoAction = {
           },
         },
       },
-      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. If the job finishes synchronously the file is saved immediately. If it needs polling, pass the SAME saveTo to check_video_status when status becomes "completed" so the result is downloaded there. Defaults to ~/.koi/videos/ when omitted.' },
+      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. If the job finishes synchronously the file is saved immediately. If it goes async, pass the SAME saveTo to await_video_generation so the result is downloaded there. Defaults to ~/.koi/videos/ when omitted.' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' }
     },
     required: ['prompt']
@@ -295,6 +362,28 @@ const generateVideoAction = {
       `, saveTo=${action.saveTo || 'default'}`,
     );
 
+    // Forward the agent's `label` selector down to the gateway so the
+    // client-side router can apply it as a model-variant filter (e.g.
+    // "sketch-guided" routes to a model that interprets drawn marks).
+    // Without this, the agent's label was silently dropped here and the
+    // router fell through to the "no label requested" branch, which
+    // pins to non-labelled models — picking the cheapest generic instead
+    // of the specialised variant the agent explicitly asked for.
+    const label = typeof action.label === 'string' && action.label.trim()
+      ? action.label.trim()
+      : null;
+
+    // Motion-transfer-specific knobs. The backend's adapter for Kling V3
+    // motion-control (and any future motion-transfer model) reads these;
+    // every other model ignores them. Default character_orientation is
+    // not set here — the backend defaults to "image" when missing.
+    const characterOrientation = (action.characterOrientation === 'image' || action.characterOrientation === 'video')
+      ? action.characterOrientation
+      : null;
+    const keepOriginalSound = typeof action.keepOriginalSound === 'boolean'
+      ? action.keepOriginalSound
+      : null;
+
     const result = await instance.generate(prompt, {
       duration: globalDuration,
       aspectRatio: globalAspect,
@@ -308,19 +397,71 @@ const generateVideoAction = {
       cameraMovement: globalCamera,
       numShots,
       shots,
+      label,
+      characterOrientation,
+      keepOriginalSound,
     });
+
+    // Build the generation-params record once — used both for the
+    // in-process job cache (so await_video_generation can persist
+    // metadata for async completions) AND for the immediate
+    // saveGeneratedVideo() call when the provider returned the URL
+    // synchronously.
+    const generationParams = {
+      prompt,
+      model: result?.model || resolved.model,
+      provider: resolved.provider,
+      duration: globalDuration,
+      aspectRatio: globalAspect,
+      resolution: globalResolution,
+      quality: globalQuality,
+      cameraMovement: globalCamera || null,
+      withAudio: !!(withAudio && caps.withAudio),
+      startFrame: action.startFrame || null,
+      endFrame: action.endFrame || null,
+      referenceImagePaths: Array.isArray(action.referenceImages) ? action.referenceImages : [],
+      referenceVideoPaths: Array.isArray(action.referenceVideos) ? action.referenceVideos : [],
+      shotCount: shots?.length || numShots || 1,
+      saveTo: action.saveTo || null,
+    };
+
+    // Stash for the async path. await_video_generation will look this up
+    // by job id when the download completes.
+    if (result.id) _stashJobMetadata(result.id, generationParams);
 
     // If the provider returned a ready URL (some models complete
     // synchronously), try to save it right away. Async providers return
-    // just an id — check_video_status handles the save later.
+    // just an id — await_video_generation handles the save later.
     let savedTo = null;
+    let saveError = null;
     if (result.url && (result.status === 'completed' || !result.status)) {
-      savedTo = await saveVideoFromUrl(result.url, {
+      const saveResult = await saveVideoFromUrl(result.url, {
         saveTo: action.saveTo,
         provider: resolved.provider,
         model: resolved.model,
         id: result.id,
       });
+      savedTo = saveResult.path;
+      saveError = saveResult.error;
+      // Mirror the image flow: surface the saved video to the UI so it
+      // appears inline in the chat (and is persisted in the display log
+      // for session restore).
+      if (savedTo && channel.canPresentResources?.()) {
+        channel.presentResource({ type: 'video', path: savedTo });
+      }
+      // Persist generation metadata to the media library so the GUI
+      // info panel can show prompt/model/duration/etc. (mirrors how
+      // generate-image saves alongside the file).
+      if (savedTo) {
+        try {
+          const { saveGeneratedVideo } = await import('../../state/media-library.js');
+          await saveGeneratedVideo(savedTo, generationParams, agent?.llmProvider || null);
+          if (result.id) clearJobMetadata(result.id);
+          channel.log('video', `Saved to media library: ${savedTo}`);
+        } catch (err) {
+          channel.log('video', `Media library save failed (continuing): ${err.message}`);
+        }
+      }
     }
 
     return {
@@ -332,6 +473,7 @@ const generateVideoAction = {
       status: result.status,
       url: result.url,
       ...(savedTo ? { savedTo } : {}),
+      ...(saveError ? { saveError } : {}),
       ...(Array.isArray(result.shots) && result.shots.length > 0 ? { shots: result.shots } : {}),
       usage: result.usage,
     };
@@ -581,11 +723,15 @@ fetchMediaCapabilities('video').then((caps) => {
   }
   if (caps.labels?.length) {
     const list = caps.labels.map((l) => `"${l}"`).join(', ');
-    fields.push(`optional "label" — ranking preference, one of: ${list}. Soft hint only, never filters.`);
+    fields.push(
+      `optional "label" — selects a SPECIALISED model variant, one of: ${list}. ` +
+      `Preferred filter with automatic fallback: when set, the router first tries to find a model carrying that label AND matching all other constraints (operation, frames, refs, etc.); if no such model exists for THIS combination, the router falls back to non-labelled models (a console warning is logged). ` +
+      `Safe to set whenever the labelled capability would help — e.g. "sketch-guided" when the active document carries drawn annotations. If the labelled capability isn't available for the current operation (say only image-to-video has it but you need video-to-video), routing still succeeds with a generic model.`,
+    );
   }
-  fields.push('optional "saveTo" — absolute directory path where the final video will be saved. If the job polls async, pass the SAME saveTo to check_video_status when it completes.');
+  fields.push('optional "saveTo" — absolute directory path where the final video will be saved. If the job goes async, pass the SAME saveTo to await_video_generation so the result lands there.');
 
-  const header = 'Generate a video from a text prompt. Video generation is ASYNC — returns a job ID to poll with check_video_status. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'Generate a video from a text prompt. Video generation is ASYNC — returns a job ID; pass it to await_video_generation, which blocks internally until the video is ready (no manual polling, no token waste). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
   const returns = '\nReturns: { success, provider, model, capabilities, id, status, savedTo? }';
   generateVideoAction.description = header + fieldsBlock + returns;

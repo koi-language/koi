@@ -589,7 +589,10 @@ When a command requires sudo, just use sudo normally in the command. The system 
 
     if (!permitted) {
       reportDone?.();
-      channel.print(`\x1b[2m${t('skipped')}\x1b[0m`);
+      // No "Skipped" chip in the chat — the user already SAID no, they
+      // don't need a system message echoing their refusal back at them.
+      // The agent still sees `{ denied: true }` in the action result and
+      // adapts its plan accordingly.
       yield {
         success: false,
         denied: true,

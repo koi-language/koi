@@ -20,6 +20,7 @@ import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+import { absolutizeMediaRefs } from './_absolutize-media-ref.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -243,45 +244,16 @@ const generateImageAction = {
       } else {
         referenceImages = [];
         const maxRef = caps.maxReferenceImages || 1;
-        // Step 1 — normalize to [{ alias, rawPath }]. String items keep alias=''.
-        const _normalized = action.referenceImages.map((item) => {
-          if (typeof item === 'string') return { alias: '', rawPath: item };
-          if (item && typeof item === 'object') {
-            const rawPath = typeof item.path === 'string' ? item.path : '';
-            const alias = typeof item.alias === 'string' ? item.alias.trim() : '';
-            return { alias, rawPath };
-          }
-          return { alias: '', rawPath: '' };
-        }).filter((x) => x.rawPath);
+        // Resolve every ref to an absolute path in one shot (handles
+        // strings, {alias, path} objects, attachment IDs, and relative
+        // paths). All downstream code — sharp decode, library save,
+        // metadata persistence, GUI thumbnails — sees absolute paths.
+        const _resolvedRefs = await absolutizeMediaRefs(action.referenceImages);
 
-        // Step 2 — resolve attachment IDs (att-N) to real paths. Any
-        // other value is passed through verbatim; Step 3 calls
-        // `path.resolve()` which absolutizes relative paths against
-        // cwd and checks existence, so this stays permissive.
-        const _resolvedRefs = [];
-        try {
-          const { attachmentRegistry: _ar } = await import('../../state/attachment-registry.js');
-          for (const { alias, rawPath } of _normalized) {
-            if (/^att-\d+$/.test(rawPath)) {
-              const entry = _ar.get(rawPath);
-              if (entry?.path) {
-                _resolvedRefs.push({ alias, filePath: entry.path });
-                continue;
-              }
-            }
-            _resolvedRefs.push({ alias, filePath: rawPath });
-          }
-        } catch {
-          for (const { alias, rawPath } of _normalized) {
-            _resolvedRefs.push({ alias, filePath: rawPath });
-          }
-        }
-
-        // Step 3 — load + normalise image bytes, track alias alignment.
-        for (const { alias, filePath } of _resolvedRefs.slice(0, maxRef)) {
-          const resolvedPath = path.resolve(filePath);
+        // Load + normalise image bytes, track alias alignment.
+        for (const { alias, absPath: resolvedPath } of _resolvedRefs.slice(0, maxRef)) {
           if (!fs.existsSync(resolvedPath)) {
-            return { success: false, error: `Reference image not found: ${filePath}` };
+            return { success: false, error: `Reference image not found: ${resolvedPath}` };
           }
           // Transcode anything that isn't PNG/JPEG before upload — providers
           // reject WebP/HEIC/AVIF/TIFF/BMP/GIF inconsistently, and failing
@@ -609,7 +581,13 @@ const generateImageAction = {
             stylePreset: action.stylePreset || null,
             // Store media library IDs of reference images (not file paths)
             referenceImageIds: Object.values(_savedRefIds),
-            referenceImagePaths: (action.referenceImages || []).map(r => typeof r === 'string' ? r : r.filePath).filter(Boolean),
+            // Absolute, resolved paths — `_savedRefIds` is keyed by the
+            // path returned by `path.resolve(filePath)` (Step 3 above),
+            // which is guaranteed absolute. Storing the agent's raw
+            // `action.referenceImages` would pin relative paths or
+            // attachment IDs ("att-1") into the metadata, and the GUI's
+            // viewer can't display thumbnails for those after the fact.
+            referenceImagePaths: Object.keys(_savedRefIds),
             seed: action.seed || null,
             steps: action.steps || null,
             guidanceScale: action.guidanceScale || null,
@@ -630,9 +608,10 @@ const generateImageAction = {
     // to-image calls get no source and start a fresh chain.
     try {
       const { recordImageOp } = await import('../../state/image-lineage.js');
-      const refPaths = (action.referenceImages || [])
-        .map(r => typeof r === 'string' ? r : r?.filePath)
-        .filter(Boolean);
+      // Reuse the already-resolved absolute paths (`_savedRefIds` is
+      // keyed by them) so lineage doesn't re-introduce the relative-
+      // path / attachment-id zoo this tool deliberately sheds upstream.
+      const refPaths = Object.keys(_savedRefIds);
       for (const img of savedImages) {
         if (!img.savedTo) continue;
         recordImageOp({
