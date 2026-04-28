@@ -4,9 +4,16 @@
  * Delegates to the provider factory which auto-selects the best available
  * video provider: Kling → Seedance → OpenAI (Sora) → Gemini (Veo) → Google (Nano Banana).
  *
- * Video generation is ASYNC — returns a job ID. Pass that id to await_video_generation
- * to block internally until the job finishes; do NOT poll manually.
- * All parameters use NORMALIZED values (aspect ratios, resolutions, etc.)
+ * `execute()` does the WHOLE pipeline in one call: kick off the provider job,
+ * poll until terminal, download the URL, persist to the media library, and
+ * return the final result. The agent calls `generate_video` once and gets
+ * either `{ success: true, savedTo, ... }` or `{ success: false, error }` —
+ * no second call is needed.
+ *
+ * Wrapped with `asyncCapable` so the agent can opt into background mode by
+ * passing `wait: false` — that returns `{ jobId }` immediately and the same
+ * pipeline runs inside a koi job. Use `await_job` / `get_job_status` to
+ * retrieve the result. (Default `wait: true` keeps the simple inline UX.)
  *
  * Permission: 'generate_video' (individual permission for video generation)
  */
@@ -179,7 +186,7 @@ const generateVideoAction = {
   // the real, catalog-driven description is rebuilt at the bottom of this
   // file by the fetchMediaCapabilities('video') block and replaces both
   // the description AND the schema enums in place.
-  description: 'Generate a video from a text prompt. Async — returns a job ID; pass it to await_video_generation to block until the video is ready (no manual polling). Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog.',
+  description: 'Generate a video from a text prompt. Blocks internally until the video is ready and returns { success, savedTo, url, ... } — no second call is needed. Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog. Pass wait=false to start it as a background koi job and retrieve the result with await_job / get_job_status.',
   thinkingHint: 'Generating video',
   permission: 'generate_video',
 
@@ -217,7 +224,9 @@ const generateVideoAction = {
           },
         },
       },
-      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. If the job finishes synchronously the file is saved immediately. If it goes async, pass the SAME saveTo to await_video_generation so the result is downloaded there. Defaults to ~/.koi/videos/ when omitted.' },
+      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. Defaults to ~/.koi/videos/ when omitted.' },
+      timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 600000 = 10 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
+      pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' }
     },
     required: ['prompt']
@@ -384,7 +393,11 @@ const generateVideoAction = {
       ? action.keepOriginalSound
       : null;
 
-    const result = await instance.generate(prompt, {
+    const abortSignal = agent?.abortSignal;
+    const reportProgress = typeof agent?.reportProgress === 'function' ? agent.reportProgress : null;
+
+    reportProgress?.(0.02, 'Submitting to provider…');
+    const submitted = await instance.generate(prompt, {
       duration: globalDuration,
       aspectRatio: globalAspect,
       resolution: globalResolution,
@@ -403,13 +416,11 @@ const generateVideoAction = {
     });
 
     // Build the generation-params record once — used both for the
-    // in-process job cache (so await_video_generation can persist
-    // metadata for async completions) AND for the immediate
-    // saveGeneratedVideo() call when the provider returned the URL
-    // synchronously.
+    // in-process job cache (kept for backwards-compat with hidden
+    // await_video_generation) AND for the saveGeneratedVideo() call.
     const generationParams = {
       prompt,
-      model: result?.model || resolved.model,
+      model: submitted?.model || resolved.model,
       provider: resolved.provider,
       duration: globalDuration,
       aspectRatio: globalAspect,
@@ -425,38 +436,71 @@ const generateVideoAction = {
       saveTo: action.saveTo || null,
     };
 
-    // Stash for the async path. await_video_generation will look this up
-    // by job id when the download completes.
-    if (result.id) _stashJobMetadata(result.id, generationParams);
+    if (submitted.id) _stashJobMetadata(submitted.id, generationParams);
 
-    // If the provider returned a ready URL (some models complete
-    // synchronously), try to save it right away. Async providers return
-    // just an id — await_video_generation handles the save later.
+    // Poll the provider until the job reaches a terminal state. Sync
+    // providers return `status === 'completed'` straight away and the
+    // loop exits immediately on the first iteration.
+    const final = await _pollUntilTerminal(instance, submitted, {
+      abortSignal,
+      reportProgress,
+      timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
+        ? action.timeoutMs
+        : DEFAULT_TIMEOUT_MS,
+      pollIntervalMs: typeof action.pollIntervalMs === 'number' && action.pollIntervalMs > 0
+        ? action.pollIntervalMs
+        : DEFAULT_POLL_INTERVAL_MS,
+    });
+
+    if (final.status === 'failed') {
+      if (submitted.id) clearJobMetadata(submitted.id);
+      return {
+        success: false,
+        provider: resolved.provider,
+        model: final.model || resolved.model,
+        id: final.id || submitted.id,
+        status: 'failed',
+        error: final.error || 'Provider reported failure with no error message.',
+      };
+    }
+
+    if (final.status === 'pending') {
+      // Timed out before the provider finished. Surface as a soft
+      // failure so the agent can retry (the provider's request id is
+      // returned for advanced manual recovery, but the agent should
+      // typically just call generate_video again).
+      return {
+        success: false,
+        provider: resolved.provider,
+        model: final.model || resolved.model,
+        id: final.id || submitted.id,
+        status: 'pending',
+        error: final.error || `Timed out waiting for provider to finish.`,
+      };
+    }
+
+    // ── status === 'completed' from here ────────────────────────────
     let savedTo = null;
     let saveError = null;
-    if (result.url && (result.status === 'completed' || !result.status)) {
-      const saveResult = await saveVideoFromUrl(result.url, {
+    if (final.url) {
+      reportProgress?.(0.95, 'Downloading video…');
+      const saveResult = await saveVideoFromUrl(final.url, {
         saveTo: action.saveTo,
         provider: resolved.provider,
         model: resolved.model,
-        id: result.id,
+        id: final.id,
       });
       savedTo = saveResult.path;
       saveError = saveResult.error;
-      // Mirror the image flow: surface the saved video to the UI so it
-      // appears inline in the chat (and is persisted in the display log
-      // for session restore).
       if (savedTo && channel.canPresentResources?.()) {
         channel.presentResource({ type: 'video', path: savedTo });
       }
-      // Persist generation metadata to the media library so the GUI
-      // info panel can show prompt/model/duration/etc. (mirrors how
-      // generate-image saves alongside the file).
       if (savedTo) {
         try {
+          const params = { ...generationParams };
+          if (final.model) params.model = final.model;
           const { saveGeneratedVideo } = await import('../../state/media-library.js');
-          await saveGeneratedVideo(savedTo, generationParams, agent?.llmProvider || null);
-          if (result.id) clearJobMetadata(result.id);
+          await saveGeneratedVideo(savedTo, params, agent?.llmProvider || null);
           channel.log('video', `Saved to media library: ${savedTo}`);
         } catch (err) {
           channel.log('video', `Media library save failed (continuing): ${err.message}`);
@@ -464,21 +508,141 @@ const generateVideoAction = {
       }
     }
 
+    // Per-shot downloads for multishot completions.
+    let savedShots;
+    if (Array.isArray(final.shots) && final.shots.length > 0) {
+      savedShots = [];
+      for (const shot of final.shots) {
+        let shotSavedTo = null;
+        let shotSaveError = null;
+        if (shot.status === 'completed' && shot.url) {
+          const sr = await saveVideoFromUrl(shot.url, {
+            saveTo: action.saveTo,
+            provider: resolved.provider,
+            model: resolved.model,
+            id: `shot${shot.index}-${shot.id || ''}`,
+          });
+          shotSavedTo = sr.path;
+          shotSaveError = sr.error;
+          if (shotSavedTo && channel.canPresentResources?.()) {
+            channel.presentResource({ type: 'video', path: shotSavedTo });
+          }
+        }
+        savedShots.push({
+          index: shot.index,
+          id: shot.id,
+          status: shot.status,
+          url: shot.url,
+          ...(shotSavedTo ? { savedTo: shotSavedTo } : {}),
+          ...(shotSaveError ? { saveError: shotSaveError } : {}),
+          error: shot.error,
+        });
+      }
+    }
+
+    if (submitted.id) clearJobMetadata(submitted.id);
+    if (final.id && final.id !== submitted.id) clearJobMetadata(final.id);
+
+    reportProgress?.(1, 'Done');
     return {
       success: true,
       provider: resolved.provider,
-      model: resolved.model,
+      model: final.model || resolved.model,
       capabilities: caps,
-      id: result.id,
-      status: result.status,
-      url: result.url,
+      id: final.id || submitted.id,
+      status: 'completed',
+      url: final.url,
       ...(savedTo ? { savedTo } : {}),
       ...(saveError ? { saveError } : {}),
-      ...(Array.isArray(result.shots) && result.shots.length > 0 ? { shots: result.shots } : {}),
-      usage: result.usage,
+      ...(savedShots ? { shots: savedShots } : {}),
+      usage: final.usage,
     };
   }
 };
+
+// ── Provider polling (collapsed from the old await_video_generation) ─
+const DEFAULT_POLL_INTERVAL_MS = 8000;
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — covers slow providers (Kling, Veo, Sora) on long durations
+const MIN_POLL_INTERVAL_MS = 2000;
+const MAX_POLL_INTERVAL_MS = 30000;
+
+const _sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  if (signal) {
+    const onAbort = () => { clearTimeout(t); reject(new Error('aborted')); };
+    if (signal.aborted) { clearTimeout(t); reject(new Error('aborted')); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+});
+
+/**
+ * Poll the provider until the job reaches a terminal state (completed
+ * or failed). Returns the final status snapshot with at least
+ * { id, status, url?, model?, shots?, error?, usage? }. Status `pending`
+ * means we hit the timeout — caller should surface it.
+ *
+ * Sync providers return `status: 'completed'` from the kick-off itself;
+ * the loop returns on the first call without polling.
+ */
+export async function _pollUntilTerminal(instance, submitted, { abortSignal, reportProgress, timeoutMs, pollIntervalMs }) {
+  const pollMs = Math.min(MAX_POLL_INTERVAL_MS, Math.max(MIN_POLL_INTERVAL_MS, pollIntervalMs));
+  const deadline = Date.now() + timeoutMs;
+  const t0 = Date.now();
+
+  // Sync completion right out of the gate. Some providers omit `status`
+  // and just return the URL — treat that as completed too.
+  if (submitted.status === 'completed' || submitted.status === 'failed') {
+    return submitted;
+  }
+  if (!submitted.status && submitted.url) {
+    return { ...submitted, status: 'completed' };
+  }
+
+  let result = submitted;
+  let consecutiveErrors = 0;
+  const jobId = submitted.id;
+  if (!jobId) {
+    return { ...submitted, status: 'failed', error: 'Provider returned no job id and no synchronous URL.' };
+  }
+
+  while (true) {
+    if (abortSignal?.aborted) {
+      return { ...result, status: 'pending', error: 'Aborted before video finished.' };
+    }
+    try {
+      result = await instance.getStatus(jobId, { abortSignal });
+      consecutiveErrors = 0;
+    } catch (err) {
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 5) {
+        return { ...result, status: 'failed', error: `Polling failed repeatedly: ${err.message}` };
+      }
+      channel.log('video', `generate_video polling: transient error (${consecutiveErrors}/5): ${err.message}`);
+      // Reuse last good `result` and try again after backoff.
+    }
+    if (result.status === 'completed' || result.status === 'failed') return result;
+
+    // Time-elapsed driven progress: 0.05..0.92 reserved for polling.
+    if (reportProgress) {
+      const elapsed = Date.now() - t0;
+      const pct = Math.min(0.92, 0.05 + 0.87 * Math.min(1, elapsed / Math.max(1, timeoutMs)));
+      reportProgress(pct, `Waiting for provider… ${Math.round(elapsed / 1000)}s`);
+    }
+
+    if (Date.now() + pollMs > deadline) {
+      return {
+        ...result,
+        status: 'pending',
+        error: `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for video.`,
+      };
+    }
+    try {
+      await _sleep(pollMs, abortSignal);
+    } catch {
+      return { ...result, status: 'pending', error: 'Aborted before video finished.' };
+    }
+  }
+}
 
 // ── Internal helpers (hoisted so execute() reads top-down) ────────────
 
@@ -569,14 +733,26 @@ function _sanitiseCameraMovement(cameraMovement, caps, resolved) {
   return undefined;
 }
 
+import asyncCapable from '../_async-capable.js';
+import { formatModelCatalog } from './_format-model-catalog.js';
+
+// Wrap FIRST so the catalog refresh below mutates the registered object.
+// asyncCapable spreads a fresh schema/description, so any in-place edit to
+// the source `generateVideoAction` would land on a copy nobody reads.
+const wrappedAction = asyncCapable(generateVideoAction);
+
 // Fire-and-forget: rewrite the tool schema + description from the backend's
 // active video model set so the agent only ever sees values the catalog can
 // actually serve. Mirrors the pattern in generate-image.js — the description
 // is the string the agent sees in AVAILABLE ACTIONS, so the enums must live
 // there, not just in schema metadata the renderer doesn't unfold.
-fetchMediaCapabilities('video').then((caps) => {
+//
+// Exposed as `_descriptionReady` so `get_tool_info` can await the rewrite
+// before reading the description (otherwise the first lookup hits the
+// static fallback).
+wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) => {
   if (!caps) return;
-  const props = generateVideoAction.schema.properties;
+  const props = wrappedAction.schema.properties;
 
   if (caps.aspectRatios?.length) {
     props.aspectRatio = { type: 'string', enum: caps.aspectRatios };
@@ -722,19 +898,28 @@ fetchMediaCapabilities('video').then((caps) => {
     );
   }
   if (caps.labels?.length) {
-    const list = caps.labels.map((l) => `"${l}"`).join(', ');
+    const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
+    const lines = caps.labels.map((slug) => {
+      const d = details.find((x) => x && x.slug === slug);
+      const desc = d && d.description ? ` — ${d.description}` : '';
+      return `    • "${slug}"${desc}`;
+    }).join('\n');
     fields.push(
-      `optional "label" — selects a SPECIALISED model variant, one of: ${list}. ` +
-      `Preferred filter with automatic fallback: when set, the router first tries to find a model carrying that label AND matching all other constraints (operation, frames, refs, etc.); if no such model exists for THIS combination, the router falls back to non-labelled models (a console warning is logged). ` +
-      `Safe to set whenever the labelled capability would help — e.g. "sketch-guided" when the active document carries drawn annotations. If the labelled capability isn't available for the current operation (say only image-to-video has it but you need video-to-video), routing still succeeds with a generic model.`,
+      'optional "label" — selects a SPECIALISED model variant. ' +
+      'Preferred filter with automatic fallback: when set, the router first tries to find a model carrying that label AND matching all other constraints (operation, frames, refs, etc.); if no such model exists for THIS combination, the router falls back to non-labelled models (a console warning is logged). ' +
+      'Pick the slug whose description matches the task; if the labelled capability isn\'t available for the current operation, routing still succeeds with a generic model:\n' +
+      lines,
     );
   }
-  fields.push('optional "saveTo" — absolute directory path where the final video will be saved. If the job goes async, pass the SAME saveTo to await_video_generation so the result lands there.');
+  fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
+  fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');
 
-  const header = 'Generate a video from a text prompt. Video generation is ASYNC — returns a job ID; pass it to await_video_generation, which blocks internally until the video is ready (no manual polling, no token waste). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'Generate a video from a text prompt. Blocks internally until the provider finishes and returns { success, savedTo, url, error? } — the agent does NOT need a second call. The router auto-picks one model from the active catalog based on your params — see the per-model breakdown at the end of this description for what each option supports. Provider failures (validation, content policy, rate-limit, …) come back as success=false with the verbatim provider error in the `error` field. Pass wait=false to run it as a background koi job (then poll with await_job / get_job_status). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
-  const returns = '\nReturns: { success, provider, model, capabilities, id, status, savedTo? }';
-  generateVideoAction.description = header + fieldsBlock + returns;
+  const returns = '\nReturns: { success, provider, model, capabilities, savedTo?, url?, status, shots?, error? }. On success=false, read `error` to see what the provider rejected.';
+  const asyncSuffix = ' This tool is async-capable: pass wait=false to kick it off as a background job (returns { jobId }) instead of blocking.';
+  const catalog = formatModelCatalog(caps.models);
+  wrappedAction.description = header + fieldsBlock + returns + catalog + asyncSuffix;
 }).catch(() => {});
 
-export default generateVideoAction;
+export default wrappedAction;

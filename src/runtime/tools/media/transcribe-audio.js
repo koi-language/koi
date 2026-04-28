@@ -153,4 +153,5 @@ fetchMediaCapabilities('audio').then((caps) => {
   }
 }).catch(() => {});
 
-export default transcribeAudioAction;
+import asyncCapable from '../_async-capable.js';
+export default asyncCapable(transcribeAudioAction);

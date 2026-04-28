@@ -12,11 +12,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
+import asyncCapable from '../_async-capable.js';
 
 // SAM 3 — text-prompted for precompute, point+text for fallback clicks.
 const SAM3_MODEL = 'fal-ai/sam-3/image';
 
-export default {
+const segmentImageAction = {
   type: 'segment_image',
   intent: 'segment_image',
   description: 'Segment objects in an image. Mode "precompute" uses vision+SAM3 text prompts. Mode "point" uses SAM2 with click coordinates.',
@@ -352,3 +353,5 @@ export default {
     }
   },
 };
+
+export default asyncCapable(segmentImageAction);

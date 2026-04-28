@@ -195,4 +195,5 @@ fetchMediaCapabilities('audio').then((caps) => {
   }
 }).catch(() => {});
 
-export default createVoiceAction;
+import asyncCapable from '../_async-capable.js';
+export default asyncCapable(createVoiceAction);

@@ -506,16 +506,23 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         );
       }
     } catch { /* best-effort logging */ }
-    if (openDocumentsStore.hasAnyInSnapshot()) {
-      const docs = openDocumentsStore.getSnapshotAll();
-      const active = openDocumentsStore.getSnapshotActive();
-      const lines = ['', '# WORKING AREA', '', `The user has ${docs.length} document(s) open next to the chat:`];
+    const active = openDocumentsStore.getSnapshotActive();
+    // Render only the ACTIVE document. Non-visible tabs are intentionally
+    // omitted — they add noise without helping the agent route the
+    // current request. With no active doc there's nothing to surface, so
+    // the # WORKING AREA block is dropped entirely.
+    if (active) {
       let anyHasComposite = false;
-      for (const d of docs) {
-        const loc = d.path || d.url || '';
-        const isActive = active && d.id === active.id;
-        const activeTag = isActive ? ' **(ACTIVE — what the user is currently looking at)**' : '';
-        lines.push(`- [${d.type}] ${d.title}${loc ? ' — `' + loc + '`' : ''}${activeTag}`);
+      const lines = ['', '# WORKING AREA', ''];
+      {
+        const loc = active.path || active.url || '';
+        lines.push(`The user is currently looking at: [${active.type}] ${active.title}${loc ? ' — `' + loc + '`' : ''}`);
+        // For videos, surface the exact playhead position so the agent
+        // knows which frame the user is paused on. The GUI stamps
+        // `playheadMs` onto the video doc payload at submit time.
+        if (active.type === 'video' && typeof active.playheadMs === 'number') {
+          lines.push(`Playhead paused at \`${_formatVideoTs(active.playheadMs)}\` (MM:SS.ms).`);
+        }
 
         // DocumentBundle — compact rendering. Only the fields the agent
         // actually needs to route a media action: annotation paths (the
@@ -524,7 +531,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         // Roles are implicit in the labels ("composite" / "frame
         // composites" / "references"); per-resource prose lives in the
         // code, not in the prompt.
-        const b = d.bundle;
+        const b = active.bundle;
         if (b && typeof b === 'object') {
           const anns = Array.isArray(b.annotations) ? b.annotations : [];
           if (anns.length > 0) {

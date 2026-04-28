@@ -592,6 +592,29 @@ export function classifyFeedback(action, result, error) {
       return { immediate, shortTerm: `✅ task_create: ${subject}`, permanent: null, ...getTTL(intent) };
     }
 
+    case 'get_tool_info': {
+      // The full schema is shown ONCE — on the first iteration after
+      // execution. From the next iteration onwards, the doc is pinned
+      // in the dynamic system-prompt block ("Tool schemas you recently
+      // requested"), and toMessages() rewrites this entry to a tiny
+      // placeholder so we don't carry the doc in two places. The
+      // expansionIter that drives the rewrite lives on
+      // agent._expandedTools (set in get-tool-info.execute).
+      const tool = action.tool || result?.tool || '';
+      const documentation = result?.documentation || '';
+      const fullDoc = documentation
+        ? `📎${id} get_tool_info(${tool}):\n${documentation}`
+        : `📎${id} get_tool_info(${tool}) — no documentation returned`;
+      const placeholder = `📎 get_tool_info(${tool}) — full schema is now pinned in the system prompt under "Tool schemas you recently requested".`;
+      return {
+        immediate: fullDoc,
+        shortTerm: placeholder,
+        permanent: null,
+        _toolInfo: { tool, placeholder },
+        ...getTTL(intent),
+      };
+    }
+
     default: {
       // Delegate action: surface the result clearly so the parent agent can answer the user
       if (action.actionType === 'delegate') {
@@ -844,6 +867,11 @@ export class ContextMemory {
     };
     if (opts.ephemeral) entry.ephemeral = true;
     if (opts.attachments?.length > 0) entry.attachments = opts.attachments;
+    // Metadata for the get_tool_info dedup path. When set, toMessages()
+    // rewrites this entry's content to `_toolInfo.placeholder` once the
+    // dynamic system-prompt block has taken over rendering the full doc
+    // (i.e. once agent._activeSession.iteration > expansionIter).
+    if (opts._toolInfo) entry._toolInfo = opts._toolInfo;
 
     if (opts.directLongTerm) {
       channel.log('memory', `↑ direct long-term: "${(permanent || shortTerm || immediate).substring(0, 60)}"`);
@@ -1023,8 +1051,19 @@ export class ContextMemory {
    *   long-term  → permanent text (condensed, essential)
    *   medium-term → shortTerm text (summary)
    *   short-term → immediate text (full detail)
+   *
+   * Pass `{ agent }` to enable get_tool_info dedup: entries with a
+   * `_toolInfo` marker collapse to a placeholder once the agent's
+   * active session has advanced past the expansion iteration recorded
+   * on `agent._expandedTools`. Without an agent, every entry renders
+   * its tier-default content (no rewrite). The block-builder for the
+   * dynamic system prompt uses the same iteration check, so the doc
+   * appears in exactly one place per turn.
    */
-  toMessages() {
+  toMessages(opts = {}) {
+    const { agent } = opts;
+    const expandedMap = agent?._expandedTools instanceof Map ? agent._expandedTools : null;
+    const currentIter = agent?._activeSession?.iteration ?? 0;
     const messages = [];
 
     // System prompt (always first)
@@ -1045,6 +1084,15 @@ export class ContextMemory {
         case 'short-term':
           content = entry.immediate;
           break;
+      }
+      // get_tool_info dedup: once the dynamic block has taken over
+      // rendering the doc (currentIter > expansionIter), replace this
+      // entry's content with the short placeholder regardless of tier.
+      if (entry._toolInfo && expandedMap) {
+        const expansionIter = expandedMap.get(entry._toolInfo.tool);
+        if (expansionIter != null && currentIter > expansionIter) {
+          content = entry._toolInfo.placeholder;
+        }
       }
       if (content) {
         const msg = { role: entry.role, content };

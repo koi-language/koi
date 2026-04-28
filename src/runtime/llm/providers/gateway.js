@@ -82,15 +82,35 @@ const _splitCsv = (s) => {
   return s.split(',').map((x) => x.trim()).filter(Boolean);
 };
 
+// Normalize a label entry into a {slug, description} pair. The backend now
+// ships labels as `{slug, description}` per model (see getMediaModels), but
+// the runtime tolerates the legacy plain-string shape so older catalogs
+// don't break the description block.
+function _normLabel(l) {
+  if (typeof l === 'string') return { slug: l.trim(), description: '' };
+  if (l && typeof l === 'object' && typeof l.slug === 'string') {
+    return { slug: l.slug.trim(), description: typeof l.description === 'string' ? l.description : '' };
+  }
+  return null;
+}
+
 function _collectCommon(models) {
-  const labelSet = new Set();
+  // slug → description. Per-model entries with the same slug carry the same
+  // description (curated centrally), but if any model ships a non-empty
+  // description and another ships '', we keep the populated one.
+  const labelMap = new Map();
   const resolutionSet = new Set();
   const aspectRatioSet = new Set();
   const durationSet = new Set();
   for (const m of models) {
     if (Array.isArray(m?.labels)) {
-      for (const l of m.labels) {
-        if (typeof l === 'string' && l.trim()) labelSet.add(l.trim());
+      for (const raw of m.labels) {
+        const norm = _normLabel(raw);
+        if (!norm || !norm.slug) continue;
+        const prev = labelMap.get(norm.slug);
+        if (!prev || (!prev && norm.description) || (prev && !prev.description && norm.description)) {
+          labelMap.set(norm.slug, norm);
+        }
       }
     }
     for (const r of _splitCsv(m?.resolutions)) resolutionSet.add(r);
@@ -100,8 +120,13 @@ function _collectCommon(models) {
       if (Number.isFinite(n) && n > 0) durationSet.add(n);
     }
   }
+  // Sorted slug list (keeps router/enum behaviour identical) plus a parallel
+  // map for callers that want descriptions for the description block.
+  const labels = [...labelMap.keys()].sort();
+  const labelDetails = labels.map((slug) => labelMap.get(slug));
   return {
-    labels:       [...labelSet].sort(),
+    labels,
+    labelDetails,
     resolutions:  [...resolutionSet],
     aspectRatios: [...aspectRatioSet],
     durations:    [...durationSet].sort((a, b) => a - b),
@@ -516,38 +541,72 @@ export class GatewayImageGen extends BaseImageGen {
       }));
     }
 
-    const res = await fetch(`${getGatewayBase()}/fal/generate`, {
+    // Submit + poll. The sync `/media/image/generate` endpoint exists for
+    // fast slugs, but Railway's edge proxy ~100s timeout cuts long calls
+    // (gpt-image-2 with refs) before fal returns — using the queue path
+    // avoids that entirely.
+    const submitRes = await fetch(`${getGatewayBase()}/media/image/submit`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(payload),
       signal: opts.abortSignal,
     });
 
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      // Preserve structured errors from the backend (e.g. no_model_matches with availableLabels).
-      const bodyText = await res.text().catch(() => '');
+    await throwIfQuotaExceeded(submitRes);
+    if (!submitRes.ok) {
+      const bodyText = await submitRes.text().catch(() => '');
       let structured = null;
       try { structured = JSON.parse(bodyText); } catch {}
       const err = new Error(
-        structured?.error || `Gateway image error (${res.status}): ${bodyText}`,
+        structured?.error || `Gateway image submit error (${submitRes.status}): ${bodyText}`,
       );
-      err.status = res.status;
+      err.status = submitRes.status;
       if (structured) err.details = structured;
       throw err;
     }
 
-    const data = await res.json();
-    const images = _collectImages(data);
-    // `resolvedModel` is the concrete slug the client-side router picked.
-    // Surface it so callers can log the real model and tag metadata with
-    // it — "auto" / declared `this.model` hides which one actually ran.
-    // When no images came back, pass the raw provider body so the caller
-    // can extract a useful reason (NSFW flag, finishReason, blockReason…)
-    // instead of a generic "no images" message.
-    const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
-    if (images.length === 0) ret.raw = data;
-    return ret;
+    const { id } = await submitRes.json();
+    if (!id) throw new Error('Gateway image submit returned no id');
+
+    // Poll. Fal usually completes in a few seconds for fast slugs and
+    // 30–90s for gpt-image-2 + refs. Cap at ~5 min to bound runaway jobs.
+    const pollDeadline = Date.now() + 5 * 60 * 1000;
+    let pollDelay = 1500;
+    while (true) {
+      if (Date.now() > pollDeadline) {
+        throw new Error(`Gateway image timeout after 5 min waiting on ${id}`);
+      }
+      await new Promise(r => setTimeout(r, pollDelay));
+      pollDelay = Math.min(pollDelay * 1.4, 5000);
+
+      const pollRes = await fetch(
+        `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
+        { headers: getAuthHeaders(), signal: opts.abortSignal },
+      );
+      await throwIfQuotaExceeded(pollRes);
+      if (!pollRes.ok) {
+        const bodyText = await pollRes.text().catch(() => '');
+        let structured = null;
+        try { structured = JSON.parse(bodyText); } catch {}
+        const err = new Error(
+          structured?.error || `Gateway image poll error (${pollRes.status}): ${bodyText}`,
+        );
+        err.status = pollRes.status;
+        if (structured) err.details = structured;
+        throw err;
+      }
+      const data = await pollRes.json();
+      if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') continue;
+      if (data.status === 'FAILED') {
+        const err = new Error(data.error || `Image generation failed (${id})`);
+        err.status = 502;
+        throw err;
+      }
+      const images = _collectImages(data);
+      const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+      if (images.length === 0) ret.raw = data;
+      return ret;
+    }
   }
 
   /**
@@ -661,41 +720,6 @@ export class GatewayImageGen extends BaseImageGen {
     return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
   }
 
-  async edit(prompt, image, opts = {}) {
-    const imgData = typeof image === 'string' ? image : image.toString('base64');
-
-    const payload = {
-      model: this.model,
-      prompt,
-      image: imgData,
-      aspect_ratio: opts.aspectRatio || '1:1',
-      resolution: opts.resolution || 'medium',
-      n: opts.n || 1,
-    };
-    if (opts.mask) {
-      payload.mask = typeof opts.mask === 'string' ? opts.mask : opts.mask.toString('base64');
-    }
-
-    const res = await fetch(`${getGatewayBase()}/media/image/edit`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify(payload),
-      signal: opts.abortSignal,
-    });
-
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway image edit error (${res.status}): ${body}`);
-    }
-
-    const data = await res.json();
-    const images = _collectImages(data);
-    // `resolvedModel` is the concrete slug the client-side router picked.
-    // Surface it so callers can log the real model and tag metadata with
-    // it — "auto" / declared `this.model` hides which one actually ran.
-    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -735,7 +759,6 @@ export class GatewayAudioGen extends BaseAudioGen {
         ...(opts.emotion ? { emotion: opts.emotion } : {}),
         ...(typeof opts.pitch === 'number' ? { pitch: opts.pitch } : {}),
         ...(typeof opts.volume === 'number' ? { volume: opts.volume } : {}),
-        ...(opts.extra ? { extra: opts.extra } : {}),
       }),
       signal: opts.abortSignal,
     });
@@ -836,6 +859,49 @@ export class GatewayAudioGen extends BaseAudioGen {
     };
   }
 
+  /** Generate a sound effect from a text prompt. Single-shot POST to
+   *  /media/audio/sfx — the backend resolves the per-category adapter
+   *  (ElevenLabs sound-effects v2, etc.) and returns audio bytes inline.
+   *
+   *  Returns: { audio: Buffer, format, usage }.
+   */
+  async sfx(prompt, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+        try {
+          return pickAudioModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'sfx', label: opts.label },
+    );
+
+    const res = await fetch(`${getGatewayBase()}/media/audio/sfx`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        model: resolvedModel,
+        prompt,
+        outputFormat: opts.outputFormat || 'mp3',
+        ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
+        ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
+        ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+      }),
+      signal: opts.abortSignal,
+    });
+
+    await throwIfQuotaExceeded(res);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Gateway sfx error (${res.status}): ${body}`);
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: prompt.length } };
+  }
+
   /** Clone a voice from a sample. Two-step: upload the sample bytes to
    *  fal storage via /uploads/audio, then call /media/audio/voice-clone
    *  with the canonical request. The backend resolves the per-model
@@ -892,7 +958,6 @@ export class GatewayAudioGen extends BaseAudioGen {
         ...(opts.description ? { description: opts.description } : {}),
         ...(opts.language ? { language: opts.language } : {}),
         ...(opts.labels ? { labels: opts.labels } : {}),
-        ...(opts.extra ? { extra: opts.extra } : {}),
       }),
       signal: opts.abortSignal,
     });
@@ -1282,7 +1347,6 @@ export class GatewayVideoGen extends BaseVideoGen {
         ...(opts.prompt ? { prompt: opts.prompt } : {}),
         ...(opts.aspectRatio ? { aspect_ratio: opts.aspectRatio } : {}),
         ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
-        ...(opts.extra ? { extra: opts.extra } : {}),
       }),
       signal: opts.abortSignal,
     });

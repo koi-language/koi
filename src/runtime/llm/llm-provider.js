@@ -1336,7 +1336,7 @@ CRITICAL RULES:
       // routed to a 1M-token model that still rejects with 413.
       let _minContextK = 0;
       try {
-        const _preMessages = contextMemory.toMessages();
+        const _preMessages = contextMemory.toMessages({ agent });
         const _preChars = _preMessages.reduce((sum, m) => {
           const c = m.content;
           if (typeof c === 'string') return sum + c.length;
@@ -1409,7 +1409,7 @@ CRITICAL RULES:
     }
 
     // Build messages from tiered memory
-    const messages = contextMemory.toMessages();
+    const messages = contextMemory.toMessages({ agent });
 
     // Track attachments for debug logging
     const _debugAttachPaths = [];

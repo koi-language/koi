@@ -16,6 +16,7 @@ import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+import asyncCapable from '../_async-capable.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -25,7 +26,7 @@ const IMAGE_EXT_TO_MIME = {
   '.gif': 'image/gif',
 };
 
-export default {
+const backgroundRemovalAction = {
   type: 'background_removal',
   intent: 'background_removal',
   description: 'Remove the background from an existing image. Returns a new PNG with transparent background. In: "image" (path or attachment id, required), optional "outputFormat" (png|webp), optional "saveTo" (directory path). Returns: { success, provider, model, images: [{ savedTo }] }.',
@@ -222,3 +223,5 @@ export default {
     };
   },
 };
+
+export default asyncCapable(backgroundRemovalAction);

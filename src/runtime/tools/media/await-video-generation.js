@@ -30,8 +30,14 @@ const _sleep = (ms, signal) => new Promise((resolve, reject) => {
 export default {
   type: 'await_video_generation',
   intent: 'await_video_generation',
+  // Hidden as of 2026-04: generate_video now does the kick-off + polling +
+  // download in a single call (or returns a koi jobId when wait=false). The
+  // file is kept callable as a fallback for legacy code paths but no longer
+  // advertised to the agent. New code should call generate_video directly
+  // and use await_job for background mode.
+  hidden: true,
   description:
-    'Wait for an async video generation job to finish. This is the ONLY way to retrieve the final video after generate_video — do NOT poll manually. The action blocks internally (no LLM tokens spent during the wait) and resolves once the job reaches "completed" or "failed", or the timeout fires.\n' +
+    'DEPRECATED — generate_video now blocks internally until the provider finishes and returns the final video. This tool is kept only for legacy callers and is no longer advertised to agents. For background runs, call generate_video with wait=false and use await_job(jobId).\n' +
     '\n' +
     'Fields:\n' +
     '  - "id" (required) — job ID returned by generate_video\n' +

@@ -1352,6 +1352,13 @@ export class Agent {
     if (this._nextSessionIsContinuation) {
       session._isContinuation = true;
       this._nextSessionIsContinuation = false;
+    } else {
+      // Fresh task — drop any tool-doc expansions from the previous one.
+      // Keeping them would carry stale "Tool schemas you recently
+      // requested" entries into a new task that may not even use those
+      // tools. The map is per-agent (delegates have their own), so this
+      // only resets the top-level run.
+      this._expandedTools = new Map();
     }
 
     // Expose session on the agent so actions (e.g. action_history) can read it
@@ -1775,7 +1782,7 @@ export class Agent {
       {
         const fmt = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
         const est = (text) => text ? Math.ceil(text.length / 4) : 0;
-        const msgs = contextMemory.toMessages();
+        const msgs = contextMemory.toMessages({ agent: this });
         const inputTk = msgs.reduce((sum, m) => sum + est(m.content || ''), 0);
         if (inputTk > 0) {
           channel.setInfo('tokens', `↑${fmt(inputTk)}`);
@@ -4455,7 +4462,7 @@ Many commands are inherently slow and produce little or no output for extended p
       const _slotKey = channel.getCurrentSlotId() ?? '_main';
       const _ctxMem = _contextMemoryBySlot.get(_slotKey) || this._activeContextMemory;
       if (_ctxMem) {
-        const messages = _ctxMem.toMessages();
+        const messages = _ctxMem.toMessages({ agent: this });
         recentContext = messages
           .filter(m => m.role !== 'system')
           .slice(-8)

@@ -27,6 +27,7 @@ import fs from 'fs';
 import path from 'path';
 import { channel } from '../../io/channel.js';
 import generateImageAction from './generate-image.js';
+import asyncCapable from '../_async-capable.js';
 
 const OUTPAINT_MAX_PAD = 4096;
 
@@ -68,7 +69,7 @@ function _directionPhrase(pads) {
   return parts;
 }
 
-export default {
+const outpaintImageAction = {
   type: 'outpaint_image',
   intent: 'outpaint_image',
   description: 'Extend (outpaint) an image\'s canvas by adding pixels to one or more sides, filling the new margins with content that seamlessly continues the scene. Internally delegates to generate_image using the same underlying image models. In: "image" (path or attachment id, required), at least one of "padTop" / "padBottom" / "padLeft" / "padRight" (pixels, 0–4096), optional "prompt" (guides what the new margins should contain — e.g. "continue the beach and sky"), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory). Returns: { success, provider, model, images: [{ savedTo }] }. Use this when the scene needs to be wider/taller than the source — for style transfer, img2img or composition, use generate_image directly.',
@@ -285,6 +286,8 @@ export default {
     };
   },
 };
+
+export default asyncCapable(outpaintImageAction);
 
 function _placementDescription(pads, newW, newH) {
   const verticalLabel = _positionLabel(pads.top, pads.bottom, 'top', 'bottom');

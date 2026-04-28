@@ -329,6 +329,22 @@ export class BaseAudioGen {
   async transcribe(audio, opts = {}) {
     throw new Error(`${this.constructor.name}.transcribe() not implemented`);
   }
+
+  /**
+   * Generate a sound effect from a text description.
+   *
+   * @param {string} prompt - Free-form description of the sound to synthesise.
+   * @param {Object} [opts]
+   * @param {number} [opts.durationSeconds]  - Target clip length in seconds (provider-clamped).
+   * @param {number} [opts.promptInfluence]  - 0..1, how strictly to follow the prompt.
+   * @param {string} [opts.outputFormat]     - 'mp3' | 'wav' | 'flac' | 'pcm' | 'aac' | 'opus'
+   * @param {number} [opts.seed]
+   * @param {AbortSignal} [opts.abortSignal]
+   * @returns {Promise<{ audio: Buffer, format: string, usage?: { characters: number } }>}
+   */
+  async sfx(prompt, opts = {}) {
+    throw new Error(`${this.constructor.name}.sfx() not implemented`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

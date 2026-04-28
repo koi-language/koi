@@ -5,12 +5,12 @@
  * checked into the project alongside source so an edit survives session
  * teardown and is reproducible from a clean checkout.
  *
- * Schema (versioned via `version`, currently 1):
+ * Schema (versioned via `version`, currently 2):
  *
  * {
  *   "id":          string  // immutable, e.g. "tl-1730000000-abc"
  *   "name":        string  // user-visible, defaults to "Timeline N"
- *   "version":     1
+ *   "version":     2
  *   "createdAt":   ISO-8601 timestamp
  *   "updatedAt":   ISO-8601 timestamp (touched on every mutation)
  *
@@ -24,6 +24,7 @@
  *
  *   "clips": [
  *     {
+ *       "id":            string  // stable random id, e.g. "clip-a3f9c2"
  *       "track":         string  // "V1" | "V2" | "A1" | "A2" | …
  *       "path":          string  // ABSOLUTE path to source media
  *       "startMs":       int     // position on the timeline
@@ -31,6 +32,21 @@
  *       "sourceInMs":    int     // offset INTO the source (trim-in)
  *       "sourceTotalMs": int     // source media's true duration; 0 = unknown
  *       "linkId":        string? // shared id pinning V/A peers together
+ *       "offsetX":       number? // visual transform — pan X (default 0)
+ *       "offsetY":       number? // visual transform — pan Y (default 0)
+ *       "scale":         number? // visual transform — uniform scale (default 1)
+ *
+ *       // Optional transitions. transitionIn fires at startMs; transitionOut
+ *       // fires at startMs+durationMs. When a same-track neighbour exists at
+ *       // the join, transitionIn defines the cross-effect between the two
+ *       // clips (renderer overlaps `durationMs` of source on each side); with
+ *       // no neighbour it fades from black/silence. transitionOut is honoured
+ *       // only when there is no following clip on the same track (end-of-
+ *       // timeline fade-out) — otherwise the next clip's transitionIn wins.
+ *       // alignment ∈ {"center" (default) | "start-on-cut" | "end-on-cut"}
+ *       // — matches DaVinci Resolve's three placement modes.
+ *       "transitionIn":  { type: string, durationMs: int, alignment?: string, params?: object }?
+ *       "transitionOut": { type: string, durationMs: int, alignment?: string, params?: object }?
  *     }
  *   ]
  * }
@@ -39,13 +55,18 @@
  * settings counts plus the per-clip `track` field. This keeps the
  * format flat and makes it trivial to merge / diff / regenerate a
  * whole timeline from an LLM tool.
+ *
+ * Clip identity: every clip carries a stable `id` independent of its
+ * position. All single-clip mutators (move/trim/remove/update) take a
+ * `clipId` and never (track, startMs) — moving a clip can't invalidate
+ * a future tool call mid-edit.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 // ── Filesystem helpers ───────────────────────────────────────────────
 
@@ -80,6 +101,15 @@ function _newId() {
   return `tl-${Date.now()}-${randomBytes(3).toString('hex')}`;
 }
 
+// Pure-random clip id — no timestamp on purpose. A clip's id is its
+// identity; moving/trimming it must not change it, so anything that
+// would imply an order or creation moment would be misleading.
+function _newClipId() {
+  return `clip-${randomBytes(4).toString('hex')}`;
+}
+
+const _CLIP_ID_RE = /^clip-[A-Za-z0-9]{4,32}$/;
+
 function _now() {
   return new Date().toISOString();
 }
@@ -89,6 +119,53 @@ function _now() {
 function _isVideoTrack(key) { return /^V\d+$/.test(key); }
 function _isAudioTrack(key) { return /^A\d+$/.test(key); }
 function _trackIdx(key) { return parseInt(key.substring(1), 10); }
+
+// Allowed transition types. Map 1:1 to FFmpeg `xfade` transitions at render time.
+// Extending this list = add the string here and a mapping in the renderer.
+const TRANSITION_TYPES = new Set([
+  'crossfade', 'fade-black', 'fade-white', 'dissolve',
+  'slide-left', 'slide-right', 'slide-up', 'slide-down',
+  'wipe-left', 'wipe-right', 'wipe-up', 'wipe-down',
+  'circle-open', 'circle-close',
+  'pixelize', 'zoom-in', 'radial',
+]);
+
+// Where the transition window sits relative to its anchor edit point.
+// Matches DaVinci Resolve's three placement modes.
+const TRANSITION_ALIGNMENTS = new Set(['center', 'start-on-cut', 'end-on-cut']);
+
+function _validateTransition(t, side, clipDurationMs) {
+  if (t === null || t === undefined) return null;
+  if (typeof t !== 'object') throw new Error(`clip.${side} must be an object`);
+  if (typeof t.type !== 'string' || !TRANSITION_TYPES.has(t.type)) {
+    throw new Error(
+      `clip.${side}.type invalid: ${JSON.stringify(t.type)} ` +
+      `(allowed: ${[...TRANSITION_TYPES].join(', ')})`,
+    );
+  }
+  if (!Number.isFinite(t.durationMs) || t.durationMs < 50) {
+    throw new Error(`clip.${side}.durationMs must be ≥ 50ms`);
+  }
+  const dur = Math.round(t.durationMs);
+  // Bound by the clip itself so a transition can't eat more than half its host.
+  const maxOnClip = Math.floor(clipDurationMs / 2);
+  if (dur > maxOnClip) {
+    throw new Error(
+      `clip.${side}.durationMs (${dur}) exceeds half of clip.durationMs (${clipDurationMs}); ` +
+      `max ${maxOnClip}ms`,
+    );
+  }
+  const alignment = t.alignment ?? 'center';
+  if (!TRANSITION_ALIGNMENTS.has(alignment)) {
+    throw new Error(
+      `clip.${side}.alignment invalid: ${JSON.stringify(alignment)} ` +
+      `(allowed: ${[...TRANSITION_ALIGNMENTS].join(', ')})`,
+    );
+  }
+  const out = { type: t.type, durationMs: dur, alignment };
+  if (t.params && typeof t.params === 'object') out.params = t.params;
+  return out;
+}
 
 function _validateClip(c, settings) {
   if (!c || typeof c !== 'object') throw new Error('clip must be an object');
@@ -104,15 +181,29 @@ function _validateClip(c, settings) {
   if (typeof p !== 'string' || !p) throw new Error('clip.path must be a non-empty string');
   if (!Number.isFinite(startMs) || startMs < 0) throw new Error('clip.startMs must be ≥ 0');
   if (!Number.isFinite(durationMs) || durationMs < 50) throw new Error('clip.durationMs must be ≥ 50ms');
-  return {
+  const dur = Math.round(durationMs);
+  // Preserve incoming id when valid; mint a fresh one for new or
+  // legacy (v1) clips that never had one. Never regenerate a valid id.
+  const clipId = (typeof c.id === 'string' && _CLIP_ID_RE.test(c.id)) ? c.id : _newClipId();
+  const out = {
+    id: clipId,
     track,
     path: p,
     startMs: Math.round(startMs),
-    durationMs: Math.round(durationMs),
+    durationMs: dur,
     sourceInMs: Math.round(c.sourceInMs ?? 0),
     sourceTotalMs: Math.round(c.sourceTotalMs ?? 0),
     linkId: c.linkId ?? null,
   };
+  // Visual transform — only persisted when non-default to keep JSON clean.
+  if (Number.isFinite(c.offsetX) && c.offsetX !== 0) out.offsetX = c.offsetX;
+  if (Number.isFinite(c.offsetY) && c.offsetY !== 0) out.offsetY = c.offsetY;
+  if (Number.isFinite(c.scale) && c.scale !== 1) out.scale = c.scale;
+  const tIn = _validateTransition(c.transitionIn, 'transitionIn', dur);
+  const tOut = _validateTransition(c.transitionOut, 'transitionOut', dur);
+  if (tIn) out.transitionIn = tIn;
+  if (tOut) out.transitionOut = tOut;
+  return out;
 }
 
 function _normaliseSettings(s = {}) {
@@ -253,46 +344,37 @@ function _withTimeline(id, mutator) {
   return normalised;
 }
 
-/** Append a clip. Optionally provides a linkId so V/A peers stay paired. */
+/**
+ * Append a clip. Returns { clip, timeline } so the caller has the
+ * minted id without re-scanning the timeline. `clip.linkId` is optional
+ * — set it (and the same value on a sibling clip) to pair V/A peers
+ * so that move/trim/remove cascade across the pair.
+ */
 export function addClip(id, clip) {
-  return _withTimeline(id, (state) => {
+  let added;
+  const tl = _withTimeline(id, (state) => {
     const validated = _validateClip(clip, state.settings);
     state.clips.push(validated);
+    added = validated;
     return state;
   });
+  // Re-resolve from the persisted state — _normalise may have re-minted
+  // ids on legacy clips around it, but the appended one keeps its id.
+  const stored = tl.clips.find((c) => c.id === added.id) || added;
+  return { clip: stored, timeline: tl };
 }
 
-/**
- * Locate a clip by `(track, startMs)` or by index in its track. Used
- * by every move/trim/remove call to identify the target.
- */
-function _findClipIndex(state, matcher) {
-  if (!matcher || typeof matcher !== 'object') return -1;
-  if (typeof matcher.index === 'number' && matcher.track) {
-    let seen = 0;
-    for (let i = 0; i < state.clips.length; i++) {
-      if (state.clips[i].track === matcher.track) {
-        if (seen === matcher.index) return i;
-        seen++;
-      }
-    }
-    return -1;
-  }
-  if (matcher.track && Number.isFinite(matcher.startMs)) {
-    return state.clips.findIndex((c) =>
-      c.track === matcher.track && Math.abs(c.startMs - matcher.startMs) < 50);
-  }
-  if (matcher.linkId) {
-    return state.clips.findIndex((c) => c.linkId === matcher.linkId);
-  }
-  return -1;
+/** Locate a clip by its stable id. Returns -1 if missing. */
+function _findClipIndexById(state, clipId) {
+  if (typeof clipId !== 'string' || !clipId) return -1;
+  return state.clips.findIndex((c) => c.id === clipId);
 }
 
-/** Remove a clip identified by [matcher]. Linked peers vanish too. */
-export function removeClip(id, matcher) {
+/** Remove a clip by id. Linked V/A peers vanish too. */
+export function removeClip(id, clipId) {
   return _withTimeline(id, (state) => {
-    const i = _findClipIndex(state, matcher);
-    if (i < 0) throw new Error(`Clip not found: ${JSON.stringify(matcher)}`);
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
     const target = state.clips[i];
     if (target.linkId) {
       state.clips = state.clips.filter((c) => c.linkId !== target.linkId);
@@ -308,12 +390,12 @@ export function removeClip(id, matcher) {
  *   - { startMs }            — same track, new start position
  *   - { track }              — same start, new track (same V/A type only)
  *   - { startMs, track }     — both
- * Linked peers shift by the same deltaMs so V/A stays sample-aligned.
+ * Linked V/A peers shift by the same deltaMs so audio stays sample-aligned.
  */
-export function moveClip(id, matcher, target) {
+export function moveClip(id, clipId, target) {
   return _withTimeline(id, (state) => {
-    const i = _findClipIndex(state, matcher);
-    if (i < 0) throw new Error(`Clip not found: ${JSON.stringify(matcher)}`);
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
     const src = state.clips[i];
     const newStart = Number.isFinite(target?.startMs) ? Math.max(0, Math.round(target.startMs)) : src.startMs;
     const newTrack = typeof target?.track === 'string' ? target.track : src.track;
@@ -339,12 +421,12 @@ export function moveClip(id, matcher, target) {
  * Trim a clip's left or right edge. Two call shapes:
  *   - { edge: -1 | 1, deltaMs }     — relative trim (NLE-style drag)
  *   - { sourceInMs?, durationMs? }  — set absolute values
- * Linked peers trim together so V/A stays sample-aligned.
+ * Linked V/A peers trim together so audio stays sample-aligned.
  */
-export function trimClip(id, matcher, change) {
+export function trimClip(id, clipId, change) {
   return _withTimeline(id, (state) => {
-    const i = _findClipIndex(state, matcher);
-    if (i < 0) throw new Error(`Clip not found: ${JSON.stringify(matcher)}`);
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
     const src = state.clips[i];
     const peers = src.linkId
       ? state.clips.filter((c) => c.linkId === src.linkId)
@@ -386,6 +468,94 @@ export function trimClip(id, matcher, change) {
       }
     } else {
       throw new Error('trimClip change must specify {edge, deltaMs} or {sourceInMs?, durationMs?}');
+    }
+    return state;
+  });
+}
+
+/**
+ * Set or clear a clip's transitions. `change` shape:
+ *   { in?:  {type, durationMs, params?} | null,
+ *     out?: {type, durationMs, params?} | null }
+ * - `null` clears that side; an undefined key leaves it untouched.
+ * Validation (type enum, ≥ 50ms, ≤ clip.durationMs/2) happens in
+ * _validateClip during normalisation.
+ */
+export function setClipTransition(id, clipId, change) {
+  return _withTimeline(id, (state) => {
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
+    if (!change || typeof change !== 'object') {
+      throw new Error('setClipTransition change must be an object with in?/out?');
+    }
+    const c = state.clips[i];
+    if ('in' in change) {
+      if (change.in === null) delete c.transitionIn;
+      else c.transitionIn = change.in;
+    }
+    if ('out' in change) {
+      if (change.out === null) delete c.transitionOut;
+      else c.transitionOut = change.out;
+    }
+    return state;
+  });
+}
+
+/**
+ * General-purpose single-clip patch. `changes` can include any of:
+ *   - path     (string)         — replace source media file
+ *   - offsetX  (number)         — visual transform pan X
+ *   - offsetY  (number)         — visual transform pan Y
+ *   - scale    (number)         — visual transform uniform scale
+ *   - linkId   (string | null)  — pair with a sibling clip (null clears)
+ *
+ * Position/duration changes go through moveClip / trimClip; transitions
+ * through setClipTransition. Anything else throws so the agent gets a
+ * clear error rather than a silently-ignored field.
+ */
+export function updateClip(id, clipId, changes) {
+  return _withTimeline(id, (state) => {
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
+    if (!changes || typeof changes !== 'object') {
+      throw new Error('updateClip changes must be an object');
+    }
+    const allowed = new Set(['path', 'offsetX', 'offsetY', 'scale', 'linkId']);
+    for (const key of Object.keys(changes)) {
+      if (!allowed.has(key)) {
+        throw new Error(
+          `updateClip: field '${key}' not patchable here. ` +
+          `Use moveClip (startMs/track), trimClip (sourceInMs/durationMs), ` +
+          `or setClipTransition (transitionIn/transitionOut).`,
+        );
+      }
+    }
+    const c = state.clips[i];
+    if ('path' in changes) {
+      if (typeof changes.path !== 'string' || !changes.path) {
+        throw new Error('updateClip.path must be a non-empty string');
+      }
+      c.path = changes.path;
+    }
+    if ('offsetX' in changes) {
+      if (!Number.isFinite(changes.offsetX)) throw new Error('updateClip.offsetX must be a number');
+      c.offsetX = changes.offsetX;
+    }
+    if ('offsetY' in changes) {
+      if (!Number.isFinite(changes.offsetY)) throw new Error('updateClip.offsetY must be a number');
+      c.offsetY = changes.offsetY;
+    }
+    if ('scale' in changes) {
+      if (!Number.isFinite(changes.scale) || changes.scale <= 0) {
+        throw new Error('updateClip.scale must be a positive number');
+      }
+      c.scale = changes.scale;
+    }
+    if ('linkId' in changes) {
+      if (changes.linkId !== null && (typeof changes.linkId !== 'string' || !changes.linkId)) {
+        throw new Error('updateClip.linkId must be a non-empty string or null');
+      }
+      c.linkId = changes.linkId;
     }
     return state;
   });

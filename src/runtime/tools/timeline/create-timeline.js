@@ -24,8 +24,9 @@ export default {
   description:
     'Create a new project timeline. Stored persistently in .koi/timelines/<id>.json. ' +
     'Optional "name", optional "settings" ({videoTracks, audioTracks, pixelsPerSecond}), ' +
-    'optional "clips" array of {track, path, startMs, durationMs, sourceInMs?, sourceTotalMs?, linkId?}, ' +
+    'optional "clips" array of {track, path, startMs, durationMs, sourceInMs?, sourceTotalMs?, linkId?, offsetX?, offsetY?, scale?}, ' +
     'or pass a complete "state" object to seed the whole edit at once. ' +
+    'Each clip is auto-assigned a stable id (clip-XXXXXX) — use it in subsequent move/trim/update/remove calls. ' +
     'Returns: { success, id, timeline }.',
   thinkingHint: 'Creating timeline',
   permission: 'write',

@@ -8,8 +8,8 @@ export default {
   type: 'remove_clip',
   intent: 'remove_clip',
   description:
-    'Remove a clip from a timeline. Identify with match: { track, startMs } | { track, index } | { linkId }. ' +
-    'If the clip has a linkId, every clip sharing that id is removed too (V+A pair stays consistent). ' +
+    'Remove a clip from a timeline. Identify it by its stable clipId. ' +
+    'If the clip is linked to a sibling (linkId), every clip sharing that linkId is removed too (V+A pair stays consistent). ' +
     'Returns: { success, timeline }.',
   thinkingHint: 'Removing clip',
   permission: 'write',
@@ -18,14 +18,14 @@ export default {
     type: 'object',
     properties: {
       id: { type: 'string', description: 'Timeline id' },
-      match: { type: 'object', description: 'Clip locator (see description)' },
+      clipId: { type: 'string', description: 'Stable clip id (e.g. "clip-a3f9c2")' },
     },
-    required: ['id', 'match'],
+    required: ['id', 'clipId'],
   },
 
   async execute(params) {
     try {
-      const tl = removeClip(params.id, params.match);
+      const tl = removeClip(params.id, params.clipId);
       return { success: true, timeline: tl };
     } catch (e) {
       return { success: false, error: e.message };

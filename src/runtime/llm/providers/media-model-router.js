@@ -61,6 +61,20 @@ const _SPECIALIST_OPS = new Set([
   'deblur',
 ]);
 
+// Labels are now per-model `Array<{slug, description}>` (see backend
+// gateway.service.ts:getMediaModels). Tolerate the legacy plain-string
+// shape so older catalogs / tests / fixtures keep working.
+const _labelSlugs = (m) => {
+  if (!Array.isArray(m?.labels)) return [];
+  return m.labels.map((l) => {
+    if (typeof l === 'string') return l;
+    if (l && typeof l === 'object' && typeof l.slug === 'string') return l.slug;
+    return null;
+  }).filter(Boolean);
+};
+const _modelHasLabel = (m, slug) => _labelSlugs(m).includes(slug);
+const _modelHasAnyLabel = (m) => _labelSlugs(m).length > 0;
+
 const _csvSupports = (csv, requested) => {
   if (!requested) return true;
   if (!csv) return true;
@@ -73,7 +87,7 @@ const _rankSort = (eligible, req) => {
   const wantRes = req.resolution || null;
   const rankOf = (m) => {
     const labelRank = wantLabel
-      ? (Array.isArray(m.labels) && m.labels.includes(wantLabel) ? 0 : 1)
+      ? (_modelHasLabel(m, wantLabel) ? 0 : 1)
       : 0;
     // Soft preferences: a model that advertises the requested
     // aspect/resolution is preferred over one that doesn't, but both
@@ -124,26 +138,20 @@ const _imageCard = (m) => ({
   // model was rejected because it carries a label the request didn't ask
   // for — otherwise the diagnostic looks like "but this model matches!"
   // while the picker silently drops it for the labels filter.
-  labels: Array.isArray(m.labels) ? m.labels : [],
+  labels: _labelSlugs(m),
   operations: Array.isArray(m.operations) ? m.operations : [],
 });
 
 /**
- * A model accepts reference images only when its OpenAPI schema declares
- * an input-image field — recorded as `refField` during the Fal sync
- * (`image_urls` / `reference_images` / `image_url` / `image`). If
- * `refField` is absent, the model is text-to-image only and any
- * `image_urls[]` we ship would be silently dropped by Fal (the exact
- * failure mode that sent edit requests to fal-ai/nano-banana-2 instead
- * of fal-ai/nano-banana-2/edit and produced hallucinated outputs).
+ * A model accepts reference images when `canEdit` is true and the request
+ * fits under `maxRefImages`. Per-slug adapters live in the backend
+ * (`backend/src/modules/gateway/adapters/image/`) — only models with an
+ * adapter that maps refs are marked editable.
  *
- * `maxRefImages` is a secondary guard when the schema declares an upper
- * bound: `> 0` means "cap at N", while `=== 0` means "no cap advertised"
- * (unlimited) and `null` means "not probed yet". Only `> 0 && refsCount
- * > N` rejects.
+ * `maxRefImages > 0` caps at N; `=== 0` means unlimited.
  */
 const _acceptsRefs = (m, refsCount) => {
-  if (!m.refField) return false;
+  if (!m.canEdit) return false;
   if (typeof m.maxRefImages === 'number' && m.maxRefImages > 0 && refsCount > m.maxRefImages) return false;
   return true;
 };
@@ -210,7 +218,29 @@ export function pickImageModel(models, req = {}) {
     : null;
 
   const wantLabel = req.label || null;
-  const modelHasLabels = (m) => Array.isArray(m.labels) && m.labels.length > 0;
+  const modelHasLabels = _modelHasAnyLabel;
+
+  // Koi-owned purpose buckets (see model_prices.categories). When a row
+  // carries them, this is the SOLE membership signal we trust — vendor
+  // tags are advisory and routinely mis-classify models. Rows with an
+  // empty categories[] keep the legacy operation/specialist path so the
+  // catalog can be backfilled gradually.
+  const modelCategories = (m) => Array.isArray(m.categories) ? m.categories : [];
+  const isCategorised = (m) => modelCategories(m).length > 0;
+  const inCategory = (m, cat) => modelCategories(m).includes(cat);
+  // When the agent attaches reference images but doesn't set an explicit
+  // operation, treat the request as an edit. Otherwise the bucket defaults
+  // to `image_generation` and every categorised edit model (e.g.
+  // nano-banana-2/edit) gets filtered out, leaving the agent staring at
+  // `no_model_matches` even though refs + the requested aspect/resolution
+  // are well-supported by an edit model.
+  const wantedImageBucket = (
+    wantsOperation === 'bg-remove' ? 'background_removal' :
+    wantsOperation === 'upscale' ? 'image_upscaling' :
+    (wantsOperation === 'edit' || wantsOperation === 'inpaint' || wantsOperation === 'outpaint') ? 'image_editing' :
+    refsCount > 0 ? 'image_editing' :
+    'image_generation'
+  );
 
   // Philosophy: the router is an AUTOMATIC PICKER. The agent supplies the
   // parameters it cares about (aspectRatio, resolution, refsCount, …) and
@@ -247,11 +277,22 @@ export function pickImageModel(models, req = {}) {
     if (m.pricePerUnit == null) return false;
 
     if (useLabel && wantLabel) {
-      if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
+      if (!_modelHasLabel(m, wantLabel)) return false;
     } else {
       // Fallback path OR no label requested: pin to non-labelled models so
       // unrelated specialised variants (lipsync, etc.) never leak in.
       if (modelHasLabels(m)) return false;
+    }
+
+    // Curated category gate — authoritative for any row that has been
+    // tagged in the backoffice. Categorised rows skip the legacy
+    // operation/specialist gates below (the category already encodes
+    // purpose); request-shape checks (maxImages, refs) still apply.
+    if (isCategorised(m)) {
+      if (!inCategory(m, wantedImageBucket)) return false;
+      if (m.maxImages != null && n > m.maxImages) return false;
+      if (refsCount > 0 && !_acceptsRefs(m, refsCount)) return false;
+      return true;
     }
 
     if (wantsOperation) {
@@ -349,7 +390,7 @@ const _videoCard = (m) => ({
   resolutions: m.resolutions || '',
   aspectRatios: m.aspectRatios || '',
   durations: m.durations || '',
-  labels: Array.isArray(m.labels) ? m.labels : [],
+  labels: _labelSlugs(m),
   pricePerUnit: m.pricePerUnit ?? null,
 });
 
@@ -405,7 +446,7 @@ function _diagnoseVideo(models, req) {
   }
   if (req.label) {
     out[`label=${req.label}`] = models
-      .filter((m) => Array.isArray(m.labels) && m.labels.includes(req.label))
+      .filter((m) => _modelHasLabel(m, req.label))
       .map(_videoCard);
   }
   return out;
@@ -435,7 +476,7 @@ export function pickVideoModel(models, req = {}) {
         textToVideo: !!m.textToVideo,
         imageToVideo: !!m.imageToVideo,
         videoToVideo: !!m.videoToVideo,
-        labels: m.labels,
+        labels: _labelSlugs(m),
         pricePerUnit: m.pricePerUnit,
       }));
       console.error('[media-router] pickVideoModel candidates', JSON.stringify({ req, models: dump }, null, 2));
@@ -456,7 +497,7 @@ export function pickVideoModel(models, req = {}) {
   const wantsVideoToVideo = videoRefsCount > 0;
   const wantsMultishot = shotCount > 1;
   const wantLabel = req.label || null;
-  const modelHasLabels = (m) => Array.isArray(m.labels) && m.labels.length > 0;
+  const modelHasLabels = _modelHasAnyLabel;
 
   // Philosophy (same as pickImageModel): the router is an AUTOMATIC PICKER.
   // Hard filters only reject models that categorically CAN'T do the task:
@@ -483,35 +524,70 @@ export function pickVideoModel(models, req = {}) {
   // `label: "sketch-guided"` for a v2v request fails with
   // no_model_matches even though a generic v2v model would do the job.
   // `kind: 'avatar'` switches the picker into a separate filter mode:
-  // the model row must advertise the `avatar` operation tag (or a
-  // dedicated `m.avatar` flag, mirrored on the upscale gating). When
-  // it's set, the t2v / i2v / v2v / multishot gates DON'T apply —
-  // avatar models specifically take an image + audio and produce a
-  // talking video, which doesn't fit the textToVideo/imageToVideo
-  // taxonomy cleanly.
+  // the model row must carry the `video_avatar` category (or, on
+  // older catalog rows, the legacy `avatar` operation tag / dedicated
+  // `m.avatar` flag). When it's set, the t2v / i2v / v2v / multishot
+  // gates DON'T apply — avatar models specifically take an image +
+  // audio and produce a talking video, which doesn't fit the
+  // textToVideo/imageToVideo taxonomy cleanly.
   const wantsAvatar = req.kind === 'avatar';
+
+  // Koi-owned purpose buckets (see model_prices.categories). When a
+  // model row carries them, this is the SOLE membership signal we
+  // trust — vendor capability flags like imageToVideo are advisory
+  // and frequently mis-tagged (avatar models routinely advertise
+  // imageToVideo despite requiring audio_url). Rows with an empty
+  // categories[] keep the legacy capability-flag path so the catalog
+  // can be backfilled gradually.
+  const modelCategories = (m) => Array.isArray(m.categories) ? m.categories : [];
+  const isCategorised = (m) => modelCategories(m).length > 0;
+  const inCategory = (m, cat) => modelCategories(m).includes(cat);
+  const wantedBucket = wantsAvatar
+    ? 'video_avatar'
+    : wantsVideoToVideo
+      ? 'video_editing'
+      : 'video_generation';
 
   const _filterVideo = (useLabel) => models.filter((m) => {
     if (m.pricePerUnit == null) return false;
 
     if (useLabel && wantLabel) {
-      if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) return false;
+      if (!_modelHasLabel(m, wantLabel)) return false;
     } else {
       // Fallback path OR no label requested: pin to non-labelled models so
       // unrelated specialised variants (lipsync, etc.) never leak in.
       if (modelHasLabels(m)) return false;
     }
 
-    if (wantsAvatar) {
-      const hasOp = Array.isArray(m.operations) && m.operations.includes('avatar');
-      // Slug-pattern fallback: many catalogs ship Kling / Hedra / Sieve
-      // avatar models tagged only as `image-to-video` because the
-      // backend's auto-tagger doesn't know "avatar" yet. The slug itself
-      // is unambiguous when it includes "ai-avatar" or ends in "/avatar"
-      // — admit those without requiring a manual op-tag in the catalog.
+    // Curated category gate. If the model declares any category, it
+    // must declare the one we're asking for — otherwise it's silently
+    // wrong-shop (e.g. an avatar model getting picked for a generic
+    // animate-this-photo request because it advertises imageToVideo).
+    if (isCategorised(m)) {
+      if (!inCategory(m, wantedBucket)) return false;
+    } else if (!wantsAvatar) {
+      // Uncategorised row + non-avatar request: the categories rollout
+      // is gradual, so we still need to keep these models eligible.
+      // BUT we must not let avatar-shaped slugs (ai-avatar, …/avatar)
+      // sneak through as generic image-to-video, which is the exact
+      // mis-tagging that motivated the categories field in the first
+      // place. Slug-pattern check below mirrors the avatar-include
+      // logic used in the wantsAvatar branch.
       const slugLooksLikeAvatar = typeof m.slug === 'string'
         && /(?:^|[\/\-_])ai[-_]?avatar(?:$|[\/\-_])|(?:^|\/)avatar(?:$|\/)/i.test(m.slug);
-      if (!m.avatar && !hasOp && !slugLooksLikeAvatar) return false;
+      if (slugLooksLikeAvatar) return false;
+    }
+
+    if (wantsAvatar) {
+      // Categorised avatar model already passed the gate above. For
+      // uncategorised rows fall back to the legacy signals: explicit
+      // op tag, dedicated flag, or unambiguous slug pattern.
+      if (!isCategorised(m)) {
+        const hasOp = Array.isArray(m.operations) && m.operations.includes('avatar');
+        const slugLooksLikeAvatar = typeof m.slug === 'string'
+          && /(?:^|[\/\-_])ai[-_]?avatar(?:$|[\/\-_])|(?:^|\/)avatar(?:$|\/)/i.test(m.slug);
+        if (!m.avatar && !hasOp && !slugLooksLikeAvatar) return false;
+      }
       // Avatar models bypass the regular video-mode gates — return early.
       return true;
     }
@@ -565,11 +641,11 @@ export function pickVideoModel(models, req = {}) {
       const reasons = [];
       if (m.pricePerUnit == null) reasons.push('pricePerUnit=null');
       if (wantLabel) {
-        if (!modelHasLabels(m) || !m.labels.includes(wantLabel)) {
+        if (!_modelHasLabel(m, wantLabel)) {
           reasons.push(`label!=${wantLabel}`);
         }
       } else if (modelHasLabels(m)) {
-        reasons.push(`has labels=[${m.labels.join(',')}] but request has none`);
+        reasons.push(`has labels=[${_labelSlugs(m).join(',')}] but request has none`);
       }
       const videoCap = m.textToVideo || m.imageToVideo || m.videoToVideo;
       if (!videoCap) reasons.push('no video capability');
@@ -582,7 +658,7 @@ export function pickVideoModel(models, req = {}) {
         const cap = typeof m.maxShots === 'number' ? m.maxShots : 1;
         if (cap < shotCount) reasons.push(`maxShots=${cap}<${shotCount}`);
       }
-      return { slug: m.slug, videoToVideo: !!m.videoToVideo, textToVideo: !!m.textToVideo, imageToVideo: !!m.imageToVideo, labels: m.labels, reasons };
+      return { slug: m.slug, videoToVideo: !!m.videoToVideo, textToVideo: !!m.textToVideo, imageToVideo: !!m.imageToVideo, labels: _labelSlugs(m), reasons };
     });
     throw new MediaModelRoutingError(
       'No active video model matches the requested capabilities',
@@ -612,8 +688,33 @@ export function pickAudioModel(models, req = {}) {
   }
 
   const kind = req.kind || 'tts';
+
+  // Koi-owned purpose buckets (see model_prices.categories) — same
+  // contract as pickImageModel / pickVideoModel: when a row declares
+  // categories, that's the authoritative signal; uncategorised rows
+  // fall back to the legacy boolean flags during the gradual backfill.
+  const modelCategories = (m) => Array.isArray(m.categories) ? m.categories : [];
+  const isCategorised = (m) => modelCategories(m).length > 0;
+  const wantedBucket = (
+    kind === 'tts'         ? 'tts' :
+    kind === 'transcribe'  ? 'audio_transcription' :
+    kind === 'voice-clone' ? 'voice_clone' :
+    kind === 'music'       ? 'music' :
+    kind === 'sfx'         ? 'sfx' :
+    null
+  );
+
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
+
+    // Curated category gate — short-circuits the legacy boolean checks
+    // for any row that's been tagged in the backoffice. Categorised
+    // rows must declare the bucket; uncategorised rows fall through
+    // to the legacy flag/operation checks below.
+    if (isCategorised(m)) {
+      if (wantedBucket) return modelCategories(m).includes(wantedBucket);
+    }
+
     if (kind === 'tts'        && !m.tts) return false;
     if (kind === 'transcribe' && !m.transcribe) return false;
     if (kind === 'music'      && !m.music) return false;

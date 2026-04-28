@@ -16,7 +16,7 @@ export default {
   type: 'trim_clip',
   intent: 'trim_clip',
   description:
-    'Trim a clip in a timeline. Identify with match: { track, startMs } | { track, index } | { linkId }. ' +
+    'Trim a clip in a timeline. Identify it by its stable clipId. ' +
     'Change shape — either { edge: -1|1, deltaMs } for an NLE-style edge drag, or { sourceInMs?, durationMs? } to set absolute values. ' +
     'Linked peers trim together. Returns: { success, timeline }.',
   thinkingHint: 'Trimming clip',
@@ -26,18 +26,18 @@ export default {
     type: 'object',
     properties: {
       id: { type: 'string', description: 'Timeline id' },
-      match: { type: 'object', description: 'Clip locator (see description)' },
+      clipId: { type: 'string', description: 'Stable clip id (e.g. "clip-a3f9c2")' },
       change: {
         type: 'object',
         description: '{ edge: -1|1, deltaMs } OR { sourceInMs?, durationMs? }',
       },
     },
-    required: ['id', 'match', 'change'],
+    required: ['id', 'clipId', 'change'],
   },
 
   async execute(params) {
     try {
-      const tl = trimClip(params.id, params.match, params.change);
+      const tl = trimClip(params.id, params.clipId, params.change);
       return { success: true, timeline: tl };
     } catch (e) {
       return { success: false, error: e.message };

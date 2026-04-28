@@ -641,6 +641,14 @@ const generateImageAction = {
   }
 };
 
+import asyncCapable from '../_async-capable.js';
+import { formatModelCatalog } from './_format-model-catalog.js';
+
+// Wrap FIRST so the catalog refresh below mutates the registered object —
+// asyncCapable spreads a fresh schema/description, so any in-place edit
+// to the source `generateImageAction` would land on a copy nobody reads.
+const wrappedAction = asyncCapable(generateImageAction);
+
 // Fire-and-forget: build the tool schema dynamically from the backend's
 // /gateway/models/image.json. The rule: the agent must only ever see values
 // the backend can actually serve. If the backend advertises no aspect ratios
@@ -648,13 +656,14 @@ const generateImageAction = {
 // reference images. The static schema above is the fallback for API-keys
 // mode (no backend reach).
 //
-// The fetchMediaCapabilities('image') helper in providers/gateway.js returns
-// the pre-computed union of all capabilities. We replace each schema property
-// in-place with an enum/limit pulled from that union.
-fetchMediaCapabilities('image').then((caps) => {
+// The promise is exposed as `_descriptionReady` so consumers (notably
+// `get_tool_info`) can await the rewrite before reading the description.
+// Without it, the first agent that asks for full docs early in the
+// session sees the static fallback (no enums, no model list).
+wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) => {
   if (!caps) return; // backend unreachable → keep static defaults
 
-  const props = generateImageAction.schema.properties;
+  const props = wrappedAction.schema.properties;
 
   // Sync the schema props with the catalog (used for JSON-schema validation
   // and by any tool-introspection consumer).
@@ -711,12 +720,21 @@ fetchMediaCapabilities('image').then((caps) => {
     fields.push(`optional "referenceImages" — array of attachment IDs (e.g. "att-1") or absolute file paths.${maxRef} Annotation attachments are auto-excluded.`);
   }
   if (caps.labels?.length) {
-    const list = caps.labels.map((l) => `"${l}"`).join(', ');
-    fields.push(`optional "label" — ranking preference, one of: ${list}. Soft hint only, never filters.`);
+    // Slug list for the enum; descriptions come via labelDetails so the
+    // agent can tell when each label is meant to apply (e.g. face-consistency
+    // is *only* relevant when a ref image contains people you want preserved
+    // exactly — not a generic "quality" knob).
+    const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
+    const lines = caps.labels.map((slug) => {
+      const d = details.find((x) => x && x.slug === slug);
+      const desc = d && d.description ? ` — ${d.description}` : '';
+      return `    • "${slug}"${desc}`;
+    }).join('\n');
+    fields.push(`optional "label" — ranking preference. Soft hint only, never filters. Pick the slug whose description matches the task; omit when no specialisation is needed:\n${lines}`);
   }
   fields.push('optional "saveTo" — absolute directory path where the tool will save the generated image(s). The real path is returned in images[].savedTo — use THAT in any downstream step, never fabricate paths.');
 
-  const header = 'Generate an image from a text prompt. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). The router auto-picks one model from the active catalog based on your params — see the per-model breakdown at the end of this description for what each option supports. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const refNote = refsEnabled
     ? `
 
@@ -757,8 +775,10 @@ Typical one-ref openers for simpler cases:
     : '';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
   const returns = '\nReturns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }';
+  const asyncSuffix = ' This tool is async-capable: pass wait=false to kick it off as a background job (returns { jobId }) instead of blocking.';
+  const catalog = formatModelCatalog(caps.models);
 
-  generateImageAction.description = header + fieldsBlock + returns + refNote;
+  wrappedAction.description = header + fieldsBlock + returns + refNote + catalog + asyncSuffix;
 }).catch(() => {});
 
-export default generateImageAction;
+export default wrappedAction;

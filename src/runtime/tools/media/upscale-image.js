@@ -23,6 +23,7 @@ import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+import asyncCapable from '../_async-capable.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -32,7 +33,7 @@ const IMAGE_EXT_TO_MIME = {
   '.gif': 'image/gif',
 };
 
-export default {
+const upscaleImageAction = {
   type: 'upscale_image',
   intent: 'upscale_image',
   description: 'Upscale an existing image to a higher resolution. Routes to a Fal model tagged operations.includes("upscale"). In: "image" (path or attachment id, required), optional "upscaleFactor" (1–4, default 2), optional "prompt" (guides generative upscalers like Topaz Redefine / Clarity), optional "creativity" (0–1, normalized across providers), optional "faceEnhancement" (bool), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory path). Pass model-specific knobs (e.g. Topaz model variant) via "extra: {}". Returns: { success, provider, model, images: [{ savedTo }] }.',
@@ -289,3 +290,5 @@ export default {
     };
   },
 };
+
+export default asyncCapable(upscaleImageAction);

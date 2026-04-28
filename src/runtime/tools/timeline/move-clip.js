@@ -1,8 +1,9 @@
 /**
  * Move an existing clip on the timeline.
  *
- * Identify the clip with `match` ({track, startMs} or {track, index}
- * or {linkId}), and supply a new `target` ({startMs?, track?}).
+ * Identify the clip with its stable `clipId` (returned from
+ * add_clip_to_timeline or read from get_timeline). Supply a new
+ * `target` ({ startMs?, track? }).
  *
  * Linked V/A peers shift by the same delta in time, but only the
  * targeted clip changes track (matches DaVinci's default behaviour).
@@ -14,9 +15,9 @@ export default {
   type: 'move_clip',
   intent: 'move_clip',
   description:
-    'Move a clip in the timeline. Identify it via match: { track, startMs } | { track, index } | { linkId }. ' +
+    'Move a clip in the timeline. Identify it by its stable clipId. ' +
     'Target: { startMs?, track? } — startMs is the new timeline position; track must be the same V/A type. ' +
-    'Linked peers (same linkId) shift by the same time delta. Returns: { success, timeline }.',
+    'Linked peers shift by the same time delta. Returns: { success, timeline }.',
   thinkingHint: 'Moving clip',
   permission: 'write',
 
@@ -24,21 +25,18 @@ export default {
     type: 'object',
     properties: {
       id: { type: 'string', description: 'Timeline id' },
-      match: {
-        type: 'object',
-        description: 'Clip locator: { track, startMs } or { track, index } (0-based within that track) or { linkId }',
-      },
+      clipId: { type: 'string', description: 'Stable clip id (e.g. "clip-a3f9c2")' },
       target: {
         type: 'object',
         description: 'New position/track: { startMs?, track? }',
       },
     },
-    required: ['id', 'match', 'target'],
+    required: ['id', 'clipId', 'target'],
   },
 
   async execute(params) {
     try {
-      const tl = moveClip(params.id, params.match, params.target);
+      const tl = moveClip(params.id, params.clipId, params.target);
       return { success: true, timeline: tl };
     } catch (e) {
       return { success: false, error: e.message };

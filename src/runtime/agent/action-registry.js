@@ -344,12 +344,24 @@ class ActionRegistry {
    * even as the agent asks for more tool details mid-conversation.
    */
   generateExpandedToolsBlock(agent) {
-    if (!(agent?._expandedTools instanceof Set) || agent._expandedTools.size === 0) {
-      return '';
+    const map = agent?._expandedTools;
+    if (!(map instanceof Map) || map.size === 0) return '';
+    // Each entry's `expansionIter` is the iteration at which the doc
+    // FIRST landed in the user-prompt history (set in get-tool-info).
+    // We only promote it to the dynamic block AFTER that — otherwise the
+    // very same iteration would carry the doc twice (once as the fresh
+    // tool-result entry, once as a dynamic-block entry). Once
+    // currentIter > expansionIter, the historical entry is rewritten to
+    // a placeholder by ContextMemory.toMessages and the doc lives here.
+    const currentIter = agent?._activeSession?.iteration ?? 0;
+    const visible = new Set();
+    for (const [tool, expansionIter] of map) {
+      if (currentIter > expansionIter) visible.add(tool);
     }
+    if (visible.size === 0) return '';
     const actions = this._filterActions(agent);
     const expandedList = actions.filter(
-      (a) => agent._expandedTools.has(a.intent || a.type),
+      (a) => visible.has(a.intent || a.type),
     );
     if (expandedList.length === 0) return '';
     let doc = '\n## Tool schemas you recently requested\n\n';
