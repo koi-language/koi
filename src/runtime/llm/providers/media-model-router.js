@@ -85,6 +85,14 @@ const _rankSort = (eligible, req) => {
   const wantLabel = req.label || null;
   const wantAspect = req.aspectRatio || null;
   const wantRes = req.resolution || null;
+  // Default behaviour: prefer quality (more expensive wins ties) —
+  // treats price as a proxy for capability tier, accurate across the
+  // image / video / audio catalogs where the premium models also sit
+  // at the top of the price ladder. Callers wanting cheapest-first
+  // (budget mode) pass `preferQuality: false` explicitly. The other
+  // rank dimensions (label, aspect, resolution, isFallback) keep the
+  // same direction either way — only the price tiebreaker flips.
+  const preferQuality = req.preferQuality !== false;
   const rankOf = (m) => {
     const labelRank = wantLabel
       ? (_modelHasLabel(m, wantLabel) ? 0 : 1)
@@ -102,7 +110,11 @@ const _rankSort = (eligible, req) => {
       ? (_csvSupports(m.resolutions, wantRes) ? 0 : 1)
       : 0;
     const fallbackRank = m.isFallback ? 0 : 1;
-    const priceRank = m.pricePerUnit ?? Number.POSITIVE_INFINITY;
+    // Cheaper wins by default (POSITIVE_INFINITY when missing pushes
+    // unpriced rows last). With preferQuality, negate the price so the
+    // most expensive wins instead — same comparator, opposite sign.
+    const rawPrice = m.pricePerUnit ?? Number.POSITIVE_INFINITY;
+    const priceRank = preferQuality ? -rawPrice : rawPrice;
     return [labelRank, aspectRank, resRank, fallbackRank, priceRank];
   };
   eligible.sort((a, b) => {
@@ -464,10 +476,48 @@ function _diagnoseVideo(models, req) {
  * @param {number}  [req.videoRefsCount=0]     video references (video-to-video)
  * @param {number}  [req.shotCount=1]          explicit shots[].length (>1 needs multishot)
  * @param {string}  [req.label]
+ * @param {string[]} [req.excludeModels]       slugs to skip (failed previously)
+ * @param {string[]} [req.includeModels]       slugs the caller wants to restrict
+ *                                              the picker to (whitelist). Empty
+ *                                              array = no restriction.
+ * @param {boolean} [req.preferQuality]        prefer pricier model on tiebreak
  */
 export function pickVideoModel(models, req = {}) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new MediaModelRoutingError('No active video models available', { requirements: req });
+  }
+  // Whitelist first: when the caller pinned a set of slugs, every other
+  // model in the catalog drops out before the rest of the pipeline sees
+  // them. This keeps the "no_model_matches" diagnostic and debug logs
+  // honest — they reflect ONLY what the user wanted to consider, not the
+  // full catalog. Empty array is treated as "no restriction".
+  const _included = Array.isArray(req.includeModels) && req.includeModels.length > 0
+    ? new Set(req.includeModels)
+    : null;
+  if (_included) {
+    models = models.filter((m) => _included.has(m.slug));
+    if (models.length === 0) {
+      throw new MediaModelRoutingError(
+        `None of the includeModels=[${[..._included].join(', ')}] are present in the active video catalog`,
+        { requirements: req, included: [..._included] },
+      );
+    }
+  }
+  // Drop slugs the caller explicitly excluded — used by retry flows
+  // where a previous slug returned a provider rejection (likeness
+  // filter, content policy, etc.) and the agent wants the next best
+  // candidate from the same category. Applied AFTER the include filter
+  // so a user can shrink an explicit whitelist by retrying with a
+  // failed slug on the exclude list.
+  const _excluded = Array.isArray(req.excludeModels) ? new Set(req.excludeModels) : null;
+  if (_excluded && _excluded.size > 0) {
+    models = models.filter((m) => !_excluded.has(m.slug));
+    if (models.length === 0) {
+      throw new MediaModelRoutingError(
+        `All active video models were explicitly excluded (excludeModels=[${[..._excluded].join(', ')}])`,
+        { requirements: req, excluded: [..._excluded] },
+      );
+    }
   }
   if (process.env.KOI_DEBUG_MEDIA_ROUTER) {
     try {

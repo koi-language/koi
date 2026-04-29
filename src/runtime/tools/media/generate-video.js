@@ -229,7 +229,8 @@ const generateVideoAction = {
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'List of model slugs to exclude from the auto-picker. Use after a provider rejection — read the failed response\'s `model` field and put that slug here on retry. The router will skip those slugs and pick the next best candidate from the same category. Example: ["bytedance/seedance-2.0/image-to-video"].' },
-      preferQuality:   { type: 'boolean', description: 'When true, the auto-picker prefers MORE EXPENSIVE models (treating price as a quality proxy) instead of the default cheapest-first tiebreaker. Use when the user explicitly asks for higher quality / better results. Default false.' },
+      includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches. Example: ["fal-ai/veo3.1/first-last-frame-to-video"].' },
+      preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
     },
     required: ['prompt']
   },
@@ -419,7 +420,10 @@ const generateVideoAction = {
       // (see GatewayVideoGen.generate → pickVideoModel) — they never leave
       // the device; the chosen slug is what travels to the backend.
       excludeModels: Array.isArray(action.excludeModels) ? action.excludeModels : undefined,
-      preferQuality: action.preferQuality === true,
+      includeModels: Array.isArray(action.includeModels) ? action.includeModels : undefined,
+      // Default true — quality wins ties unless the agent / user
+      // explicitly opts out for budget runs.
+      preferQuality: action.preferQuality !== false,
     });
 
     // Build the generation-params record once — used both for the

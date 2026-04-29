@@ -1088,6 +1088,17 @@ export class GatewayVideoGen extends BaseVideoGen {
         videoRefsCount: Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0,
         shotCount,
         label: opts.label,
+        // Auto-picker hints from the agent. excludeModels comes from the
+        // failed-response slug (the agent retries with the offender on
+        // the list); includeModels narrows the pool to a user-selected
+        // whitelist; preferQuality flips the price tiebreaker so a more
+        // expensive model wins ties when the user explicitly asked for
+        // better quality.
+        excludeModels: Array.isArray(opts.excludeModels) ? opts.excludeModels : undefined,
+        includeModels: Array.isArray(opts.includeModels) ? opts.includeModels : undefined,
+        // Default true — quality wins ties unless the caller passed an
+        // explicit `false` to opt into budget mode.
+        preferQuality: opts.preferQuality !== false,
       },
     );
 
