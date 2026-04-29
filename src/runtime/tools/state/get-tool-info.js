@@ -74,11 +74,11 @@ export default {
     //     only lives in one place — the dynamic block.
     // Scoped to one agent instance, so delegates don't inherit siblings'
     // expansions.
+    const expansionIter = (agent?._activeSession?.iteration ?? -1) + 1;
     if (agent) {
       if (!(agent._expandedTools instanceof Map)) agent._expandedTools = new Map();
-      const expansionIter = (agent._activeSession?.iteration ?? -1) + 1;
       agent._expandedTools.set(tool, expansionIter);
     }
-    return { success: true, tool, documentation: doc };
+    return { success: true, tool, documentation: doc, expansionIter };
   },
 };

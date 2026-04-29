@@ -8,22 +8,26 @@
  *
  * How it works:
  *   1. Resolves the source image (path or att-N), reads its dimensions.
- *   2. Derives the TARGET aspect ratio from (origDims + pads).
- *   3. Composes an outpainting prompt that pins the original content's
- *      position in the new canvas and names the direction(s) to extend.
- *   4. Delegates to generate_image with the ORIGINAL image as a reference
- *      and the derived aspect ratio. Same label-free models as
- *      generate_image — no `operation: 'outpaint'` tag.
- *
- * Why the original image (not a transparent-padded canvas): general-purpose
- * edit models (gpt-image-1, Gemini 2.5 Flash Image, …) handle alpha
- * inconsistently and frequently return zero images when a large fraction of
- * the input is transparent. Passing the original image + target aspect
- * ratio + spatial prompt is what produces reliable extensions in practice.
+ *   2. Builds a TRANSPARENT-padded canvas at the target size with the
+ *      original image composited at (padLeft, padTop). The model sees
+ *      exactly where the existing scene sits and what regions need
+ *      filling — no ambiguity about composition.
+ *   3. Composes a prompt that asks the model to FILL the transparent
+ *      regions, continuing the scene seamlessly across the boundary.
+ *   4. Delegates to generate_image passing the padded canvas as the
+ *      reference (not the original). Modern edit models (gpt-image-1
+ *      v2+, Gemini 3, Flux Fill) handle alpha reliably and produce
+ *      extensions that connect at the boundary instead of regenerating
+ *      the whole scene.
+ *   5. As a final safety net, the ORIGINAL pixels are composited on
+ *      top of the model output at the same offset — guarantees
+ *      pixel-identical preservation of the existing region even when
+ *      the model nudged it.
  *
  * Permission: 'generate_image' (same billing category).
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
 import generateImageAction from './generate-image.js';
@@ -58,6 +62,67 @@ function _closestAspectRatio(width, height) {
     if (d < bestDiff) { best = c; bestDiff = d; }
   }
   return best[0];
+}
+
+/// Pick a feather width (in pixels) for the alpha gradient at the
+/// boundary between original and outpainted regions. Scales with image
+/// size so small thumbnails get a thin ring and large prints get a
+/// wider one, but never wider than half the smallest non-zero pad
+/// (otherwise the feather would extend past where the model painted).
+function _computeFeather(origW, origH, pads) {
+  const minPad = Math.min(
+    pads.top    > 0 ? pads.top    : Infinity,
+    pads.bottom > 0 ? pads.bottom : Infinity,
+    pads.left   > 0 ? pads.left   : Infinity,
+    pads.right  > 0 ? pads.right  : Infinity,
+  );
+  if (!Number.isFinite(minPad) || minPad <= 0) return 0;
+  const sizeBased = Math.floor(Math.min(origW, origH) * 0.015); // ~1.5% of smaller side
+  const padCap = Math.floor(minPad / 2);
+  return Math.max(8, Math.min(32, sizeBased, padCap));
+}
+
+/// Build an RGBA buffer of the original image whose alpha channel is a
+/// soft mask: 255 in the bulk, fading to 0 over `feather` pixels at the
+/// sides that have padding. Sides without padding stay 255 (sharp). Used
+/// at composite time so the original blends gradient-smooth into the
+/// model's painted margins instead of being hard-stamped on top.
+async function _buildFeatheredOriginal(sharp, srcPath, origW, origH, pads, feather) {
+  const fT = pads.top    > 0 ? feather : 0;
+  const fB = pads.bottom > 0 ? feather : 0;
+  const fL = pads.left   > 0 ? feather : 0;
+  const fR = pads.right  > 0 ? feather : 0;
+
+  // Inset white rectangle representing the fully-opaque core. After
+  // gaussian blur with sigma = feather/2, the step at each padded side
+  // becomes a smooth ramp ~feather pixels wide, centred on the inset
+  // edge. Result: alpha ≈ 0 at the padded boundary, ≈ 255 a couple of
+  // feather widths inside the original.
+  const innerW = origW - fL - fR;
+  const innerH = origH - fT - fB;
+  if (innerW <= 0 || innerH <= 0) {
+    // Pathological case: feather wider than the image. Fall back to no feather.
+    return null;
+  }
+
+  const innerWhite = await sharp({
+    create: { width: innerW, height: innerH, channels: 1, background: { r: 255 } },
+  }).png().toBuffer();
+
+  const blurredMask = await sharp({
+    create: { width: origW, height: origH, channels: 1, background: { r: 0 } },
+  })
+    .composite([{ input: innerWhite, left: fL, top: fT }])
+    .blur(Math.max(1, feather / 2))
+    .raw()
+    .toBuffer();
+
+  // Combine RGB from the original with the soft alpha mask.
+  const rgb = await sharp(srcPath).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  return await sharp(rgb.data, { raw: rgb.info })
+    .joinChannel(blurredMask, { raw: { width: origW, height: origH, channels: 1 } })
+    .png()
+    .toBuffer();
 }
 
 function _directionPhrase(pads) {
@@ -177,10 +242,33 @@ const outpaintImageAction = {
     const newHeight = origHeight + pads.top + pads.bottom;
     const newAspect = _closestAspectRatio(newWidth, newHeight);
 
-    // Describe where the original content sits IN THE NEW CANVAS so the
-    // edit model places it correctly. Using percentages because general
-    // edit models reason about composition in relative terms, not pixels.
-    const placement = _placementDescription(pads, newWidth, newHeight);
+    // Build the transparent-padded canvas: a `newWidth × newHeight`
+    // PNG with full alpha=0, with the original image composited at
+    // (padLeft, padTop). The model sees the exact spatial layout —
+    // there is no ambiguity about where the existing pixels live and
+    // which regions need filling. This is the key win over the old
+    // "pass original + describe layout in prompt" approach: that one
+    // gave the model freedom to RECOMPOSE the whole scene, which is
+    // what produced the "picture-in-picture" seam we kept hitting.
+    const paddedCanvasPath = path.join(os.tmpdir(), `outpaint-canvas-${Date.now()}.png`);
+    try {
+      const sharp = (await import('sharp')).default;
+      const canvasBuffer = await sharp({
+        create: {
+          width: newWidth,
+          height: newHeight,
+          channels: 4,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      })
+        .composite([{ input: resolvedPath, left: pads.left, top: pads.top }])
+        .png()
+        .toBuffer();
+      fs.writeFileSync(paddedCanvasPath, canvasBuffer);
+    } catch (err) {
+      return { success: false, error: `Failed to build padded canvas: ${err.message}` };
+    }
+
     const directions = _directionPhrase(pads);
     const directionsList = directions.length > 0 ? directions.join(', ') : 'on the added margins';
 
@@ -188,11 +276,14 @@ const outpaintImageAction = {
       ? String(action.prompt).slice(0, 1024).trim()
       : '';
 
+    // The reference is now a canvas where the scene already sits at
+    // the correct position. The model's job is purely to fill the
+    // transparent regions — it must NOT redraw the opaque area.
     const basePrompt =
-      `Outpaint the reference image by producing a WIDER/TALLER version at aspect ratio ${newAspect || `${newWidth}:${newHeight}`}. ` +
-      `Keep the reference image's scene, subjects, composition, style, perspective, lighting, and color palette intact — ${placement}. ` +
-      `Extend the scene naturally by ${directionsList}, inventing plausible new content that matches the reference's texture and atmosphere seamlessly at the edges. ` +
-      `The final image must read as a larger photograph of the SAME moment — not a crop, not a stylised reinterpretation, not a different scene.`;
+      `The reference image is a ${newWidth}×${newHeight} canvas where the existing scene already occupies its correct final position; the surrounding areas are transparent and need to be filled. ` +
+      `Paint ONLY the transparent regions, extending the scene seamlessly ${directionsList}. ` +
+      `The opaque region must stay pixel-identical — same composition, subjects, perspective, lighting, color palette, texture. The boundary between original and new content must be invisible: continue the same surfaces, lines, gradients across the seam. ` +
+      `Output the SAME ${newWidth}×${newHeight} canvas with the transparent areas now filled. Do not crop, do not resize, do not reinterpret the existing scene.`;
 
     const effectivePrompt = userPrompt
       ? `${basePrompt}\n\nAdditional guidance for the extended regions: ${userPrompt}`
@@ -201,15 +292,15 @@ const outpaintImageAction = {
     channel.log(
       'image',
       `outpaint_image: source=${path.basename(resolvedPath)} ${origWidth}×${origHeight} → ${newWidth}×${newHeight} ` +
-      `(T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right}) aspect=${newAspect || '-'}`,
+      `(T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right}) aspect=${newAspect || '-'} canvas=${path.basename(paddedCanvasPath)}`,
     );
 
-    // Delegate to generate_image. Pass the ORIGINAL image as the reference
-    // and let the aspect ratio + prompt drive the extension. Same label-
-    // free models as generate_image — no operation tag.
+    // Delegate to generate_image. Pass the PADDED CANVAS (with original
+    // at offset, transparent margins) as the reference. The aspect
+    // ratio still travels for models that key off it.
     const genAction = {
       prompt: effectivePrompt,
-      referenceImages: [{ alias: 'source', path: resolvedPath }],
+      referenceImages: [{ alias: 'source', path: paddedCanvasPath }],
       aspectRatio: newAspect || undefined,
       outputFormat: action.outputFormat || 'png',
       saveTo: action.saveTo,
@@ -217,6 +308,10 @@ const outpaintImageAction = {
     };
 
     const result = await generateImageAction.execute(genAction, agent);
+
+    // Clean up the temp canvas regardless of outcome — keeps /tmp tidy
+    // and avoids leaking PII (the canvas contains the original image).
+    try { fs.unlinkSync(paddedCanvasPath); } catch { /* best-effort */ }
 
     if (!result || result.success === false) {
       return {
@@ -234,17 +329,33 @@ const outpaintImageAction = {
     // surfaces as "the outpaint output looks similar but NOT the same".
     // Here we force the guarantee: resize the generated canvas to the exact
     // target dimensions, then composite the ORIGINAL image on top at the
-    // requested offset. Result: original pixels verbatim; model-invented
-    // content only in the margins.
+    // requested offset.
+    //
+    // Edge feathering: a hard-edge stamp produces a visible seam on every
+    // padded side because the model's output near the boundary, no matter
+    // how well-conditioned, never matches the original byte-for-byte
+    // (lighting, exposure, lines crossing the boundary). We build a
+    // soft-alpha version of the original where the bulk stays fully
+    // opaque (preserved verbatim) but a narrow ring on the padded sides
+    // fades from opaque → transparent. The composite then naturally
+    // BLENDS the original with the model's painted boundary across that
+    // ring, so the transition reads as a smooth gradient instead of a
+    // hard cut. Sides without padding stay sharp (no fade) — those
+    // weren't extended and shouldn't lose any detail to a blend.
     try {
       const sharp = (await import('sharp')).default;
+      const featherPx = _computeFeather(origWidth, origHeight, pads);
+      const softOriginal = featherPx > 0
+        ? await _buildFeatheredOriginal(sharp, resolvedPath, origWidth, origHeight, pads, featherPx)
+        : null;
       for (const img of result.images || []) {
         if (!img.savedTo || !fs.existsSync(img.savedTo)) continue;
         const resized = await sharp(img.savedTo)
           .resize(newWidth, newHeight, { fit: 'fill' })
           .toBuffer();
+        const overlay = softOriginal ?? resolvedPath;
         const stamped = await sharp(resized)
-          .composite([{ input: resolvedPath, left: pads.left, top: pads.top }])
+          .composite([{ input: overlay, left: pads.left, top: pads.top }])
           .toFormat(action.outputFormat || 'png')
           .toBuffer();
         fs.writeFileSync(img.savedTo, stamped);
@@ -288,22 +399,3 @@ const outpaintImageAction = {
 };
 
 export default asyncCapable(outpaintImageAction);
-
-function _placementDescription(pads, newW, newH) {
-  const verticalLabel = _positionLabel(pads.top, pads.bottom, 'top', 'bottom');
-  const horizontalLabel = _positionLabel(pads.left, pads.right, 'left', 'right');
-  const pieces = [];
-  if (verticalLabel) pieces.push(verticalLabel);
-  if (horizontalLabel) pieces.push(horizontalLabel);
-  const where = pieces.length === 0 ? 'centered' : pieces.join(' and ');
-  return `position the reference's existing content ${where} in the new canvas (${newW}×${newH})`;
-}
-
-function _positionLabel(padA, padB, labelA, labelB) {
-  if (padA === 0 && padB === 0) return '';
-  if (padA > 0 && padB === 0) return `anchored to the ${labelB}`;
-  if (padB > 0 && padA === 0) return `anchored to the ${labelA}`;
-  const axis = labelA === 'top' ? 'vertically' : 'horizontally';
-  if (Math.abs(padA - padB) / Math.max(padA, padB) < 0.15) return `${axis} centered`;
-  return padA > padB ? `closer to the ${labelB}` : `closer to the ${labelA}`;
-}

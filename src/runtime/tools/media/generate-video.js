@@ -227,7 +227,9 @@ const generateVideoAction = {
       saveTo:          { type: 'string',  description: 'Directory to save the final video file in. Defaults to ~/.koi/videos/ when omitted.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 600000 = 10 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
-      model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' }
+      model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
+      excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'List of model slugs to exclude from the auto-picker. Use after a provider rejection — read the failed response\'s `model` field and put that slug here on retry. The router will skip those slugs and pick the next best candidate from the same category. Example: ["bytedance/seedance-2.0/image-to-video"].' },
+      preferQuality:   { type: 'boolean', description: 'When true, the auto-picker prefers MORE EXPENSIVE models (treating price as a quality proxy) instead of the default cheapest-first tiebreaker. Use when the user explicitly asks for higher quality / better results. Default false.' },
     },
     required: ['prompt']
   },
@@ -413,6 +415,11 @@ const generateVideoAction = {
       label,
       characterOrientation,
       keepOriginalSound,
+      // Forward auto-picker hints. The router consumes these client-side
+      // (see GatewayVideoGen.generate → pickVideoModel) — they never leave
+      // the device; the chosen slug is what travels to the backend.
+      excludeModels: Array.isArray(action.excludeModels) ? action.excludeModels : undefined,
+      preferQuality: action.preferQuality === true,
     });
 
     // Build the generation-params record once — used both for the

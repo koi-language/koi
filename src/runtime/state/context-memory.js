@@ -605,12 +605,13 @@ export function classifyFeedback(action, result, error) {
       const fullDoc = documentation
         ? `📎${id} get_tool_info(${tool}):\n${documentation}`
         : `📎${id} get_tool_info(${tool}) — no documentation returned`;
-      const placeholder = `📎 get_tool_info(${tool}) — full schema is now pinned in the system prompt under "Tool schemas you recently requested".`;
+      const placeholder = `📎 get_tool_info(${tool}) — schema previously fetched (collapsed to free context).`;
+      const expansionIter = typeof result?.expansionIter === 'number' ? result.expansionIter : null;
       return {
         immediate: fullDoc,
         shortTerm: placeholder,
         permanent: null,
-        _toolInfo: { tool, placeholder },
+        _toolInfo: { tool, placeholder, expansionIter },
         ...getTTL(intent),
       };
     }
@@ -1062,7 +1063,6 @@ export class ContextMemory {
    */
   toMessages(opts = {}) {
     const { agent } = opts;
-    const expandedMap = agent?._expandedTools instanceof Map ? agent._expandedTools : null;
     const currentIter = agent?._activeSession?.iteration ?? 0;
     const messages = [];
 
@@ -1085,14 +1085,15 @@ export class ContextMemory {
           content = entry.immediate;
           break;
       }
-      // get_tool_info dedup: once the dynamic block has taken over
-      // rendering the doc (currentIter > expansionIter), replace this
-      // entry's content with the short placeholder regardless of tier.
-      if (entry._toolInfo && expandedMap) {
-        const expansionIter = expandedMap.get(entry._toolInfo.tool);
-        if (expansionIter != null && currentIter > expansionIter) {
-          content = entry._toolInfo.placeholder;
-        }
+      // get_tool_info dedup: once we're past the iteration where the
+      // LLM first saw the doc, collapse this entry to its placeholder
+      // regardless of tier. Driven by the expansionIter baked into
+      // _toolInfo at insertion time, so it survives clearing of the
+      // agent._expandedTools map (which only governs the dynamic
+      // system-prompt block).
+      if (entry._toolInfo && typeof entry._toolInfo.expansionIter === 'number'
+          && currentIter > entry._toolInfo.expansionIter) {
+        content = entry._toolInfo.placeholder;
       }
       if (content) {
         const msg = { role: entry.role, content };

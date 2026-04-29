@@ -235,8 +235,8 @@ export function pickImageModel(models, req = {}) {
   // `no_model_matches` even though refs + the requested aspect/resolution
   // are well-supported by an edit model.
   const wantedImageBucket = (
-    wantsOperation === 'bg-remove' ? 'background_removal' :
-    wantsOperation === 'upscale' ? 'image_upscaling' :
+    (wantsOperation === 'bg-remove' || wantsOperation === 'background-removal' || wantsOperation === 'rembg') ? 'background_removal' :
+    (wantsOperation === 'upscale' || wantsOperation === 'upscaling') ? 'image_upscaling' :
     (wantsOperation === 'edit' || wantsOperation === 'inpaint' || wantsOperation === 'outpaint') ? 'image_editing' :
     refsCount > 0 ? 'image_editing' :
     'image_generation'

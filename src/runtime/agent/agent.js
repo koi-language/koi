@@ -2634,6 +2634,13 @@ export class Agent {
               this._printTokenSummary(session, contextMemory, { reset: true });
               // Tick memory (age entries)
               await contextMemory.tick();
+              // Task is done — drop pinned tool schemas so the next task
+              // doesn't inherit "Tool schemas you recently requested" for
+              // tools that may not even be relevant anymore. Without this
+              // the dynamic block accumulates across every task in the
+              // same CLI session (the loop never exits between tasks; it
+              // just waits for the next user prompt).
+              this._expandedTools = new Map();
               // Record the return so the LLM knows the task is done,
               // and add feedback telling it to wait for user input
               session.recordAction(action, returnData);
