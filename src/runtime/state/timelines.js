@@ -134,6 +134,39 @@ const TRANSITION_TYPES = new Set([
 // Matches DaVinci Resolve's three placement modes.
 const TRANSITION_ALIGNMENTS = new Set(['center', 'start-on-cut', 'end-on-cut']);
 
+// Title clips have no real file behind them: their `path` is a synthetic
+// `title:<id>` sentinel and the actual text/typography live in a sibling
+// `titleProps` object. The GUI (video_timeline_tab.dart) reads/writes the
+// same JSON, so the validator must round-trip these props verbatim — anything
+// else would silently strip the user's title styling on the next mutation.
+const _TITLE_PATH_RE = /^title:[A-Za-z0-9_-]{1,128}$/;
+function _isTitlePath(p) { return typeof p === 'string' && _TITLE_PATH_RE.test(p); }
+function _newTitlePath() { return `title:${randomBytes(4).toString('hex')}`; }
+
+// Validate / normalise the props sidecar attached to a title clip. We
+// preserve every field the GUI knows (see TitleProps in
+// video_timeline_tab.dart) but only `text` is required; missing fields
+// fall back to the GUI's TitleProps defaults at render time.
+function _validateTitleProps(props) {
+  if (props == null) return null;
+  if (typeof props !== 'object') throw new Error('clip.titleProps must be an object');
+  if (typeof props.text !== 'string') throw new Error('clip.titleProps.text must be a string');
+  const out = { text: props.text };
+  // Pass-through optional typography fields. We only check shape — the GUI
+  // clamps the actual values.
+  if (typeof props.fontFamily === 'string') out.fontFamily = props.fontFamily;
+  if (Number.isFinite(props.fontSize)) out.fontSize = props.fontSize;
+  if (Number.isFinite(props.colorArgb)) out.colorArgb = props.colorArgb | 0;
+  if (Number.isFinite(props.fontWeight)) out.fontWeight = props.fontWeight | 0;
+  if (Number.isFinite(props.align)) out.align = props.align | 0;
+  if (typeof props.italic === 'boolean') out.italic = props.italic;
+  if (Number.isFinite(props.outlineWidth)) out.outlineWidth = props.outlineWidth;
+  if (Number.isFinite(props.outlineColorArgb)) out.outlineColorArgb = props.outlineColorArgb | 0;
+  if (Number.isFinite(props.shadowBlur)) out.shadowBlur = props.shadowBlur;
+  if (Number.isFinite(props.shadowColorArgb)) out.shadowColorArgb = props.shadowColorArgb | 0;
+  return out;
+}
+
 function _validateTransition(t, side, clipDurationMs) {
   if (t === null || t === undefined) return null;
   if (typeof t !== 'object') throw new Error(`clip.${side} must be an object`);
@@ -179,6 +212,12 @@ function _validateClip(c, settings) {
     throw new Error(`clip.track ${track} exceeds available tracks (${cap})`);
   }
   if (typeof p !== 'string' || !p) throw new Error('clip.path must be a non-empty string');
+  // Title clips (path === 'title:<id>') only make sense on video tracks —
+  // they're a visual overlay, not audio. Reject early so the agent gets a
+  // clear error instead of an "invisible" clip on an A track.
+  if (_isTitlePath(p) && !_isVideoTrack(track)) {
+    throw new Error(`Title clip ${p} must live on a video track, not ${track}`);
+  }
   if (!Number.isFinite(startMs) || startMs < 0) throw new Error('clip.startMs must be ≥ 0');
   if (!Number.isFinite(durationMs) || durationMs < 50) throw new Error('clip.durationMs must be ≥ 50ms');
   const dur = Math.round(durationMs);
@@ -203,6 +242,13 @@ function _validateClip(c, settings) {
   const tOut = _validateTransition(c.transitionOut, 'transitionOut', dur);
   if (tIn) out.transitionIn = tIn;
   if (tOut) out.transitionOut = tOut;
+  // Round-trip the title sidecar so a re-validation pass (any mutator
+  // re-normalises every clip) doesn't silently drop the typography
+  // payload set by add_title / update_title / the GUI editor.
+  if (_isTitlePath(p)) {
+    const tp = _validateTitleProps(c.titleProps);
+    if (tp) out.titleProps = tp;
+  }
   return out;
 }
 
@@ -255,6 +301,27 @@ function _write(state) {
   const tmp = `${fp}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, fp);
+  // Mirror the timeline into the media-library. The library is the
+  // single source of truth for the GUI's drawer / creations strip,
+  // so a timeline that doesn't exist there is effectively invisible.
+  // Fire-and-forget — a failure here MUST NOT block the disk write
+  // (the JSON IS the canonical record; the row is the index).
+  _mirrorToMediaLibrary(fp, state).catch(() => { /* best-effort */ });
+}
+
+/** Best-effort upsert of the timeline row in the media library.
+ *  Resolves after the DB write returns; callers don't await. */
+async function _mirrorToMediaLibrary(filePath, state) {
+  try {
+    const { saveTimelineEntry } = await import('./media-library.js');
+    // No llmProvider here — the registry layer doesn't have one and
+    // we don't want to make every save block on a network round-trip.
+    // The migration / a later embed-on-idle pass can fill in vectors
+    // for rows that landed without one.
+    await saveTimelineEntry(filePath, state, null);
+  } catch (e) {
+    process.stderr.write(`[timelines] mirror to media-library failed: ${e.message}\n`);
+  }
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -330,6 +397,15 @@ export function deleteTimeline(id) {
   const fp = _filePath(id);
   if (!fs.existsSync(fp)) return false;
   fs.unlinkSync(fp);
+  // Best-effort removal of the matching media-library row. Same
+  // fire-and-forget pattern as `_write` — the JSON unlink is the
+  // canonical action; the row is just the index.
+  (async () => {
+    try {
+      const { MediaLibrary } = await import('./media-library.js');
+      await MediaLibrary.global().removeByPath(fp);
+    } catch { /* best-effort */ }
+  })();
   return true;
 }
 
@@ -559,6 +635,158 @@ export function updateClip(id, clipId, changes) {
     }
     return state;
   });
+}
+
+// ── Title clips (synthetic V-track overlays) ─────────────────────────
+
+/**
+ * Append a title (text overlay) clip to a video track. Title clips are
+ * synthetic — there's no source media file behind them; the renderer and
+ * GUI read `titleProps` to draw the text. Apart from `path` and
+ * `titleProps`, they otherwise behave exactly like a normal clip
+ * (track / startMs / durationMs / linkId / transforms / transitions).
+ *
+ * `titleProps` is required and must include at least `text`. The agent
+ * may pass any subset of the GUI's TitleProps fields (fontSize / colorArgb /
+ * fontWeight / italic / align / outlineWidth / outlineColorArgb /
+ * shadowBlur / shadowColorArgb / fontFamily); missing fields fall back to
+ * the GUI defaults (Inter, 96pt, white, bold, centred, soft drop shadow).
+ *
+ * Returns { clip, timeline } the same way addClip does.
+ */
+export function addTitle(id, { track = 'V1', startMs, durationMs = 3000, titleProps, linkId, offsetX, offsetY, scale } = {}) {
+  if (!titleProps || typeof titleProps !== 'object') {
+    throw new Error('addTitle: titleProps is required and must be an object');
+  }
+  if (typeof titleProps.text !== 'string' || !titleProps.text) {
+    throw new Error('addTitle: titleProps.text is required');
+  }
+  if (!Number.isFinite(startMs) || startMs < 0) {
+    throw new Error('addTitle: startMs must be ≥ 0');
+  }
+  if (!_isVideoTrack(track)) {
+    throw new Error(`addTitle: track must be a V-track (got ${track})`);
+  }
+  const clip = {
+    track,
+    path: _newTitlePath(),
+    startMs: Math.round(startMs),
+    durationMs: Math.round(durationMs),
+    titleProps,
+  };
+  if (linkId) clip.linkId = linkId;
+  if (Number.isFinite(offsetX)) clip.offsetX = offsetX;
+  if (Number.isFinite(offsetY)) clip.offsetY = offsetY;
+  if (Number.isFinite(scale)) clip.scale = scale;
+  return addClip(id, clip);
+}
+
+/**
+ * Patch an existing title clip's `titleProps`. Only the fields you pass
+ * are overwritten — everything else (and the clip's position/transform/
+ * link) is left untouched. Pass null to clear an optional field back to
+ * its TitleProps default.
+ */
+export function updateTitle(id, clipId, propsPatch) {
+  return _withTimeline(id, (state) => {
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
+    const c = state.clips[i];
+    if (!_isTitlePath(c.path)) {
+      throw new Error(`Clip ${clipId} is not a title clip (path=${c.path})`);
+    }
+    if (!propsPatch || typeof propsPatch !== 'object') {
+      throw new Error('updateTitle: propsPatch must be an object');
+    }
+    const merged = { ...(c.titleProps || {}) };
+    for (const [k, v] of Object.entries(propsPatch)) {
+      if (v === null) delete merged[k];
+      else merged[k] = v;
+    }
+    if (typeof merged.text !== 'string' || !merged.text) {
+      throw new Error('updateTitle: resulting titleProps.text would be empty');
+    }
+    c.titleProps = merged; // _validateClip on the way out scrubs unknown fields
+    return state;
+  });
+}
+
+/**
+ * Bulk-append a series of subtitle/caption clips in a single mutation.
+ * Each segment becomes its own title clip on `track` with a shared
+ * `titleProps` baseline (font/colour/outline/etc.) plus its own
+ * `startMs` / `durationMs` and per-segment `text`. We only do one
+ * timeline read+write for the whole batch, so a 200-line transcript
+ * costs the same disk IO as a single addClip.
+ *
+ * `segments` is an array of `{ startMs, durationMs?, endMs?, text }`.
+ * Either `durationMs` or `endMs` must be present per segment.
+ *
+ * `propsBaseline` is a fully-resolved TitleProps object (typically built
+ * via `titleOptionsToProps` from the agent's flat options). The caller
+ * is responsible for choosing subtitle-appropriate defaults (smaller
+ * fontSize, white-on-black outline, bottom offsetY) — this function is
+ * format-agnostic on purpose so it can also seed karaoke-style or
+ * commentary captions.
+ *
+ * Returns { clips, timeline } so the caller can echo back per-segment
+ * clipIds for follow-up edits.
+ */
+export function addSubtitles(id, { track = 'V2', segments, propsBaseline, offsetY } = {}) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw new Error('addSubtitles: segments must be a non-empty array');
+  }
+  if (!propsBaseline || typeof propsBaseline !== 'object' || typeof propsBaseline.text !== 'string') {
+    // text on the baseline is overwritten per segment but the validator
+    // still demands a string, so seed it with an empty placeholder when
+    // the caller didn't provide one.
+    propsBaseline = { ...(propsBaseline || {}), text: '' };
+  }
+  if (!_isVideoTrack(track)) {
+    throw new Error(`addSubtitles: track must be a V-track (got ${track})`);
+  }
+  // Pre-validate every segment up-front so a bad row at index 17 doesn't
+  // leave 16 half-written subtitles on disk.
+  const prepared = segments.map((seg, idx) => {
+    if (!seg || typeof seg !== 'object') throw new Error(`addSubtitles: segment[${idx}] must be an object`);
+    if (typeof seg.text !== 'string' || !seg.text) {
+      throw new Error(`addSubtitles: segment[${idx}].text is required`);
+    }
+    if (!Number.isFinite(seg.startMs) || seg.startMs < 0) {
+      throw new Error(`addSubtitles: segment[${idx}].startMs must be ≥ 0`);
+    }
+    let dur;
+    if (Number.isFinite(seg.durationMs)) {
+      dur = seg.durationMs;
+    } else if (Number.isFinite(seg.endMs)) {
+      dur = seg.endMs - seg.startMs;
+    } else {
+      throw new Error(`addSubtitles: segment[${idx}] needs durationMs or endMs`);
+    }
+    if (dur < 50) throw new Error(`addSubtitles: segment[${idx}] duration < 50ms`);
+    return {
+      track,
+      path: _newTitlePath(),
+      startMs: Math.round(seg.startMs),
+      durationMs: Math.round(dur),
+      titleProps: { ...propsBaseline, text: seg.text },
+      ...(Number.isFinite(offsetY) && offsetY !== 0 ? { offsetY } : {}),
+    };
+  });
+  const created = [];
+  const tl = _withTimeline(id, (state) => {
+    for (const c of prepared) {
+      const validated = _validateClip(c, state.settings);
+      state.clips.push(validated);
+      created.push(validated);
+    }
+    return state;
+  });
+  // Re-resolve from persisted state so the caller sees the canonical clip
+  // objects (with stable ids, sorted etc.) — same pattern as addClip.
+  const ids = new Set(created.map((c) => c.id));
+  const stored = tl.clips.filter((c) => ids.has(c.id));
+  return { clips: stored, timeline: tl };
 }
 
 // ── Track add / remove ───────────────────────────────────────────────

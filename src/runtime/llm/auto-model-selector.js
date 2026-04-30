@@ -254,7 +254,7 @@ export function getAvailableProviders() {
   return providers;
 }
 
-function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0, profile = null) {
+function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCooldown, minContextK = 0, profile = null, requiresVideo = false, requiresAudio = false, requiresFile = false) {
   const candidates = [];
   const wantsThinking = profile?.thinking ?? false;
 
@@ -268,6 +268,9 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       // Per-model cooldown: skip models that recently errored mid-stream.
       if (!skipCooldown && _isModelOnCooldown(provider, modelName)) continue;
       if (requiresImage && !caps.inputImage) continue;
+      if (requiresVideo && !caps.inputVideo) continue;
+      if (requiresAudio && !caps.inputAudio) continue;
+      if (requiresFile && !caps.inputFile) continue;
       // Skip OpenRouter-only models in standalone mode (direct API keys).
       // These don't exist on the provider's native API:
       // - Suffixed variants (:free, :extended) — OpenRouter pricing tiers
@@ -319,7 +322,7 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
 }
 
 /** Build all text-output models regardless of score, used as last-resort fallback. */
-function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0) {
+function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0, requiresVideo = false, requiresAudio = false, requiresFile = false) {
   const candidates = [];
   for (const provider of providers) {
     const providerModels = modelsData[provider];
@@ -327,6 +330,9 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
     for (const [modelName, caps] of Object.entries(providerModels)) {
       if (caps.outputType !== 'text') continue;
       if (requiresImage && !caps.inputImage) continue;
+      if (requiresVideo && !caps.inputVideo) continue;
+      if (requiresAudio && !caps.inputAudio) continue;
+      if (requiresFile && !caps.inputFile) continue;
       if (!process.env.KOI_AUTH_TOKEN) {
         if (modelName.includes(':')) continue;
         if (modelName.startsWith('gpt-oss')) continue;
@@ -398,7 +404,7 @@ function _maybeDegradeForLatency(winner) {
  * @param {string[]} availableProviders - providers with API keys
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
-export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, minContextK = 0, profile = null } = {}) {
+export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, requiresVideo = false, requiresAudio = false, requiresFile = false, minContextK = 0, profile = null } = {}) {
   // Code tasks require minimum scores to ensure capable models are selected.
   // Cheap/fast models can't reliably generate structured output like unified diffs.
   if (taskType === 'code') {
@@ -408,25 +414,25 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
     }
   }
 
-  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, profile);
+  let candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, profile, requiresVideo, requiresAudio, requiresFile);
 
   // If thinking was requested but no thinking model qualifies, fall back to non-thinking
   if (candidates.length === 0 && profile?.thinking) {
     const noThinkingProfile = { ...profile, thinking: false };
-    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, noThinkingProfile);
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, noThinkingProfile, requiresVideo, requiresAudio, requiresFile);
   }
 
   // If all providers are on cooldown, ignore cooldowns and pick the best available
   // so we never block LLM calls entirely.
   if (candidates.length === 0) {
-    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK, profile);
+    candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK, profile, requiresVideo, requiresAudio, requiresFile);
   }
 
   // No model meets the difficulty threshold — pick the one with the highest score
   // for this task type rather than failing. This avoids crashes when available
   // models are weaker than the minimum required score.
   if (candidates.length === 0) {
-    candidates = _buildAllCandidates(availableProviders, taskType, requiresImage, minContextK);
+    candidates = _buildAllCandidates(availableProviders, taskType, requiresImage, minContextK, requiresVideo, requiresAudio, requiresFile);
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => {
       const scoreDiff = b.score - a.score;

@@ -82,6 +82,12 @@ export function saveVoice(entry) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(all, null, 2));
   fs.renameSync(tmp, file);
+  // Mirror into the media library (single source of truth for the GUI
+  // drawer / strip). The voice's `samplePath` IS the row's filePath —
+  // the audio file already exists by the time saveVoice is called.
+  if (entry.samplePath) {
+    _mirrorVoiceToMediaLibrary(entry).catch(() => { /* best-effort */ });
+  }
   return entry;
 }
 
@@ -89,14 +95,35 @@ export function saveVoice(entry) {
  *  responsibility — keeps undo/restore simple). */
 export function deleteVoice(id) {
   const all = listVoices();
+  const idx = all.findIndex((e) => e.id === id);
+  if (idx < 0) return false;
+  const removed = all[idx];
   const next = all.filter((e) => e.id !== id);
-  if (next.length === all.length) return false;
   _ensureDir();
   const file = _voicesJson();
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
   fs.renameSync(tmp, file);
+  // Best-effort removal of the matching media-library row.
+  if (removed?.samplePath) {
+    (async () => {
+      try {
+        const { MediaLibrary } = await import('./media-library.js');
+        await MediaLibrary.global().removeByPath(removed.samplePath);
+      } catch { /* best-effort */ }
+    })();
+  }
   return true;
+}
+
+/** Best-effort upsert of the voice row in the media library. */
+async function _mirrorVoiceToMediaLibrary(entry) {
+  try {
+    const { saveVoiceEntry } = await import('./media-library.js');
+    await saveVoiceEntry(entry.samplePath, entry, null);
+  } catch (e) {
+    process.stderr.write(`[voice-registry] mirror to media-library failed: ${e.message}\n`);
+  }
 }
 
 /** Allocate the directory where a freshly-minted voice's local sample

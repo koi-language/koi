@@ -48,6 +48,9 @@ import { channel } from '../../io/channel.js';
  * @param {string}   [req.taskType]         - 'code' | 'reasoning' | 'speed'
  * @param {number}   [req.difficulty]       - 1-10
  * @param {boolean}  [req.requiresImage]    - Needs vision-capable model
+ * @param {boolean}  [req.requiresVideo]    - Needs a model with `inputVideo` (raw video bytes)
+ * @param {boolean}  [req.requiresAudio]    - Needs a model with `inputAudio` (raw audio bytes)
+ * @param {boolean}  [req.requiresFile]     - Needs a model with `inputFile` (PDF/document bytes)
  * @param {Object}   [req.session]          - Agent session (for difficulty boost calculation)
  * @param {string}   [req.agentName]        - For logging
  * @param {number}   [req.temperature]      - Override temperature
@@ -78,6 +81,7 @@ export function resolve(req) {
 function _resolveLLM(req) {
   const {
     taskType = 'code', difficulty: baseDifficulty = 50, profile = null, requiresImage = false,
+    requiresVideo = false, requiresAudio = false, requiresFile = false,
     session, agentName, availableProviders, clients,
     temperature, maxTokens, minContextK = 0
   } = req;
@@ -144,7 +148,7 @@ function _resolveLLM(req) {
   if (_declined?.size > 0) {
     channel.log('llm', `[auto] Provider filter: available=[${availableProviders.join(',')}] filtered=[${_filteredProviders.join(',')}] declined=[${[..._declined.entries()].map(([p,e]) => `${p}(risk${e.risk})`).join(',')}] taskRisk=${_currentRisk}`);
   }
-  const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, minContextK, profile });
+  const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, requiresVideo, requiresAudio, requiresFile, minContextK, profile });
   if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
   const provider = selected.provider;
   const model    = selected.model;

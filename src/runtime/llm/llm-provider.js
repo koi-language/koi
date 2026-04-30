@@ -1038,6 +1038,15 @@ CRITICAL RULES:
           if (_promptAtts.some(a => a.type === 'image')) {
             session._hasImageAttachments = true;
           }
+          // Same idea for non-image attachments — flag the session so the
+          // model selector requires a model that can natively consume the
+          // bytes. Today most read paths transcode (video → frames, pdf →
+          // text+images) so these flags rarely fire; they exist so that as
+          // soon as we start sending raw video/audio/file bytes through,
+          // routing already gates on input_video / input_audio / input_file.
+          if (_promptAtts.some(a => a.type === 'video')) session._hasVideoAttachments = true;
+          if (_promptAtts.some(a => a.type === 'audio')) session._hasAudioAttachments = true;
+          if (_promptAtts.some(a => a.type === 'file' || a.type === 'document' || a.type === 'pdf')) session._hasFileAttachments = true;
           session._promptAttachments = null;
 
           // Queue MCP image results for multimodal injection into the next LLM call.
@@ -1279,6 +1288,21 @@ CRITICAL RULES:
                e.result.attachments.some(a => a.type === 'image')
         );
 
+      // Same hard-filter logic for video / audio / non-image-file inputs.
+      // The runtime currently transcodes most non-image media before the
+      // bytes ever reach the LLM, so these typically stay false. They turn
+      // true only when a tool (e.g. read_file on a video, or a future
+      // raw-bytes pass-through) explicitly flags the session.
+      const _hasFileTypeAtt = (t) => !!(session._promptAttachments?.some(a => a.type === t)) ||
+        session.actionHistory.some(
+          e => e.action?.intent === 'prompt_user' &&
+               Array.isArray(e.result?.attachments) &&
+               e.result.attachments.some(a => a.type === t)
+        );
+      const _requiresVideo = !!session._hasVideoAttachments || _hasFileTypeAtt('video');
+      const _requiresAudio = !!session._hasAudioAttachments || _hasFileTypeAtt('audio');
+      const _requiresFile  = !!session._hasFileAttachments  || _hasFileTypeAtt('file') || _hasFileTypeAtt('document') || _hasFileTypeAtt('pdf');
+
       // When images are attached, enforce minimum difficulty so we get a model
       // that can actually understand images. Coordinators also need vision to
       // look at images before deciding who to delegate to.
@@ -1355,6 +1379,9 @@ CRITICAL RULES:
         difficulty: profile.difficulty,
         profile,
         requiresImage: _requiresImage,
+        requiresVideo: _requiresVideo,
+        requiresAudio: _requiresAudio,
+        requiresFile:  _requiresFile,
         session,
         agentName,
         minContextK: _minContextK,
@@ -1365,6 +1392,9 @@ CRITICAL RULES:
       // Clear the image flag now that model selection has consumed it.
       // It will be re-set on the next iteration if new images arrive.
       if (session._hasImageAttachments) session._hasImageAttachments = false;
+      if (session._hasVideoAttachments) session._hasVideoAttachments = false;
+      if (session._hasAudioAttachments) session._hasAudioAttachments = false;
+      if (session._hasFileAttachments)  session._hasFileAttachments  = false;
 
       // Store for cost tracking after the finally block restores this.model → 'auto'
       session._autoProvider = resolved.provider;

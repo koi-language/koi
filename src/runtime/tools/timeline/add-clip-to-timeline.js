@@ -15,6 +15,9 @@ export default {
   description:
     'Append a clip to a timeline. The clip object: { track ("V1"/"V2"/"A1"/…), path (absolute), startMs, durationMs, ' +
     'sourceInMs?, sourceTotalMs?, linkId?, offsetX?, offsetY?, scale? }. ' +
+    'path can be a video, audio, OR image file (.png/.jpg/.webp/...) — images become still-frame clips on V tracks ' +
+    'whose visible length is whatever you set in durationMs (images have no intrinsic duration; sourceInMs/sourceTotalMs are ignored). ' +
+    'For text overlays, use add_title_to_timeline instead — it produces a synthetic title clip with editable typography. ' +
     'linkId is optional pairing — set the same linkId on a V-clip and an A-clip and they will move/trim/remove together. ' +
     'Returns: { success, clipId, clip, timeline }. Use clipId for any subsequent move/trim/update/remove call.',
   thinkingHint: 'Adding clip',
