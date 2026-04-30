@@ -279,6 +279,14 @@ export function classifyFeedback(action, result, error) {
     // alternatives list and retry with a compatible request. Kept compact
     // (5kb cap) to avoid ballooning context.
     const diagParts = [];
+    // `model` (resolved slug) is critical for media tools: when the
+    // upstream provider rejects (likeness filter, content policy, etc.)
+    // the agent's recovery path is to retry with `excludeModels: [<slug>]`.
+    // Without the slug in the failure message the agent guesses (often
+    // wrongly — e.g. inventing `excludeProviders: ["fal-ai"]` which the
+    // schema doesn't accept). Keep this line FIRST in diagParts so it
+    // sits right under the FAILED header.
+    if (result.model) diagParts.push(`model: ${result.model}`);
     if (result.errorType) diagParts.push(`errorType: ${result.errorType}`);
     if (result.hint) diagParts.push(`hint: ${result.hint}`);
     if (result.requirements) {

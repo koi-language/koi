@@ -4067,6 +4067,48 @@ export class Agent {
         console.error(`[Agent:${this.name}] 🔀 Delegating action: ${action.intent}`);
       }
 
+      // ── PLAN-IN-FLIGHT GUARD ──────────────────────────────────────────
+      // Workflows already instantiate their full task plan (see
+      // `activate_workflow`) and the System is told (in
+      // `has-pending-tasks.md`) to execute the existing tasks rather
+      // than re-plan. If the LLM ignores that and tries to delegate to
+      // the Planner anyway — or any other agent re-enters the planner
+      // mid-execution — short-circuit here. Re-planning at this point
+      // produces a duplicate/competing task list that collides with the
+      // live one (the "25 tangled tasks" failure mode). We synthesise a
+      // success result; the post-delegate code at the call site re-fires
+      // `planner.result { success: true }`, transitioning the System
+      // back to `running_plan` to keep working through what's already
+      // queued.
+      const _intentAgentLower = (action.intent || '').split('::')[0].toLowerCase();
+      if (_intentAgentLower === 'planner') {
+        let _existingCount = 0;
+        const _activeWorkflow = this.state?.activeWorkflow ?? null;
+        try {
+          const { taskManager: _tmGuard } = await import('../state/task-manager.js');
+          _existingCount = _tmGuard.list().filter(
+            t => t.status === 'pending' || t.status === 'in_progress'
+          ).length;
+        } catch { /* non-fatal */ }
+        if (_activeWorkflow || _existingCount > 0) {
+          channel.log(
+            'agent',
+            `${this.name}: Plan already in flight — short-circuiting delegate to '${action.intent}' (activeWorkflow=${_activeWorkflow || 'none'}, pendingTasks=${_existingCount}). Re-planning is blocked while a plan is running.`
+          );
+          return {
+            result: {
+              success: true,
+              alreadyPlanned: true,
+              activeWorkflow: _activeWorkflow,
+              taskCount: _existingCount,
+              summary:
+                'Plan already in progress — execute existing tasks instead of re-planning.',
+            },
+            shouldExitLoop: false,
+          };
+        }
+      }
+
       // Auto-mark the associated task as in_progress before delegating,
       // and completed/failed after — so the UI always reflects the real state
       // regardless of whether the LLM remembered to call task_update.

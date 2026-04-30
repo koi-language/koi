@@ -228,8 +228,8 @@ const generateVideoAction = {
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 600000 = 10 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
-      excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'List of model slugs to exclude from the auto-picker. Use after a provider rejection — read the failed response\'s `model` field and put that slug here on retry. The router will skip those slugs and pick the next best candidate from the same category. Example: ["bytedance/seedance-2.0/image-to-video"].' },
-      includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches. Example: ["fal-ai/veo3.1/first-last-frame-to-video"].' },
+      excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
+      includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
     },
     required: ['prompt']
@@ -465,13 +465,22 @@ const generateVideoAction = {
 
     if (final.status === 'failed') {
       if (submitted.id) clearJobMetadata(submitted.id);
+      // Prefix the error string with the resolved slug so the agent
+      // sees WHICH model rejected the call — even when the action
+      // result is summarised as a single line (`❌ generate_video
+      // FAILED: <error>`). Without this prefix the slug only shows up
+      // as a structured field that some renderers swallow, and the
+      // agent ends up guessing wrong (e.g. `excludeProviders:
+      // ['fal-ai']` instead of `excludeModels: [<slug>]`).
+      const _failSlug = final.model || resolved.model;
+      const _failMsg = final.error || 'Provider reported failure with no error message.';
       return {
         success: false,
         provider: resolved.provider,
-        model: final.model || resolved.model,
+        model: _failSlug,
         id: final.id || submitted.id,
         status: 'failed',
-        error: final.error || 'Provider reported failure with no error message.',
+        error: `[model=${_failSlug}] ${_failMsg}`,
       };
     }
 
@@ -480,13 +489,15 @@ const generateVideoAction = {
       // failure so the agent can retry (the provider's request id is
       // returned for advanced manual recovery, but the agent should
       // typically just call generate_video again).
+      const _pendingSlug = final.model || resolved.model;
+      const _pendingMsg = final.error || `Timed out waiting for provider to finish.`;
       return {
         success: false,
         provider: resolved.provider,
-        model: final.model || resolved.model,
+        model: _pendingSlug,
         id: final.id || submitted.id,
         status: 'pending',
-        error: final.error || `Timed out waiting for provider to finish.`,
+        error: `[model=${_pendingSlug}] ${_pendingMsg}`,
       };
     }
 
