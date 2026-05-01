@@ -47,6 +47,7 @@ import os from 'os';
 
 const EMBEDDING_DIM = 1536;
 const DB_DIR = path.join(os.homedir(), '.koi', 'media-library');
+const EMPTY_CATEGORIES_FILE = path.join(DB_DIR, 'empty-categories.json');
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.avi']);
 const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
@@ -304,6 +305,10 @@ export class MediaLibrary {
     if (Array.isArray(categories)) {
       const norm = _normaliseCategories(categories);
       metadata = { ...metadata, categories: norm };
+      // Any caller-supplied tag promotes a previously-empty category into a
+      // real one — drop those entries from the empty registry so listCategories
+      // doesn't surface them as empty alongside their now-populated row.
+      for (const c of norm) this.unregisterEmptyCategory(c);
     }
 
     // Dedup: content_hash is the primary identity — same bytes == same asset.
@@ -318,10 +323,25 @@ export class MediaLibrary {
     // the stored embedding is the zero placeholder. `table.filter()` is
     // purely metadata-driven and always sees the row.
     const escHash = String(hash).replace(/'/g, "''");
+    // When dedup hits, we still want to merge any caller-supplied
+    // categories into the existing row — otherwise "drop a file from
+    // Finder into a new collection" silently no-ops on second drop of
+    // the same file (or any file already known to the gallery).
+    const mergeCategoriesInto = async (existingId) => {
+      if (!Array.isArray(categories) || categories.length === 0) return;
+      try {
+        const cur = await this._readCategories(existingId);
+        const merged = _normaliseCategories([...cur, ...categories]);
+        if (merged.length !== cur.length) {
+          await this._writeCategories(existingId, merged);
+        }
+      } catch { /* best effort — dedup wins, tag is opportunistic */ }
+    };
     if (!replaceByPath) {
       try {
         const byHash = await table.query().where(`content_hash = '${escHash}'`).limit(1).toArray();
         if (byHash.length > 0) {
+          await mergeCategoriesInto(byHash[0].id);
           return { id: byHash[0].id, isNew: false };
         }
       } catch { /* table empty — fall through */ }
@@ -333,6 +353,7 @@ export class MediaLibrary {
       try {
         const byPath = await table.query().where(`file_path = '${escPath}'`).limit(1).toArray();
         if (byPath.length > 0) {
+          await mergeCategoriesInto(byPath[0].id);
           return { id: byPath[0].id, isNew: false };
         }
       } catch { /* ignore */ }
@@ -637,12 +658,16 @@ export class MediaLibrary {
     }
   }
 
-  /** Add a single category to a row's tag set. Idempotent. */
+  /** Add a single category to a row's tag set. Idempotent. Also drops
+   *  the name from the empty-categories registry — once a category has
+   *  at least one item it's "real" and the row scan picks it up. */
   async addCategory(id, category) {
     if (!category || typeof category !== 'string') return false;
     const cats = await this._readCategories(id);
     const next = _normaliseCategories([...cats, category]);
-    return this._writeCategories(id, next);
+    const ok = await this._writeCategories(id, next);
+    if (ok) this.unregisterEmptyCategory(category);
+    return ok;
   }
 
   /** Remove a single category from a row. Case-insensitive match. */
@@ -655,8 +680,65 @@ export class MediaLibrary {
     return this._writeCategories(id, next);
   }
 
+  // ── Empty-categories registry ──────────────────────────────────────────
+  //
+  // A user-created category with zero items has no natural home in the
+  // row-derived listing. We persist it as a tiny JSON sidecar so the
+  // chip survives restarts. The first time something gets tagged with
+  // the category, we drop the entry — at that point the row scan picks
+  // it up and the registry is no longer load-bearing.
+
+  _readEmptyCategoriesFile() {
+    try {
+      if (!fs.existsSync(EMPTY_CATEGORIES_FILE)) return [];
+      const arr = JSON.parse(fs.readFileSync(EMPTY_CATEGORIES_FILE, 'utf8'));
+      return Array.isArray(arr) ? arr.filter(s => typeof s === 'string' && s.trim()) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  _writeEmptyCategoriesFile(arr) {
+    try {
+      fs.mkdirSync(DB_DIR, { recursive: true });
+      fs.writeFileSync(EMPTY_CATEGORIES_FILE, JSON.stringify(arr, null, 2));
+      return true;
+    } catch (e) {
+      process.stderr.write(`[MediaLibrary] empty-categories write failed: ${e.message}\n`);
+      return false;
+    }
+  }
+
+  /** Register a category with no items yet. Persists across restarts so
+   *  the chip stays visible until the user fills or deletes it. */
+  registerEmptyCategory(name) {
+    if (typeof name !== 'string') return false;
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    const cur = this._readEmptyCategoriesFile();
+    const lower = trimmed.toLowerCase();
+    if (cur.some(c => c.toLowerCase() === lower)) return true;
+    cur.push(trimmed);
+    return this._writeEmptyCategoriesFile(cur);
+  }
+
+  /** Drop a name from the empty-categories registry. Used when the
+   *  category gets its first item (becomes "real") OR when the user
+   *  explicitly deletes it. Case-insensitive. */
+  unregisterEmptyCategory(name) {
+    if (typeof name !== 'string') return false;
+    const target = name.trim().toLowerCase();
+    if (!target) return false;
+    const cur = this._readEmptyCategoriesFile();
+    const next = cur.filter(c => c.toLowerCase() !== target);
+    if (next.length === cur.length) return false;
+    return this._writeEmptyCategoriesFile(next);
+  }
+
   /** Distinct categories across the whole library, with item counts.
-   *  Returns [{ name, count }] sorted alphabetically. */
+   *  Returns [{ name, count }] sorted alphabetically. Includes any
+   *  user-created empty categories with count=0 so the drawer chip
+   *  stays visible before the first drop. */
   async listCategories() {
     const table = await this._ensureTable();
     const rows = await table.query().limit(100000).toArray();
@@ -673,6 +755,15 @@ export class MediaLibrary {
           if (!display.has(key)) display.set(key, c);
         }
       } catch { /* skip corrupt row */ }
+    }
+    // Merge in user-created empty categories. Skip ones the row scan
+    // already saw — once a category has items its registry entry is
+    // stale and will get cleaned up on the next addCategory call.
+    for (const empty of this._readEmptyCategoriesFile()) {
+      const key = empty.toLowerCase();
+      if (counts.has(key)) continue;
+      counts.set(key, 0);
+      display.set(key, empty);
     }
     return Array.from(counts.entries())
       .map(([key, count]) => ({ name: display.get(key) || key, count }))
