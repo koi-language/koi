@@ -320,18 +320,18 @@ export class MediaLibrary {
     const escHash = String(hash).replace(/'/g, "''");
     if (!replaceByPath) {
       try {
-        const byHash = await table.filter(`content_hash = '${escHash}'`).limit(1).toArray();
+        const byHash = await table.query().where(`content_hash = '${escHash}'`).limit(1).toArray();
         if (byHash.length > 0) {
           return { id: byHash[0].id, isNew: false };
         }
-      } catch { /* table empty or filter unsupported — fall through */ }
+      } catch { /* table empty — fall through */ }
 
       // Secondary dedup: same file_path. Defends against the rare case where
       // the file was re-encoded identically (same pixels, new bytes → new
       // hash) between the original save and this one. Still preserves the
       // original row and its metadata.
       try {
-        const byPath = await table.filter(`file_path = '${escPath}'`).limit(1).toArray();
+        const byPath = await table.query().where(`file_path = '${escPath}'`).limit(1).toArray();
         if (byPath.length > 0) {
           return { id: byPath[0].id, isNew: false };
         }
@@ -374,10 +374,8 @@ export class MediaLibrary {
   async get(id) {
     const table = await this._ensureTable();
     try {
-      const rows = await table.search(new Array(EMBEDDING_DIM).fill(0))
-        .where(`id = '${id}'`)
-        .limit(1)
-        .toArray();
+      const escId = String(id).replace(/'/g, "''");
+      const rows = await table.query().where(`id = '${escId}'`).limit(1).toArray();
       return rows.length > 0 ? this._deserialize(rows[0]) : null;
     } catch {
       return null;
@@ -391,20 +389,10 @@ export class MediaLibrary {
     const table = await this._ensureTable();
     try {
       const escaped = filePath.replace(/'/g, "''");
-      // Use filter instead of search to avoid vector dimension issues
-      const rows = await table.filter(`file_path = '${escaped}'`).limit(1).toArray();
+      const rows = await table.query().where(`file_path = '${escaped}'`).limit(1).toArray();
       return rows.length > 0 ? this._deserialize(rows[0]) : null;
-    } catch (e) {
-      // Fallback: try with vector search
-      try {
-        const rows = await table.search(new Array(EMBEDDING_DIM).fill(0))
-          .where(`file_path = '${escaped}'`)
-          .limit(1)
-          .toArray();
-        return rows.length > 0 ? this._deserialize(rows[0]) : null;
-      } catch {
-        return null;
-      }
+    } catch {
+      return null;
     }
   }
 
@@ -414,10 +402,8 @@ export class MediaLibrary {
   async getByHash(hash) {
     const table = await this._ensureTable();
     try {
-      const rows = await table.search(new Array(EMBEDDING_DIM).fill(0))
-        .where(`content_hash = '${hash}'`)
-        .limit(1)
-        .toArray();
+      const escHash = String(hash).replace(/'/g, "''");
+      const rows = await table.query().where(`content_hash = '${escHash}'`).limit(1).toArray();
       return rows.length > 0 ? this._deserialize(rows[0]) : null;
     } catch {
       return null;
@@ -443,7 +429,10 @@ export class MediaLibrary {
     const table = await this._ensureTable();
 
     const conditions = [];
-    if (favorite !== undefined) conditions.push(`favorite = ${favorite}`);
+    // `favorite` is a Float64 column (seeded with 0/1) — comparing against
+    // a SQL boolean literal `true`/`false` errors with "could not convert
+    // to literal of type 'Float64'". Coerce to the numeric literal.
+    if (favorite !== undefined) conditions.push(`favorite = ${favorite ? 1 : 0}`);
     if (mediaType) conditions.push(`media_type = '${mediaType}'`);
     if (Array.isArray(mediaTypes) && mediaTypes.length > 0) {
       const list = mediaTypes
@@ -543,10 +532,14 @@ export class MediaLibrary {
   async setFavorite(id, favorite) {
     const table = await this._ensureTable();
     const val = favorite ? '1' : '0';
-    const filter = `id = '${id}'`;
+    const escId = String(id).replace(/'/g, "''");
     try {
-      // LanceDB update() expects SQL expression strings as values, not JS numbers.
-      await table.update({ favorite: val }).where(filter).execute();
+      // LanceDB update() expects SQL expression strings as values, not JS
+      // numbers, AND the where clause goes inside the options object — not
+      // via a `.where().execute()` chain (that API doesn't exist on the
+      // installed lancedb). For `favorite` the value `'1'` / `'0'` IS a
+      // valid SQL literal so the default 2-arg shape works.
+      await table.update({ favorite: val }, { where: `id = '${escId}'` });
     } catch (e) {
       process.stderr.write(`[MediaLibrary] setFavorite failed for ${id}: ${e.message}\n`);
     }
@@ -558,13 +551,21 @@ export class MediaLibrary {
    */
   async setSam2Masks(id, masks) {
     const table = await this._ensureTable();
-    await table.update({ sam2_masks_json: JSON.stringify(masks) }, `id = '${id}'`);
+    const escId = String(id).replace(/'/g, "''");
+    // Use the explicit `{values, where}` shape so the JSON blob is
+    // toSQL-escaped instead of being spliced as a raw SQL expression
+    // (which fails to parse on the leading `{`).
+    await table.update({
+      values: { sam2_masks_json: JSON.stringify(masks) },
+      where: `id = '${escId}'`,
+    });
     return true;
   }
 
   async setEmbedding(id, embedding) {
     const table = await this._ensureTable();
-    await table.update({ embedding }, `id = '${id}'`);
+    const escId = String(id).replace(/'/g, "''");
+    await table.update({ values: { embedding }, where: `id = '${escId}'` });
     return true;
   }
 
@@ -601,7 +602,7 @@ export class MediaLibrary {
   async _readCategories(id) {
     const table = await this._ensureTable();
     try {
-      const rows = await table.filter(`id = '${id}'`).limit(1).toArray();
+      const rows = await table.query().where(`id = '${id}'`).limit(1).toArray();
       if (rows.length === 0) return [];
       const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
       return Array.isArray(meta.categories) ? meta.categories : [];
@@ -612,11 +613,23 @@ export class MediaLibrary {
   async _writeCategories(id, categories) {
     const table = await this._ensureTable();
     try {
-      const rows = await table.filter(`id = '${id}'`).limit(1).toArray();
+      const rows = await table.query().where(`id = '${id}'`).limit(1).toArray();
       if (rows.length === 0) return false;
       const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
       meta.categories = _normaliseCategories(categories);
-      await table.update({ metadata_json: JSON.stringify(meta) }).where(`id = '${id}'`).execute();
+      const escId = String(id).replace(/'/g, "''");
+      // LanceDB has two `update` shapes:
+      //   - the "default" 2-arg form maps each value through toSQL on the
+      //     way down — except when neither `values` nor `valuesSql` is set,
+      //     in which case the values are spliced into SQL **as raw
+      //     expressions** (so a JSON blob with `{` blows up the parser).
+      //   - the explicit `{values, where}` form runs every value through
+      //     toSQL (string → quoted SQL string). That's what we need for
+      //     metadata_json, which is JSON, not a SQL expression.
+      await table.update({
+        values: { metadata_json: JSON.stringify(meta) },
+        where: `id = '${escId}'`,
+      });
       return true;
     } catch (e) {
       process.stderr.write(`[MediaLibrary] _writeCategories(${id}) failed: ${e.message}\n`);

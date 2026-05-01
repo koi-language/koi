@@ -530,10 +530,14 @@ const generateVideoAction = {
       }
     }
 
-    // Per-shot downloads for multishot completions.
+    // Per-shot downloads for multishot completions. Each shot is also
+    // registered in the MediaLibrary so it appears in the creations
+    // drawer alongside the parent video — without this, multishot
+    // generations only put their first/last shot in the drawer.
     let savedShots;
     if (Array.isArray(final.shots) && final.shots.length > 0) {
       savedShots = [];
+      const { saveGeneratedVideo } = await import('../../state/media-library.js');
       for (const shot of final.shots) {
         let shotSavedTo = null;
         let shotSaveError = null;
@@ -548,6 +552,19 @@ const generateVideoAction = {
           shotSaveError = sr.error;
           if (shotSavedTo && channel.canPresentResources?.()) {
             channel.presentResource({ type: 'video', path: shotSavedTo });
+          }
+          if (shotSavedTo) {
+            try {
+              const shotParams = {
+                ...generationParams,
+                ...(final.model ? { model: final.model } : {}),
+                shotIndex: shot.index,
+                ...(shot.prompt ? { prompt: shot.prompt } : {}),
+              };
+              await saveGeneratedVideo(shotSavedTo, shotParams, agent?.llmProvider || null);
+            } catch (err) {
+              channel.log('video', `Media library save failed for shot ${shot.index} (continuing): ${err.message}`);
+            }
           }
         }
         savedShots.push({
