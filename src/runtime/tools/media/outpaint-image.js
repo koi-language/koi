@@ -310,9 +310,14 @@ const outpaintImageAction = {
 
     // Delegate to generate_image. Pass the PADDED CANVAS (with original
     // at offset, transparent margins) as the reference. The aspect
-    // ratio still travels for models that key off it.
+    // ratio still travels for models that key off it. `operation:
+    // "outpaint"` routes the picker to the curated `image_extend`
+    // category bucket so a backoffice-tagged model owns extension —
+    // the generic edit pool tends to redraw the whole scene rather
+    // than painting only the transparent margins.
     const genAction = {
       prompt: effectivePrompt,
+      operation: 'outpaint',
       referenceImages: [{ alias: 'source', path: paddedCanvasPath }],
       aspectRatio: newAspect || undefined,
       outputFormat: action.outputFormat || 'png',

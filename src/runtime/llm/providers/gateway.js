@@ -523,6 +523,9 @@ export class GatewayImageGen extends BaseImageGen {
         aspectRatio: opts.aspectRatio,
         refsCount: opts.referenceImages?.length || 0,
         label: opts.label,
+        // Intent flag — pickImageModel maps this to the curated
+        // category bucket (e.g. 'outpaint' → 'image_extend').
+        operation: opts.operation,
       },
     );
 

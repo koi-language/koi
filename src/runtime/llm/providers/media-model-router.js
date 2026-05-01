@@ -249,7 +249,12 @@ export function pickImageModel(models, req = {}) {
   const wantedImageBucket = (
     (wantsOperation === 'bg-remove' || wantsOperation === 'background-removal' || wantsOperation === 'rembg') ? 'background_removal' :
     (wantsOperation === 'upscale' || wantsOperation === 'upscaling') ? 'image_upscaling' :
-    (wantsOperation === 'edit' || wantsOperation === 'inpaint' || wantsOperation === 'outpaint') ? 'image_editing' :
+    // outpaint = canvas extension. Routes to its own `image_extend`
+    // bucket so a single backoffice tag controls which model owns
+    // outpainting (the generic edit pool tends to redraw the whole
+    // scene instead of only painting the transparent margins).
+    (wantsOperation === 'outpaint' || wantsOperation === 'extend') ? 'image_extend' :
+    (wantsOperation === 'edit' || wantsOperation === 'inpaint') ? 'image_editing' :
     refsCount > 0 ? 'image_editing' :
     'image_generation'
   );
