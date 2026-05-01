@@ -48,9 +48,10 @@ export default {
   intent: 'extract_frame',
   description:
     'Extract a single still frame from a local video at an exact timestamp, at the source\'s native resolution. ' +
-    'Required: "video" (absolute path) and one of "timeMs" or "timeSeconds". ' +
+    'Required: "video" (absolute path) AND one of: "timeMs", "timeSeconds", or "lastFrame:true". ' +
+    'Use "lastFrame:true" to grab the final frame of the video (the canonical "extend video from where it left off" use-case) — no need to know the duration up-front. ' +
     'Optional: "saveTo" — destination path; the extension picks the codec ("png" lossless [default], "jpg"/"jpeg" smaller). ' +
-    'Defaults to "<projectRoot>/.koi/frames/<videoName>-t<ms>.png". ' +
+    'Defaults to "<projectRoot>/.koi/frames/<videoName>-t<ms>.png" (or "-last.png" for lastFrame). ' +
     'Returns { success, savedTo, width, height, timeMs, format }. ffmpeg is auto-installed on first use.',
   thinkingHint: 'Extracting frame',
   permission: 'write',
@@ -59,8 +60,9 @@ export default {
     type: 'object',
     properties: {
       video:       { type: 'string',  description: 'Absolute path to the source video file.' },
-      timeMs:      { type: 'number',  description: 'Timestamp to grab, in milliseconds. Use this OR timeSeconds.' },
-      timeSeconds: { type: 'number',  description: 'Timestamp to grab, in seconds (float). Use this OR timeMs.' },
+      timeMs:      { type: 'number',  description: 'Timestamp to grab, in milliseconds. Use this OR timeSeconds OR lastFrame.' },
+      timeSeconds: { type: 'number',  description: 'Timestamp to grab, in seconds (float). Use this OR timeMs OR lastFrame.' },
+      lastFrame:   { type: 'boolean', description: 'When true, extract the FINAL decoded frame of the video. Saves the agent from having to probe duration first via ffprobe / shell. Mutually exclusive with timeMs / timeSeconds.' },
       saveTo:      { type: 'string',  description: 'Destination file path. Extension picks the format: .png (lossless, default) or .jpg/.jpeg.' },
     },
     required: ['video'],
@@ -69,6 +71,7 @@ export default {
   examples: [
     { intent: 'extract_frame', video: '/Users/me/clips/intro.mp4', timeSeconds: 12.5 },
     { intent: 'extract_frame', video: '/tmp/render.mov', timeMs: 33000, saveTo: '/tmp/poster.jpg' },
+    { intent: 'extract_frame', video: '/tmp/clip.mp4', lastFrame: true, saveTo: '/tmp/last.png' },
   ],
 
   async execute(action) {
@@ -79,11 +82,21 @@ export default {
       return { success: false, error: `Video not found: ${videoPath}` };
     }
 
+    const lastFrame = action.lastFrame === true;
     let timeMs;
-    if (typeof action.timeMs === 'number') timeMs = action.timeMs;
-    else if (typeof action.timeSeconds === 'number') timeMs = action.timeSeconds * 1000;
-    else return { success: false, error: 'extract_frame: pass either "timeMs" or "timeSeconds"' };
-    if (!Number.isFinite(timeMs) || timeMs < 0) {
+    if (lastFrame) {
+      if (typeof action.timeMs === 'number' || typeof action.timeSeconds === 'number') {
+        return { success: false, error: 'extract_frame: "lastFrame:true" is mutually exclusive with timeMs / timeSeconds' };
+      }
+      timeMs = -1;
+    } else if (typeof action.timeMs === 'number') {
+      timeMs = action.timeMs;
+    } else if (typeof action.timeSeconds === 'number') {
+      timeMs = action.timeSeconds * 1000;
+    } else {
+      return { success: false, error: 'extract_frame: pass one of "timeMs", "timeSeconds", or "lastFrame:true"' };
+    }
+    if (!lastFrame && (!Number.isFinite(timeMs) || timeMs < 0)) {
       return { success: false, error: `extract_frame: invalid timestamp (${timeMs}ms)` };
     }
 
@@ -97,7 +110,8 @@ export default {
     } else {
       const stem = path.basename(resolvedVideo, path.extname(resolvedVideo));
       const dir = path.join(_projectRoot(), '.koi', 'frames');
-      savePath = path.join(dir, `${stem}-t${Math.round(timeMs)}.png`);
+      const tag = lastFrame ? 'last' : `t${Math.round(timeMs)}`;
+      savePath = path.join(dir, `${stem}-${tag}.png`);
     }
     const ext = path.extname(savePath).toLowerCase();
     let format;
@@ -113,19 +127,21 @@ export default {
 
     const { ffmpeg } = await ensureFfmpeg();
 
-    // -ss <ts> before -i: fast seek to the nearest keyframe, then decode
-    // forward to the exact PTS. Modern ffmpeg makes this both fast AND
-    // accurate, so we don't need the post-input slow-seek form.
-    // -frames:v 1 stops after one written frame.
+    // Two modes:
+    //   - lastFrame: `-sseof -3` seeks 3s from EOF, then `-update 1`
+    //     keeps overwriting the same output so the LAST decoded frame
+    //     wins. No need to know duration up-front.
+    //   - timestamp: `-ss <ts>` before `-i` fast-seeks to the nearest
+    //     keyframe, then decodes forward to the exact PTS. Modern
+    //     ffmpeg makes this both fast AND accurate.
+    // -frames:v 1 stops after one written frame (timestamp mode only).
     // -y overwrites; -an drops audio (a single frame doesn't need it).
-    const argv = [
-      '-hide_banner',
-      '-loglevel', 'error',
-      '-ss', _formatTimestamp(timeMs / 1000),
-      '-i', resolvedVideo,
-      '-frames:v', '1',
-      '-an',
-    ];
+    const argv = ['-hide_banner', '-loglevel', 'error'];
+    if (lastFrame) {
+      argv.push('-sseof', '-3', '-i', resolvedVideo, '-update', '1', '-frames:v', '1', '-an');
+    } else {
+      argv.push('-ss', _formatTimestamp(timeMs / 1000), '-i', resolvedVideo, '-frames:v', '1', '-an');
+    }
     if (format === 'jpg') {
       // -q:v 2 ≈ "visually transparent" — the lowest JPEG quantizer
       // that still produces a small file. We could expose this as a
@@ -134,7 +150,8 @@ export default {
     }
     argv.push('-y', savePath);
 
-    channel.log('media', `extract_frame: ${path.basename(resolvedVideo)} @ ${(timeMs / 1000).toFixed(3)}s → ${savePath}`);
+    const whenLabel = lastFrame ? 'last frame' : `${(timeMs / 1000).toFixed(3)}s`;
+    channel.log('media', `extract_frame: ${path.basename(resolvedVideo)} @ ${whenLabel} → ${savePath}`);
 
     const stderrTail = await new Promise((resolve, reject) => {
       const child = spawn(ffmpeg, argv, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -154,10 +171,10 @@ export default {
     }
 
     if (!fs.existsSync(savePath)) {
-      return {
-        success: false,
-        error: `extract_frame: ffmpeg produced no output (timestamp ${timeMs}ms may be past the end of the video).`,
-      };
+      const reason = lastFrame
+        ? 'no decoded frame in the trailing 3s window (try a longer video or a specific timeMs)'
+        : `timestamp ${timeMs}ms may be past the end of the video`;
+      return { success: false, error: `extract_frame: ffmpeg produced no output (${reason}).` };
     }
 
     // ffmpeg's banner is suppressed at -loglevel error, so dimensions
@@ -172,6 +189,7 @@ export default {
       width: dims.width,
       height: dims.height,
       timeMs,
+      lastFrame,
       fileSize: stat.size,
     };
   },

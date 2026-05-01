@@ -186,7 +186,7 @@ const generateVideoAction = {
   // the real, catalog-driven description is rebuilt at the bottom of this
   // file by the fetchMediaCapabilities('video') block and replaces both
   // the description AND the schema enums in place.
-  description: 'Generate a video from a text prompt. Blocks internally until the video is ready and returns { success, savedTo, url, ... } — no second call is needed. Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog. Pass wait=false to start it as a background koi job and retrieve the result with await_job / get_job_status.',
+  description: 'Generate a video from a text prompt. Blocks internally until the video is ready and returns { success, savedTo, url, ... } — no second call is needed. Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog. Pass wait=false to start it as a background koi job and retrieve the result with await_job / get_job_status. To EXTEND or CONTINUE an existing video, call `extract_frame` first to grab the source\'s last (or any) frame and pass its `savedTo` here as `startFrame` — never assume a frame file already exists on disk; if you didn\'t extract it in this turn, it doesn\'t exist.',
   thinkingHint: 'Generating video',
   permission: 'generate_video',
 
@@ -699,7 +699,18 @@ async function _loadFrame(pathStr, capFlag, resolved, label) {
   }
   const resolvedPath = path.resolve(pathStr);
   if (!fs.existsSync(resolvedPath)) {
-    return { _error: `${label === 'start' ? 'Start' : label === 'end' ? 'End' : label} frame image not found: ${pathStr}` };
+    // Self-healing hint: missing frames are almost always the
+    // "extend / continue this video" flow where the agent assumed a
+    // previous step already extracted the still. Tell it where the
+    // file is missing AND which tool to call instead, so the next
+    // iteration produces the right action automatically.
+    return {
+      _error:
+        `${label === 'start' ? 'Start' : label === 'end' ? 'End' : label} frame image not found: ${pathStr}. ` +
+        `If you need a still from an existing video (e.g. last/specific frame to use as startFrame), call the \`extract_frame\` tool first ` +
+        `(intent: "extract_frame", video: "<source.mp4>", timeMs|timeSeconds: <position>), then pass its \`savedTo\` here as the frame path. ` +
+        `For "extend video from last frame", use timeMs equal to the source's duration in ms minus a few frames (e.g. duration - 33).`,
+    };
   }
   const normalized = await normalizeImageForProvider(resolvedPath);
   if (normalized.converted) {
@@ -943,12 +954,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
       const desc = d && d.description ? ` — ${d.description}` : '';
       return `    • "${slug}"${desc}`;
     }).join('\n');
-    fields.push(
-      'optional "label" — selects a SPECIALISED model variant. ' +
-      'Preferred filter with automatic fallback: when set, the router first tries to find a model carrying that label AND matching all other constraints (operation, frames, refs, etc.); if no such model exists for THIS combination, the router falls back to non-labelled models (a console warning is logged). ' +
-      'Pick the slug whose description matches the task; if the labelled capability isn\'t available for the current operation, routing still succeeds with a generic model:\n' +
-      lines,
-    );
+    fields.push(`optional "label" — ranking preference. Soft hint only, never filters. Pick the slug whose description matches the task; omit when no specialisation is needed:\n${lines}`);
   }
   fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
   fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');

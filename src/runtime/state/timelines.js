@@ -63,6 +63,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -74,12 +75,25 @@ function _projectRoot() {
   return process.env.KOI_PROJECT_ROOT || process.cwd();
 }
 
+/// Canonical, user-global timelines dir. Matches the GUI's
+/// `TimelineLibrary._dir` and the rest of the user-content storage
+/// convention (`~/.koi/voices/`, `~/.koi/images/`). Timelines belong
+/// to the user, not to a specific project — moving across projects
+/// shouldn't lose them.
 function _dir() {
+  return path.join(os.homedir(), '.koi', 'timelines');
+}
+
+/// Legacy directory: previous engine versions wrote `<project>/.koi/
+/// timelines/`. Reads still fall back here so old project-scoped files
+/// remain reachable. Writes default to [_dir()] so new content lands
+/// in the unified location.
+function _legacyProjectDir() {
   return path.join(_projectRoot(), '.koi', 'timelines');
 }
 
 function _ensureDir() {
-  const koiDir = path.join(_projectRoot(), '.koi');
+  const koiDir = path.join(os.homedir(), '.koi');
   if (!fs.existsSync(koiDir)) {
     fs.mkdirSync(koiDir, { recursive: true });
   }
@@ -89,12 +103,29 @@ function _ensureDir() {
   }
 }
 
+/// Resolve a timeline id to the file path it currently lives at.
+/// Tries the home dir first, then the legacy project dir. Returns
+/// the home path even when the file doesn't exist anywhere — callers
+/// that need an existence check should use [_findExistingFile].
 function _filePath(id) {
   // Refuse path-traversal IDs. Real ids only contain alnum + dashes.
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{3,128}$/.test(id)) {
     throw new Error(`Invalid timeline id: ${JSON.stringify(id)}`);
   }
   return path.join(_dir(), `${id}.json`);
+}
+
+/// Locate the on-disk file for [id], probing both the canonical home
+/// dir and the legacy project dir. Returns null if neither has it.
+function _findExistingFile(id) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{3,128}$/.test(id)) {
+    return null;
+  }
+  const homeFp = path.join(_dir(), `${id}.json`);
+  if (fs.existsSync(homeFp)) return homeFp;
+  const legacyFp = path.join(_legacyProjectDir(), `${id}.json`);
+  if (fs.existsSync(legacyFp)) return legacyFp;
+  return null;
 }
 
 function _newId() {
@@ -164,6 +195,39 @@ function _validateTitleProps(props) {
   if (Number.isFinite(props.outlineColorArgb)) out.outlineColorArgb = props.outlineColorArgb | 0;
   if (Number.isFinite(props.shadowBlur)) out.shadowBlur = props.shadowBlur;
   if (Number.isFinite(props.shadowColorArgb)) out.shadowColorArgb = props.shadowColorArgb | 0;
+  return out;
+}
+
+// Volume automation curve attached to an audio clip. Each entry is
+// `{ t: clipLocalMs, v: linearGain }`. v=1.0 is unity, 0.0 silent,
+// values >1 boost (capped at 2.0 = +6 dB). The GUI (video_timeline_tab.dart)
+// and the macOS native player (BraxilTimelinePlayer.swift) read the
+// same JSON shape, so this validator only checks types — does NOT
+// resort, since the GUI/player handle ordering.
+function _validateVolumePoints(pts, clipDurationMs) {
+  if (pts == null) return null;
+  if (!Array.isArray(pts)) throw new Error('clip.volumePoints must be an array');
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (!p || typeof p !== 'object') {
+      throw new Error(`clip.volumePoints[${i}] must be an object`);
+    }
+    const t = Number(p.t);
+    const v = Number(p.v);
+    if (!Number.isFinite(t) || t < 0 || t > clipDurationMs) {
+      throw new Error(
+        `clip.volumePoints[${i}].t must be in [0, ${clipDurationMs}] (got ${p.t})`,
+      );
+    }
+    if (!Number.isFinite(v) || v < 0 || v > 2) {
+      throw new Error(
+        `clip.volumePoints[${i}].v must be in [0, 2] linear gain (got ${p.v})`,
+      );
+    }
+    out.push({ t: Math.round(t), v });
+  }
+  out.sort((a, b) => a.t - b.t);
   return out;
 }
 
@@ -249,6 +313,13 @@ function _validateClip(c, settings) {
     const tp = _validateTitleProps(c.titleProps);
     if (tp) out.titleProps = tp;
   }
+  // Audio-clip volume automation curve. Same round-trip discipline as
+  // titleProps — without explicit pass-through, any unrelated mutator
+  // would strip the agent's keyframes on the next save.
+  if (_isAudioTrack(track)) {
+    const vps = _validateVolumePoints(c.volumePoints, dur);
+    if (vps && vps.length > 0) out.volumePoints = vps;
+  }
   return out;
 }
 
@@ -284,8 +355,10 @@ function _normalise(state) {
 // ── IO ───────────────────────────────────────────────────────────────
 
 function _read(id) {
-  const fp = _filePath(id);
-  if (!fs.existsSync(fp)) return null;
+  // Probe both home and legacy project dirs so a timeline created by
+  // either the GUI (home) or an older engine (project) is reachable.
+  const fp = _findExistingFile(id);
+  if (fp == null) return null;
   try {
     return JSON.parse(fs.readFileSync(fp, 'utf8'));
   } catch (e) {
@@ -295,7 +368,12 @@ function _read(id) {
 
 function _write(state) {
   _ensureDir();
-  const fp = _filePath(state.id);
+  // Preserve the file's existing location: if a row already lives in
+  // the legacy project dir, keep writing there (avoids duplicating
+  // the file in the home dir on every save). New timelines default to
+  // the canonical home dir.
+  const existing = _findExistingFile(state.id);
+  const fp = existing ?? _filePath(state.id);
   // Atomic replace: write to .tmp then rename so a crashed write
   // never leaves a half-flushed JSON file behind.
   const tmp = `${fp}.tmp`;
@@ -349,26 +427,32 @@ export function createTimeline({ name, settings, clips, state } = {}) {
   return toWrite;
 }
 
-/** List every timeline file in the project, lightest-touch (no parse cost). */
+/** List every timeline file across both the canonical home dir and the
+ *  legacy project dir. Dedupes by id (home wins on collision — newer
+ *  state lives there post-refactor). */
 export function listTimelines() {
-  const dir = _dir();
-  if (!fs.existsSync(dir)) return [];
+  const seenIds = new Set();
   const entries = [];
-  for (const name of fs.readdirSync(dir)) {
-    if (!name.endsWith('.json')) continue;
-    const id = name.slice(0, -5);
-    try {
-      const data = _read(id);
-      if (!data) continue;
-      entries.push({
-        id: data.id,
-        name: data.name,
-        clipCount: Array.isArray(data.clips) ? data.clips.length : 0,
-        videoTracks: data.settings?.videoTracks ?? 0,
-        audioTracks: data.settings?.audioTracks ?? 0,
-        updatedAt: data.updatedAt,
-      });
-    } catch { /* skip corrupt */ }
+  for (const dir of [_dir(), _legacyProjectDir()]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -5);
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      try {
+        const data = _read(id);
+        if (!data) continue;
+        entries.push({
+          id: data.id,
+          name: data.name,
+          clipCount: Array.isArray(data.clips) ? data.clips.length : 0,
+          videoTracks: data.settings?.videoTracks ?? 0,
+          audioTracks: data.settings?.audioTracks ?? 0,
+          updatedAt: data.updatedAt,
+        });
+      } catch { /* skip corrupt */ }
+    }
   }
   // Most-recently-edited first.
   entries.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
@@ -394,8 +478,10 @@ export function updateTimeline(id, state) {
 
 /** Delete a timeline file. Returns true if removed, false if it wasn't there. */
 export function deleteTimeline(id) {
-  const fp = _filePath(id);
-  if (!fs.existsSync(fp)) return false;
+  // Look up where the file actually lives (home or legacy project).
+  // _filePath alone would only point at the home dir.
+  const fp = _findExistingFile(id);
+  if (fp == null) return false;
   fs.unlinkSync(fp);
   // Best-effort removal of the matching media-library row. Same
   // fire-and-forget pattern as `_write` — the JSON unlink is the
@@ -578,6 +664,62 @@ export function setClipTransition(id, clipId, change) {
 }
 
 /**
+ * Set / replace / clear an audio clip's volume automation curve.
+ *
+ * `change.points`:
+ *   - `Array<{t, v}>` — replace the entire curve with these keyframes
+ *      (sorted internally; clamped to [0, clip.durationMs] × [0, 2]).
+ *   - `null`          — clear the curve, restoring unity gain.
+ *
+ * Single-keyframe shortcut: `change.gain` (number, 0..2) sets a uniform
+ * clip-wide gain by writing two anchor points (start + end) at that
+ * value, which is the cheapest way to "turn this clip down 3 dB".
+ *
+ * Only valid on audio tracks (A1, A2, …). Throws on V tracks so the
+ * agent gets a clear error instead of a silently-ignored mutation.
+ */
+export function setClipVolume(id, clipId, change) {
+  return _withTimeline(id, (state) => {
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
+    if (!change || typeof change !== 'object') {
+      throw new Error('setClipVolume change must be an object with points or gain');
+    }
+    const c = state.clips[i];
+    if (!_isAudioTrack(c.track)) {
+      throw new Error(
+        `setClipVolume: clip ${clipId} is on ${c.track} (video). ` +
+        'Volume automation only applies to audio clips (A<n>).',
+      );
+    }
+    if ('points' in change) {
+      if (change.points === null) {
+        delete c.volumePoints;
+      } else {
+        const vps = _validateVolumePoints(change.points, c.durationMs);
+        if (vps && vps.length > 0) c.volumePoints = vps;
+        else delete c.volumePoints;
+      }
+    } else if ('gain' in change) {
+      const g = Number(change.gain);
+      if (!Number.isFinite(g) || g < 0 || g > 2) {
+        throw new Error(
+          `setClipVolume.gain must be in [0, 2] linear gain (got ${change.gain})`,
+        );
+      }
+      // Unity → drop the field entirely so clean clips stay clean in the JSON.
+      if (g === 1) delete c.volumePoints;
+      else c.volumePoints = [{ t: 0, v: g }, { t: c.durationMs, v: g }];
+    } else {
+      throw new Error(
+        'setClipVolume change must include either `points` (array | null) or `gain` (number)',
+      );
+    }
+    return state;
+  });
+}
+
+/**
  * General-purpose single-clip patch. `changes` can include any of:
  *   - path     (string)         — replace source media file
  *   - offsetX  (number)         — visual transform pan X
@@ -602,6 +744,7 @@ export function updateClip(id, clipId, changes) {
         throw new Error(
           `updateClip: field '${key}' not patchable here. ` +
           `Use moveClip (startMs/track), trimClip (sourceInMs/durationMs), ` +
+          `setClipVolume (volumePoints), ` +
           `or setClipTransition (transitionIn/transitionOut).`,
         );
       }

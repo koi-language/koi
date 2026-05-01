@@ -21,7 +21,7 @@ export default {
     'path replaces the source media file. offsetX/offsetY pan the clip in canvas pixels (0,0 = centred). ' +
     'scale uniformly scales the clip (1 = original). linkId pairs the clip with a sibling on another track ' +
     '(use the same value on a V- and an A-clip so move/trim/remove cascade across the pair); pass null to clear. ' +
-    'For startMs/track use move_clip; for sourceInMs/durationMs use trim_clip; for transitions use set_clip_transition. ' +
+    'For startMs/track use move_clip; for sourceInMs/durationMs use trim_clip; for transitions use set_clip_transition; for audio volume automation use set_clip_volume. ' +
     'Returns: { success, timeline }.',
   thinkingHint: 'Updating clip',
   permission: 'write',

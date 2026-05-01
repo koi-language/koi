@@ -278,11 +278,24 @@ const outpaintImageAction = {
 
     // The reference is now a canvas where the scene already sits at
     // the correct position. The model's job is purely to fill the
-    // transparent regions — it must NOT redraw the opaque area.
+    // transparent regions — it must NOT redraw the opaque area, and
+    // it MUST NOT invent new subjects in the margins. Generic
+    // "extend the scene" prompts have a strong tendency to add
+    // people / objects whenever the existing scene "looks like
+    // somewhere people would be" (a B&W noir stencil → invented
+    // diner patrons; an outdoor portrait → invented bystanders).
+    // The explicit ban below is what curbs that — without it the
+    // outpaint reads as a recomposed group shot rather than a clean
+    // canvas extension.
     const basePrompt =
       `The reference image is a ${newWidth}×${newHeight} canvas where the existing scene already occupies its correct final position; the surrounding areas are transparent and need to be filled. ` +
       `Paint ONLY the transparent regions, extending the scene seamlessly ${directionsList}. ` +
       `The opaque region must stay pixel-identical — same composition, subjects, perspective, lighting, color palette, texture. The boundary between original and new content must be invisible: continue the same surfaces, lines, gradients across the seam. ` +
+      `STRICT RULES for the new content: ` +
+      `(a) Do NOT add any new people, faces, characters, animals, or living creatures — only the subjects already visible in the opaque region exist; ` +
+      `(b) Do NOT introduce new prominent objects that weren't visible at the boundary (no extra furniture, vehicles, signs, foreground items); ` +
+      `(c) Treat the margins as a continuation of the BACKGROUND only — the same wall, sky, floor, wallpaper, environment that the boundary suggests. ` +
+      `(d) If the boundary shows a transparent / empty area, fill it with a plausible plain backdrop (matching style, palette, and texture) — do NOT populate it with new content. ` +
       `Output the SAME ${newWidth}×${newHeight} canvas with the transparent areas now filled. Do not crop, do not resize, do not reinterpret the existing scene.`;
 
     const effectivePrompt = userPrompt

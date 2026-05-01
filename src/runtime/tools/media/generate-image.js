@@ -347,9 +347,19 @@ const generateImageAction = {
               channel.log('image', `Auto-detected resolution=${autoResolution} from base ref (max=${Math.max(meta.width, meta.height)}px)`);
             }
           }
+        } else {
+          // sharp returned no dims — almost always a corrupt buffer or
+          // an unsupported format. Loud because the next stage (adapter)
+          // will silently default to 1:1 / square otherwise.
+          console.warn(`[generate_image] Auto-detect: sharp returned no width/height for base ref (will fall through to 1:1 default downstream)`);
+          channel.log('image', `Auto-detect: sharp returned no dims for base ref → downstream will default to 1:1`);
         }
       } catch (err) {
-        channel.log('image', `Aspect/resolution auto-detect failed (non-fatal): ${err?.message || err}`);
+        // Loud — used to be a quiet info log, which let edits silently
+        // come back square because the adapter has no way to recover an
+        // aspect ratio without help from the client.
+        console.warn(`[generate_image] Auto-detect FAILED for base ref: ${err?.message || err}`);
+        channel.log('image', `Aspect/resolution auto-detect FAILED: ${err?.message || err} (downstream will default to 1:1)`);
       }
     }
     const effectiveAspect = action.aspectRatio || autoAspectRatio;
@@ -576,7 +586,14 @@ const generateImageAction = {
             // metadata hides the audit trail for billing and reproduction.
             model: result?.model || resolved.model,
             provider: resolved.provider,
-            aspectRatio: action.aspectRatio || null,
+            // Persist the EFFECTIVE values — what was actually sent to the
+            // gateway, including the auto-detect from the base reference.
+            // Saving `action.aspectRatio` directly hid the auto-detected
+            // value and made the metadata panel read "no aspect ratio
+            // requested", which is misleading for edits where we always
+            // auto-fill from the ref dimensions.
+            aspectRatio: effectiveAspect || null,
+            resolution: effectiveResolution || null,
             outputFormat: action.outputFormat || 'png',
             stylePreset: action.stylePreset || null,
             // Store media library IDs of reference images (not file paths)
