@@ -183,6 +183,7 @@ function _aggregateVideo(models) {
   let anyVideoToVideo = false;
   let anyFrameControl = false;
   let anyAudio = false;
+  let anyExtend = false;
   let maxShots = 1;
   const cameraMovementSet = new Set();
   for (const m of models) {
@@ -191,6 +192,11 @@ function _aggregateVideo(models) {
     if (m?.videoToVideo) anyVideoToVideo = true;
     if (m?.frameControl) anyFrameControl = true;
     if (m?.hasAudio) anyAudio = true;
+    // Curated `video_extend` bucket — surfaces the `kind: "extend"`
+    // tool parameter only when at least one model carries the tag.
+    if (Array.isArray(m?.categories) && m.categories.includes('video_extend')) {
+      anyExtend = true;
+    }
     // Per-model `cameraMovements`: CSV of supported tokens like
     // "static,pan_left,zoom_in". Union across active models — tools then
     // expose the superset as an enum.
@@ -210,6 +216,7 @@ function _aggregateVideo(models) {
     anyVideoToVideo,
     anyFrameControl,
     anyAudio,
+    anyExtend,
     hasRefImageSupport: anyImageToVideo || anyVideoToVideo,
     cameraMovements: [...cameraMovementSet].sort(),
     maxShots,
@@ -288,17 +295,67 @@ export function fetchMediaCapabilities(kind) {
 // skip the router.
 
 function _toNoMatchError(routingErr) {
-  const err = new Error(routingErr.message);
-  err.details = { code: 'no_model_matches', ...(routingErr.details || {}) };
+  const details = { code: 'no_model_matches', ...(routingErr.details || {}) };
+  // Enrich the agent-visible message: only `err.message` reaches the
+  // agent's "Action failed" feedback — `err.details` stays in-process.
+  // Without a summary the worker just sees "no active model matches"
+  // and has nothing to pivot on, so it retries with the same shape.
+  const hint = _summariseNoMatch(details);
+  const message = hint ? `${routingErr.message} — ${hint}` : routingErr.message;
+  const err = new Error(message);
+  err.details = details;
   try {
     const summary = {
-      requirements: err.details.requirements,
-      candidates: err.details.candidates,
-      rejections: err.details.rejections,
+      requirements: details.requirements,
+      candidates: details.candidates,
+      rejections: details.rejections,
     };
     console.error('[media-router] no_model_matches', JSON.stringify(summary, null, 2));
   } catch { /* non-fatal */ }
   return err;
+}
+
+// Compact one-line summary of why the catalog collapsed: top rejection
+// reasons grouped by frequency, plus which dimensions still have viable
+// models (so the agent knows what to drop). The `alternatives` map is
+// per-dimension `{ "videoRefsCount>0": [{slug,...}, ...] }`.
+function _summariseNoMatch(details) {
+  const parts = [];
+  const rejections = Array.isArray(details.rejections) ? details.rejections : [];
+  if (rejections.length > 0) {
+    const counts = new Map();
+    for (const r of rejections) {
+      for (const reason of (r.reasons || [])) {
+        counts.set(reason, (counts.get(reason) || 0) + 1);
+      }
+    }
+    const top = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([reason, n]) => `${reason} (${n})`)
+      .join(', ');
+    if (top) parts.push(`tried ${rejections.length} model(s); top reasons: ${top}`);
+  } else if (typeof details.candidates === 'number') {
+    parts.push(`candidates=${details.candidates}`);
+  }
+  const alts = details.alternatives;
+  if (alts && typeof alts === 'object') {
+    const viable = [];
+    for (const [dim, list] of Object.entries(alts)) {
+      if (Array.isArray(list) && list.length > 0) {
+        const slugs = list.slice(0, 3).map((m) => m?.slug).filter(Boolean).join(',');
+        viable.push(`${dim}=${list.length} model(s)${slugs ? ` [${slugs}${list.length > 3 ? ',…' : ''}]` : ''}`);
+      }
+    }
+    if (viable.length > 0) parts.push(`viable per-dimension: ${viable.join(' | ')}`);
+  }
+  if (Array.isArray(details.included) && details.included.length > 0) {
+    parts.push(`includeModels=[${details.included.join(',')}]`);
+  }
+  if (Array.isArray(details.excluded) && details.excluded.length > 0) {
+    parts.push(`excludeModels=[${details.excluded.join(',')}]`);
+  }
+  return parts.join(' — ');
 }
 
 // Normalize the handful of shapes Fal / OpenAI / Google / custom proxies
@@ -542,6 +599,34 @@ export class GatewayImageGen extends BaseImageGen {
         data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
         mime_type: ref.mimeType || 'image/png',
       }));
+    }
+    if (opts.maskImage) {
+      const m = opts.maskImage;
+      payload.mask_image = {
+        data: typeof m.data === 'string' ? m.data : m.data.toString('base64'),
+        mime_type: m.mimeType || 'image/png',
+      };
+    }
+    if (opts.sourceImage) {
+      const s = opts.sourceImage;
+      payload.source_image = {
+        data: typeof s.data === 'string' ? s.data : s.data.toString('base64'),
+        mime_type: s.mimeType || 'image/png',
+      };
+    }
+    if (opts.targetSize?.width && opts.targetSize?.height) {
+      payload.target_size = {
+        width: opts.targetSize.width,
+        height: opts.targetSize.height,
+      };
+    }
+    if (opts.sourceImageOffset
+        && typeof opts.sourceImageOffset.x === 'number'
+        && typeof opts.sourceImageOffset.y === 'number') {
+      payload.source_image_offset = {
+        x: opts.sourceImageOffset.x,
+        y: opts.sourceImageOffset.y,
+      };
     }
 
     // Submit + poll. The sync `/media/image/generate` endpoint exists for
@@ -869,6 +954,7 @@ export class GatewayAudioGen extends BaseAudioGen {
    *  Returns: { audio: Buffer, format, usage }.
    */
   async sfx(prompt, opts = {}) {
+    const hasVideoRef = !!opts.videoUrl;
     const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
       import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
         try {
@@ -878,7 +964,7 @@ export class GatewayAudioGen extends BaseAudioGen {
           throw e;
         }
       }),
-      { kind: 'sfx', label: opts.label },
+      { kind: 'sfx', label: opts.label, hasVideoRef },
     );
 
     const res = await fetch(`${getGatewayBase()}/media/audio/sfx`, {
@@ -891,6 +977,7 @@ export class GatewayAudioGen extends BaseAudioGen {
         ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
         ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
         ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+        ...(hasVideoRef ? { video_url: opts.videoUrl } : {}),
       }),
       signal: opts.abortSignal,
     });
@@ -899,6 +986,50 @@ export class GatewayAudioGen extends BaseAudioGen {
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Gateway sfx error (${res.status}): ${body}`);
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: prompt.length } };
+  }
+
+  /** Generate music from a text prompt. Distinct from sfx(): music is
+   *  text-only (no video conditioning today), uses its own backend route
+   *  and adapter kind. Single-shot POST to /media/audio/music — the
+   *  backend resolves the per-slug adapter (ElevenLabs Music, etc.) and
+   *  returns audio bytes inline.
+   *
+   *  Returns: { audio: Buffer, format, usage }.
+   */
+  async music(prompt, opts = {}) {
+    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+        try {
+          return pickAudioModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      { kind: 'music', label: opts.label },
+    );
+
+    const res = await fetch(`${getGatewayBase()}/media/audio/music`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        model: resolvedModel,
+        prompt,
+        outputFormat: opts.outputFormat || 'mp3',
+        ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
+        ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+      }),
+      signal: opts.abortSignal,
+    });
+
+    await throwIfQuotaExceeded(res);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Gateway music error (${res.status}): ${body}`);
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
@@ -1102,6 +1233,8 @@ export class GatewayVideoGen extends BaseVideoGen {
         // Default true — quality wins ties unless the caller passed an
         // explicit `false` to opt into budget mode.
         preferQuality: opts.preferQuality !== false,
+        // Extension intent → `video_extend` bucket in pickVideoModel.
+        kind: opts.kind,
       },
     );
 

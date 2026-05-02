@@ -30,6 +30,18 @@ class ActionRegistry {
     if (!action.type || !action.description) {
       throw new Error('Action must have type and description');
     }
+
+    // Banner middleware. If a tool declares `bannerKind` ('image' / 'video'
+    // / 'audio'), wrap its execute() to emit mediaToolStart before the
+    // upstream call and mediaToolEnd after, so the GUI can render an
+    // asymptotic progress bar sized to the model's average latency.
+    // Wrapping at registration time means each tool stays declarative —
+    // it just states `bannerKind`/`bannerLabel`/`bannerIconId` and the
+    // dispatch glue lives in one place.
+    if (action.bannerKind && typeof action.execute === 'function' && !action.__bannerWrapped) {
+      _wrapWithBanner(action);
+    }
+
     this.actions.set(action.type, action);
 
     // NUEVO: indexar también por intent
@@ -512,6 +524,77 @@ class ActionRegistry {
   clear() {
     this.actions.clear();
   }
+}
+
+// ── Banner middleware (slow media generators) ─────────────────────────
+// Wraps `action.execute` to emit mediaToolStart / mediaToolEnd around the
+// upstream call. The expected duration comes from the gateway catalog —
+// average of the last 20 successful samples for that slug, falling back
+// to the kind-wide median, then to a 120 s constant. Channel + capabilities
+// imports are dynamic to keep this module's startup cycle clean (the
+// registry loads before the LLM provider stack initialises).
+const _DEFAULT_EXPECTED_MS = 120_000;
+const _MEDIA_BANNER_INTENTS = new Set();
+let _channelPromise = null;
+function _getChannel() {
+  if (!_channelPromise) _channelPromise = import('../io/channel.js').then((m) => m.channel);
+  return _channelPromise;
+}
+let _capsModulePromise = null;
+function _getCapsModule() {
+  if (!_capsModulePromise) _capsModulePromise = import('../llm/providers/gateway.js');
+  return _capsModulePromise;
+}
+
+async function _resolveExpectedDurationMs(kind, slug) {
+  try {
+    const mod = await _getCapsModule();
+    const caps = await mod.fetchMediaCapabilities(kind);
+    if (!caps?.models) return _DEFAULT_EXPECTED_MS;
+    if (slug && slug !== 'auto') {
+      const row = caps.models.find((m) => m.slug === slug);
+      if (row && Number.isFinite(row.avgLatencyMs) && row.avgLatencyMs > 0) {
+        return row.avgLatencyMs;
+      }
+    }
+    // Kind-wide median across slugs that have at least one sample.
+    const samples = caps.models
+      .map((m) => m.avgLatencyMs)
+      .filter((v) => Number.isFinite(v) && v > 0)
+      .sort((a, b) => a - b);
+    if (samples.length === 0) return _DEFAULT_EXPECTED_MS;
+    return samples[Math.floor(samples.length / 2)];
+  } catch {
+    return _DEFAULT_EXPECTED_MS;
+  }
+}
+
+function _wrapWithBanner(action) {
+  const _orig = action.execute;
+  _MEDIA_BANNER_INTENTS.add(action.intent || action.type);
+  action.execute = async function _bannerWrapped(act, agent) {
+    const id = `media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const slug = act?.model || null;
+    const expectedDurationMs = await _resolveExpectedDurationMs(action.bannerKind, slug);
+    const channel = await _getChannel();
+    channel.mediaToolStart({
+      id,
+      intent: action.intent || action.type,
+      kind: action.bannerKind,
+      label: action.bannerLabel || action.intent || action.type,
+      iconId: action.bannerIconId || action.intent || action.type,
+      expectedDurationMs,
+    });
+    let ok = false;
+    try {
+      const result = await _orig.call(this, act, agent);
+      ok = !!(result && result.success !== false);
+      return result;
+    } finally {
+      channel.mediaToolEnd({ id, ok });
+    }
+  };
+  action.__bannerWrapped = true;
 }
 
 // Global singleton instance

@@ -210,6 +210,74 @@ export class Agent {
     Agent._cliHooks = hooks;
   }
 
+  /**
+   * Nuclear cancel — same sweep that `cancel_plan` (the typed "stop"/
+   * "para" classification) runs. Shared so the GUI Stop button can
+   * trigger identical behaviour: every pending/in-progress task and
+   * workqueue item is marked deleted, every registered agent's
+   * AbortController fires with reason='cancel', and every sleeping
+   * agent's `_wakeupPromise` is resolved so its loop drains the (now
+   * empty) queue and exits. Without the wakeup, an idle agent stays
+   * asleep until the next inbox message — which is the "no reacciona
+   * inmediatamente" symptom users see when only `uiBridge.abort()` is
+   * called.
+   */
+  static async cancelAll() {
+    let cancelledTasks = 0;
+    let abortedAgents = 0;
+
+    try {
+      const { taskManager } = await import('../state/task-manager.js');
+      for (const t of taskManager.list()) {
+        if (t.status === 'pending' || t.status === 'in_progress') {
+          try {
+            taskManager.update(t.id, { status: 'deleted' });
+            cancelledTasks++;
+          } catch { /* non-fatal */ }
+        }
+      }
+    } catch (err) {
+      channel.log('cancel-all', `taskManager sweep failed: ${err?.message || err}`);
+    }
+
+    for (const [, agent] of Agent._inboxRegistry) {
+      const q = agent?._workQueue;
+      if (q) {
+        try {
+          for (const item of q.list()) {
+            if (item.status === 'pending' || item.status === 'in_progress') {
+              try {
+                q.update(String(item.id), { status: 'deleted' });
+                cancelledTasks++;
+              } catch { /* non-fatal */ }
+            }
+          }
+        } catch (err) {
+          channel.log('cancel-all', `queue sweep (${agent.name}) failed: ${err?.message || err}`);
+        }
+      }
+
+      if (typeof agent?.abort === 'function') {
+        try {
+          agent.abort('cancel');
+          abortedAgents++;
+        } catch { /* non-fatal */ }
+      }
+
+      try {
+        const fn = agent?._wakeupResolve;
+        if (typeof fn === 'function') {
+          agent._wakeupResolve = null;
+          agent._wakeupPromise = null;
+          fn();
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    channel.log('cancel-all', `swept ${cancelledTasks} task(s), aborted ${abortedAgents} delegate(s)`);
+    return { cancelledTasks, abortedAgents };
+  }
+
   constructor(config) {
     this.name = config.name;
     this.displayName = config.displayName || this.name;

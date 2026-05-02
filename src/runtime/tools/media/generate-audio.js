@@ -19,6 +19,7 @@
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { findVoiceByName } from '../../state/voice-registry.js';
+import { _uploadVideoRef } from './generate-video.js';
 
 import fs from 'fs';
 import path from 'path';
@@ -27,10 +28,14 @@ import { channel } from '../../io/channel.js';
 const generateAudioAction = {
   type: 'generate_audio',
   intent: 'generate_audio',
-  description: 'Generate speech audio from text, transcribe audio to text, OR synthesise a sound effect from a prompt. Model is auto-selected from the active catalog — describe what you want (mode, voice, label) and let the picker pick the cheapest capable model. Three modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / ambient clip (door slam, rain, footsteps, sci-fi whoosh, etc.) from a free-form prompt. Fields for speech mode: "text" (required), "saveTo" (required, file path), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (required, file path), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx; { success, text } for transcribe.',
+  bannerKind: 'audio',
+  bannerLabel: 'Generando audio',
+  bannerIconId: 'generate-audio',
+  description: 'Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. Model is auto-selected from the active catalog — describe what you want (mode, voice, label) and let the picker pick the cheapest capable model. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (mmaudio-v2) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (required, file path), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (required, file path), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (required, file path), optional "durationSeconds" (ElevenLabs Music ~10..300), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
   thinkingHint: (action) => {
     if (action.mode === 'transcribe') return 'Transcribing audio';
     if (action.mode === 'sfx') return 'Generating sound effect';
+    if (action.mode === 'music') return 'Generating music';
     return 'Generating speech';
   },
   permission: 'generate_audio',
@@ -38,7 +43,7 @@ const generateAudioAction = {
   schema: {
     type: 'object',
     properties: {
-      mode:         { type: 'string', description: 'Mode: "speech" (text→audio, default), "transcribe" (audio→text), or "sfx" (prompt→sound effect)' },
+      mode:         { type: 'string', description: 'Mode: "speech" (text→audio, default), "transcribe" (audio→text), "sfx" (prompt→sound effect, optionally video-conditioned via videoFile), or "music" (prompt→music track / score / backing — text-only, NOT video-conditioned).' },
       // Speech mode fields
       text:         { type: 'string', description: 'Text to convert to speech (speech mode)' },
       voice:        { type: 'string', description: 'Voice: preset name (alloy, echo, fable, onyx, nova, shimmer for OpenAI; provider-specific names for ElevenLabs / MiniMax) OR a cloned-voice name registered via create_voice. Default: alloy.' },
@@ -53,6 +58,7 @@ const generateAudioAction = {
       durationSeconds: { type: 'number', description: 'Target clip length in seconds (sfx mode). Provider-clamped — ElevenLabs sound-effects/v2 accepts 0.5–22. Omit to let the provider auto-pick.' },
       promptInfluence: { type: 'number', description: 'How strictly to follow the prompt vs. take creative liberties (sfx mode, 0..1). ElevenLabs-specific; ignored elsewhere.' },
       seed:         { type: 'number', description: 'Optional reproducibility seed (sfx mode).' },
+      videoFile:    { type: 'string', description: 'Optional path to a reference video (sfx mode). When provided, the router picks a video-conditioned model (e.g. mmaudio-v2) that synchronises the generated SFX / Foley to the visible action — preferred when adding audio to a silent video. The video is uploaded to fal storage automatically. Omit for prompt-only SFX (faster / cheaper).' },
       // Transcribe mode fields
       audioFile:    { type: 'string', description: 'Path to audio file to transcribe (transcribe mode)' },
       language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' }
@@ -76,6 +82,8 @@ const generateAudioAction = {
     { intent: 'generate_audio', text: 'Narration for the video', voice: 'nova', outputFormat: 'wav', speed: 0.9, saveTo: '/tmp/narration.wav' },
     { intent: 'generate_audio', mode: 'transcribe', audioFile: '/tmp/recording.mp3', language: 'en' },
     { intent: 'generate_audio', mode: 'sfx', prompt: 'heavy wooden door slamming shut in a stone hallway, with a faint echo', durationSeconds: 3, saveTo: '/tmp/door-slam.mp3' },
+    { intent: 'generate_audio', mode: 'sfx', prompt: 'crackling fire, collapsing wooden beams, distant shouts', videoFile: '/Users/me/clips/burning-house.mp4', durationSeconds: 6, saveTo: '/tmp/burning.mp3' },
+    { intent: 'generate_audio', mode: 'music', prompt: 'epic orchestral score with rising tension, cellos and percussion, building to a crescendo', durationSeconds: 30, saveTo: '/tmp/score.mp3' },
   ],
 
   async execute(action, agent) {
@@ -166,7 +174,7 @@ const generateAudioAction = {
       };
     }
 
-    // ── SFX mode (text→sound-effect) ──────────────────────────────────
+    // ── SFX mode (text→sound-effect, optionally video-conditioned) ────
     if (mode === 'sfx') {
       const prompt = action.prompt || action.text;
       if (!prompt) throw new Error('generate_audio: "prompt" is required for sfx mode');
@@ -179,11 +187,29 @@ const generateAudioAction = {
         };
       }
 
+      // Upload reference video FIRST. Threading the resulting URL into the
+      // router (`hasVideoRef: true`) is what steers the picker to a video-
+      // conditioned model (e.g. mmaudio-v2) instead of a text-only one.
+      // We do the upload here rather than in instance.sfx() so callers
+      // see a clean failure mode if the file is missing / unreadable
+      // before the (slow) inference call kicks off.
+      let videoUrl;
+      if (action.videoFile) {
+        videoUrl = await _uploadVideoRef(action.videoFile);
+        if (!videoUrl) {
+          return {
+            success: false,
+            error: `generate_audio: failed to upload reference video "${action.videoFile}". Check the path and that fal storage is reachable.`,
+          };
+        }
+      }
+
       const outputFormat = action.outputFormat || 'mp3';
       channel.log(
         'audio',
         `generate_audio (sfx): ${resolved.provider}/${resolved.model}, format=${outputFormat}, ` +
-        `duration=${action.durationSeconds ?? '-'}s, prompt="${String(prompt).substring(0, 100)}", saveTo=${action.saveTo}`,
+        `duration=${action.durationSeconds ?? '-'}s, prompt="${String(prompt).substring(0, 100)}", ` +
+        `saveTo=${action.saveTo}${videoUrl ? ` (video-conditioned)` : ''}`,
       );
 
       const result = await instance.sfx(prompt, {
@@ -191,6 +217,7 @@ const generateAudioAction = {
         ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
         ...(typeof action.promptInfluence === 'number' ? { promptInfluence: action.promptInfluence } : {}),
         ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
+        ...(videoUrl ? { videoUrl } : {}),
         ...(action.label ? { label: action.label } : {}),
         ...(action.extra ? { extra: action.extra } : {}),
       });
@@ -206,6 +233,55 @@ const generateAudioAction = {
         provider: resolved.provider,
         model: resolved.model,
         mode: 'sfx',
+        savedTo: savePath,
+        format: result.format,
+        fileSize: result.audio.length,
+        usage: result.usage,
+      };
+    }
+
+    // ── Music mode (text→music track / score / backing) ───────────────
+    // Text-only: no video conditioning. For Foley / SFX synchronised to
+    // a clip use mode='sfx' with a videoFile (mmaudio-v2) — that's the
+    // path that watches the source frames.
+    if (mode === 'music') {
+      const prompt = action.prompt || action.text;
+      if (!prompt) throw new Error('generate_audio: "prompt" is required for music mode');
+      if (!action.saveTo) throw new Error('generate_audio: "saveTo" is required for music mode — specify where to save the audio file');
+      if (typeof instance.music !== 'function') {
+        return {
+          success: false,
+          error: 'Music generation is only available when signed in (gateway mode). The current audio provider does not expose music().',
+          provider: resolved.provider,
+        };
+      }
+
+      const outputFormat = action.outputFormat || 'mp3';
+      channel.log(
+        'audio',
+        `generate_audio (music): ${resolved.provider}/${resolved.model}, format=${outputFormat}, ` +
+        `duration=${action.durationSeconds ?? '-'}s, prompt="${String(prompt).substring(0, 100)}", saveTo=${action.saveTo}`,
+      );
+
+      const result = await instance.music(prompt, {
+        outputFormat,
+        ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
+        ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
+        ...(action.label ? { label: action.label } : {}),
+        ...(action.extra ? { extra: action.extra } : {}),
+      });
+
+      const savePath = path.resolve(action.saveTo);
+      const dir = path.dirname(savePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(savePath, result.audio);
+      channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
+
+      return {
+        success: true,
+        provider: resolved.provider,
+        model: resolved.model,
+        mode: 'music',
         savedTo: savePath,
         format: result.format,
         fileSize: result.audio.length,
@@ -241,7 +317,7 @@ const generateAudioAction = {
       };
     }
 
-    throw new Error(`generate_audio: unknown mode "${mode}" — use "speech", "transcribe", or "sfx"`);
+    throw new Error(`generate_audio: unknown mode "${mode}" — use "speech", "transcribe", "sfx", or "music"`);
   }
 };
 

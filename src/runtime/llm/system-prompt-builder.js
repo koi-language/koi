@@ -636,13 +636,16 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         }
       }
 
-      // When the ACTIVE doc is a video and the user asks for an edit /
-      // restyle / motion change, the video itself is the subject — pass
-      // its path as `referenceVideos` so the router can pick a v2v model.
-      // Without this block the agent routinely calls generate_video with
-      // only `prompt` set (no refs) → the router classifies it as pure
-      // text-to-video and rejects any video-to-video specialist, even
-      // when the user clearly meant "edit this video".
+      // When the ACTIVE doc is a video, two distinct intents collapse into
+      // the same surface ("do X with this video"): (A) transform the source
+      // footage — preserve motion, change look — which is v2v; (B) reuse
+      // the SUBJECTS in a new scene — new motion, new setting — which is
+      // extract_frame → generate_image → generate_video (image-to-video).
+      // Without this distinction the agent routinely funnels (B) through
+      // v2v with `referenceVideos`, which (a) preserves source motion the
+      // user didn't ask for and (b) collides with v2v specialists' tighter
+      // content filters. The block below spells out both paths so the
+      // planner picks the right pipeline up-front.
       if (active && active.type === 'video' && active.path) {
         const activeLoc = active.path;
         const saveDir = activeLoc.replace(/\/[^/]+$/, '');
@@ -650,17 +653,39 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
           ? active.bundle.annotations.filter((a) => a?.role === 'video-frame-composite')
           : [];
         lines.push('');
-        lines.push('## 🎬 ACTIVE document is a video — route edits via video-to-video');
+        lines.push('## 🎬 ACTIVE document is a video — pick the right path');
         lines.push('');
-        lines.push('The video IS the subject. "Cambia el color", "make it slow-motion", "apply cinematic grading", "remove the watermark", "extend", "restyle", "add audio", etc. → the ACTIVE video is the input.');
+        lines.push('There are TWO distinct intents on a video, with two different pipelines. Pick before calling anything.');
         lines.push('');
-        lines.push(`For **any edit / restyle / transformation** of the active video, call \`generate_video\` with its path in \`referenceVideos\`. The router uses that to pick a video-to-video model; omitting it forces text-to-video routing and the call will be rejected.`);
+        lines.push('### A) EDIT the video itself (transform the existing footage)');
+        lines.push('');
+        lines.push('"Cambia el color", "make it slow-motion", "apply cinematic grading", "remove the watermark", "extend", "restyle", "add audio". The motion of the source is preserved; only its look / length / audio changes. → v2v: call `generate_video` with the active path in `referenceVideos`.');
         lines.push('');
         lines.push('```json');
         lines.push(`{ "intent": "generate_video", "prompt": "<paraphrase the user's request, describing the desired result>", "referenceVideos": ["${activeLoc}"], "saveTo": "${saveDir}" }`);
         lines.push('```');
         lines.push('');
-        lines.push('Only skip `referenceVideos` if the user is asking for a brand-new clip that does NOT reference the active video (e.g. "generate a video of a sunset" while a different video is open).');
+        lines.push('### B) REUSE the SUBJECTS of the video in a NEW scene');
+        lines.push('');
+        lines.push('"Haz a esta pareja en X", "ponla haciendo Y", "muéstralo en Z", "create a scene where they…". The user wants the people / characters / objects from the video doing something the source does NOT already show — new action, new setting, new pose. The source video is a character reference, not the footage to transform.');
+        lines.push('');
+        lines.push('**DO NOT pass the video as `referenceVideos`** in this case (that forces v2v routing, which is the wrong tool: v2v models try to preserve source motion and v2v specialists are also the most restrictive about content). Instead chain three calls:');
+        lines.push('');
+        lines.push(`1. \`extract_frame\` on \`${activeLoc}\` (use \`lastFrame: true\`, or a specific \`timeMs\` if a particular pose matters) — yields a still PNG of the subjects.`);
+        lines.push('2. `generate_image` with that frame in `referenceImages` to compose the new scene as a still.');
+        lines.push('3. `generate_video` with the generated image as `startFrame` (image-to-video) for the final clip. **No `referenceVideos`** in this call.');
+        lines.push('');
+        lines.push('This preserves the visual identity of the subjects while letting you generate motion / settings absent from the source.');
+        lines.push('');
+        lines.push('### How to choose between A and B');
+        lines.push('');
+        lines.push('- The request describes a **transformation of what the source already shows** (recolor, restyle, slow-mo, extend by N seconds, watermark removal) → **A (v2v)**.');
+        lines.push('- The request describes **new action / new setting** the source video does NOT show → **B (frame → image → video)**.');
+        lines.push('- If you are unsure, prefer **B** — it is more flexible and less likely to be rejected. Only skip `referenceVideos` entirely when the user is asking for a brand-new clip with NO connection to the active video (e.g. "generate a video of a sunset" while a different video is open) — that is text-to-video, not path B.');
+        // Paths C and D (audio generation) used to live here, but they
+        // also apply when the active document is a TIMELINE (which
+        // references video clips) — pulled out below so the same guidance
+        // fires for both kinds of doc.
 
         // Per-frame annotations published with the video — read them as
         // vision before writing the prompt so the marks become a SPECIFIC
@@ -699,6 +724,55 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
           _pushSurgicalAnnotationGuide(lines);
         }
       }
+
+      // Audio generation guidance — fires for BOTH video and timeline
+      // active docs. A timeline references video clips internally, so
+      // "ponle sonido a esto" is the same intent regardless of which kind
+      // of doc the user has focused. Without this, the timeline path
+      // landed on the LLM's training priors and produced a `prompt_user`
+      // with music chips even when the user said "sonido" — wrong on
+      // both axes (chose music over sfx, AND asked instead of acting).
+      const _audioActive = active && (active.type === 'video' || active.type === 'timeline') && (active.path || active.url);
+      if (_audioActive) {
+        const _activeLoc = active.path || active.url;
+        const _activeKind = active.type;
+        lines.push('');
+        lines.push(`## 🔊 ACTIVE document is a ${_activeKind} — adding audio`);
+        lines.push('');
+        lines.push('### C) ADD SFX / SOUND / FOLEY (the user said "sonido" / "audio" / "SFX" / "Foley" / "ambient sound")');
+        lines.push('');
+        lines.push('**This is NOT a clarification step.** Do NOT call `prompt_user`. Do NOT propose music chips. Do NOT ask "qué tipo de música prefieres". The user said "sonido" — that means **diegetic SFX synchronised to what\'s on screen**, not music. Go straight to the workflow below.');
+        lines.push('');
+        lines.push('**Workflow — strictly required before calling `generate_audio`:**');
+        lines.push('');
+        lines.push(`1. Call \`read_file\` on \`${_activeLoc}\` so vision receives the source frames (for a timeline, the engine renders/serialises a representative view of the clips). WITHOUT this read you have no idea what's on screen; defaulting to "ambient electronic music" or similar generic prompts is the canonical failure mode here and produces audio unrelated to the content.`);
+        lines.push('');
+        lines.push('2. Identify the dominant on-screen action / texture / mood (e.g. "wooden building engulfed in flames, crackling and roaring, people running with metal buckets"; "calm forest path with leaves rustling and footsteps on gravel"; "underwater scene with bubbles and muffled ambient hum").');
+        lines.push('');
+        lines.push(`3. Write the \`generate_audio\` call with \`mode: "sfx"\`. **Pass \`videoFile: "${_activeLoc}"\`** — with \`videoFile\` present the router lands on a video-conditioned model (mmaudio-v2) that synchronises the SFX to the visible action: silence for the silent moments, peaks at impact frames. Without \`videoFile\` you fall back to a text-only sfx model (ElevenLabs) which produces a generic clip that won't sync.`);
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_audio", "mode": "sfx", "prompt": "<concrete sound description anchored in what's on-screen>", "videoFile": "${_activeLoc}", "durationSeconds": <duration in seconds>, "saveTo": "<absolute path>.mp3" }`);
+        lines.push('```');
+        lines.push('');
+        lines.push('Even with the video-conditioned model, the prompt still matters — it disambiguates which sounds to emphasise. Specific sensory prompts ("crackling fire, collapsing wooden beams, distant shouts and metal buckets clanging") produce specific audio; vague prompts ("background sound") get vague audio.');
+        lines.push('');
+        lines.push('### D) ADD MUSIC / SCORE / SOUNDTRACK (only when the user explicitly says "música" / "soundtrack" / "score" / "backing track")');
+        lines.push('');
+        lines.push('Music is text-only, NOT video-conditioned — the model does not watch the frames. Read the active doc anyway so you can describe the mood / genre / pacing that fits the visuals, then call `generate_audio` with `mode: "music"`. **Do NOT pass `videoFile`** — in music mode it would be ignored.');
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_audio", "mode": "music", "prompt": "<mood + instrumentation + tempo + structure, e.g. 'epic orchestral score with cellos and percussion, slow build into a crescendo at 0:20'>", "durationSeconds": <duration>, "saveTo": "<absolute path>.mp3" }`);
+        lines.push('```');
+        lines.push('');
+        lines.push('### Disambiguation C vs D — STRICT keyword rules');
+        lines.push('');
+        lines.push('- "sonido" / "audio" / "SFX" / "Foley" / "ambient sound" / "sound effects" → **C (sfx)**. Never music.');
+        lines.push('- "música" / "soundtrack" / "score" / "backing track" / "BSO" / "musical theme" → **D (music)**.');
+        lines.push('- If only neutral words appear ("ponle algo", "add audio"), default to **C (sfx)**. The user can always say "no, quiero música" on the next turn.');
+        lines.push('- **Never** call `prompt_user` to disambiguate between C and D unless the user used a word that genuinely matches BOTH categories ("acompañamiento sonoro" — rare). Asking the user is the wrong default; reading the file and acting is right.');
+      }
+
       lines.push('');
       lines.push('**ACTIVE doc = default target.** Demonstratives ("this", "esto", "the image", "the pdf", …) always mean the ACTIVE document — never the project codebase. Use only paths / URLs listed above, never invent.');
       lines.push('- **Read** active doc → `read_file` with its path/URL. Images & web come back as vision; if there\'s a composite, it\'s queued right after as `[ANNOTATIONS OVERLAY]` (image) or `[ANNOTATIONS @ MM:SS.ms]` (video — one per annotated frame, chronological).');

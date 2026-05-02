@@ -102,6 +102,9 @@ function _closestResolution(pixelMax, available) {
 const generateImageAction = {
   type: 'generate_image',
   intent: 'generate_image',
+  bannerKind: 'image',
+  bannerLabel: 'Generando imagen',
+  bannerIconId: 'generate-image',
   // NOTE: this description is the API-keys fallback. When the backend catalog
   // is reachable, the fetchMediaCapabilities('image') block at the bottom of
   // this file REWRITES this string at import time with the real enums (aspect
@@ -395,6 +398,44 @@ const generateImageAction = {
     // 'outpaint' here so the router routes to the `image_extend`
     // bucket instead of the generic edit pool.
     if (action.operation) genOpts.operation = action.operation;
+    // Inpaint/fill mask. Tools that own a precise fill region (outpaint_image)
+    // pass it as { data: Buffer, mimeType }. Adapters that need a separate
+    // mask URL (flux-pro/v1/fill) consume it from the canonical request.
+    if (action.maskImage?.data) {
+      genOpts.maskImage = {
+        data: action.maskImage.data,
+        mimeType: action.maskImage.mimeType || 'image/png',
+      };
+    }
+    // sourceImage carries the unpadded original for reframe-style adapters
+    // (bria/expand, ideogram/v3/reframe). Plumbed separately from
+    // referenceImages so the router's refsCount filter doesn't exclude
+    // single-ref models that are perfectly able to outpaint.
+    if (action.sourceImage?.data) {
+      genOpts.sourceImage = {
+        data: action.sourceImage.data,
+        mimeType: action.sourceImage.mimeType || 'image/png',
+      };
+    }
+    // Absolute target dimensions for *reframe* models (ideogram/v3/reframe,
+    // flux/kontext, …) which take a source image + a target frame size and
+    // outpaint to fill. Set by outpaint_image to the post-padding dims.
+    if (action.targetSize?.width && action.targetSize?.height) {
+      genOpts.targetSize = {
+        width: action.targetSize.width,
+        height: action.targetSize.height,
+      };
+    }
+    // Source-image offset within the target canvas — required for
+    // asymmetric outpaint on models with explicit placement (bria/expand).
+    if (action.sourceImageOffset
+        && typeof action.sourceImageOffset.x === 'number'
+        && typeof action.sourceImageOffset.y === 'number') {
+      genOpts.sourceImageOffset = {
+        x: action.sourceImageOffset.x,
+        y: action.sourceImageOffset.y,
+      };
+    }
 
     let result;
     try {

@@ -312,6 +312,16 @@ export function pickImageModel(models, req = {}) {
       return true;
     }
 
+    // `image_extend` is a STRICT-curation bucket: only backoffice-tagged
+    // models are eligible. Without this gate, uncategorised models that
+    // happen to advertise `outpaint`/`outpainting` in their operations
+    // would leak through (line 315 below) and the router would silently
+    // pick a generic edit model — which produces "outpaint" results by
+    // redrawing the whole scene rather than painting only the new
+    // margins. Outpaint is an explicit curation decision: tag the model
+    // in the backoffice or it doesn't get picked.
+    if (wantedImageBucket === 'image_extend') return false;
+
     if (wantsOperation) {
       if (!Array.isArray(m.operations) || !m.operations.includes(wantsOperation)) return false;
       // Operation-scoped routing short-circuits the soft preferences below
@@ -586,6 +596,11 @@ export function pickVideoModel(models, req = {}) {
   // audio and produce a talking video, which doesn't fit the
   // textToVideo/imageToVideo taxonomy cleanly.
   const wantsAvatar = req.kind === 'avatar';
+  // `kind: 'extend'` is the explicit "continue this clip" signal —
+  // the agent passes it when the user asks to extend / make-longer
+  // an existing video. Routes to the dedicated `video_extend` bucket
+  // so a single backoffice tag controls which model owns extension.
+  const wantsExtend = req.kind === 'extend';
 
   // Koi-owned purpose buckets (see model_prices.categories). When a
   // model row carries them, this is the SOLE membership signal we
@@ -599,9 +614,11 @@ export function pickVideoModel(models, req = {}) {
   const inCategory = (m, cat) => modelCategories(m).includes(cat);
   const wantedBucket = wantsAvatar
     ? 'video_avatar'
-    : wantsVideoToVideo
-      ? 'video_editing'
-      : 'video_generation';
+    : wantsExtend
+      ? 'video_extend'
+      : wantsVideoToVideo
+        ? 'video_editing'
+        : 'video_generation';
 
   const _filterVideo = (useLabel) => models.filter((m) => {
     if (m.pricePerUnit == null) return false;
@@ -759,8 +776,23 @@ export function pickAudioModel(models, req = {}) {
     null
   );
 
+  // Hard filter for video-conditioned sfx: mmaudio-v2 et al. declare
+  // `inputVideo: true` in the catalog. When the caller passes a video
+  // reference the picker MUST land on a video-capable model — text-only
+  // models would silently drop the videoUrl and produce unrelated SFX.
+  // Symmetric: when no video is provided, EXCLUDE video-conditioned
+  // models so we don't pay their (typically higher) price for prompt-
+  // only requests.
+  const wantsVideoRef = kind === 'sfx' && req.hasVideoRef === true;
+
   const eligible = models.filter((m) => {
     if (m.pricePerUnit == null) return false;
+
+    if (kind === 'sfx') {
+      const acceptsVideo = !!m.inputVideo;
+      if (wantsVideoRef && !acceptsVideo) return false;
+      if (!wantsVideoRef && acceptsVideo) return false;
+    }
 
     // Curated category gate — short-circuits the legacy boolean checks
     // for any row that's been tagged in the backoffice. Categorised

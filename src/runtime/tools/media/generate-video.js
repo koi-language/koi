@@ -71,7 +71,7 @@ export function clearJobMetadata(jobId) {
  *  Returns null (and logs) on any failure so the caller can continue
  *  without the reference instead of aborting the whole generation.
  */
-async function _uploadVideoRef(ref) {
+export async function _uploadVideoRef(ref) {
   if (!ref) return null;
   if (typeof ref !== 'string') return null;
   if (/^https?:\/\//i.test(ref)) return ref; // already a URL
@@ -181,6 +181,9 @@ export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}
 const generateVideoAction = {
   type: 'generate_video',
   intent: 'generate_video',
+  bannerKind: 'video',
+  bannerLabel: 'Generando vídeo',
+  bannerIconId: 'generate-video',
   // Static fallback for the rare case fetchMediaCapabilities('video') isn't
   // reachable (API-keys-only mode, gateway down at boot). Keep it short —
   // the real, catalog-driven description is rebuilt at the bottom of this
@@ -231,6 +234,7 @@ const generateVideoAction = {
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
+      kind:            { type: 'string',  enum: ['extend'], description: 'Set to "extend" when the user asks to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated `video_extend` model bucket (curated in the backoffice). Combine with referenceVideos=[<source>] (or startFrame=<last frame> via extract_frame). Omit for fresh generations / restyles / edits.' },
     },
     required: ['prompt']
   },
@@ -424,6 +428,9 @@ const generateVideoAction = {
       // Default true — quality wins ties unless the agent / user
       // explicitly opts out for budget runs.
       preferQuality: action.preferQuality !== false,
+      // `extend` routes to the curated `video_extend` category bucket
+      // in pickVideoModel (see media-model-router.js).
+      kind: action.kind,
     });
 
     // Build the generation-params record once — used both for the
@@ -890,6 +897,13 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     delete props.label;
   }
 
+  // `kind: "extend"` only surfaces when at least one model in the
+  // catalog is tagged with the `video_extend` category. Without a
+  // backing model the parameter would just dead-end the picker.
+  if (!caps.anyExtend) {
+    delete props.kind;
+  }
+
   // Build the human-readable field list the agent actually reads. Values
   // come from the live catalog — anything outside the enums will be
   // rejected at submit time. No field is listed unless at least one active
@@ -955,6 +969,9 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
       return `    • "${slug}"${desc}`;
     }).join('\n');
     fields.push(`optional "label" — ranking preference. Soft hint only, never filters. Pick the slug whose description matches the task; omit when no specialisation is needed:\n${lines}`);
+  }
+  if (caps.anyExtend) {
+    fields.push('optional "kind" — set to "extend" when the user wants to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated extension-tuned model. Combine with referenceVideos=[<source>] (or startFrame=<last frame>). Omit for fresh generations / restyles / edits.');
   }
   fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
   fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');

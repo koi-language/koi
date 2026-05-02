@@ -105,15 +105,19 @@ async function _buildFeatheredOriginal(sharp, srcPath, origW, origH, pads, feath
     return null;
   }
 
+  // Sharp's `create` only accepts channels: 3 or 4 (no single-channel
+  // synthesis). Build the mask with 3 channels, then collapse to one
+  // via extractChannel after blur.
   const innerWhite = await sharp({
-    create: { width: innerW, height: innerH, channels: 1, background: { r: 255 } },
+    create: { width: innerW, height: innerH, channels: 3, background: { r: 255, g: 255, b: 255 } },
   }).png().toBuffer();
 
   const blurredMask = await sharp({
-    create: { width: origW, height: origH, channels: 1, background: { r: 0 } },
+    create: { width: origW, height: origH, channels: 3, background: { r: 0, g: 0, b: 0 } },
   })
     .composite([{ input: innerWhite, left: fL, top: fT }])
     .blur(Math.max(1, feather / 2))
+    .extractChannel(0)
     .raw()
     .toBuffer();
 
@@ -137,6 +141,9 @@ function _directionPhrase(pads) {
 const outpaintImageAction = {
   type: 'outpaint_image',
   intent: 'outpaint_image',
+  bannerKind: 'image',
+  bannerLabel: 'Extendiendo imagen',
+  bannerIconId: 'outpaint',
   description: 'Extend (outpaint) an image\'s canvas by adding pixels to one or more sides, filling the new margins with content that seamlessly continues the scene. Internally delegates to generate_image using the same underlying image models. In: "image" (path or attachment id, required), at least one of "padTop" / "padBottom" / "padLeft" / "padRight" (pixels, 0–4096), optional "prompt" (guides what the new margins should contain — e.g. "continue the beach and sky"), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory). Returns: { success, provider, model, images: [{ savedTo }] }. Use this when the scene needs to be wider/taller than the source — for style transfer, img2img or composition, use generate_image directly.',
   thinkingHint: 'Outpainting image',
   permission: 'generate_image',
@@ -250,7 +257,14 @@ const outpaintImageAction = {
     // "pass original + describe layout in prompt" approach: that one
     // gave the model freedom to RECOMPOSE the whole scene, which is
     // what produced the "picture-in-picture" seam we kept hitting.
+    //
+    // We also build a companion MASK (white in the new margins, black
+    // over the original region). Adapters whose underlying model takes
+    // a separate `mask_url` (flux-pro/v1/fill) consume it from the
+    // canonical request's `maskImage`. Adapters that handle alpha
+    // natively (gpt-image, gemini) ignore it.
     const paddedCanvasPath = path.join(os.tmpdir(), `outpaint-canvas-${Date.now()}.png`);
+    let maskBuffer;
     try {
       const sharp = (await import('sharp')).default;
       const canvasBuffer = await sharp({
@@ -265,6 +279,21 @@ const outpaintImageAction = {
         .png()
         .toBuffer();
       fs.writeFileSync(paddedCanvasPath, canvasBuffer);
+
+      // Mask: RGB canvas (sharp's create only supports 3 or 4 channels),
+      // white background (= "fill this") with a black rectangle over the
+      // original image's footprint (= "keep"). Adapters that need a
+      // single-channel mask can extract one trivially since RGB values
+      // are identical here.
+      const blackPatch = await sharp({
+        create: { width: origWidth, height: origHeight, channels: 3, background: { r: 0, g: 0, b: 0 } },
+      }).png().toBuffer();
+      maskBuffer = await sharp({
+        create: { width: newWidth, height: newHeight, channels: 3, background: { r: 255, g: 255, b: 255 } },
+      })
+        .composite([{ input: blackPatch, left: pads.left, top: pads.top }])
+        .png()
+        .toBuffer();
     } catch (err) {
       return { success: false, error: `Failed to build padded canvas: ${err.message}` };
     }
@@ -276,30 +305,28 @@ const outpaintImageAction = {
       ? String(action.prompt).slice(0, 1024).trim()
       : '';
 
-    // The reference is now a canvas where the scene already sits at
-    // the correct position. The model's job is purely to fill the
-    // transparent regions — it must NOT redraw the opaque area, and
-    // it MUST NOT invent new subjects in the margins. Generic
-    // "extend the scene" prompts have a strong tendency to add
-    // people / objects whenever the existing scene "looks like
-    // somewhere people would be" (a B&W noir stencil → invented
-    // diner patrons; an outdoor portrait → invented bystanders).
-    // The explicit ban below is what curbs that — without it the
-    // outpaint reads as a recomposed group shot rather than a clean
-    // canvas extension.
+    // The prompt has to survive TWO very different model families:
+    //
+    //   - Instruction-following edit models (gpt-image, gemini-edit) that
+    //     need to be told "don't recompose the whole scene" or they will.
+    //   - Pure fill/inpaint models (flux-pro/v1/fill) that do NOT follow
+    //     instructions — they treat any English text as CONTENT to render
+    //     into the masked region. We have screenshots of the prompt's own
+    //     words coming back as post-it notes inside the painted margins.
+    //
+    // The compromise: a short scene-description prompt with NO meta
+    // instructions about canvas dimensions, ban-lists, or rule lists.
+    // The mask + the existing pixels at the seam already tell every model
+    // where and what to paint. We only describe the desired CONTENT and
+    // (briefly) ban text/new-subjects, in declarative form. This is safe
+    // for both families.
     const basePrompt =
-      `The reference image is a ${newWidth}×${newHeight} canvas where the existing scene already occupies its correct final position; the surrounding areas are transparent and need to be filled. ` +
-      `Paint ONLY the transparent regions, extending the scene seamlessly ${directionsList}. ` +
-      `The opaque region must stay pixel-identical — same composition, subjects, perspective, lighting, color palette, texture. The boundary between original and new content must be invisible: continue the same surfaces, lines, gradients across the seam. ` +
-      `STRICT RULES for the new content: ` +
-      `(a) Do NOT add any new people, faces, characters, animals, or living creatures — only the subjects already visible in the opaque region exist; ` +
-      `(b) Do NOT introduce new prominent objects that weren't visible at the boundary (no extra furniture, vehicles, signs, foreground items); ` +
-      `(c) Treat the margins as a continuation of the BACKGROUND only — the same wall, sky, floor, wallpaper, environment that the boundary suggests. ` +
-      `(d) If the boundary shows a transparent / empty area, fill it with a plausible plain backdrop (matching style, palette, and texture) — do NOT populate it with new content. ` +
-      `Output the SAME ${newWidth}×${newHeight} canvas with the transparent areas now filled. Do not crop, do not resize, do not reinterpret the existing scene.`;
+      `Continue the existing scene into the surrounding background area, ${directionsList}. ` +
+      `Match the same art style, color palette, texture, and lighting as the existing pixels at the boundary. ` +
+      `Background continuation only — no new people, no new objects, no text, no captions, no labels.`;
 
     const effectivePrompt = userPrompt
-      ? `${basePrompt}\n\nAdditional guidance for the extended regions: ${userPrompt}`
+      ? `${userPrompt}. ${basePrompt}`
       : basePrompt;
 
     channel.log(
@@ -315,10 +342,35 @@ const outpaintImageAction = {
     // category bucket so a backoffice-tagged model owns extension —
     // the generic edit pool tends to redraw the whole scene rather
     // than painting only the transparent margins.
+    // ONE reference image (the padded RGBA canvas). The unpadded original
+    // travels via the dedicated `sourceImage` field — keeping it out of
+    // referenceImages prevents the router's refsCount filter from excluding
+    // single-ref models that are perfectly able to outpaint via reframe.
+    //
+    // Adapter consumption:
+    //   - fill models (flux-pro/v1/fill): refs[0] (padded) + maskImage
+    //   - alpha-edit models (gpt-image, gemini-edit): refs[0] (padded), alpha
+    //     channel encodes the fill region
+    //   - reframe models (bria/expand, ideogram/v3/reframe): sourceImage
+    //     (unpadded original) + targetSize + sourceImageOffset
+    //
+    // Aliases intentionally omitted: a named ref triggers generate-image.js
+    // to prepend a "Reference images (by position)" legend to the prompt,
+    // which fill models render as visible text inside the painted region.
+    let originalBuffer;
+    try { originalBuffer = fs.readFileSync(resolvedPath); } catch { /* fall through; reframe models will fail loudly */ }
     const genAction = {
       prompt: effectivePrompt,
       operation: 'outpaint',
-      referenceImages: [{ alias: 'source', path: paddedCanvasPath }],
+      referenceImages: [paddedCanvasPath],
+      maskImage: maskBuffer ? { data: maskBuffer, mimeType: 'image/png' } : undefined,
+      sourceImage: originalBuffer ? { data: originalBuffer, mimeType: 'image/png' } : undefined,
+      targetSize: { width: newWidth, height: newHeight },
+      // Where the original sits inside the new canvas. bria/expand uses
+      // this to position the source for asymmetric outpaint (e.g.
+      // padRight=512 only → original flush to the left). Models that
+      // always centre the source ignore it.
+      sourceImageOffset: { x: pads.left, y: pads.top },
       aspectRatio: newAspect || undefined,
       outputFormat: action.outputFormat || 'png',
       saveTo: action.saveTo,

@@ -680,6 +680,30 @@ export class MediaLibrary {
     return this._writeCategories(id, next);
   }
 
+  /** Toggle the "hidden from Latest creations" flag on a row. The row
+   *  stays in the library (and in any user category it carries); the
+   *  drawer's Latest tab filters these out client-side so removing an
+   *  item from Latest doesn't cascade-destroy its category memberships. */
+  async setHiddenFromLatest(id, hidden) {
+    const table = await this._ensureTable();
+    try {
+      const escId = String(id).replace(/'/g, "''");
+      const rows = await table.query().where(`id = '${escId}'`).limit(1).toArray();
+      if (rows.length === 0) return false;
+      const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
+      if (hidden) meta.hidden_from_latest = true;
+      else delete meta.hidden_from_latest;
+      await table.update({
+        values: { metadata_json: JSON.stringify(meta) },
+        where: `id = '${escId}'`,
+      });
+      return true;
+    } catch (e) {
+      process.stderr.write(`[MediaLibrary] setHiddenFromLatest(${id}) failed: ${e.message}\n`);
+      return false;
+    }
+  }
+
   // ── Empty-categories registry ──────────────────────────────────────────
   //
   // A user-created category with zero items has no natural home in the
@@ -805,6 +829,11 @@ export class MediaLibrary {
       // implementation detail; categories will move to a top-level
       // column when cloud sync lands).
       categories,
+      // Surfaced separately so the drawer's Latest filter doesn't have
+      // to reach into `metadata` either. True means the user X'd the
+      // tile from Latest — the row still exists with its categories
+      // intact, just hidden from the "everything" view.
+      hiddenFromLatest: !!metadata.hidden_from_latest,
       sam2Masks: row.sam2_masks_json ? JSON.parse(row.sam2_masks_json) : null,
       // Embedding omitted from deserialization (large, not needed for display)
     };

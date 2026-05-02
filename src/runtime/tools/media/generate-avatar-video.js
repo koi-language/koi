@@ -29,6 +29,9 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const generateAvatarVideoAction = {
   type: 'generate_avatar_video',
   intent: 'generate_avatar_video',
+  bannerKind: 'video',
+  bannerLabel: 'Animando avatar',
+  bannerIconId: 'generate-video',
   description:
     'Generate a talking-avatar video by driving a still face image with an audio track. Blocks internally until the video is ready and returns { success, savedTo, url, error? } — no second call is needed. Pass wait=false to run as a background koi job (use await_job / get_job_status).\n' +
     '\n' +

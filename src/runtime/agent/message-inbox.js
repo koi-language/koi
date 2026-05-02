@@ -423,73 +423,10 @@ export class MessageInbox {
    */
   async _applyCrossAgentCancelPlan(entry, result) {
     const AgentClass = this._agent?.constructor;
-    let cancelledTasks = 0;
-    let abortedAgents = 0;
-
-    // 1. Clear the global plan (taskManager).
-    try {
-      const { taskManager } = await import('../state/task-manager.js');
-      const tmTasks = taskManager.list();
-      for (const t of tmTasks) {
-        if (t.status === 'pending' || t.status === 'in_progress') {
-          try {
-            taskManager.update(t.id, { status: 'deleted' });
-            cancelledTasks++;
-          } catch { /* non-fatal */ }
-        }
-      }
-    } catch (err) {
-      channel.log('inbox', `${this._agent.name}: cancel_plan taskManager sweep failed: ${err?.message || err}`);
+    if (typeof AgentClass?.cancelAll === 'function') {
+      const { cancelledTasks, abortedAgents } = await AgentClass.cancelAll();
+      channel.log('inbox', `${this._agent.name}: cancel_plan swept ${cancelledTasks} task(s), aborted ${abortedAgents} delegate(s)`);
     }
-
-    // 2. Clear every agent's workqueue + abort any running delegate.
-    if (AgentClass?._inboxRegistry) {
-      for (const [, agent] of AgentClass._inboxRegistry) {
-        // Cancel workqueue items
-        const q = agent?._workQueue;
-        if (q) {
-          try {
-            for (const item of q.list()) {
-              if (item.status === 'pending' || item.status === 'in_progress') {
-                try {
-                  q.update(String(item.id), { status: 'deleted' });
-                  cancelledTasks++;
-                } catch { /* non-fatal */ }
-              }
-            }
-          } catch (err) {
-            channel.log('inbox', `${this._agent.name}: cancel_plan queue sweep (${agent.name}) failed: ${err?.message || err}`);
-          }
-        }
-
-        // Abort every agent's current LLM stream, including self (the
-        // classifier agent). The classifier chain runs in MessageInbox,
-        // separately from the reactive loop's LLM stream — aborting
-        // self here only cancels the reactive loop, not our own
-        // classification pipeline. On 'cancel', each agent's loop
-        // exits cleanly; root (the classifier agent) then hits the
-        // recovery path which waits for the next user message via
-        // prompt_user with a fresh contextMemory slate.
-        if (typeof agent?.abort === 'function') {
-          try {
-            agent.abort('cancel');
-            abortedAgents++;
-          } catch { /* non-fatal */ }
-        }
-
-        // Wake each agent so it drains the (now-empty) queue and exits.
-        try {
-          const fn = agent?._wakeupResolve;
-          if (typeof fn === 'function') {
-            agent._wakeupResolve = null;
-            agent._wakeupPromise = null;
-            fn();
-          }
-        } catch { /* non-fatal */ }
-      }
-    }
-
-    channel.log('inbox', `${this._agent.name}: cancel_plan swept ${cancelledTasks} task(s), aborted ${abortedAgents} delegate(s)`);
     return true;
   }
 
