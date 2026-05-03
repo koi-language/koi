@@ -9,7 +9,7 @@
 export default {
   type: 'get_tool_info',
   intent: 'get_tool_info',
-  description: 'Get full documentation (schema, instructions, examples) for a built-in action. Use when you need parameter details before calling an action.',
+  description: 'Get full documentation (schema, instructions, examples) for a built-in action. Use when you need parameter details before calling an action. **Never batch `get_tool_info` with a call to the same tool in the same response** — by the time the doc lands, the call is already constructed and you have not learned anything from the fetch. If you need the docs, call `get_tool_info` ALONE this turn and craft the tool call in the NEXT turn with the schema you just learned.',
   thinkingHint: 'Looking up tool info',
   permission: null,
   hidden: false,

@@ -507,6 +507,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       }
     } catch { /* best-effort logging */ }
     const active = openDocumentsStore.getSnapshotActive();
+    const _allDocs = openDocumentsStore.getSnapshotAll();
     // Render only the ACTIVE document. Non-visible tabs are intentionally
     // omitted — they add noise without helping the agent route the
     // current request. With no active doc there's nothing to surface, so
@@ -522,6 +523,65 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         // `playheadMs` onto the video doc payload at submit time.
         if (active.type === 'video' && typeof active.playheadMs === 'number') {
           lines.push(`Playhead paused at \`${_formatVideoTs(active.playheadMs)}\` (MM:SS.ms).`);
+        }
+
+        // Timeline + selected clip: when the user has clicked a specific
+        // clip on the timeline, EVERY action they describe scopes to
+        // that clip alone — not the whole timeline. Surface the clip's
+        // source path so the agent passes IT (not the timeline JSON) as
+        // videoFile / startFrame / referenceVideos / etc. Without this,
+        // the agent treats "ponle sonido a este clip" as "render the
+        // whole timeline and generate audio for it" — wrong scope.
+        if (active.type === 'timeline' && active.path) {
+          try {
+            const _tlRaw = fs.readFileSync(active.path, 'utf8');
+            const _tlJson = JSON.parse(_tlRaw);
+            const _clips = Array.isArray(_tlJson?.clips) ? _tlJson.clips : [];
+            const _selId = typeof active.selectedClipId === 'string' ? active.selectedClipId : null;
+            const _selClip = _selId ? _clips.find((c) => c?.id === _selId) : null;
+
+            if (_selClip && typeof _selClip.path === 'string') {
+              // A specific clip is selected — narrow the agent's scope
+              // to JUST that clip's source. Override beats listing.
+              const _durSec = typeof _selClip.durationMs === 'number' ? (_selClip.durationMs / 1000).toFixed(2) : '?';
+              const _trackLbl = _selClip.track ? ` on track ${_selClip.track}` : '';
+              lines.push('');
+              lines.push(`**Selected clip on this timeline${_trackLbl}**: \`${_selClip.path}\` (id ${_selClip.id}, ${_durSec}s of source).`);
+              lines.push('When the user says "este clip", "esto", "this", "el segmento" — they mean this clip ONLY, not the whole timeline. Scope every media call to its source path: pass it as `videoFile` / `startFrame` / `referenceVideos` / `image` (whatever the tool expects), and use the clip\'s duration (not the timeline\'s) for any `durationSeconds` parameter. Reading the timeline JSON to find the clip is unnecessary — its source path is right above.');
+            } else if (_clips.length > 0) {
+              // No selection — list every clip's underlying source path
+              // so the agent has the actual files in hand. Without this
+              // the timeline JSON is the ONLY path the agent sees and
+              // it ends up passing the JSON (or, worse, the last path
+              // it saw in history — a generated SFX mp3, an image,
+              // etc.) into tools like extract_frame, which then fail
+              // with "Output file does not contain any stream".
+              const _vClips = _clips.filter((c) => c?.path && /\.(mp4|mov|webm|mkv|avi|m4v|mpeg|mpg)$/i.test(c.path));
+              const _aClips = _clips.filter((c) => c?.path && /\.(mp3|wav|m4a|flac|ogg|opus|aac)$/i.test(c.path));
+              if (_vClips.length > 0) {
+                lines.push('');
+                lines.push(`Video clips inside this timeline (${_vClips.length}):`);
+                for (const c of _vClips) {
+                  const _durSec = typeof c.durationMs === 'number' ? (c.durationMs / 1000).toFixed(2) : '?';
+                  const _trackLbl = c.track ? `${c.track} ` : '';
+                  lines.push(`- ${_trackLbl}\`${c.path}\` (${_durSec}s, id ${c.id || '?'})`);
+                }
+              }
+              if (_aClips.length > 0) {
+                lines.push('');
+                lines.push(`Audio clips inside this timeline (${_aClips.length}):`);
+                for (const c of _aClips) {
+                  const _durSec = typeof c.durationMs === 'number' ? (c.durationMs / 1000).toFixed(2) : '?';
+                  const _trackLbl = c.track ? `${c.track} ` : '';
+                  lines.push(`- ${_trackLbl}\`${c.path}\` (${_durSec}s, id ${c.id || '?'})`);
+                }
+              }
+              if (_vClips.length > 0) {
+                lines.push('');
+                lines.push('When the user says "el vídeo" / "the video" / "este vídeo" / refers to "the last frame" or any moment of "the video", they mean **the video clip(s) above** — pass one of THESE paths to `extract_frame`, `generate_video`, `generate_audio.videoFile`, etc. NEVER pass the timeline JSON path itself, NEVER pass an audio file, NEVER pass a generated image — those are not videos and the underlying tools (ffmpeg) will fail with cryptic stream errors.');
+              }
+            }
+          } catch { /* malformed JSON or fs error — fall through silently */ }
         }
 
         // DocumentBundle — compact rendering. Only the fields the agent
@@ -563,6 +623,47 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
           }
         }
       }
+
+      // Other open media (videos / timelines that aren't the active
+      // doc). When the user asks for "una imagen del último fotograma"
+      // / "el primer frame" / "este momento del vídeo" the right answer
+      // is `extract_frame` on that source first, then pass the PNG as
+      // `referenceImages` to generate_image — NOT a text-only prompt.
+      // Surfacing the path here gives the agent the input it needs to
+      // wire that chain even when the active tab is unrelated (e.g.
+      // the user is looking at an image they just generated and asks
+      // about a video that's still open behind it).
+      try {
+        const _otherMedia = (_allDocs || [])
+          .filter((d) => d && d !== active && (d.type === 'video' || d.type === 'timeline') && (d.path || d.url));
+        if (_otherMedia.length > 0) {
+          lines.push('');
+          lines.push('Other open media (not the active tab, but the user may still be referring to them):');
+          for (const d of _otherMedia) {
+            const _loc = d.path || d.url;
+            lines.push(`- [${d.type}] ${d.title || d.id} — \`${_loc}\``);
+          }
+          lines.push('');
+          lines.push('**Frame-reference rule** — when the user\'s request mentions a specific frame or moment of any video/timeline ("último fotograma", "primer frame", "este instante", "ese momento", "the last frame", "frame at 0:03", "como se vería desde otro ángulo en este punto"), DO NOT go straight to text-to-image. Chain:');
+          lines.push('  1. `extract_frame` on the referenced source — `lastFrame: true` for "último/last frame", or `timeMs: <ms>` for a specific moment. Yields a still PNG.');
+          lines.push('  2. `generate_image` with that PNG in `referenceImages` and a MINIMAL prompt that describes ONLY the variation requested.');
+          lines.push('  3. (Optional) `generate_video` with the result image as `startFrame` if the user wanted motion.');
+          lines.push('');
+          lines.push('**Prompt discipline for step 2 — read this twice.** When the user asks for "otro ángulo de la misma escena" / "another angle of the same scene" / "vista desde X" / "POV de Y", the prompt must:');
+          lines.push('- Describe ONLY the camera change (angle, position, distance, height) and any explicitly-requested edit. Ten to thirty words is plenty.');
+          lines.push('- **NEVER invent setting, location, or weather** that aren\'t in the reference. If the reference shows a Manhattan street at sunset, do NOT write "jungle floor", "humid jungle atmosphere", "forest", "desert", "snow", "underwater", or any other ambient description that contradicts what\'s on screen. The reference IS the setting; trust it.');
+          lines.push('- **NEVER add new subjects** (a fallen woman, extra animals, bystanders, vehicles…) that weren\'t in the reference. The user wants the same scene from a new viewpoint, not a different scene.');
+          lines.push('- Optionally end with a short anchor like *"preserve the setting, lighting, palette, weather, time of day, and surrounding architecture from the reference image."* This explicit anchor counters the edit model\'s tendency to drift toward generic dinosaur tropes (jungle / Jurassic Park).');
+          lines.push('');
+          lines.push('Concrete example for "vista aérea desde detrás del T-Rex en el último fotograma" with a Manhattan reference:');
+          lines.push('  - ✅ GOOD: `"Aerial high-angle shot from directly above and behind the T-Rex\'s head, camera pointing forward down the same street. Preserve the Manhattan setting, sunset lighting, taxis and skyscrapers from the reference image."`');
+          lines.push('  - ❌ BAD: `"Aerial bird\'s-eye view of a T-Rex in a humid jungle. A young woman lies on the jungle floor looking up in terror. Cinematic dinosaur encounter."` (invented jungle, invented woman, ignored Manhattan setting → result is a totally different scene).');
+          lines.push('');
+          lines.push('Skipping step 1 makes generate_image hallucinate a plausible-but-wrong scene. Even with the frame as reference, an over-elaborate prompt at step 2 ALSO drifts away from the source — the model has to choose between your prose and the picture, and a wordy prose wins. Keep prose short, factual, scoped to the change.');
+          lines.push('');
+          lines.push('**`extract_frame.video` MUST be a video file path** (`.mp4` / `.mov` / `.webm` / etc.) — one of the paths listed above. NEVER pass an audio file you just generated (`sfx_*.mp3`, `*.wav`), an image (`.png`/`.jpg`), or a timeline JSON (`.json`) here. ffmpeg will fail with "Output file does not contain any stream" and you\'ll loop. If unsure which is the source video, look for the `.mp4` under `~/.koi/videos/` or the path surfaced in the read_file result of the timeline.');
+        }
+      } catch { /* best-effort surfacing */ }
 
       // Crystal-clear routing guidance when the active doc carries any
       // user-placed spatial guidance (annotations or pasted cutouts).
@@ -736,8 +837,36 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       if (_audioActive) {
         const _activeLoc = active.path || active.url;
         const _activeKind = active.type;
+        // Resolve the actual scope path: if the user has a clip
+        // selected on a timeline, every audio call must target that
+        // clip's source — NOT the timeline JSON. Falls back to the
+        // active doc path when there's no selection (whole timeline /
+        // raw video). Computed once so the example JSON below shows
+        // the right thing in both cases.
+        let _scopePath = _activeLoc;
+        let _scopeIsSelectedClip = false;
+        let _scopeDurationMs = null;
+        if (active.type === 'timeline' && typeof active.selectedClipId === 'string') {
+          try {
+            const _tlRaw = fs.readFileSync(active.path, 'utf8');
+            const _tlJson = JSON.parse(_tlRaw);
+            const _clip = Array.isArray(_tlJson?.clips)
+              ? _tlJson.clips.find((c) => c?.id === active.selectedClipId)
+              : null;
+            if (_clip && typeof _clip.path === 'string') {
+              _scopePath = _clip.path;
+              _scopeIsSelectedClip = true;
+              if (typeof _clip.durationMs === 'number') _scopeDurationMs = _clip.durationMs;
+            }
+          } catch { /* fall back to active doc path */ }
+        }
         lines.push('');
         lines.push(`## 🔊 ACTIVE document is a ${_activeKind} — adding audio`);
+        if (_scopeIsSelectedClip) {
+          const _durSec = _scopeDurationMs != null ? (_scopeDurationMs / 1000).toFixed(2) : '?';
+          lines.push('');
+          lines.push(`**Scope: a single clip is SELECTED on the timeline.** Every audio call below MUST target \`${_scopePath}\` (the clip's source video, ${_durSec}s) — NOT the timeline JSON. This is non-negotiable: ignoring the selection means generating audio for a section the user wasn't pointing at.`);
+        }
         lines.push('');
         lines.push('### C) ADD SFX / SOUND / FOLEY (the user said "sonido" / "audio" / "SFX" / "Foley" / "ambient sound")');
         lines.push('');
@@ -745,14 +874,17 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('');
         lines.push('**Workflow — strictly required before calling `generate_audio`:**');
         lines.push('');
-        lines.push(`1. Call \`read_file\` on \`${_activeLoc}\` so vision receives the source frames (for a timeline, the engine renders/serialises a representative view of the clips). WITHOUT this read you have no idea what's on screen; defaulting to "ambient electronic music" or similar generic prompts is the canonical failure mode here and produces audio unrelated to the content.`);
+        lines.push(`1. **Call \`read_file\` on \`${_scopePath}\`.** Do NOT use shell, ls, stat, or any size check first — \`read_file\` on a video samples four evenly-spaced frames via ffmpeg, the cost is constant regardless of file size, and there is no other path to vision here. Skipping this step is the canonical failure mode: the agent guesses "cinematic ambient sound design" from the filename and generates audio unrelated to the content.${_scopeIsSelectedClip ? ' (For the selected clip, this is the clip\'s source video.)' : (active.type === 'timeline' ? ' (For a timeline, the engine renders / picks a representative video automatically — you still call read_file on the timeline JSON path.)' : '')}`);
         lines.push('');
         lines.push('2. Identify the dominant on-screen action / texture / mood (e.g. "wooden building engulfed in flames, crackling and roaring, people running with metal buckets"; "calm forest path with leaves rustling and footsteps on gravel"; "underwater scene with bubbles and muffled ambient hum").');
         lines.push('');
-        lines.push(`3. Write the \`generate_audio\` call with \`mode: "sfx"\`. **Pass \`videoFile: "${_activeLoc}"\`** — with \`videoFile\` present the router lands on a video-conditioned model (mmaudio-v2) that synchronises the SFX to the visible action: silence for the silent moments, peaks at impact frames. Without \`videoFile\` you fall back to a text-only sfx model (ElevenLabs) which produces a generic clip that won't sync.`);
+        lines.push(`3. Write the \`generate_audio\` call with \`mode: "sfx"\`. **Pass \`videoFile: "${_scopePath}"\`** — with \`videoFile\` present the router lands on a video-conditioned model (mmaudio-v2) that synchronises the SFX to the visible action: silence for the silent moments, peaks at impact frames. Without \`videoFile\` you fall back to a text-only sfx model (ElevenLabs) which produces a generic clip that won't sync.${_scopeIsSelectedClip ? ' DO NOT use the timeline JSON path here — it would generate audio for the WHOLE timeline; the user has a single clip selected and that\'s the scope.' : ''}`);
+        lines.push('');
+        lines.push(`**\`durationSeconds\` is non-negotiable**: copy it VERBATIM from the \`durationSec\` field in your \`read_file\` result (or the clip\'s duration if a clip is selected). NEVER round to 10, 12, 15, etc. Audio that runs longer than the source plays past the end of the video — the SFX track and the visual cease being in sync. If you can\'t see a numeric \`durationSec\` in the previous tool results, re-read the file before calling this.`);
         lines.push('');
         lines.push('```json');
-        lines.push(`{ "intent": "generate_audio", "mode": "sfx", "prompt": "<concrete sound description anchored in what's on-screen>", "videoFile": "${_activeLoc}", "durationSeconds": <duration in seconds>, "saveTo": "<absolute path>.mp3" }`);
+        const _durExample = _scopeDurationMs != null ? (_scopeDurationMs / 1000).toFixed(2) : '<exact durationSec from read_file — do NOT default to 10>';
+        lines.push(`{ "intent": "generate_audio", "mode": "sfx", "prompt": "<concrete sound description anchored in what's on-screen>", "videoFile": "${_scopePath}", "durationSeconds": ${_durExample}, "saveTo": "<absolute path>.mp3" }`);
         lines.push('```');
         lines.push('');
         lines.push('Even with the video-conditioned model, the prompt still matters — it disambiguates which sounds to emphasise. Specific sensory prompts ("crackling fire, collapsing wooden beams, distant shouts and metal buckets clanging") produce specific audio; vague prompts ("background sound") get vague audio.');

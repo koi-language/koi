@@ -43,6 +43,23 @@ function _formatTimestamp(seconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(3).padStart(6, '0')}`;
 }
 
+/** Probe a video's duration in milliseconds via ffprobe. Returns null
+ *  on failure — caller falls back to the `-sseof` heuristic. */
+async function _probeDurationMs(filePath) {
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      'ffprobe',
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', filePath],
+      { timeout: 3000 },
+    );
+    const sec = JSON.parse(stdout)?.format?.duration ? Number(JSON.parse(stdout).format.duration) : null;
+    return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : null;
+  } catch { return null; }
+}
+
 export default {
   type: 'extract_frame',
   intent: 'extract_frame',
@@ -80,6 +97,21 @@ export default {
     const resolvedVideo = path.resolve(videoPath);
     if (!fs.existsSync(resolvedVideo)) {
       return { success: false, error: `Video not found: ${videoPath}` };
+    }
+    // Defensive: agents routinely pass the LAST FILE THEY CREATED here
+    // (an .mp3 SFX they just generated, a .png poster, etc.) instead of
+    // the original video. ffmpeg's downstream error ("Output file does
+    // not contain any stream") is cryptic and the agent retries the
+    // wrong path 3 times before giving up. Fail fast with a useful
+    // message that names what we expect.
+    const _videoExts = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mpeg', '.mpg', '.ts', '.flv']);
+    const _ext = path.extname(resolvedVideo).toLowerCase();
+    if (!_videoExts.has(_ext)) {
+      return {
+        success: false,
+        error: `extract_frame: "video" must point to a VIDEO file (${[..._videoExts].join(', ')}). Got "${_ext || '(no extension)'}" — \`${path.basename(resolvedVideo)}\` is not a video. ` +
+               `Common mistake: passing an audio file you just generated (sfx_*.mp3, *.wav) or a generated image (.png/.jpg). Pass the path of the SOURCE VIDEO instead — it lives under \`~/.koi/videos/\` or is the clip's source on the timeline.`,
+      };
     }
 
     const lastFrame = action.lastFrame === true;
@@ -128,17 +160,35 @@ export default {
     const { ffmpeg } = await ensureFfmpeg();
 
     // Two modes:
-    //   - lastFrame: `-sseof -3` seeks 3s from EOF, then `-update 1`
-    //     keeps overwriting the same output so the LAST decoded frame
-    //     wins. No need to know duration up-front.
+    //   - lastFrame: probe the video's duration with ffprobe, seek to
+    //     `duration - 50ms`, grab one frame. Deterministic. The earlier
+    //     `-sseof -3 -update 1` form was supposed to work the same way
+    //     by overwriting the output with every decoded frame from the
+    //     trailing 3s, but in practice ffmpeg's flush behaviour at EOF
+    //     is version-dependent and the file routinely ended up with a
+    //     frame from somewhere in that 3s window — NOT the actual last
+    //     frame. Probing duration takes one extra round trip (~50ms);
+    //     accuracy is worth it. Falls back to the `-sseof -3` heuristic
+    //     only when the probe fails (e.g. ffprobe missing).
     //   - timestamp: `-ss <ts>` before `-i` fast-seeks to the nearest
     //     keyframe, then decodes forward to the exact PTS. Modern
-    //     ffmpeg makes this both fast AND accurate.
-    // -frames:v 1 stops after one written frame (timestamp mode only).
+    //     ffmpeg makes this both fast AND accurate. Here we DO want
+    //     `-frames:v 1` so ffmpeg writes one frame and exits.
     // -y overwrites; -an drops audio (a single frame doesn't need it).
     const argv = ['-hide_banner', '-loglevel', 'error'];
+    let lastFrameSeekMs = null;
     if (lastFrame) {
-      argv.push('-sseof', '-3', '-i', resolvedVideo, '-update', '1', '-frames:v', '1', '-an');
+      const totalMs = await _probeDurationMs(resolvedVideo);
+      if (totalMs && totalMs > 100) {
+        // Seek to 50ms before EOF — close enough to the last visible
+        // frame, far enough to dodge encoders that pad an empty tail
+        // frame after the last visible one.
+        lastFrameSeekMs = Math.max(0, totalMs - 50);
+        argv.push('-ss', _formatTimestamp(lastFrameSeekMs / 1000), '-i', resolvedVideo, '-frames:v', '1', '-an');
+      } else {
+        // Fallback when ffprobe fails: best-effort EOF seek.
+        argv.push('-sseof', '-3', '-i', resolvedVideo, '-update', '1', '-an');
+      }
     } else {
       argv.push('-ss', _formatTimestamp(timeMs / 1000), '-i', resolvedVideo, '-frames:v', '1', '-an');
     }
@@ -150,7 +200,9 @@ export default {
     }
     argv.push('-y', savePath);
 
-    const whenLabel = lastFrame ? 'last frame' : `${(timeMs / 1000).toFixed(3)}s`;
+    const whenLabel = lastFrame
+      ? (lastFrameSeekMs != null ? `last frame (probed @ ${(lastFrameSeekMs / 1000).toFixed(3)}s)` : 'last frame (sseof fallback)')
+      : `${(timeMs / 1000).toFixed(3)}s`;
     channel.log('media', `extract_frame: ${path.basename(resolvedVideo)} @ ${whenLabel} → ${savePath}`);
 
     const stderrTail = await new Promise((resolve, reject) => {

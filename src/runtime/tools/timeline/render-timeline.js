@@ -19,6 +19,7 @@ import { getTimeline } from '../../state/timelines.js';
 import { startJob, awaitJob, getJob } from '../../state/jobs.js';
 import { ensureFfmpeg } from '../../media/ffmpeg-installer.js';
 import { compileTimeline } from '../../media/timeline-renderer.js';
+import { resolveTimelineId } from './_resolve-timeline-id.js';
 
 export default {
   type: 'render_timeline',
@@ -56,8 +57,12 @@ export default {
   },
 
   async execute(action, agent) {
-    const tl = getTimeline(action.id);
-    if (!tl) return { success: false, error: `Timeline ${action.id} not found` };
+    const id = await resolveTimelineId(action);
+    if (!id) {
+      return { success: false, error: 'render_timeline: pass `id` (or have a timeline as the active document).' };
+    }
+    const tl = getTimeline(id);
+    if (!tl) return { success: false, error: `Timeline ${id} not found` };
 
     let plan;
     try {

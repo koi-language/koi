@@ -6,6 +6,7 @@
  */
 
 import { addTrack } from '../../state/timelines.js';
+import { resolveTimelineId } from './_resolve-timeline-id.js';
 
 export default {
   type: 'add_track',
@@ -26,8 +27,15 @@ export default {
   },
 
   async execute(params) {
+    const id = await resolveTimelineId(params);
+    if (!id) {
+      return {
+        success: false,
+        error: 'add_track: pass `id` (or have a timeline as the active document).',
+      };
+    }
     try {
-      const trackKey = addTrack(params.id, params.type);
+      const trackKey = addTrack(id, params.type);
       return { success: true, trackKey };
     } catch (e) {
       return { success: false, error: e.message };

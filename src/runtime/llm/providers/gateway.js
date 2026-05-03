@@ -955,17 +955,48 @@ export class GatewayAudioGen extends BaseAudioGen {
    */
   async sfx(prompt, opts = {}) {
     const hasVideoRef = !!opts.videoUrl;
-    const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
-      import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
-        try {
-          return pickAudioModel(models, req);
-        } catch (e) {
-          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
-          throw e;
-        }
-      }),
-      { kind: 'sfx', label: opts.label, hasVideoRef },
-    );
+    let resolvedModel;
+    let usingVideoRef = hasVideoRef;
+    try {
+      resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+        import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+          try {
+            return pickAudioModel(models, req);
+          } catch (e) {
+            if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+            throw e;
+          }
+        }),
+        { kind: 'sfx', label: opts.label, hasVideoRef: usingVideoRef },
+      );
+    } catch (err) {
+      // Graceful fallback: caller asked for video-conditioned SFX but no
+      // active model has `input_video: true` (likely a catalog-config gap
+      // — e.g. fal-ai/mmaudio-v2 not activated, or activated without the
+      // input_video flag). Rather than failing the whole call, retry once
+      // with the constraint dropped and surface a warning. The agent
+      // gets text-only audio that's at least usable; the user gets a
+      // signal in the logs that the catalog needs fixing.
+      const isNoMatch = err && err.details && err.details.code === 'no_model_matches';
+      if (!hasVideoRef || !isNoMatch) throw err;
+      console.warn(
+        '[gateway/sfx] no audio model with input_video=true is active; ' +
+        'falling back to text-only SFX. To enable video-conditioned SFX activate ' +
+        '"fal-ai/mmaudio-v2" (base slug) in model_prices and set input_video=true.',
+      );
+      usingVideoRef = false;
+      resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
+        import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
+          try {
+            return pickAudioModel(models, req);
+          } catch (e) {
+            if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+            throw e;
+          }
+        }),
+        { kind: 'sfx', label: opts.label, hasVideoRef: false },
+      );
+    }
 
     const res = await fetch(`${getGatewayBase()}/media/audio/sfx`, {
       method: 'POST',
@@ -976,8 +1007,9 @@ export class GatewayAudioGen extends BaseAudioGen {
         outputFormat: opts.outputFormat || 'mp3',
         ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
         ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
+        ...(typeof opts.loop === 'boolean' ? { loop: opts.loop } : {}),
         ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
-        ...(hasVideoRef ? { video_url: opts.videoUrl } : {}),
+        ...(usingVideoRef ? { video_url: opts.videoUrl } : {}),
       }),
       signal: opts.abortSignal,
     });

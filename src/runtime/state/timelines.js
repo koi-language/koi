@@ -20,6 +20,8 @@
  *     "pixelsPerSecond":  number
  *     "previewSplit":     number 0..1   // viewer / timeline split fraction
  *     "playheadMs":       int
+ *     "markInMs":         int?  // export-range start mark (null = unset)
+ *     "markOutMs":        int?  // export-range end mark (null = unset)
  *   }
  *
  *   "clips": [
@@ -333,7 +335,27 @@ function _normaliseSettings(s = {}) {
     ? Math.max(0.1, Math.min(0.9, s.previewSplit))
     : 0.5;
   const playheadMs = Math.max(0, parseInt(s.playheadMs ?? 0, 10));
-  return { videoTracks, audioTracks, pixelsPerSecond, previewSplit, playheadMs };
+  // I/O marks for fragment / frame export and "work on a part" actions.
+  // Stored as integer milliseconds, or omitted when unset. We don't
+  // enforce in < out here because the GUI can momentarily place either
+  // mark first; drop a clearly-invalid pair (out <= in) defensively
+  // since downstream consumers (export dialog, render-timeline rangeMs)
+  // assume a valid range when both are set.
+  const markInRaw = s.markInMs;
+  const markOutRaw = s.markOutMs;
+  let markInMs = Number.isFinite(markInRaw) && markInRaw >= 0
+    ? Math.max(0, parseInt(markInRaw, 10))
+    : null;
+  let markOutMs = Number.isFinite(markOutRaw) && markOutRaw >= 0
+    ? Math.max(0, parseInt(markOutRaw, 10))
+    : null;
+  if (markInMs != null && markOutMs != null && markOutMs <= markInMs) {
+    markOutMs = null;
+  }
+  const out = { videoTracks, audioTracks, pixelsPerSecond, previewSplit, playheadMs };
+  if (markInMs != null) out.markInMs = markInMs;
+  if (markOutMs != null) out.markOutMs = markOutMs;
+  return out;
 }
 
 function _normalise(state) {
@@ -472,6 +494,53 @@ export function getTimeline(id) {
 export function updateTimeline(id, state) {
   if (!_read(id)) throw new Error(`Timeline ${id} not found`);
   const merged = _normalise({ ...state, id, createdAt: state.createdAt });
+  _write(merged);
+  return merged;
+}
+
+/**
+ * Set or clear the timeline's I/O marks (used for fragment / frame
+ * export and "open marked range as timeline"). Pass a non-negative
+ * integer to set the mark or null to clear it; `undefined` leaves the
+ * existing value untouched. Throws if the requested in/out pair would
+ * be inverted (out <= in).
+ */
+export function setTimelineMarks(id, { markInMs, markOutMs } = {}) {
+  const state = _read(id);
+  if (!state) throw new Error(`Timeline ${id} not found`);
+  const settings = { ...(state.settings || {}) };
+  if (markInMs !== undefined) {
+    if (markInMs === null) {
+      delete settings.markInMs;
+    } else {
+      const v = parseInt(markInMs, 10);
+      if (!Number.isFinite(v) || v < 0) {
+        throw new Error('markInMs must be a non-negative integer or null');
+      }
+      settings.markInMs = v;
+    }
+  }
+  if (markOutMs !== undefined) {
+    if (markOutMs === null) {
+      delete settings.markOutMs;
+    } else {
+      const v = parseInt(markOutMs, 10);
+      if (!Number.isFinite(v) || v < 0) {
+        throw new Error('markOutMs must be a non-negative integer or null');
+      }
+      settings.markOutMs = v;
+    }
+  }
+  if (
+    settings.markInMs != null &&
+    settings.markOutMs != null &&
+    settings.markOutMs <= settings.markInMs
+  ) {
+    throw new Error(
+      `markOutMs (${settings.markOutMs}) must be greater than markInMs (${settings.markInMs})`,
+    );
+  }
+  const merged = _normalise({ ...state, settings });
   _write(merged);
   return merged;
 }

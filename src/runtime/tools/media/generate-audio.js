@@ -57,6 +57,7 @@ const generateAudioAction = {
       prompt:       { type: 'string', description: 'Free-form description of the sound effect to synthesise (sfx mode).' },
       durationSeconds: { type: 'number', description: 'Target clip length in seconds (sfx mode). Provider-clamped — ElevenLabs sound-effects/v2 accepts 0.5–22. Omit to let the provider auto-pick.' },
       promptInfluence: { type: 'number', description: 'How strictly to follow the prompt vs. take creative liberties (sfx mode, 0..1). ElevenLabs-specific; ignored elsewhere.' },
+      loop:         { type: 'boolean', description: 'Render a seamlessly-looping clip (sfx mode). ElevenLabs sound-effects/v2 only — useful for ambient beds (rain, engine hum, drone) where you want a stitched loop. Ignored by other SFX adapters.' },
       seed:         { type: 'number', description: 'Optional reproducibility seed (sfx mode).' },
       videoFile:    { type: 'string', description: 'Optional path to a reference video (sfx mode). When provided, the router picks a video-conditioned model (e.g. mmaudio-v2) that synchronises the generated SFX / Foley to the visible action — preferred when adding audio to a silent video. The video is uploaded to fal storage automatically. Omit for prompt-only SFX (faster / cheaper).' },
       // Transcribe mode fields
@@ -216,6 +217,7 @@ const generateAudioAction = {
         outputFormat,
         ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
         ...(typeof action.promptInfluence === 'number' ? { promptInfluence: action.promptInfluence } : {}),
+        ...(typeof action.loop === 'boolean' ? { loop: action.loop } : {}),
         ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
         ...(videoUrl ? { videoUrl } : {}),
         ...(action.label ? { label: action.label } : {}),

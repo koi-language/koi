@@ -8,6 +8,7 @@
  */
 
 import { addClip } from '../../state/timelines.js';
+import { resolveTimelineId } from './_resolve-timeline-id.js';
 
 export default {
   type: 'add_clip_to_timeline',
@@ -33,9 +34,44 @@ export default {
   },
 
   async execute(params) {
+    const id = await resolveTimelineId(params);
+    if (!id) {
+      return {
+        success: false,
+        error: 'add_clip_to_timeline: pass `id` (or have a timeline as the active document).',
+      };
+    }
+    // The agent occasionally calls this with `clip` fields flattened
+    // into the top level (`{id, track, path, startMs, ...}` instead of
+    // `{id, clip: {track, path, startMs, ...}}`). Accept both shapes —
+    // the schema documents the nested form, but rejecting the flat
+    // form sends the agent into a "clip must be an object" retry loop.
+    let clip = params.clip;
+    if (!clip || typeof clip !== 'object') {
+      // Promote known clip fields from top-level to a synthetic object.
+      const flatKeys = ['track', 'path', 'startMs', 'durationMs', 'sourceInMs',
+                        'sourceTotalMs', 'linkId', 'offsetX', 'offsetY', 'scale',
+                        'rotation', 'transformEnabled', 'titleProps'];
+      const promoted = {};
+      let any = false;
+      for (const k of flatKeys) {
+        if (params[k] !== undefined) { promoted[k] = params[k]; any = true; }
+      }
+      if (any) clip = promoted;
+    }
+    // Aliases: `add_track` returns `{ trackKey: "A4" }`, and the agent
+    // routinely echoes that key under the same name on the next call.
+    // Accept both `track` and `trackKey` (and `trackId`) as the same
+    // field — rejecting causes "clip.track invalid: undefined" right
+    // after a successful add_track, which is the most predictable
+    // gotcha in this tool's history.
+    if (clip && typeof clip === 'object' && !clip.track) {
+      const alias = clip.trackKey || clip.trackId;
+      if (typeof alias === 'string' && alias.length > 0) clip.track = alias;
+    }
     try {
-      const { clip, timeline } = addClip(params.id, params.clip);
-      return { success: true, clipId: clip.id, clip, timeline };
+      const { clip: created, timeline } = addClip(id, clip);
+      return { success: true, clipId: created.id, clip: created, timeline };
     } catch (e) {
       return { success: false, error: e.message };
     }

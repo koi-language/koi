@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import sharp from 'sharp';
 import Tesseract from 'tesseract.js';
 
@@ -223,6 +224,88 @@ function _formatDuration(sec) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/** Probe a video's duration in milliseconds via ffprobe. Returns null
+ *  when ffprobe is missing or the file is unreadable — callers should
+ *  treat that as "no signal" and degrade gracefully. */
+async function _probeVideoDurationMs(filePath) {
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      'ffprobe',
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', filePath],
+      { timeout: 3000 },
+    );
+    const data = JSON.parse(stdout);
+    const sec = data?.format?.duration ? Number(data.format.duration) : null;
+    return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sample N evenly-spaced JPEG frames from a video and queue them for
+ *  the next LLM turn as vision inputs. Centre-of-bin sampling (5/8/etc%
+ *  through their slice) avoids the all-black opening frame and the
+ *  freeze-on-EOF problem you'd hit by sampling at exactly 0% / 100%.
+ *  Returns the chosen timestamps so the caller can name them in the
+ *  result message. Best-effort — bails out (returns []) if ffmpeg is
+ *  unavailable or every extraction errors. */
+async function _queueVideoFramesForVision(videoPath, session, opts = {}) {
+  const count = Math.max(1, Math.min(8, opts.count || 4));
+  const durMs = await _probeVideoDurationMs(videoPath);
+  if (!durMs) return [];
+
+  let ffmpegBin;
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    ffmpegBin = r.ffmpeg;
+  } catch {
+    return [];
+  }
+  const { spawn } = await import('child_process');
+
+  const tmpDir = path.join(
+    os.tmpdir(),
+    'koi-read-file-video',
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const sampledMs = [];
+  for (let i = 0; i < count; i++) {
+    const tMs = Math.floor((durMs * (i + 0.5)) / count);
+    const outPath = path.join(tmpDir, `frame-${String(i).padStart(2, '0')}.jpg`);
+    const ts = (tMs / 1000).toFixed(3);
+    const argv = [
+      '-hide_banner', '-loglevel', 'error',
+      '-ss', ts,
+      '-i', videoPath,
+      '-frames:v', '1', '-an',
+      '-q:v', '3',
+      '-y', outPath,
+    ];
+    const ok = await new Promise((resolve) => {
+      const child = spawn(ffmpegBin, argv, { stdio: ['ignore', 'ignore', 'pipe'] });
+      child.on('error', () => resolve(false));
+      child.on('exit', (code) => resolve(code === 0));
+    });
+    if (!ok || !fs.existsSync(outPath)) continue;
+    const b64 = fs.readFileSync(outPath).toString('base64');
+    if (!session._pendingMcpImages) session._pendingMcpImages = [];
+    session._pendingMcpImages.push({
+      mimeType: 'image/jpeg',
+      data: b64,
+      _debugPath: outPath,
+      role: 'video_frame_sample',
+    });
+    sampledMs.push(tMs);
+  }
+  return sampledMs;
+}
+
 /** Best-effort metadata probe via ffprobe. Returns null when ffprobe
  *  isn't installed or the file is unreadable — caller falls back to
  *  basic file-stat info. The 2-second timeout protects against a
@@ -430,13 +513,14 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Supports text files, PDF files, and images (PNG, JPG, GIF, WebP). For images, the file is attached as vision input — you will see the image on your next response and can describe or analyze it visually. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
+  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
   instructions: `read_file rules:
 - Always use offset + limit for text files
 - Prefer 50-150 lines per read
 - Never read more than 200 lines at once
 - For large files, never omit offset/limit
-- For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.`,
+- For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
+- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them. For a frame at a SPECIFIC timestamp, call extract_frame instead.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,
@@ -502,7 +586,7 @@ export default {
       }
     }
 
-    const resolvedPath = path.resolve(filePath);
+    let resolvedPath = path.resolve(filePath);
 
     if (!fs.existsSync(resolvedPath)) {
       return { success: false, error: `File not found: ${filePath}` };
@@ -544,23 +628,109 @@ export default {
       return { success: true, path: filePath, type: 'directory', entries: listing };
     }
 
-    // --- Video support (vision via per-frame annotation composites) ---
-    // The video file itself can't be sent to vision, but if it's the
-    // active working-area document AND has annotations published in its
-    // bundle, route through the active-doc helper so the LLM gets each
-    // annotated frame as a `[ANNOTATIONS @ MM:SS.ms]` composite.
+    // --- Timeline support (vision via render or single-clip shortcut) ---
+    // A timeline is a JSON description of clips on tracks; reading it as
+    // raw text gives the agent metadata but ZERO knowledge of what the
+    // video actually shows. So we transparently turn the timeline into a
+    // viewable video and feed THAT to the vision pipeline:
+    //   (a) If a clip is selected (selectedClipId from the working-area
+    //       snapshot) AND it's a video clip → read the clip's source
+    //       video directly. The agent's intent is scoped to that clip.
+    //   (b) Else if the timeline contains exactly one video clip → take
+    //       the same shortcut on that single clip — saves a render pass
+    //       on the common "single clip on V1 + audio on A1" timeline.
+    //   (c) Else → render the whole timeline to a cached mp4 (sha1 of
+    //       the JSON content). The cache lives in
+    //       `~/.koi/cache/timeline-renders/<id>-<hash>.mp4` and survives
+    //       restarts; identical content reuses the cache instead of
+    //       re-rendering. Then read that mp4 as a normal video.
+    let _fromTimelineRedirect = false;
+    if (_isTimelineFile(resolvedPath)) {
+      channel.log('read_file', `[timeline] detected ${path.basename(resolvedPath)}, resolving renderable video…`);
+      const tlBranch = await _resolveTimelineForRead(resolvedPath, agent);
+      if (tlBranch?._error) {
+        channel.log('read_file', `[timeline] resolution failed: ${tlBranch._error}`);
+        return { success: false, error: tlBranch._error };
+      }
+      if (tlBranch?.redirectPath) {
+        // Fall through with the resolved video path so the existing
+        // video branch handles vision sampling. Preserve the original
+        // timeline path only in the log for traceability.
+        channel.log('read_file', `[timeline] ${path.basename(resolvedPath)} → ${tlBranch.reason}: ${tlBranch.redirectPath}`);
+        resolvedPath = tlBranch.redirectPath;
+        filePath = tlBranch.redirectPath;
+        _fromTimelineRedirect = true;
+      } else {
+        channel.log('read_file', `[timeline] no redirect produced — falling through to raw-text read (likely a bug)`);
+      }
+    }
+
+    // --- Video support (vision) ---
+    // Two paths:
+    //   (1) Active working-area video → route through the bundle helper
+    //       so per-frame annotation composites land at the LLM with
+    //       `[ANNOTATIONS @ MM:SS.ms]` captions.
+    //   (2) Off-canvas video → ffmpeg-sample N evenly-spaced JPEG frames
+    //       and queue them as vision inputs. The chat models we target
+    //       (OpenAI / Anthropic / Gemini-via-OpenRouter) don't accept
+    //       raw video bytes through the multimodal chat interface, so a
+    //       sampled-frame mosaic is the provider-agnostic equivalent of
+    //       "attach this video": the agent sees enough of the visual
+    //       content to describe / analyse / write a follow-up prompt.
     if (_VIDEO_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
-      try {
-        const { openDocumentsStore } = await import('../../state/open-documents-store.js');
-        const doc = openDocumentsStore.findInSnapshotByPathOrUrl(resolvedPath) ||
-                    openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
-        if (doc) {
-          return await _queueActiveDocumentForVision(doc, agent, filePath);
+      // When we got here via the timeline redirect, skip the working-
+      // area-doc shortcut and go straight to ffmpeg sampling. Reason:
+      // the redirect target is the underlying clip file, which OFTEN
+      // also exists as a sibling video tab in the working area with
+      // an empty bundle. The bundle helper would then return success
+      // with ZERO sampled frames ("primary is video, only annotation
+      // composites will be queued") and the agent gets nothing — the
+      // exact opposite of why the user asked us to read the timeline.
+      if (!_fromTimelineRedirect) {
+        try {
+          const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+          const doc = openDocumentsStore.findInSnapshotByPathOrUrl(resolvedPath) ||
+                      openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
+          if (doc) {
+            return await _queueActiveDocumentForVision(doc, agent, filePath);
+          }
+        } catch { /* store unavailable — fall through to sampling */ }
+      }
+
+      const session = agent?._activeSession;
+      if (session) {
+        const sampledMs = await _queueVideoFramesForVision(resolvedPath, session, { count: 4 });
+        if (sampledMs.length > 0) {
+          const stamps = sampledMs.map((ms) => _formatDuration(ms / 1000)).join(', ');
+          // Probe duration up-front and surface it in the result so the
+          // agent never has to guess `durationSeconds` for follow-up
+          // calls (generate_audio sfx, etc.). Without this the agent
+          // routinely picks 10/12s for a 5s clip — the SFX runs past
+          // the end of the source.
+          const totalDurMs = await _probeVideoDurationMs(resolvedPath);
+          const totalDurSec = totalDurMs != null ? (totalDurMs / 1000) : null;
+          channel.log(
+            'read_file',
+            `Video sampled for vision (${sampledMs.length} frames): ${filePath}` +
+            (totalDurSec != null ? ` — duration ${totalDurSec.toFixed(2)}s` : ''),
+          );
+          const durationHint = totalDurSec != null
+            ? ` Total video duration: **${totalDurSec.toFixed(2)} seconds** — use this exact value for any \`durationSeconds\` parameter on follow-up calls (generate_audio, etc.). Do NOT guess; the source is ${totalDurSec.toFixed(2)}s long, audio that runs longer plays past the end.`
+            : '';
+          return {
+            success: true,
+            path: filePath,
+            type: 'video',
+            sampledFrames: sampledMs.length,
+            sampledTimestampsMs: sampledMs,
+            ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
+            message: `Video attached as ${sampledMs.length} sampled frames at ${stamps}. Use them as a visual summary of the video — they're evenly spaced, so reason about progression / motion / scene changes from the sequence.${durationHint} For per-frame inspection at a specific timestamp, call extract_frame.`,
+          };
         }
-      } catch { /* store unavailable — fall through to "unsupported" */ }
+      }
       return {
         success: false,
-        error: `Cannot read "${filePath}" as text and it is not the active working-area video. Open the video in the GUI working area to inspect it; for offline analysis use a video-specific tool.`,
+        error: `Could not sample frames from "${filePath}" — ffmpeg may be unavailable or the file is unreadable. For offline analysis call extract_frame at specific timestamps.`,
       };
     }
 
@@ -991,3 +1161,143 @@ function _describeEditorSelection(content, start, end) {
       `Selected text${truncated ? ' (truncated)' : ''}:\n"""${snippet}"""`,
   };
 }
+
+// ─── Timeline → renderable-video resolution ─────────────────────────
+// A timeline is a JSON file under `~/.koi/timelines/`. When the agent
+// calls read_file on it, the raw JSON is useless for sound design —
+// what matters is what the rendered video shows. These helpers turn
+// the JSON into a video path (either a single underlying clip or a
+// freshly rendered mp4 from the export pipeline) so the existing
+// video branch can handle vision sampling unchanged.
+
+const _TIMELINE_PATH_RE = /[/\\]\.koi[/\\]timelines[/\\][^/\\]+\.json$/i;
+
+function _isTimelineFile(absPath) {
+  if (!absPath) return false;
+  if (!_TIMELINE_PATH_RE.test(absPath)) return false;
+  if (!fs.existsSync(absPath)) return false;
+  // Path-based detection is enough: ~/.koi/timelines/ is a koi-managed
+  // directory, every .json inside is a timeline. The earlier "sniff
+  // first 200 bytes for `clips`" guard sounded prudent but actively
+  // broke real timelines whose settings block (videoTracks, audioTracks,
+  // pixelsPerSecond, previewSplit, playheadMs, …) consumed the entire
+  // window before the clips array showed up — the sniff returned false,
+  // the agent got the raw JSON instead of the rendered video, and the
+  // SFX prompt was generic ("cinematic sound design"). Trust the dir.
+  return true;
+}
+
+const _VIDEO_EXTS_FOR_TIMELINE = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mpeg', '.mpg']);
+
+function _isVideoClipPath(p) {
+  if (!p) return false;
+  return _VIDEO_EXTS_FOR_TIMELINE.has(path.extname(p).toLowerCase());
+}
+
+async function _resolveTimelineForRead(timelinePath, agent) {
+  let raw;
+  try {
+    raw = fs.readFileSync(timelinePath, 'utf8');
+  } catch (err) {
+    return { _error: `Could not read timeline JSON: ${err.message}` };
+  }
+  let tl;
+  try {
+    tl = JSON.parse(raw);
+  } catch (err) {
+    return { _error: `Timeline JSON is malformed: ${err.message}` };
+  }
+  const clips = Array.isArray(tl?.clips) ? tl.clips : [];
+  if (clips.length === 0) {
+    return { _error: `Timeline ${tl.id || path.basename(timelinePath)} has no clips — nothing to read.` };
+  }
+
+  // Branch (a): the user has selected a specific clip. The GUI surfaces
+  // selectedClipId on the active document via working-area state; if it
+  // matches a video clip, narrow the read to that clip's source. Audio
+  // and image clips don't make sense as "the active visual" — fall
+  // through to render in those cases.
+  const selectedClipId = await _getSelectedClipId(timelinePath);
+  if (selectedClipId) {
+    const sel = clips.find((c) => c?.id === selectedClipId);
+    if (sel && _isVideoClipPath(sel.path) && fs.existsSync(sel.path)) {
+      return { redirectPath: sel.path, reason: `selected clip ${sel.id}` };
+    }
+  }
+
+  // Branch (b): exactly one video clip on the timeline → no need to
+  // render, the clip IS the visual. Saves seconds-to-minutes of FFmpeg
+  // work on the common "single clip + audio peer" timeline.
+  const videoClips = clips.filter((c) => _isVideoClipPath(c?.path));
+  if (videoClips.length === 1 && fs.existsSync(videoClips[0].path)) {
+    return { redirectPath: videoClips[0].path, reason: 'single video clip shortcut' };
+  }
+  if (videoClips.length === 0) {
+    return { _error: `Timeline ${tl.id || path.basename(timelinePath)} has no video clips — read_file vision needs a renderable visual.` };
+  }
+
+  // Branch (c): multi-clip → render and cache by sha1 of the JSON.
+  const renderedPath = await _ensureCachedTimelineRender(tl, raw, agent);
+  if (!renderedPath) {
+    return { _error: `Timeline render failed for ${tl.id || path.basename(timelinePath)}.` };
+  }
+  return { redirectPath: renderedPath, reason: 'rendered timeline' };
+}
+
+/** Snapshot helper: read selectedClipId from the active doc when it
+ *  matches the timeline path. Returns null when not available. */
+async function _getSelectedClipId(timelinePath) {
+  try {
+    const { openDocumentsStore } = await import('../../state/open-documents-store.js');
+    const active = openDocumentsStore.getSnapshotActive?.() || openDocumentsStore.getActive?.();
+    if (!active) return null;
+    if (active.path !== timelinePath) return null;
+    return active.selectedClipId || null;
+  } catch { return null; }
+}
+
+async function _ensureCachedTimelineRender(timelineJson, rawJsonStr, agent) {
+  const home = process.env.HOME || os.homedir();
+  const cacheDir = path.join(home, '.koi', 'cache', 'timeline-renders');
+  fs.mkdirSync(cacheDir, { recursive: true });
+
+  // Hash the JSON content (not just the id) so any clip / setting edit
+  // invalidates the cache automatically. 12 hex chars is collision-safe
+  // enough for a per-user cache and keeps filenames readable.
+  const hash = crypto.createHash('sha1').update(rawJsonStr).digest('hex').slice(0, 12);
+  const tlId = timelineJson.id || 'tl';
+  const cachedPath = path.join(cacheDir, `${tlId}-${hash}.mp4`);
+
+  if (fs.existsSync(cachedPath)) {
+    channel.log('read_file', `[timeline] cache hit ${path.basename(cachedPath)}`);
+    return cachedPath;
+  }
+
+  channel.log('read_file', `[timeline] rendering ${tlId} → ${path.basename(cachedPath)} (this may take a few seconds)`);
+  let renderTool;
+  try {
+    renderTool = (await import('../timeline/render-timeline.js')).default;
+  } catch (err) {
+    channel.log('read_file', `[timeline] render-timeline tool unavailable: ${err.message}`);
+    return null;
+  }
+  try {
+    const result = await renderTool.execute(
+      { id: tlId, wait: true, outputPath: cachedPath },
+      agent,
+    );
+    if (!result?.success) {
+      channel.log('read_file', `[timeline] render failed: ${result?.error || 'unknown'}`);
+      return null;
+    }
+    if (!fs.existsSync(cachedPath)) {
+      channel.log('read_file', `[timeline] render returned success but file missing: ${cachedPath}`);
+      return null;
+    }
+    return cachedPath;
+  } catch (err) {
+    channel.log('read_file', `[timeline] render threw: ${err.message}`);
+    return null;
+  }
+}
+
