@@ -65,21 +65,23 @@ function _closestAspectRatio(width, height) {
 }
 
 /// Pick a feather width (in pixels) for the alpha gradient at the
-/// boundary between original and outpainted regions. Scales with image
-/// size so small thumbnails get a thin ring and large prints get a
-/// wider one, but never wider than half the smallest non-zero pad
-/// (otherwise the feather would extend past where the model painted).
+/// boundary between original and outpainted regions. The ramp lives
+/// ENTIRELY inside the original (alpha falls 1→0 from `feather` pixels
+/// inside the boundary to the boundary itself), so we don't constrain
+/// by pad size — only by image size. Wider feather → smoother seam at
+/// the cost of more original detail being blended with the model's
+/// (possibly subtly different) painted output near the edge.
+///
+/// 1.5% / cap=32 was the original setting and produced visible cuts
+/// on full-HD inputs (a 16px ramp on a 1080px-tall scene reads as a
+/// hard line). 5% / cap=160 gives a ~50–100px gradient on typical
+/// scene-grade images, which is wide enough that exposure/colour
+/// drift between original and outpaint dissolves visually.
 function _computeFeather(origW, origH, pads) {
-  const minPad = Math.min(
-    pads.top    > 0 ? pads.top    : Infinity,
-    pads.bottom > 0 ? pads.bottom : Infinity,
-    pads.left   > 0 ? pads.left   : Infinity,
-    pads.right  > 0 ? pads.right  : Infinity,
-  );
-  if (!Number.isFinite(minPad) || minPad <= 0) return 0;
-  const sizeBased = Math.floor(Math.min(origW, origH) * 0.015); // ~1.5% of smaller side
-  const padCap = Math.floor(minPad / 2);
-  return Math.max(8, Math.min(32, sizeBased, padCap));
+  const anyPad = pads.top > 0 || pads.bottom > 0 || pads.left > 0 || pads.right > 0;
+  if (!anyPad) return 0;
+  const sizeBased = Math.floor(Math.min(origW, origH) * 0.05);
+  return Math.max(24, Math.min(160, sizeBased));
 }
 
 /// Build an RGBA buffer of the original image whose alpha channel is a
@@ -362,6 +364,10 @@ const outpaintImageAction = {
     const genAction = {
       prompt: effectivePrompt,
       operation: 'outpaint',
+      // outpaint_image already shows its own "Extendiendo imagen…" banner;
+      // suppress generate_image's "Generando imagen…" so the user sees one
+      // operation, not two stacked progress bars.
+      _suppressBanner: true,
       referenceImages: [paddedCanvasPath],
       maskImage: maskBuffer ? { data: maskBuffer, mimeType: 'image/png' } : undefined,
       sourceImage: originalBuffer ? { data: originalBuffer, mimeType: 'image/png' } : undefined,

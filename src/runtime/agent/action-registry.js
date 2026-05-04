@@ -573,6 +573,14 @@ function _wrapWithBanner(action) {
   const _orig = action.execute;
   _MEDIA_BANNER_INTENTS.add(action.intent || action.type);
   action.execute = async function _bannerWrapped(act, agent) {
+    // Suppress the banner when another media tool is delegating to us
+    // (e.g. outpaint_image → generate_image). The outer tool already
+    // showed its own banner, and a nested second banner reads as two
+    // independent operations to the user. The caller signals this by
+    // setting `_suppressBanner: true` on the action params.
+    if (act && act._suppressBanner) {
+      return await _orig.call(this, act, agent);
+    }
     const id = `media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const slug = act?.model || null;
     const expectedDurationMs = await _resolveExpectedDurationMs(action.bannerKind, slug);

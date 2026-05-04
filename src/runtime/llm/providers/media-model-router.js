@@ -96,7 +96,10 @@ const _rankSort = (eligible, req) => {
   const rankOf = (m) => {
     const labelRank = wantLabel
       ? (_modelHasLabel(m, wantLabel) ? 0 : 1)
-      : 0;
+      // No label requested: labelled models compete but rank lower than
+      // unlabelled ones. Labels describe what a model is BEST at — they
+      // don't gate participation. Categories handle the hard discrimination.
+      : (_modelHasAnyLabel(m) ? 1 : 0);
     // Soft preferences: a model that advertises the requested
     // aspect/resolution is preferred over one that doesn't, but both
     // still compete. For edits, the output inherits the base
@@ -230,7 +233,6 @@ export function pickImageModel(models, req = {}) {
     : null;
 
   const wantLabel = req.label || null;
-  const modelHasLabels = _modelHasAnyLabel;
 
   // Koi-owned purpose buckets (see model_prices.categories). When a row
   // carries them, this is the SOLE membership signal we trust — vendor
@@ -295,11 +297,11 @@ export function pickImageModel(models, req = {}) {
 
     if (useLabel && wantLabel) {
       if (!_modelHasLabel(m, wantLabel)) return false;
-    } else {
-      // Fallback path OR no label requested: pin to non-labelled models so
-      // unrelated specialised variants (lipsync, etc.) never leak in.
-      if (modelHasLabels(m)) return false;
     }
+    // No label requested → don't filter on labels at all. Categories are
+    // the authoritative discriminator now; labels are a soft preference
+    // surfaced via `_rankSort` (unlabelled wins ties when no label is
+    // requested, but labelled models still compete).
 
     // Curated category gate — authoritative for any row that has been
     // tagged in the backoffice. Categorised rows skip the legacy
@@ -562,7 +564,6 @@ export function pickVideoModel(models, req = {}) {
   const wantsVideoToVideo = videoRefsCount > 0;
   const wantsMultishot = shotCount > 1;
   const wantLabel = req.label || null;
-  const modelHasLabels = _modelHasAnyLabel;
 
   // Philosophy (same as pickImageModel): the router is an AUTOMATIC PICKER.
   // Hard filters only reject models that categorically CAN'T do the task:
@@ -625,11 +626,11 @@ export function pickVideoModel(models, req = {}) {
 
     if (useLabel && wantLabel) {
       if (!_modelHasLabel(m, wantLabel)) return false;
-    } else {
-      // Fallback path OR no label requested: pin to non-labelled models so
-      // unrelated specialised variants (lipsync, etc.) never leak in.
-      if (modelHasLabels(m)) return false;
     }
+    // No label requested → don't filter on labels at all. Categories are
+    // the authoritative discriminator now; labels are a soft preference
+    // surfaced via `_rankSort` (unlabelled wins ties when no label is
+    // requested, but labelled models still compete).
 
     // Curated category gate. If the model declares any category, it
     // must declare the one we're asking for — otherwise it's silently
@@ -712,12 +713,8 @@ export function pickVideoModel(models, req = {}) {
     const rejections = models.map((m) => {
       const reasons = [];
       if (m.pricePerUnit == null) reasons.push('pricePerUnit=null');
-      if (wantLabel) {
-        if (!_modelHasLabel(m, wantLabel)) {
-          reasons.push(`label!=${wantLabel}`);
-        }
-      } else if (modelHasLabels(m)) {
-        reasons.push(`has labels=[${_labelSlugs(m).join(',')}] but request has none`);
+      if (wantLabel && !_modelHasLabel(m, wantLabel)) {
+        reasons.push(`label!=${wantLabel}`);
       }
       const videoCap = m.textToVideo || m.imageToVideo || m.videoToVideo;
       if (!videoCap) reasons.push('no video capability');
