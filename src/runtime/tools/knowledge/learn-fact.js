@@ -1,17 +1,30 @@
 /**
- * Learn Fact Action — write a discovered fact to the shared session knowledge store.
+ * Learn Fact Action — store a discovered fact in the persistent memory vault.
  *
- * Facts written here are automatically injected into the context of every
- * agent that starts AFTER this call, so they don't need to rediscover them.
- * Agents running in parallel can retrieve them via recall_facts.
+ * Backed by the new memory architecture (Ori-vendored RMH at .koi/memory/).
+ * The action's external API (key/value/category/scope) is preserved for
+ * backward compatibility with existing .koi agent prompts; internally it
+ * routes through `memory.write()`.
  *
- * Good candidates: tech stacks, exact file paths, required env var names,
- * service endpoints, deployment outputs (ECR URL, cluster name…), constraints.
- * Bad candidates: file contents, generated code, intermediate results.
+ * Mapping:
+ *   key       → note title (slugified)
+ *   value     → description (≤200) + body
+ *   category  → project tag (tech_stack|path|config|...) — preserved for filtering
+ *   scope     → 'session' or 'plan' — both stored as type=learning. 'plan' notes
+ *               get a `_plan` project tag so they can be filtered/cleared per plan.
  */
 
-import { sessionKnowledge, planKnowledge } from '../../state/session-knowledge.js';
+import * as memory from '../../memory/index.js';
 import { channel } from '../../io/channel.js';
+
+const VALID_CATEGORIES = new Set([
+  'tech_stack', 'path', 'config', 'credential', 'status', 'dependency',
+]);
+
+const _IGNORED_KEYS = new Set([
+  'current_intent', 'initial_user_request', 'context',
+  'user_request', 'task_intent', 'goal', 'objective',
+]);
 
 export default {
   type: 'learn_fact',
@@ -30,7 +43,7 @@ export default {
       },
       value: {
         type: 'string',
-        description: 'Descriptive fact value (max 200 chars). Must explain WHAT it is and WHY it matters, not just the raw value. Example: "../backend/src/db/schema.ts — Drizzle ORM table definitions (users, apiKeys, modelPrices)". Do NOT include file contents, code snippets, or binary data.',
+        description: 'Descriptive fact value (max 200 chars). Must explain WHAT it is and WHY it matters, not just the raw value.',
       },
       category: {
         type: 'string',
@@ -40,23 +53,19 @@ export default {
       scope: {
         type: 'string',
         enum: ['session', 'plan'],
-        description: 'Scope. "session" (default) = durable project knowledge that persists across the session. "plan" = transient implementation details shared between tasks of the current plan (auto-cleared when all tasks complete). Use "plan" for: files you created, patterns you established, intermediate findings that help sibling tasks. Use "session" for: tech stacks, project structure, env vars, config.',
+        description: 'Scope. "session" (default) = durable project knowledge. "plan" = transient details shared between sibling tasks.',
       },
     },
     required: ['key', 'value'],
   },
 
   examples: [
-    { actionType: 'direct', intent: 'learn_fact', key: 'frontend_tech_stack', value: 'React 18 + Vite 5 + TypeScript, no SSR, builds to dist/', category: 'tech_stack' },
-    { actionType: 'direct', intent: 'learn_fact', key: 'db_schema_path', value: '../backend/src/db/schema.ts — Drizzle ORM table definitions (users, apiKeys, usageLogs, modelPrices)', category: 'path' },
-    { actionType: 'direct', intent: 'learn_fact', key: 'backend_db_env_var', value: 'DATABASE_URL — full PostgreSQL connection string, required by backend and migrations', category: 'config' },
-    { actionType: 'direct', intent: 'learn_fact', key: 'ecr_base_url', value: '123456789.dkr.ecr.eu-west-1.amazonaws.com — Docker image registry for all microservices', category: 'status' },
-    { actionType: 'direct', intent: 'learn_fact', key: 'gateway_api_dependency', value: 'frontend calls backend at /gateway/* — OpenAI-compatible proxy that routes to OpenRouter/native APIs', category: 'dependency' },
+    { actionType: 'direct', intent: 'learn_fact', key: 'frontend_tech_stack', value: 'React 18 + Vite 5 + TypeScript', category: 'tech_stack' },
+    { actionType: 'direct', intent: 'learn_fact', key: 'db_schema_path', value: '../backend/src/db/schema.ts — Drizzle ORM table definitions', category: 'path' },
   ],
 
   async execute(action, agent) {
-    const { key, category = 'other', scope = 'session' } = action;
-    // Serialize objects — LLMs sometimes pass objects instead of strings
+    const { key, category = 'config', scope = 'session' } = action;
     const value = typeof action.value === 'object' && action.value !== null
       ? JSON.stringify(action.value)
       : action.value;
@@ -65,26 +74,50 @@ export default {
       return { success: false, error: 'learn_fact: "key" and "value" are required' };
     }
 
-    // Silently ignore non-project facts (intent tracking, context dumps, narrative summaries).
-    // Returning success prevents the LLM from wasting iterations retrying.
-    const _ignoredKeys = new Set(['current_intent', 'initial_user_request', 'context', 'user_request', 'task_intent', 'goal', 'objective']);
-    if (_ignoredKeys.has(key)) {
+    // Silently swallow non-project keys.
+    if (_IGNORED_KEYS.has(key)) {
       channel.log('knowledge', `[${agent?.name || '?'}] Ignored learn_fact: "${key}" (not a project fact)`);
       return { success: true, stored: false, message: 'Noted.' };
     }
 
-    // Accept any category — normalize unknown ones to 'other'
-    const _validCategories = new Set(['tech_stack', 'path', 'config', 'credential', 'status', 'dependency']);
-    const effectiveCategory = _validCategories.has(category) ? category : 'other';
+    const effectiveCategory = VALID_CATEGORIES.has(category) ? category : 'other';
 
-    const store = scope === 'plan' ? planKnowledge : sessionKnowledge;
-    store.learn(key, value, {
-      category: effectiveCategory,
-      agentName: agent?.name || 'unknown',
-    });
+    try {
+      await memory.ensureInit(agent);
+    } catch (err) {
+      // Memory not available — degrade gracefully so the agent doesn't crash.
+      channel.log('knowledge', `learn_fact: memory init failed (${err.message}) — fact dropped`);
+      return { success: true, stored: false, message: 'Memory unavailable; fact not persisted.' };
+    }
 
-    channel.log('knowledge', `[${agent?.name || '?'}] learned [${scope}/${effectiveCategory}] ${key}: ${String(value).slice(0, 80)}`);
+    const title = String(key).replace(/_/g, ' ');
+    const projects = [effectiveCategory];
+    if (scope === 'plan') projects.push('_plan');
 
-    return { success: true, key, category: effectiveCategory, scope, stored: true };
+    try {
+      const result = await memory.write({
+        title,
+        description: String(value).slice(0, 200),
+        type: 'learning',
+        project: projects,
+        confidence: 'validated',
+        body: String(value),
+      });
+
+      channel.log('knowledge',
+        `[${agent?.name || '?'}] learned [${scope}/${effectiveCategory}] ${key} → ${result.title} (${result.status})`);
+
+      return {
+        success: true,
+        key,
+        category: effectiveCategory,
+        scope,
+        stored: true,
+        promoted: result.status === 'active',
+      };
+    } catch (err) {
+      channel.log('knowledge', `learn_fact write failed: ${err.message}`);
+      return { success: false, error: `learn_fact failed: ${err.message}` };
+    }
   },
 };

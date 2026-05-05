@@ -65,6 +65,9 @@
     "crypto-js": "^4.2.0",
     "dotenv": "^17.2.3",
     "got-scraping": "^4.2.1",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-metrics": "^2.4.0",
     "keyv": "^5.1.1",
     "linkedom": "^0.18.12",
     "lodash": "^4.17.23",
@@ -84,7 +87,8 @@
     "tree-sitter-typescript": "^0.23.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "yaml": "^2.8.4"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",

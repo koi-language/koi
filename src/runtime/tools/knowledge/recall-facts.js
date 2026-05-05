@@ -1,20 +1,21 @@
 /**
- * Recall Facts Action — retrieve shared session knowledge discovered by any agent.
+ * Recall Facts Action — retrieve shared knowledge from the memory vault.
  *
- * Use this when starting a new task to check what other agents have already
- * learned (tech stacks, file paths, config values, service URLs, etc.) so you
- * don't rediscover it yourself.
+ * Backed by the new memory architecture. External API preserved for backward
+ * compat with existing .koi agent prompts.
  *
- * Without a category filter it returns all facts. Filter by category to narrow
- * results when you only need a specific type (e.g. "path", "tech_stack").
+ * Note for future: under the new architecture this action becomes increasingly
+ * redundant — the Context Compiler retrieves relevant memories proactively per
+ * agent slot map. recall_facts remains as an explicit escape hatch and produces
+ * a telemetry signal: high call frequency suggests the slot map needs tuning.
  */
 
-import { sessionKnowledge, planKnowledge } from '../../state/session-knowledge.js';
+import * as memory from '../../memory/index.js';
 
 export default {
   type: 'recall_facts',
   intent: 'recall_facts',
-  description: 'Retrieve shared knowledge discovered by other agents. Returns BOTH session-level facts (durable project knowledge) AND plan-level facts (transient implementation details shared between tasks of the current plan). Use at task start to avoid rediscovering what others already know. Fields: "category" (optional filter).',
+  description: 'Retrieve shared knowledge discovered by other agents. Returns facts learned this session (and persisted across sessions in the project memory vault). Most contexts already include relevant memory — only call when you need to look up something specific that was not in your prompt. Fields: "category" (optional filter).',
   thinkingHint: 'Recalling knowledge',
   permission: null,
   hidden: false,
@@ -36,40 +37,47 @@ export default {
     { actionType: 'direct', intent: 'recall_facts', category: 'path' },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     const { category } = action;
-    const sections = [];
 
-    // Session knowledge (durable)
-    const sessionFacts = category
-      ? sessionKnowledge.recall(category)
-      : sessionKnowledge.recall();
-    if (sessionFacts.length > 0) {
-      const lines = sessionFacts.map(f =>
-        `- [${f.category}] **${f.key}**: ${f.value}  _(by ${f.agentName})_`
-      );
-      sections.push(`## Session knowledge\n_Durable project facts._\n\n${lines.join('\n')}`);
+    try {
+      await memory.ensureInit(agent);
+    } catch (err) {
+      return { success: true, knowledge: 'Memory unavailable.' };
     }
 
-    // Plan knowledge (transient, cleared when plan completes)
-    const planFacts = category
-      ? planKnowledge.recall(category)
-      : planKnowledge.recall();
+    // Single list call, then partition by `_plan` tag to separate session vs plan facts.
+    const filter = { type: 'learning', status: 'active' };
+    if (category) filter.project = category;
+    const allFacts = await memory.list({ filter, limit: 70 });
+
+    const planFacts = allFacts.filter((f) => (f.frontmatter.project || []).includes('_plan'));
+    const sessionOnly = allFacts.filter((f) => !(f.frontmatter.project || []).includes('_plan'));
+
+    const sections = [];
+    if (sessionOnly.length > 0) {
+      const lines = sessionOnly.map((f) => {
+        const proj = (f.frontmatter.project || []).filter((p) => p !== '_plan').join(',');
+        const desc = f.frontmatter.description || '';
+        return `- [${proj || 'general'}] **${f.title}**: ${desc}`;
+      });
+      sections.push(`## Session knowledge\n_Durable project facts._\n\n${lines.join('\n')}`);
+    }
     if (planFacts.length > 0) {
-      const lines = planFacts.map(f =>
-        `- [${f.category}] **${f.key}**: ${f.value}  _(by ${f.agentName})_`
-      );
+      const lines = planFacts.map((f) => {
+        const desc = f.frontmatter.description || '';
+        return `- **${f.title}**: ${desc}`;
+      });
       sections.push(`## Plan knowledge\n_Implementation details from sibling tasks — use them._\n\n${lines.join('\n')}`);
     }
 
     if (sections.length === 0) {
       return { success: true, knowledge: 'No shared knowledge stored yet.' };
     }
-
     return {
       success: true,
       knowledge: sections.join('\n\n'),
-      count: sessionFacts.length + planFacts.length,
+      count: sessionOnly.length + planFacts.length,
     };
   },
 };
