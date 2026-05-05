@@ -140,10 +140,13 @@ export class MediaLibrary {
   async _ensureDb() {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
+    // Migrated off @lancedb/lancedb to a SQLite-backed adapter (same one
+    // semantic-index uses). Storage layout is preserved (same DB_DIR/lancedb
+    // path), schema is auto-derived from the seed row in _ensureTable.
     this._dbPromise = (async () => {
-      const lancedb = await import('@lancedb/lancedb');
+      const { connect } = await import('./_sqlite-vector-adapter.js');
       fs.mkdirSync(DB_DIR, { recursive: true });
-      this._db = await lancedb.connect(path.join(DB_DIR, 'lancedb'));
+      this._db = await connect(path.join(DB_DIR, 'lancedb'));
     })();
     await this._dbPromise;
   }

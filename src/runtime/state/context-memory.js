@@ -105,27 +105,14 @@ class LatentStore {
   async _ensureDb() {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
+    // Migrated off @lancedb/lancedb to the SQLite-backed adapter — same one
+    // used by semantic-index and media-library. The on-disk layout (the
+    // `latent-lancedb/` directory) is preserved; the format inside changes
+    // from a LanceDB store to a single index.sqlite file.
     this._dbPromise = (async () => {
-      let lancedb;
-      try {
-        const isBinary = typeof process.pkg !== 'undefined';
-        if (isBinary && process.env.KOI_EXTRACTED_NODE_MODULES) {
-          const lancedbPath = path.join(process.env.KOI_EXTRACTED_NODE_MODULES, '@lancedb', 'lancedb', 'dist', 'index.js');
-          let binaryRequire = globalThis.require;
-          if (!binaryRequire) {
-            try { binaryRequire = eval('require'); } catch {}
-          }
-          lancedb = binaryRequire(lancedbPath);
-          lancedb = lancedb?.default ?? lancedb;
-        } else {
-          lancedb = await import('@lancedb/lancedb');
-        }
-      } catch (err) {
-        channel.log('memory', `@lancedb/lancedb failed to load: ${err.message}`);
-        throw err;
-      }
+      const { connect } = await import('./_sqlite-vector-adapter.js');
       fs.mkdirSync(this._dbPath, { recursive: true });
-      this._db = await lancedb.connect(this._dbPath);
+      this._db = await connect(this._dbPath);
     })();
     await this._dbPromise;
   }

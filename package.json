@@ -57,9 +57,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
     "@keyv/sqlite": "^4.0.1",
-    "@lancedb/lancedb": "^0.13.0",
     "@mozilla/readability": "^0.6.0",
-    "apache-arrow": "^17.0.0",
     "better-sqlite3": "^11.8.1",
     "croner": "^10.0.1",
     "crypto-js": "^4.2.0",

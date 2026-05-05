@@ -518,39 +518,19 @@ export class SemanticIndex {
   async _ensureDb() {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
+    // Migrated off @lancedb/lancedb to a SQLite-backed adapter. Storage layout
+    // is preserved (one dir under cacheDir holding a single index.sqlite),
+    // schema is auto-derived from sample rows, vector search is in-process JS
+    // cosine. See state/_sqlite-vector-adapter.js for the contract.
     this._dbPromise = (async () => {
-      channel.log('semantic-index', 'Loading @lancedb/lancedb...');
-      let lancedb;
-      const isBinary = typeof process.pkg !== 'undefined';
-      try {
-        if (isBinary) {
-          const lancedbPath = path.join(process.env.KOI_EXTRACTED_NODE_MODULES, '@lancedb', 'lancedb', 'dist', 'index.js');
-          channel.log('semantic-index', `Loading LanceDB from disk: ${lancedbPath}`);
-          let binaryRequire = globalThis.require;
-          if (!binaryRequire) {
-            try { binaryRequire = eval('require'); } catch {}
-          }
-          if (!binaryRequire) {
-            throw new Error('require is not available in binary mode');
-          }
-          lancedb = binaryRequire(lancedbPath);
-          lancedb = lancedb?.default ?? lancedb;
-        } else {
-          lancedb = await import('@lancedb/lancedb');
-        }
-        channel.log('semantic-index', '@lancedb/lancedb loaded OK');
-      } catch (err) {
-        channel.log('semantic-index', `@lancedb/lancedb FAILED to load: ${err.message}`);
-        throw err;
-      }
+      const { connect } = await import('./_sqlite-vector-adapter.js');
       const dbPath = path.join(this.cacheDir, 'lancedb');
       fs.mkdirSync(dbPath, { recursive: true });
-      channel.log('semantic-index', `Connecting to LanceDB at: ${dbPath}`);
       try {
-        this._db = await lancedb.connect(dbPath);
-        channel.log('semantic-index', 'LanceDB connected OK');
+        this._db = await connect(dbPath);
+        channel.log('semantic-index', `Vector adapter connected at ${dbPath}`);
       } catch (err) {
-        channel.log('semantic-index', `LanceDB connect FAILED: ${err.message}`);
+        channel.log('semantic-index', `Vector adapter connect FAILED: ${err.message}`);
         throw err;
       }
     })();
