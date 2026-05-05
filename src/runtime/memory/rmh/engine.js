@@ -2,7 +2,16 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
+// koi-fork: pkg-aware better-sqlite3 require. The pkg binary extracts
+// native deps to KOI_EXTRACTED_NODE_MODULES at boot (see koi-cli/src/bin-entry.js);
+// outside pkg (dev mode) the regular require resolves through node_modules.
+// Using a runtime-resolved require keeps esbuild from emitting a static
+// `require("better-sqlite3")` that pkg can't find inside its snapshot.
+import { createRequire } from "node:module";
+const _koiRequire = createRequire(import.meta.url);
+const Database = (typeof process.pkg !== "undefined" && process.env.KOI_EXTRACTED_NODE_MODULES)
+  ? _koiRequire(path.join(process.env.KOI_EXTRACTED_NODE_MODULES, "better-sqlite3"))
+  : _koiRequire("better-sqlite3");
 // koi-fork: cloud embeddings via Koi's EmbeddingProvider, no @huggingface/transformers
 import { embedText as koiEmbedText } from "./_koi-bridge.js";
 import { buildGraph } from "./graph.js";
