@@ -386,6 +386,86 @@ function _toSlug(title) {
     .slice(0, 80);
 }
 
+// ─── Conversational loop bridge (Phase 8b.2) ─────────────────────────────
+
+/**
+ * Build the conversation messages array from the event log.
+ *
+ * Drop-in replacement for legacy `ContextMemory.toMessages({agent})`. Used by
+ * `agent.js` and `llm-provider.js` when `KOI_NEW_CONV_LOOP=1` is set —
+ * otherwise those callers stay on the tiered ContextMemory path.
+ *
+ * Mapping (mirror of context-memory.js _emitToEventLog):
+ *   UserMessage          → { role: 'user',      content: payload.content }
+ *   AgentPlanned         → { role: 'assistant', content: payload.reasoning }
+ *   ToolResultReceived   → { role: 'user',      content: payload.result }
+ *   (everything else is skipped — those events aren't conversation turns)
+ *
+ * Output is run through the same consecutive-same-role merge that
+ * ContextMemory.toMessages applies, so the LLM never receives two user-role
+ * messages back to back when it didn't ask for them.
+ *
+ * @param {object} opts
+ * @param {string} [opts.systemPrompt]  Prepended as `{role:'system'}` if provided.
+ * @param {string} [opts.sessionId]     Defaults to current session.
+ * @param {number} [opts.limit]         Cap most-recent N conversational events.
+ * @returns {Promise<Array<{role: string, content: string}>>}
+ */
+export async function eventLogToMessages({ systemPrompt, sessionId, limit } = {}) {
+  _ensureInit();
+  const sid = sessionId ?? _state.sessionId;
+  if (!sid) return systemPrompt ? [{ role: 'system', content: systemPrompt }] : [];
+
+  const conversational = [
+    eventTypes.UserMessage,
+    eventTypes.AgentPlanned,
+    eventTypes.ToolResultReceived,
+  ];
+  const events = await eventLog.load(_state.vaultRoot, sid, {
+    types: conversational,
+    limit,
+  });
+
+  const messages = [];
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+
+  for (const e of events) {
+    let role, content;
+    if (e.type === eventTypes.UserMessage) {
+      role = 'user';
+      content = e.payload?.content ?? '';
+    } else if (e.type === eventTypes.AgentPlanned) {
+      role = 'assistant';
+      content = e.payload?.reasoning ?? '';
+    } else if (e.type === eventTypes.ToolResultReceived) {
+      role = 'user';
+      content = e.payload?.result ?? '';
+    } else {
+      continue;
+    }
+    if (typeof content !== 'string' || content.length === 0) continue;
+    messages.push({ role, content });
+  }
+
+  // Collapse adjacent same-role messages (an emergent property of the legacy
+  // tier system: an action result + a Continue. nudge would land as two
+  // consecutive 'user' entries that ContextMemory then merged before sending).
+  return _mergeConsecutiveMessages(messages);
+}
+
+function _mergeConsecutiveMessages(msgs) {
+  const out = [];
+  for (const m of msgs) {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role && last.role !== 'system') {
+      last.content = `${last.content}\n\n${m.content}`;
+    } else {
+      out.push({ ...m });
+    }
+  }
+  return out;
+}
+
 // Re-exports for convenience
 export { eventLog };
 export const types = eventTypes;

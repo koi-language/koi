@@ -1663,57 +1663,11 @@ export class Agent {
       } catch { /* non-fatal */ }
     }
 
-    // Inject shared session knowledge discovered by other agents.
-    // This runs once per delegate/agent start so parallel agents that started
-    // before certain facts were stored can use recall_facts mid-run instead.
-    {
-      const { sessionKnowledge } = await import('../state/session-knowledge.js');
-
-      // On first run in this process: restore knowledge persisted from previous session.
-      // Set a flag on the singleton so we only restore once even with multiple agents.
-      if (sessionTracker && !sessionKnowledge._restored) {
-        sessionKnowledge._restored = true;
-        try {
-          const savedFacts = sessionTracker.loadKnowledge();
-          if (savedFacts.length > 0) {
-            sessionKnowledge.restore(savedFacts);
-            channel.log('knowledge', `Restored ${savedFacts.length} fact(s) from previous session`);
-          }
-        } catch { /* non-fatal */ }
-
-        // Auto-save knowledge to disk whenever a new fact is learned.
-        sessionKnowledge.on('learn', () => {
-          try { sessionTracker.saveKnowledge(sessionKnowledge.serialize()); } catch { /* non-fatal */ }
-        });
-      }
-
-      const knowledgeBlock = sessionKnowledge.format();
-      if (knowledgeBlock) {
-        // Remove stale copies so the latest snapshot is the only one in
-        // short-term memory. Without this, every agent start / recall_facts
-        // appends a new copy → duplicates pile up in the context window.
-        contextMemory.entries = contextMemory.entries.filter(
-          e => e.shortTerm !== 'Shared session knowledge'
-        );
-        contextMemory.add('user', knowledgeBlock, 'Shared session knowledge', null);
-        channel.log('knowledge', `${this.name}: injected ${sessionKnowledge.size} session fact(s)`);
-      }
-
-      // Plan-scoped knowledge: transient facts from sibling tasks.
-      const { planKnowledge } = await import('../state/session-knowledge.js');
-      if (planKnowledge.size > 0) {
-        const planBlock = planKnowledge.format()
-          ?.replace('Shared session knowledge', 'Plan knowledge (sibling tasks)')
-          ?.replace('Facts discovered during this session', 'Implementation details from completed tasks in this plan');
-        if (planBlock) {
-          contextMemory.entries = contextMemory.entries.filter(
-            e => e.shortTerm !== 'Plan knowledge'
-          );
-          contextMemory.add('user', planBlock, 'Plan knowledge', null);
-          channel.log('knowledge', `${this.name}: injected ${planKnowledge.size} plan fact(s)`);
-        }
-      }
-    }
+    // Phase 8b.3: legacy session-knowledge injection removed. Shared facts
+    // now live in the Ori vault (`<repo>/.koi/memory/notes/`) and are pulled
+    // into each agent's prompt automatically by the Context Compiler when
+    // its slot map specifies a `memory` source. Persistence across sessions
+    // is handled by the markdown files on disk; no in-process restore step.
 
     // Project init (BRAXIL.md creation) removed from auto-startup.
     // Users can run /init manually when they want.
@@ -1850,7 +1804,7 @@ export class Agent {
       {
         const fmt = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
         const est = (text) => text ? Math.ceil(text.length / 4) : 0;
-        const msgs = contextMemory.toMessages({ agent: this });
+        const msgs = await contextMemory.toMessages({ agent: this });
         const inputTk = msgs.reduce((sum, m) => sum + est(m.content || ''), 0);
         if (inputTk > 0) {
           channel.setInfo('tokens', `↑${fmt(inputTk)}`);
@@ -4579,7 +4533,7 @@ Many commands are inherently slow and produce little or no output for extended p
       const _slotKey = channel.getCurrentSlotId() ?? '_main';
       const _ctxMem = _contextMemoryBySlot.get(_slotKey) || this._activeContextMemory;
       if (_ctxMem) {
-        const messages = _ctxMem.toMessages({ agent: this });
+        const messages = await _ctxMem.toMessages({ agent: this });
         recentContext = messages
           .filter(m => m.role !== 'system')
           .slice(-8)

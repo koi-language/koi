@@ -69,11 +69,20 @@ function _nextId() {
 
 let _lastId = null;
 
+// Serialised write queue. Multiple append() calls may arrive concurrently
+// (e.g. fire-and-forget mirrors from ContextMemory.add); without queueing
+// they race and produce out-of-order JSONL. We chain every write off a
+// single tail promise so events land on disk in the exact order they were
+// requested.
+let _writeChain = Promise.resolve();
 async function _writeRaw(event) {
-  await fs.appendFile(_logPath, JSON.stringify(event) + '\n', 'utf8');
+  const next = _writeChain.then(() => fs.appendFile(_logPath, JSON.stringify(event) + '\n', 'utf8'));
+  // Keep the chain alive even when one write fails — drop the error here so
+  // a single broken write doesn't poison subsequent appends.
+  _writeChain = next.catch(() => {});
+  await next;
   _lastId = event.id;
   // Fire-and-forget notification to subscribers (extractor, dashboards, …).
-  // Listeners should never throw; if they do, swallow to keep the writer alive.
   try { emitter.emit('event', event); } catch { /* ignore */ }
   return event.id;
 }

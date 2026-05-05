@@ -18,11 +18,10 @@ try {
 }
 
 import { actionRegistry } from '../agent/action-registry.js';
-import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
-// Phase 8b.1: parallel emission to the new event log is handled inside
-// ContextMemory.add() itself (see state/context-memory.js _emitToEventLog).
-// All 108+25 contextMemory.add call sites in this file and agent.js are
-// covered automatically — no edits needed here for that wiring.
+import { classifyFeedback, classifyResponse } from '../state/feedback-classifier.js';
+// All conversational state is mirrored to the Event Log via the deprecated
+// ContextMemory shim (state/context-memory.js). The shim's toMessages() now
+// reads directly from the Event Log — no flag, no fallback.
 import { costCenter, getModelCaps } from './cost-center.js';
 import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_RANK, THINKING_INACTIVITY_MS, DEFAULT_INACTIVITY_MS } from './constants.js';
 
@@ -1442,8 +1441,10 @@ CRITICAL RULES:
       }
     }
 
-    // Build messages from tiered memory
-    const messages = contextMemory.toMessages({ agent });
+    // Build messages from the Event Log via the deprecated ContextMemory shim
+    // (which now proxies to memory.eventLogToMessages internally). toMessages
+    // is async post-Phase 8b.3 — await it.
+    const messages = await contextMemory.toMessages({ agent });
 
     // Track attachments for debug logging
     const _debugAttachPaths = [];
