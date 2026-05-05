@@ -19,6 +19,10 @@ try {
 
 import { actionRegistry } from '../agent/action-registry.js';
 import { classifyFeedback, classifyResponse } from '../state/context-memory.js';
+// Phase 8b.1: parallel emission to the new event log is handled inside
+// ContextMemory.add() itself (see state/context-memory.js _emitToEventLog).
+// All 108+25 contextMemory.add call sites in this file and agent.js are
+// covered automatically — no edits needed here for that wiring.
 import { costCenter, getModelCaps } from './cost-center.js';
 import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_RANK, THINKING_INACTIVITY_MS, DEFAULT_INACTIVITY_MS } from './constants.js';
 

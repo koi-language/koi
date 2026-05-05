@@ -17,8 +17,66 @@ import fs from 'node:fs';
 
 import { taskManager } from './task-manager.js';
 import { channel } from '../io/channel.js';
+// Phase 8b.1: emit parallel events to the new Event Log for every
+// ContextMemory.add(). The legacy tier-based memory keeps working; the
+// new Event Log captures the same conversational signal so the Context
+// Compiler (and future replacement of this loop) has full data.
+//
+// Lazy-loaded to avoid loading memory/ until it's actually used (helps
+// boot speed and keeps tests that don't touch memory cheap).
+let _eventLogCache = null;
+async function _getEventLog() {
+  if (_eventLogCache !== null) return _eventLogCache;
+  try {
+    const mod = await import('../memory/event-log/index.js');
+    _eventLogCache = mod;
+    return mod;
+  } catch {
+    _eventLogCache = false;  // mark as failed; don't retry
+    return false;
+  }
+}
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Phase 8b.1 — mirror a ContextMemory.add() into the new Event Log.
+ *
+ * Mapping:
+ *   role='user'   + opts.intent (action result coming back) → ToolResultReceived
+ *   role='user'   + no intent (genuine user message)        → UserMessage
+ *   role='assistant'                                         → AgentPlanned
+ *
+ * Defensive: never throws. If the event log isn't initialised (boot
+ * phase, or no embedding provider configured), append() is itself a
+ * graceful no-op.
+ */
+async function _emitToEventLog(agentName, role, immediate, opts) {
+  const eventLog = await _getEventLog();
+  if (!eventLog) return;
+  let type, payload;
+  if (role === 'assistant') {
+    type = eventLog.types.AgentPlanned;
+    payload = {
+      reasoning: typeof immediate === 'string' ? immediate.slice(0, 4000) : '',
+    };
+  } else if (opts && (opts.intent || opts.successKey || opts.failureKey)) {
+    type = eventLog.types.ToolResultReceived;
+    const ok = !opts.failureKey;
+    payload = {
+      name: opts.intent || 'unknown',
+      ok,
+      result: typeof immediate === 'string' ? immediate.slice(0, 4000) : null,
+    };
+    if (opts.failureKey) payload.failureKey = opts.failureKey;
+  } else {
+    type = eventLog.types.UserMessage;
+    payload = {
+      content: typeof immediate === 'string' ? immediate.slice(0, 4000) : '',
+    };
+  }
+  await eventLog.append(type, agentName || 'agent', payload);
+}
 
 function cosineSimilarity(a, b) {
   if (!a || !b || a.length !== b.length) return 0;
@@ -815,6 +873,12 @@ export class ContextMemory {
     immediate = _capString(immediate, 'immediate');
     shortTerm = _capString(shortTerm, 'shortTerm');
     permanent = _capString(permanent, 'permanent');
+
+    // Phase 8b.1 — parallel emission to the new Event Log.
+    // Legacy tier system above is unchanged; this just mirrors the signal
+    // so the new Compiler/Extractor see the same conversational stream.
+    // Fire-and-forget; never blocks add().
+    _emitToEventLog(this.agentName, role, immediate, opts).catch(() => {});
 
     // Handle replaceTag: expire old entries with the same tag
     if (opts.replaceTag) {
