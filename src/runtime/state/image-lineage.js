@@ -3,9 +3,10 @@
  *
  * Every time a tool produces a media file (generate_image,
  * background_removal, upscale_image, …) it calls `recordImageOp(...)`.
- * The resulting fact enters the plan-scoped knowledge store, so the
- * System agent can see — via `recall_facts` — what operations have
- * already been applied to the file currently in the user's working area.
+ * The resulting note enters the project memory vault tagged with
+ * `image-lineage`, so the System agent can see — via memory.list or
+ * recall_facts — what operations have already been applied to the file
+ * currently in the user's working area.
  *
  * Why: after a mid-pipeline failure (e.g. a ProviderBlockedError) System
  * tends to "retry" by replaying the WHOLE user request. Without lineage
@@ -15,31 +16,22 @@
  * already represented in the file's history and only re-delegate what
  * actually failed.
  *
- * Facts live in `planKnowledge` (not `sessionKnowledge`):
- *   - They are transient working-memory of the current plan.
- *   - They auto-clear when the plan completes, so a fresh user request
- *     doesn't pick up stale "this file was upscaled" signals from an
- *     earlier unrelated task.
+ * Storage: notes are written to the project vault with type=insight,
+ * project=[image-lineage]. They persist across sessions and are filterable.
  *
- * Key format:  `image_lineage_<basename-without-ext>`
- * Value format (human-readable, parseable — ≤300 chars):
- *   <abs-path> — ops: <op1>(k=v,…) → <op2> → …; from: <source-abs-path>
- *
- * Example:
- *   key   = image_lineage_upscale_1776687611619_0
- *   value = /Users/me/.koi/images/upscale_…png —
- *           ops: bg-remove → upscale(factor=2); from: /Users/me/…/photo.jpg
+ * Title format:  `image-lineage-<basename-without-ext>`
+ * Description: `<output-path> ops: <op1> → <op2> → ...; from: <root-source>`
  */
 
 import path from 'path';
-import { planKnowledge } from './session-knowledge.js';
+import * as memory from '../memory/index.js';
 import { channel } from '../io/channel.js';
 
 /** Strip the extension to form a stable, filesystem-safe key suffix. */
 function _keyFor(filePath) {
   const base = path.basename(filePath, path.extname(filePath));
-  // Restrict to [a-zA-Z0-9_-] so the recall_facts markdown stays readable.
-  return `image_lineage_${base.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  // Normalise to slug form used by memory.write title slugifier.
+  return `image-lineage-${base.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 }
 
 /** Parse the pipeline segment (between "ops:" and ";") back into an op list. */
@@ -60,22 +52,33 @@ function _formatOp(op, params) {
 }
 
 /**
- * Look up the lineage string for a given file path. Returns `null` when
- * the file has no recorded history (e.g. a brand-new generation, or an
- * external image the user dropped in).
+ * Look up the lineage for a given file path. Returns `null` when the file
+ * has no recorded history (brand-new generation, external user-supplied
+ * image, or memory subsystem not yet initialized).
+ *
+ * NOTE: now async (was sync). Internal use only — no external callers.
  *
  * @param {string} filePath
- * @returns {{ops: string[], sourcePath: string|null} | null}
+ * @returns {Promise<{ops: string[], sourcePath: string|null} | null>}
  */
-export function getImageLineage(filePath) {
+export async function getImageLineage(filePath) {
   if (!filePath) return null;
+  if (!memory.isInitialized()) return null;
   const key = _keyFor(filePath);
-  const entries = planKnowledge.recall();
-  const entry = entries.find(e => e.key === key);
-  if (!entry) return null;
-  const ops = _extractOps(entry.value);
-  const fromMatch = entry.value.match(/from:\s*(.+?)(?:$|;)/);
-  return { ops, sourcePath: fromMatch ? fromMatch[1].trim() : null };
+  try {
+    const matches = await memory.list({
+      filter: { project: 'image-lineage', type: 'insight' },
+      limit: 200,
+    });
+    const entry = matches.find(m => m.title === key || m.title.startsWith(`${key}-`));
+    if (!entry) return null;
+    const desc = entry.frontmatter?.description || '';
+    const ops = _extractOps(desc);
+    const fromMatch = desc.match(/from:\s*(.+?)(?:$|;)/);
+    return { ops, sourcePath: fromMatch ? fromMatch[1].trim() : null };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -86,35 +89,38 @@ export function getImageLineage(filePath) {
  * Safe to call from any tool — never throws. Failures are logged and
  * swallowed so they cannot break the main action result.
  *
+ * Now async (was sync). Callers don't have to await — the tools that use
+ * this already wrap it in fire-and-forget try/catch.
+ *
  * @param {Object} args
- * @param {string} args.op          — short label: 'generate', 'upscale', 'bg-remove', 'edit'
+ * @param {string} args.op          — 'generate' | 'upscale' | 'bg-remove' | 'edit' | …
  * @param {string} args.outputPath  — absolute path of the file this op produced
  * @param {string} [args.sourcePath] — absolute path of the input file (if any)
  * @param {Object} [args.params]    — small param bag that ends up in `op(k=v,…)`
- * @param {string} [args.agentName] — who recorded it (usually the tool-owning agent)
+ * @param {string} [args.agentName] — who recorded it (informational)
  */
-export function recordImageOp({ op, outputPath, sourcePath, params, agentName } = {}) {
+export async function recordImageOp({ op, outputPath, sourcePath, params, agentName } = {}) {
   if (!op || !outputPath) return;
+  if (!memory.isInitialized()) return; // best-effort — silent no-op when memory not ready
   try {
-    // Inherit upstream ops so a single fact answers "what has been done
-    // to this file up to now" without the caller having to walk the
-    // chain.
-    const parent = sourcePath ? getImageLineage(sourcePath) : null;
+    const parent = sourcePath ? await getImageLineage(sourcePath) : null;
     const ops = parent ? [...parent.ops] : [];
     ops.push(_formatOp(op, params));
 
-    // Root source: prefer the parent's root if any, so long pipelines
-    // keep pointing back to the original input instead of the immediate
-    // predecessor.
     const rootSource = parent?.sourcePath || sourcePath || null;
+    // Format must keep `;` as the boundary between ops and from segments
+    // so _extractOps's `ops:\s*([^;]+)` regex still terminates correctly.
+    const opsSegment = `${outputPath} — ops: ${ops.join(' → ')}`;
+    const fromSegment = rootSource ? `; from: ${rootSource}` : '';
+    const description = (opsSegment + fromSegment).slice(0, 200);
 
-    const parts = [outputPath, `ops: ${ops.join(' → ')}`];
-    if (rootSource) parts.push(`from: ${rootSource}`);
-    const value = parts.join(' — ');
-
-    planKnowledge.learn(_keyFor(outputPath), value, {
-      category: 'status',
-      agentName: agentName || 'media-tool',
+    await memory.write({
+      title: _keyFor(outputPath),
+      description,
+      type: 'insight',
+      project: ['image-lineage', agentName || 'media-tool'],
+      confidence: 'validated',
+      body: [opsSegment, fromSegment.replace(/^;\s*/, '')].filter(Boolean).join('\n'),
     });
   } catch (err) {
     channel.log('image', `[image-lineage] record failed (non-fatal): ${err?.message || err}`);

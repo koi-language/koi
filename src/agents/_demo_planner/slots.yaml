@@ -1,0 +1,46 @@
+# Demo slot map for the Context Compiler smoke test.
+# Real agent slot maps live alongside their .koi files in src/agents/<name>/.
+# This _demo_planner exists purely to exercise the compiler.
+
+template: template.md
+
+slots:
+  - id: identity
+    source: static
+    path: _demo_planner/identity.md
+    budget: fixed
+
+  - id: task
+    source: trigger
+    field: payload.task
+    budget: fixed
+
+  - id: project_context
+    source: memory
+    query:
+      filter:
+        type: [decision, learning]
+        status: active
+      limit: 5
+    budget: 4000
+
+  - id: relevant_constraints
+    source: memory
+    query:
+      semantic: "{{trigger.payload.task}}"
+      filter:
+        type: decision
+      limit: 5
+    budget: flex
+
+  - id: recent_episodes
+    source: event_log
+    query:
+      types: [DecisionMade, TaskCompleted]
+      last_n: 5
+    budget: 2000
+
+  - id: tools
+    source: runtime
+    provider: list_tools
+    budget: fixed

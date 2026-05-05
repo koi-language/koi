@@ -332,14 +332,12 @@ class TaskManager {
       // keep firing on no-op updates.
       if (!hasActive && (hasAnyCompleted || all.length > 0)) {
         this._allCompletedNotified = true;
-        // Clear plan-scoped knowledge — it was useful while tasks
-        // were executing but is no longer needed once the plan is done.
-        import('../state/session-knowledge.js').then(({ planKnowledge }) => {
-          if (planKnowledge.size > 0) {
-            channel.log('knowledge', `[task-manager] Plan complete — clearing ${planKnowledge.size} plan-scoped facts`);
-            planKnowledge.clear();
-          }
-        }).catch(() => {});
+        // In the new memory architecture plan-scoped facts are tagged
+        // `_plan` and live in the same vault as session facts. They're
+        // filterable on read; we don't drop them at plan completion any
+        // more — the agent can choose to surface or ignore them, and the
+        // event log preserves the chain for any later re-derivation.
+        // (Legacy planKnowledge.clear() removed.)
         // Auto-deactivate any active workflow when its task plan drains.
         // Mirrors the plan-knowledge clear above: when every task reaches
         // `completed`, the workflow that created them is "done". Without

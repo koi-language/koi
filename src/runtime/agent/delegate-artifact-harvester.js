@@ -12,17 +12,17 @@
  * This module plugs that hole. Right before the delegate's session is
  * terminated the runtime calls `harvestAndPersist(agent, session)` —
  * fire-and-forget — which walks the action history, extracts the
- * artifacts, and writes one compact `sessionKnowledge` fact per source /
- * file. Future `recall_facts` calls (or semantic searches against the
- * facts store) can then surface those trails to any sibling or follow-up
- * task without a single extra LLM token being spent rediscovering them.
+ * artifacts, and writes one compact memory note per source / file in
+ * the project vault. Future memory.retrieve() / recall_facts calls can
+ * then surface those trails to any sibling or follow-up task without a
+ * single extra LLM token being spent rediscovering them.
  *
  * Design notes
  *  - Fire-and-forget: the caller awaits nothing. Any thrown error is
  *    caught and logged; it never propagates into the return path.
- *  - One fact per artifact (not one big blob). Each fact stays under
- *    sessionKnowledge's 300-char cap, and semantic recall can match on
- *    the exact URL / path without having to destructure JSON.
+ *  - One note per artifact (not one big blob). Each fits the memory
+ *    note description budget, and semantic recall can match on the
+ *    exact URL / path without having to destructure JSON.
  *  - Keyed by task id when available, otherwise by agent + timestamp.
  *    Keeping the key unique per invocation prevents one Worker's facts
  *    from being overwritten by a later invocation's.
@@ -30,7 +30,10 @@
  *    that was produced by a failed or denied action.
  */
 
-import { sessionKnowledge } from '../state/session-knowledge.js';
+// Migrated from legacy sessionKnowledge to the new memory subsystem.
+// Each harvested artifact (URL or file) is written as a separate memory
+// note so semantic recall + multi-hop retrieval can surface it later.
+import * as memory from '../memory/index.js';
 import { channel } from '../io/channel.js';
 
 const MAX_URLS = 5;
@@ -152,37 +155,61 @@ export async function harvestAndPersist(agent, session) {
 
     const agentName = agent?.name || 'delegate';
 
+    // Defensive: memory may not be initialised yet (very early in boot, or
+    // when running a fixture without an embedding provider). Do not crash —
+    // the harvest is fire-and-forget and the agent must continue regardless.
+    let memReady = false;
+    try {
+      await memory.ensureInit(agent);
+      memReady = true;
+    } catch (err) {
+      channel.log('knowledge', `delegate harvest: memory init skipped (${err?.message || err})`);
+    }
+
+    const writeNote = async (titleSuffix, description, project, body) => {
+      if (!memReady) return;
+      try {
+        await memory.write({
+          title: `${keyPrefix}_${titleSuffix}`,
+          description: clip(description, 200),
+          type: 'insight',
+          project,
+          confidence: 'validated',
+          body,
+        });
+      } catch (err) {
+        channel.log('knowledge', `delegate harvest write failed: ${err?.message || err}`);
+      }
+    };
+
     // Stamp the task subject first: gives semantic recall something to
-    // hang the rest of the facts off of when the user asks a vague
-    // follow-up like "the one where you wrote the recipe".
+    // hang the rest of the artifacts off of for vague follow-ups like
+    // "the one where you wrote the recipe".
     if (subject) {
-      sessionKnowledge.learn(
-        `${keyPrefix}_subject`,
-        clip(subject, 290),
-        { category: 'status', agentName },
+      await writeNote('subject', subject, ['delegate-artifact', agentName], `${agentName} delegate task: ${subject}`);
+    }
+
+    for (let i = 0; i < urls.length; i++) {
+      const u = urls[i];
+      const value = u.title ? `${u.title} — ${u.url}` : u.url;
+      await writeNote(
+        `source_${i + 1}`,
+        value,
+        ['delegate-artifact', 'source', agentName],
+        `URL discovered by ${agentName}: ${u.url}${u.title ? ` (${u.title})` : ''}`,
       );
     }
 
-    urls.forEach((u, i) => {
-      const value = u.title ? `${u.title} — ${u.url}` : u.url;
-      sessionKnowledge.learn(
-        `${keyPrefix}_source_${i + 1}`,
-        clip(value, 290),
-        { category: 'status', agentName },
-      );
-    });
-
-    filesWritten.forEach((f, i) => {
-      // Suffix with subject so recall by "recipe2.md" OR by "onion soup"
-      // both surface the same fact. Kept short so the full value still
-      // fits under the sessionKnowledge ceiling.
+    for (let i = 0; i < filesWritten.length; i++) {
+      const f = filesWritten[i];
       const detail = subject ? ` — ${clip(subject, 120)}` : '';
-      sessionKnowledge.learn(
-        `${keyPrefix}_file_${i + 1}`,
-        clip(`${f.path} (${f.action})${detail}`, 290),
-        { category: 'path', agentName },
+      await writeNote(
+        `file_${i + 1}`,
+        `${f.path} (${f.action})${detail}`,
+        ['delegate-artifact', 'file', agentName],
+        `${agentName} ${f.action} ${f.path}${detail}`,
       );
-    });
+    }
 
     channel.log(
       'knowledge',
