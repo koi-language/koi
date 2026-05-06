@@ -18,22 +18,30 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const runtimeDir = path.join(__dirname, '..', 'src', 'runtime');
+const runtimeDir = path.join(__dirname, '..', 'src', 'runtime', 'state');
 
 // ─── Mock LLM Provider ──────────────────────────────────────────────────
 
 let embeddingCallCount = 0;
 
+function _mockEmbed(text) {
+  const hash = simpleHash(text);
+  const vec = new Array(1536);
+  for (let i = 0; i < 1536; i++) vec[i] = Math.sin(hash + i * 0.01) * 0.5;
+  return vec;
+}
+
 const mockLlmProvider = {
   async getEmbedding(text) {
     embeddingCallCount++;
-    // Deterministic pseudo-embedding based on text hash
-    const hash = simpleHash(text);
-    const vec = new Array(1536);
-    for (let i = 0; i < 1536; i++) {
-      vec[i] = Math.sin(hash + i * 0.01) * 0.5;
-    }
-    return vec;
+    return _mockEmbed(text);
+  },
+
+  // semantic-index calls getEmbeddingBatch when indexing — added so the
+  // mock matches the real EmbeddingProvider surface.
+  async getEmbeddingBatch(texts) {
+    embeddingCallCount += texts.length;
+    return texts.map(_mockEmbed);
   },
 
   async callJSON(prompt, agent, opts) {

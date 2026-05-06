@@ -88,6 +88,24 @@ async function _writeRaw(event) {
 }
 
 /**
+ * Wait until every pending append has been flushed to disk.
+ *
+ * Critical for the read-after-write pattern: ContextMemory.add() fires
+ * _emitToEventLog as fire-and-forget; if the runtime then calls
+ * toMessages() (which reads the JSONL from disk) before that promise
+ * settles, the read sees an incomplete view and the LLM is handed an
+ * empty conversation. Callers about to read should await flush() first.
+ *
+ * Idempotent and cheap when nothing's pending — resolves on the next
+ * microtask.
+ */
+export async function flush() {
+  // Snapshot the current chain — by the time it settles, every append
+  // queued before this call has hit disk.
+  await _writeChain;
+}
+
+/**
  * Append an event to the log.
  *
  * @param {string} type     Event type — see types.js

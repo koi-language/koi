@@ -77,9 +77,18 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
 
   // Executor function - receives the action and agent context
   async execute(action, agent) {
-    const message = action.message || action.data?.message || '';
-    const question = action.question || action.data?.question || '';
+    let message = action.message || action.data?.message || '';
+    let question = action.question || action.data?.question || '';
     const options = action.options || action.data?.options || null;
+    // LLM rescue: smaller models occasionally emit prompt_user with ONLY
+    // a `message` field (treating it like print). The schema says message
+    // is for context and `question` is the ask — but rather than reject
+    // and loop, promote message → question when it's the only signal
+    // present. The user still sees a question; the agent moves on.
+    if (!question && message && !options && !action.prompt && !action.data?.prompt) {
+      question = message;
+      message = '';
+    }
     // `prompt` on the action is the ONLY legitimate INLINE-mode trigger
     // (shell-style "$ " input). It is provided BY THE AGENT explicitly
     // and is separate from the visual prompt below. Without all three

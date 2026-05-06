@@ -1519,6 +1519,28 @@ export class Agent {
     }
     channel.log('agent', `${this.name}: Starting reactive loop${isDelegate ? ' [delegate]' : ''}`);
 
+    // Phase 8b.3: kick the Memory Extractor on the FIRST reactive loop a
+    // root agent ever runs. The extractor is a module-scoped singleton; it
+    // listens to event-log emissions and converts DecisionMade-class events
+    // into vault notes. Without this wiring `notes/` (and `.ori/embeddings.db`)
+    // stay empty even though the event log is filling up.
+    if (!isDelegate && !globalThis.__koiExtractorStarted) {
+      globalThis.__koiExtractorStarted = true;
+      // Fire-and-forget: never block the agent on extractor setup.
+      (async () => {
+        try {
+          const memMod = await import('../memory/index.js');
+          if (!memMod.isInitialized()) await memMod.ensureInit(this);
+          const ext = await import('../memory/extractor.js');
+          ext.registerBuiltins();
+          ext.start({ agent: this });
+          channel.log('memory', 'Memory Extractor started (DecisionMade rule active)');
+        } catch (err) {
+          channel.log('memory', `Memory Extractor start failed: ${err?.message || err}`);
+        }
+      })();
+    }
+
     // Fresh AbortController per invocation. Delegates are shared instances
     // across repeated invocations, so a previous run's aborted state must
     // NOT carry over into this one (would cause an instant exit on the

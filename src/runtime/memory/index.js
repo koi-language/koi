@@ -416,6 +416,12 @@ export async function eventLogToMessages({ systemPrompt, sessionId, limit } = {}
   const sid = sessionId ?? _state.sessionId;
   if (!sid) return systemPrompt ? [{ role: 'system', content: systemPrompt }] : [];
 
+  // CRITICAL: drain the writer's queue before reading. ContextMemory.add()
+  // emits asynchronously; without this flush a read-after-write returns
+  // the pre-write view of the log and the LLM is handed a conversation
+  // that's missing the latest user/agent turns.
+  await eventLog.flush();
+
   const conversational = [
     eventTypes.UserMessage,
     eventTypes.AgentPlanned,
