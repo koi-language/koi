@@ -53,6 +53,11 @@ const _MAX_SUMMARY_INPUT_CHARS = 12000;
 /**
  * Move one ContextMemory's turn buffer into an episode note.
  *
+ * Snapshot + reset happen SYNCHRONOUSLY at the start so anything added to
+ * the buffer mid-write (e.g. a new user message arriving while the LLM
+ * summary call is in flight) lands in a clean buffer and is not absorbed
+ * into the episode being written. The async path operates on the snapshot.
+ *
  * @param {object} opts
  * @param {object} opts.contextMemory  ContextMemory instance with `_buffer`
  *                                      and `resetTurnBuffer`.
@@ -72,20 +77,40 @@ export async function compactSessionToEpisode({
   if (!contextMemory || !Array.isArray(contextMemory._buffer)) return null;
   if (contextMemory._buffer.length === 0) return null;
 
-  const transcript = contextMemory._buffer
+  // ── Snapshot + reset SYNCHRONOUSLY ──
+  // Take a copy of the buffer NOW, then immediately reset the live buffer.
+  // Any new turn pushed while the async write below is in flight goes into
+  // a clean buffer and is preserved for the next exchange — instead of
+  // being silently absorbed into the episode we're about to write or, worse,
+  // being lost when reset finally runs after a delay.
+  const snapshot = contextMemory._buffer.slice();
+  contextMemory.resetTurnBuffer();
+
+  const transcript = snapshot
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join('\n\n');
 
   const totalChars = transcript.length;
-  const turnCount = contextMemory._buffer.length;
+  const turnCount = snapshot.length;
   const isLarge = totalChars >= _SUMMARY_CHAR_THRESHOLD || turnCount >= _SUMMARY_TURN_THRESHOLD;
 
   // ── Defaults (used when isLarge=false OR when LLM is unavailable) ──
-  let title = taskTitles.length > 0
-    ? `Episode: ${taskTitles[0].slice(0, 60)}`
-    : `Episode ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
-  const firstUserTurn = contextMemory._buffer.find((m) => m.role === 'user');
-  const previewSource = firstUserTurn?.content || contextMemory._buffer[0]?.content || '';
+  // Title preference order:
+  //   1. Real task title from a TaskManager plan, if one closed.
+  //   2. The first user turn in the buffer — the actual ask, the most
+  //      searchable label for casual chat episodes.
+  //   3. Timestamp, as a last resort.
+  const firstUserTurn = snapshot.find((m) => m.role === 'user');
+  const firstUserText = firstUserTurn?.content?.replace(/\s+/g, ' ').trim() ?? '';
+  let title;
+  if (taskTitles.length > 0 && taskTitles[0]) {
+    title = `Episode: ${taskTitles[0].slice(0, 60)}`;
+  } else if (firstUserText) {
+    title = `Episode: ${firstUserText.slice(0, 60)}`;
+  } else {
+    title = `Episode ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+  }
+  const previewSource = firstUserTurn?.content || snapshot[0]?.content || '';
   let description = previewSource
     .replace(/\s+/g, ' ')
     .slice(0, _DESCRIPTION_PREVIEW_CHARS)
@@ -134,6 +159,9 @@ export async function compactSessionToEpisode({
     body = `## Transcript\n\n${transcript}`;
   }
 
+  // Buffer was already reset synchronously at the top — only the persistent
+  // write remains. If it fails the snapshot is lost (the audit log still
+  // holds a copy in ops/sessions/), but cross-task contamination is gone.
   let result = null;
   try {
     result = await memory.write({
@@ -146,9 +174,6 @@ export async function compactSessionToEpisode({
   } catch {
     result = null;
   }
-
-  // Always reset the buffer, even if the write failed.
-  contextMemory.resetTurnBuffer();
 
   return result ? { title: result.title, path: result.path, summarised: !!llmSummary } : null;
 }

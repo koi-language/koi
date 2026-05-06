@@ -81,6 +81,42 @@ export class MessageInbox {
 
     channel.log('inbox', `${this._agent.name}: ← message from ${entry.from}: "${entry.text.substring(0, 80)}"`);
 
+    // Compaction trigger for casual chat (no TaskManager plan).
+    // When a NEW user message arrives AND the agent's buffer already has
+    // content from a previous exchange, snapshot that previous exchange to
+    // the memory vault as an episode and reset the buffer. Without this
+    // hook, casual conversations never produce episodes (since they don't
+    // create plan-level tasks that drain), so a process restart loses all
+    // context — exactly the "memoria no disponible" complaint.
+    //
+    // Heuristic: only fire when (a) the message is from a user (not an
+    // agent broadcast), (b) the buffer is non-empty, and (c) the buffer's
+    // last entry is from the assistant — meaning the previous exchange
+    // already concluded. Mid-task user follow-ups (where last entry is
+    // user / tool result) DON'T trigger — we keep the working context.
+    if (entry.from === 'user') {
+      const cm = this._agent.contextMemory ?? this._agent._activeContextMemory;
+      const buf = cm?._buffer;
+      if (Array.isArray(buf) && buf.length > 0 && buf[buf.length - 1]?.role === 'assistant') {
+        // Fire-and-forget — don't block message processing on the LLM
+        // summary call. The buffer reset happens synchronously inside
+        // compactSessionToEpisode so the new message lands in a clean
+        // buffer regardless of the async write completing.
+        import('../memory/compactor.js').then(({ compactSessionToEpisode }) => {
+          // Pass no taskTitles — let the compactor use the first user turn
+          // as the episode title (more searchable than a generic placeholder).
+          return compactSessionToEpisode({
+            contextMemory: cm,
+            agentName: this._agent.name,
+          });
+        }).then((ep) => {
+          if (ep) channel.log('memory', `${this._agent.name}: compacted previous exchange → ${ep.title}`);
+        }).catch((err) => {
+          channel.log('memory', `${this._agent.name}: casual-chat compaction failed: ${err?.message || err}`);
+        });
+      }
+    }
+
     // Chain classification — serialized per agent
     this._processChain = this._processChain
       .then(() => this._processNext())

@@ -118,15 +118,32 @@ export async function ensureInit(agent) {
   const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
   const sessionId = process.env.KOI_SESSION_ID || `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const llmProvider = agent?.llmProvider;
-  // The agent doesn't expose embeddingProvider directly — LLMProvider holds
-  // an internal EmbeddingProvider instance (line 2213 of llm-provider.js).
-  // Try both shapes so callers don't have to know the layout.
-  const embeddingProvider = agent?.embeddingProvider
-    ?? llmProvider?._embeddingProvider
-    ?? llmProvider?.embeddingProvider
-    ?? null;
+
+  // Resolve an embedding provider. Three places to look, in order:
+  //   1. agent.embeddingProvider — explicit, if a caller wired one.
+  //   2. llmProvider itself — Koi's LLMProvider duck-types as an embedding
+  //      provider via its public getEmbedding/getEmbeddingDim methods. Those
+  //      lazy-create the internal _embeddingProvider on first call, so we
+  //      MUST go through the methods, not poke at the private field (which
+  //      is null until then — that was the source of the "Memory unavailable"
+  //      bug seen in the chat).
+  //   3. Direct llmProvider._embeddingProvider / .embeddingProvider — last-
+  //      ditch shapes for any non-Koi providers that pre-instantiate.
+  let embeddingProvider = agent?.embeddingProvider ?? null;
+  if (!embeddingProvider && llmProvider && typeof llmProvider.getEmbedding === 'function') {
+    embeddingProvider = {
+      getEmbedding: (t) => llmProvider.getEmbedding(t),
+      getEmbeddingDim: () => llmProvider.getEmbeddingDim(),
+    };
+  }
   if (!embeddingProvider) {
-    throw new Error('memory.ensureInit: no embedding provider on agent (checked agent.embeddingProvider and agent.llmProvider._embeddingProvider)');
+    embeddingProvider = llmProvider?._embeddingProvider
+      ?? llmProvider?.embeddingProvider
+      ?? null;
+  }
+
+  if (!embeddingProvider) {
+    throw new Error('memory.ensureInit: no embedding provider available on agent or its llmProvider');
   }
   await init({ projectRoot, sessionId, embeddingProvider, llmProvider, create: true });
   return true;
