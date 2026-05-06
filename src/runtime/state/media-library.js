@@ -146,7 +146,7 @@ export class MediaLibrary {
     this._dbPromise = (async () => {
       const { connect } = await import('./_sqlite-vector-adapter.js');
       fs.mkdirSync(DB_DIR, { recursive: true });
-      this._db = await connect(path.join(DB_DIR, 'lancedb'));
+      this._db = await connect(path.join(DB_DIR, 'vector-cache'));
     })();
     await this._dbPromise;
   }

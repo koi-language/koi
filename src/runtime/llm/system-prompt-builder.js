@@ -956,12 +956,12 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
   // ── Dynamic section: runtime context, project map, language, non-interactive ──
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
-  const dynamic = `${now} | ${timezone || 'unknown'}
-${phaseSystemBlock}
+  const dynamic = `${phaseSystemBlock}
 # RUNTIME CONTEXT
 
 | Field | Value |
 |---|---|
+| Current date/time | \`${now}\`${timezone ? ` (${timezone})` : ''} |
 | Working directory | \`${cwd}\` |${platformField}${langField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.

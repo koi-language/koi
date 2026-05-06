@@ -268,7 +268,7 @@ export class SemanticIndex {
       }
       this._cacheValidated = true;
       if (!_hasVectors) {
-        channel.log('semantic-index', `Cache has ${_totalRows} rows but ZERO vectors — forcing reload from LanceDB`);
+        channel.log('semantic-index', `Cache has ${_totalRows} rows but ZERO vectors — forcing reload from disk`);
         this._cache = null;
         this._ready = false;
         await this._ensureCacheLoaded();
@@ -418,7 +418,7 @@ export class SemanticIndex {
       await this._cachePromise;
       return;
     }
-    channel.log('semantic-index', 'Loading cache from LanceDB (first time)...');
+    channel.log('semantic-index', 'Loading vector cache (first time)...');
     this._cachePromise = this._loadCacheFromDb();
     try {
       await this._cachePromise;
@@ -440,18 +440,18 @@ export class SemanticIndex {
     try {
       await this._ensureDb();
       const names = await this._db.tableNames();
-      channel.log('semantic-index', `LanceDB tables found: [${names.join(', ')}]`);
+      channel.log('semantic-index', `vector tables found: [${names.join(', ')}]`);
       const cache = { files: [], classes: [], functions: [] };
 
       for (const tableName of ['files', 'classes', 'functions']) {
         if (!names.includes(tableName)) {
-          channel.log('semantic-index', `Table "${tableName}" not found in LanceDB, skipping`);
+          channel.log('semantic-index', `table "${tableName}" not in vector cache, skipping`);
           continue;
         }
         try {
           const table = await this._db.openTable(tableName);
           const rows = await table.query().toArray();
-          channel.log('semantic-index', `Table "${tableName}": ${rows.length} rows loaded from LanceDB`);
+          channel.log('semantic-index', `table "${tableName}": ${rows.length} rows loaded`);
           // Convert Arrow rows to plain JS objects with regular arrays for vectors.
           // Multiple conversion strategies to handle Arrow Vector objects in both
           // native Node.js and pkg binary environments where native bindings may differ.
@@ -524,7 +524,7 @@ export class SemanticIndex {
     // cosine. See state/_sqlite-vector-adapter.js for the contract.
     this._dbPromise = (async () => {
       const { connect } = await import('./_sqlite-vector-adapter.js');
-      const dbPath = path.join(this.cacheDir, 'lancedb');
+      const dbPath = path.join(this.cacheDir, 'vector-cache');
       fs.mkdirSync(dbPath, { recursive: true });
       try {
         this._db = await connect(dbPath);
@@ -605,7 +605,7 @@ export class SemanticIndex {
       for (const t of tables) {
         await db.dropTable(t);
       }
-      channel.log('semantic-index', `Dropped ${tables.length} LanceDB tables for re-index`);
+      channel.log('semantic-index', `dropped ${tables.length} vector tables for re-index`);
     } catch (e) {
       channel.log('semantic-index', `Failed to drop tables: ${e.message}`);
     }

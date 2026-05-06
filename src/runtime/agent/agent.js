@@ -1440,7 +1440,7 @@ export class Agent {
     const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
     const sessionId = process.env.KOI_SESSION_ID;
     const latentDbPath = (projectRoot && sessionId)
-      ? path.join(projectRoot, '.koi', 'sessions', sessionId, 'latent-lancedb')
+      ? path.join(projectRoot, '.koi', 'sessions', sessionId, 'latent-vectors')
       : null;
     const contextMemory = new ContextMemory({
       agentName: this.name,
@@ -1526,15 +1526,18 @@ export class Agent {
     // stay empty even though the event log is filling up.
     if (!isDelegate && !globalThis.__koiExtractorStarted) {
       globalThis.__koiExtractorStarted = true;
-      // Fire-and-forget: never block the agent on extractor setup.
+      // Fire-and-forget: never block the agent on extractor setup. We do
+      // NOT call memory.ensureInit() here — the embedding provider may not
+      // be attached yet at boot. The extractor lazy-inits memory on each
+      // candidate write inside `_processEvent`, so the first few events
+      // queue silently and subsequent ones write once embeddingProvider
+      // becomes available.
       (async () => {
         try {
-          const memMod = await import('../memory/index.js');
-          if (!memMod.isInitialized()) await memMod.ensureInit(this);
           const ext = await import('../memory/extractor.js');
           ext.registerBuiltins();
           ext.start({ agent: this });
-          channel.log('memory', 'Memory Extractor started (DecisionMade rule active)');
+          channel.log('memory', 'Memory Extractor listening (DecisionMade rule active)');
         } catch (err) {
           channel.log('memory', `Memory Extractor start failed: ${err?.message || err}`);
         }
@@ -4346,7 +4349,7 @@ export class Agent {
         }
       }
 
-      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_facts', 'learn_fact', 'list_skills', 'activate_skill', 'deactivate_skill', 'list_workflows', 'activate_workflow', 'deactivate_workflow', 'queue_add', 'queue_update']);
+      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_memory', 'add_memory', 'list_skills', 'activate_skill', 'deactivate_skill', 'list_workflows', 'activate_workflow', 'deactivate_workflow', 'queue_add', 'queue_update']);
       if (_intent && !_SELF_MANAGED.has(_intent)) {
         channel.beginAction(_intent, action.url || action.path || action.pattern || action.query || action.subject || '');
       }

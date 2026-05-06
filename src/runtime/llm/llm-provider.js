@@ -921,7 +921,7 @@ CRITICAL RULES:
               }
             }
           } catch { /* ignore */ }
-          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}${_attNote}\n\nIf anything is unclear or you need additional context, check shared knowledge first (recall_facts). If you still can't find what you need, use ask_parent. Otherwise, start implementing now.`;
+          contextStr = `\n\n📋 YOUR TASK SPEC:\n${_specLines}${_imageNote}${_attNote}\n\nIf anything is unclear or you need additional context, project knowledge is already in your prompt; if it really isn't there, use recall_memory for a targeted lookup or ask_parent. Otherwise, start implementing now.`;
         }
         // NOTE: we intentionally no longer serialize `context` for non-delegate
         // agents. For the root agent (System) the context is just ephemeral
