@@ -4,7 +4,12 @@ const VALID_TYPES = /* @__PURE__ */ new Set([
   "learning",
   "insight",
   "blocker",
-  "opportunity"
+  "opportunity",
+  // koi-fork: episode = compacted task transcript written when a task plan
+  // drains. Replaces the conversation buffer with a searchable, summarised
+  // note so future tasks can recall_memory / explore_memory it without the
+  // raw turns contaminating the live buffer.
+  "episode"
 ]);
 const PATTERN_RULES = [
   {

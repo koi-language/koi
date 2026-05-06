@@ -377,6 +377,28 @@ class TaskManager {
               }
             }
           } catch { /* non-fatal — sweep is best-effort */ }
+
+          // ── Compact each agent's turn buffer into an episode note ──
+          // The plan just drained → the user is back in the loop and the
+          // next request is a NEW task. Snapshot every agent's in-process
+          // turn buffer to memory (type: episode) and reset it so the LLM
+          // doesn't see prior unrelated turns on the next call. Searchable
+          // via recall_memory / explore_memory if the agent later needs
+          // to reference what happened.
+          const _completedTitles = all
+            .filter(t => t.status === 'completed')
+            .map(t => t.subject || (t.description?.slice(0, 60)) || `task-${t.id}`);
+          import('../memory/compactor.js').then(({ compactAllAgents }) => {
+            compactAllAgents(root, { taskTitles: _completedTitles })
+              .then((episodes) => {
+                if (episodes.length > 0) {
+                  channel.log('memory',
+                    `Compacted ${episodes.length} agent buffer(s) into episode(s): ` +
+                    episodes.map(e => e.title).join(' | '));
+                }
+              })
+              .catch(err => channel.log('memory', `episode compaction failed: ${err.message}`));
+          }).catch(() => { /* compactor module unavailable — skip */ });
         }).catch(() => {});
         setTimeout(() => {
           channel.setTaskPanel([]);

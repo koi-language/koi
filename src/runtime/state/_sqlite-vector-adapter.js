@@ -163,6 +163,51 @@ class SqliteTable {
     this._db.exec(`DELETE FROM ${_qid(this._name)} WHERE ${_normaliseWhere(whereClause)}`);
   }
 
+  /**
+   * Update rows matching `where`. Mimics the two LanceDB shapes used by
+   * media-library.js:
+   *   1) `update({ col: val, ... }, { where: "..." })`        ← legacy 2-arg
+   *   2) `update({ values: { col: val }, where: "..." })`     ← explicit 1-arg
+   * Values are bound via SQLite parameters (no SQL splicing), so JSON blobs
+   * and strings with quotes are safe — that's the whole reason the consumer
+   * had to use the explicit shape on LanceDB.
+   */
+  async update(arg1, arg2) {
+    let values, where;
+    if (arg2 !== undefined) {
+      values = arg1 || {};
+      where = (arg2 && typeof arg2 === 'object') ? arg2.where : null;
+    } else if (arg1 && typeof arg1 === 'object'
+        && (arg1.values !== undefined || arg1.where !== undefined)) {
+      values = arg1.values || {};
+      where = arg1.where;
+    } else {
+      values = arg1 || {};
+      where = null;
+    }
+
+    const keys = Object.keys(values);
+    if (keys.length === 0) return;
+
+    const setClauses = keys.map((k) => `${_qid(k)} = ?`).join(', ');
+    const params = keys.map((k) => {
+      const col = this._schema.columns.find((c) => c.name === k);
+      // If the column wasn't in the seed row (shouldn't happen in practice
+      // — consumers add it via the seed), fall back to a sensible kind so
+      // we still write SOMETHING usable instead of throwing.
+      const kind = col?.kind
+        ?? (typeof values[k] === 'number' ? 'real'
+          : typeof values[k] === 'boolean' ? 'boolean'
+          : typeof values[k] === 'string' ? 'text'
+          : 'json');
+      return _encodeValue(values[k], kind);
+    });
+
+    let sql = `UPDATE ${_qid(this._name)} SET ${setClauses}`;
+    if (where) sql += ` WHERE ${_normaliseWhere(where)}`;
+    this._db.prepare(sql).run(...params);
+  }
+
   query() {
     return new SqliteQueryBuilder(this);
   }

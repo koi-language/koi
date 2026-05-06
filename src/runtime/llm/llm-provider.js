@@ -1441,9 +1441,8 @@ CRITICAL RULES:
       }
     }
 
-    // Build messages from the Event Log via the deprecated ContextMemory shim
-    // (which now proxies to memory.eventLogToMessages internally). toMessages
-    // is async post-Phase 8b.3 — await it.
+    // Build messages from the in-process TurnBuffer (per-slot ContextMemory).
+    // toMessages is async — await it.
     const messages = await contextMemory.toMessages({ agent });
 
     // Track attachments for debug logging

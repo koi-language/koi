@@ -1,18 +1,23 @@
 /**
- * ContextMemory — DEPRECATED thin shim.
+ * ContextMemory — task-scoped turn buffer + audit emitter.
  *
- * The tier-based memory model (SHORT/MEDIUM/LONG/LATENT) was replaced by the
- * Event Log + Ori vault + Context Compiler pipeline (Phase 8b). Real storage
- * lives in `src/runtime/memory/`. This file remains only to keep the existing
- * call sites (~133 across `agent.js` and `llm-provider.js`) working without a
- * mass rewrite — every method here either:
+ * After Phase 8c (the "tucán bug" fix) ContextMemory is the per-slot, in-
+ * process buffer of the LLM-visible conversation. It does TWO things on
+ * every `add()`:
  *
- *   - emits to the Event Log (add)
- *   - reads from the Event Log (toMessages, hasHistory)
- *   - is a no-op kept for API compatibility (serialize, restore, hydrate, tick)
+ *   1. Push the turn into an in-memory ring buffer used by `toMessages()`.
+ *   2. Emit the same payload to the Event Log as an audit / RL signal.
  *
- * Once those call sites are migrated to import from `runtime/memory/index.js`
- * directly, this file goes away.
+ * The Event Log is NO LONGER replayed into the LLM prompt. That was the
+ * source of cross-task contamination: a single long-lived KOI_SESSION_ID
+ * accumulated hundreds of events and mixed yesterday's task with today's
+ * request ("by the way the user mentioned a toucan three hours ago").
+ *
+ * The Ori-Mnemos design we follow now: the conversation history is the
+ * agent runtime's responsibility (in-process buffer, task-scoped). Long-
+ * term knowledge lives in the memory vault and is retrieved on demand via
+ * `recall_memory` / `explore_memory` / `memory_status` tools — not auto-
+ * replayed at every turn.
  *
  * `classifyFeedback` and `classifyResponse` were moved to
  * `state/feedback-classifier.js`. They are re-exported here so existing
@@ -40,11 +45,19 @@ export class ContextMemory {
     this.agentName = opts.agentName || 'unknown';
     this.systemPrompt = '';
     /** Kept as an empty array — legacy callers iterate over it for filtering;
-     *  the Event Log is the real store. */
+     *  the buffer below is the real store. */
     this.entries = [];
     this.turnCounter = 0;
     /** Legacy fields kept zeroed for any code that peeks at them. */
     this._latentCount = 0;
+    /**
+     * Task-scoped in-memory buffer of LLM-visible turns. Each entry is
+     * `{ role: 'user'|'assistant', content: string }`. Capped via
+     * `_maxBufferSize` below. NOT persisted — when the agent restarts the
+     * buffer starts empty (and that's the point: no replay across tasks).
+     */
+    this._buffer = [];
+    this._writeCount = 0;
   }
 
   // ── Setters / counters ───────────────────────────────────────────────
@@ -61,6 +74,18 @@ export class ContextMemory {
     this.entries.length = 0;
     this.turnCounter = 0;
     this._writeCount = 0;
+    this._buffer.length = 0;
+  }
+  /**
+   * Reset the in-process buffer without clearing systemPrompt. Use this at
+   * task boundaries (new top-level user message, /clear, delegate spawn)
+   * to ensure the LLM doesn't carry forward turns from an unrelated task.
+   * Audit history in the Event Log is untouched.
+   */
+  resetTurnBuffer() {
+    this._buffer.length = 0;
+    this.entries.length = 0;
+    this._writeCount = 0;
   }
 
   // ── Write path ───────────────────────────────────────────────────────
@@ -73,69 +98,50 @@ export class ContextMemory {
    */
   add(role, immediate, _shortTerm = null, _permanent = null, opts = {}) {
     this._writeCount = (this._writeCount || 0) + 1;
-    // Track the in-flight emission so toMessages() can await every pending
-    // write before reading. Without this, the read may run before
-    // _emitToEventLog has even queued the append (it's still inside its
-    // dynamic import or _ensureEventLogReady), and writer.flush() — which
-    // only drains the writer queue — wouldn't help.
-    const p = _emitToEventLog(this.agentName, role, immediate, opts).catch(() => {});
-    _addPending(p);
+
+    // 1) Push to the in-process turn buffer. This is what the LLM sees on
+    //    the next toMessages() call. Apply the scaffolding filter here so
+    //    the buffer never grows with internal nudges.
+    //
+    // No size cap. The buffer starts empty per process and only accumulates
+    // turns from the current run, so cross-task contamination is structurally
+    // impossible (that was the bug the cap was patching). If a single task
+    // grows large enough to stress a model's context window, the LLM
+    // provider's auto model-selector already picks a bigger-context model
+    // based on the estimated token count (see llm-provider.js _minContextK).
+    // If the user wants a hard reset mid-session, they call /clear.
+    const content = typeof immediate === 'string' ? immediate : '';
+    if (content.length > 0 && !_isScaffoldingMessage(content)) {
+      const bufRole = role === 'assistant' ? 'assistant' : 'user';
+      this._buffer.push({ role: bufRole, content });
+    }
+
+    // 2) Audit-emit to the Event Log (fire-and-forget). The log is no longer
+    //    the source of truth for `toMessages()` — it's audit + RL signal.
+    _emitToEventLog(this.agentName, role, immediate, opts).catch(() => {});
   }
 
   // ── Read path ────────────────────────────────────────────────────────
 
   /**
-   * Build messages array for the LLM, sourced from the Event Log.
-   * NOTE: now async (was sync). Callers must await.
+   * Build messages array for the LLM from the in-process turn buffer.
+   * NOTE: kept async (was async pre-Phase 8c when it read from disk) so
+   * call sites that already `await` keep working without changes.
    *
-   * Reads as long as the event log itself is initialised (projectRoot +
-   * sessionId from env), even if the full memory module hasn't been
-   * lazily initialised yet by an action handler.
+   * Source: this._buffer — populated by add(). NOT the Event Log.
+   * Adjacent same-role messages are merged (matches legacy ContextMemory
+   * behaviour the LLM providers expect — many models reject two consecutive
+   * user-role messages).
    */
   async toMessages(_opts = {}) {
-    let mod;
-    try { mod = await import('../memory/event-log/index.js'); } catch {
-      return this.systemPrompt ? [{ role: 'system', content: this.systemPrompt }] : [];
-    }
-    if (!(await _ensureEventLogReady(mod))) {
-      return this.systemPrompt ? [{ role: 'system', content: this.systemPrompt }] : [];
-    }
-    // Drain the shim's in-flight emissions first (covers the window
-    // between cm.add() returning and the append() landing on the writer
-    // queue), then flush the writer queue itself to disk.
-    await _drainPendingEmits();
-    await mod.flush();
-    const sid = mod.currentSessionId();
-    const conversational = [
-      eventTypes.UserMessage,
-      eventTypes.AgentPlanned,
-      eventTypes.ToolResultReceived,
-    ];
-    const events = await mod.load(
-      path.join(process.env.KOI_PROJECT_ROOT || process.cwd(), '.koi', 'memory'),
-      sid,
-      { types: conversational },
-    );
     const messages = [];
     if (this.systemPrompt) messages.push({ role: 'system', content: this.systemPrompt });
-    for (const e of events) {
-      let role, content;
-      if (e.type === eventTypes.UserMessage) {
-        role = 'user';
-        content = e.payload?.content ?? '';
-      } else if (e.type === eventTypes.AgentPlanned) {
-        role = 'assistant';
-        content = e.payload?.reasoning ?? '';
-      } else if (e.type === eventTypes.ToolResultReceived) {
-        role = 'user';
-        content = e.payload?.result ?? '';
-      } else continue;
-      if (typeof content !== 'string' || content.length === 0) continue;
-      messages.push({ role, content });
+    for (const m of this._buffer) {
+      messages.push({ role: m.role, content: m.content });
     }
-    // Merge consecutive same-role messages (mirrors the legacy ContextMemory
-    // behaviour: an action result + Continue. nudge would otherwise land
-    // as two adjacent user-role entries).
+    // Merge consecutive same-role messages (an action result + a Continue.
+    // nudge that escaped the scaffolding filter would otherwise land as two
+    // adjacent user-role entries).
     const out = [];
     for (const m of messages) {
       const last = out[out.length - 1];
@@ -177,17 +183,23 @@ export class ContextMemory {
  * first ContextMemory.add() fires — otherwise events emitted at boot
  * are silently dropped and the conversational loop reads an empty log.
  */
-// Pending emit promises — toMessages awaits all of these before reading
-// so events from add() calls that haven't yet reached the writer queue
-// are still seen by the next read.
-const _pendingEmits = new Set();
-function _addPending(p) {
-  _pendingEmits.add(p);
-  p.finally(() => _pendingEmits.delete(p));
-}
-async function _drainPendingEmits() {
-  if (_pendingEmits.size === 0) return;
-  await Promise.all(_pendingEmits);
+/**
+ * Filter scaffolding events the inbox/classifier injects as UserMessages.
+ * Examples seen in the wild:
+ *   "[INBOX] Message from user: ... (classifier: ...)"
+ *   "[INBOX] User said: '...'"
+ *   "Return your FIRST action."
+ *   "Continue."
+ * These are internal runtime nudges and would only confuse the LLM if
+ * surfaced as turn history.
+ */
+function _isScaffoldingMessage(content) {
+  if (typeof content !== 'string') return false;
+  const t = content.trim();
+  if (t.startsWith('[INBOX]')) return true;
+  if (t === 'Continue.' || t === 'Continue') return true;
+  if (/^Return your FIRST action\.?$/i.test(t)) return true;
+  return false;
 }
 
 let _eventLogBootstrapped = false;

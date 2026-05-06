@@ -392,90 +392,304 @@ function _toSlug(title) {
     .slice(0, 80);
 }
 
-// ─── Conversational loop bridge (Phase 8b.2) ─────────────────────────────
+// ─── read() — fetch the full content of a single note ──────────────────
+//
+// Default retrieval (recall_memory / explore_memory) returns title + score
+// + frontmatter (description, type, project…) but NOT the body. That's
+// the right default — the agent gets a discriminating preview without
+// loading walls of text. When the preview is not enough — typically for
+// `episode` notes whose body holds a `## Transcript` of past turns the
+// agent now needs to inspect — the agent calls `read({title})`.
 
 /**
- * Build the conversation messages array from the event log.
- *
- * Drop-in replacement for legacy `ContextMemory.toMessages({agent})`. Used by
- * `agent.js` and `llm-provider.js` when `KOI_NEW_CONV_LOOP=1` is set —
- * otherwise those callers stay on the tiered ContextMemory path.
- *
- * Mapping (mirror of context-memory.js _emitToEventLog):
- *   UserMessage          → { role: 'user',      content: payload.content }
- *   AgentPlanned         → { role: 'assistant', content: payload.reasoning }
- *   ToolResultReceived   → { role: 'user',      content: payload.result }
- *   (everything else is skipped — those events aren't conversation turns)
- *
- * Output is run through the same consecutive-same-role merge that
- * ContextMemory.toMessages applies, so the LLM never receives two user-role
- * messages back to back when it didn't ask for them.
- *
  * @param {object} opts
- * @param {string} [opts.systemPrompt]  Prepended as `{role:'system'}` if provided.
- * @param {string} [opts.sessionId]     Defaults to current session.
- * @param {number} [opts.limit]         Cap most-recent N conversational events.
- * @returns {Promise<Array<{role: string, content: string}>>}
+ * @param {string} opts.title
+ * @param {string} [opts.scope='project']
+ * @returns {Promise<{title, frontmatter, body}|null>}
+ *          null if the note doesn't exist.
  */
-export async function eventLogToMessages({ systemPrompt, sessionId, limit } = {}) {
+export async function read(opts = {}) {
   _ensureInit();
-  const sid = sessionId ?? _state.sessionId;
-  if (!sid) return systemPrompt ? [{ role: 'system', content: systemPrompt }] : [];
-
-  // CRITICAL: drain the writer's queue before reading. ContextMemory.add()
-  // emits asynchronously; without this flush a read-after-write returns
-  // the pre-write view of the log and the LLM is handed a conversation
-  // that's missing the latest user/agent turns.
-  await eventLog.flush();
-
-  const conversational = [
-    eventTypes.UserMessage,
-    eventTypes.AgentPlanned,
-    eventTypes.ToolResultReceived,
-  ];
-  const events = await eventLog.load(_state.vaultRoot, sid, {
-    types: conversational,
-    limit,
-  });
-
-  const messages = [];
-  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-
-  for (const e of events) {
-    let role, content;
-    if (e.type === eventTypes.UserMessage) {
-      role = 'user';
-      content = e.payload?.content ?? '';
-    } else if (e.type === eventTypes.AgentPlanned) {
-      role = 'assistant';
-      content = e.payload?.reasoning ?? '';
-    } else if (e.type === eventTypes.ToolResultReceived) {
-      role = 'user';
-      content = e.payload?.result ?? '';
-    } else {
-      continue;
-    }
-    if (typeof content !== 'string' || content.length === 0) continue;
-    messages.push({ role, content });
+  if (!opts.title || typeof opts.title !== 'string') {
+    throw new Error('memory.read: title (string) required');
   }
-
-  // Collapse adjacent same-role messages (an emergent property of the legacy
-  // tier system: an action result + a Continue. nudge would land as two
-  // consecutive 'user' entries that ContextMemory then merged before sending).
-  return _mergeConsecutiveMessages(messages);
+  const scope = opts.scope || 'project';
+  const scopePaths = _resolveScopePaths(scope);
+  const filePath = path.join(scopePaths.notes, `${opts.title}.md`);
+  let content;
+  try {
+    content = await fs.readFile(filePath, 'utf8');
+  } catch {
+    // Note may live in inbox if it wasn't auto-promoted yet.
+    const inboxPath = path.join(scopePaths.inbox, `${opts.title}.md`);
+    try {
+      content = await fs.readFile(inboxPath, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+  // Inline frontmatter parse (avoids pulling rmh into the public surface
+  // for a one-off read that already lives behind memory.write/list).
+  const m = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!m) return { title: opts.title, frontmatter: {}, body: content };
+  let frontmatter = {};
+  try { frontmatter = yaml.parse(m[1]) || {}; } catch { /* keep empty */ }
+  return { title: opts.title, frontmatter, body: m[2].trim() };
 }
 
-function _mergeConsecutiveMessages(msgs) {
-  const out = [];
-  for (const m of msgs) {
-    const last = out[out.length - 1];
-    if (last && last.role === m.role && last.role !== 'system') {
-      last.content = `${last.content}\n\n${m.content}`;
-    } else {
-      out.push({ ...m });
+// ─── explore() — multi-hop graph traversal (RMH explore.js) ─────────────
+//
+// Wraps rmh/explore.js's exploreRecursive with the snapshot setup that
+// runRetrieve uses for seeding. The LLM provider configured at init() drives
+// sub-question decomposition; if no LLM is configured (NullProvider), explore
+// degrades to a single-pass result identical to retrieve().
+
+/**
+ * @param {object} opts
+ * @param {string} opts.query
+ * @param {object} [opts.filter]    { type, status, project }
+ * @param {number} [opts.limit]     Default 8.
+ * @param {number} [opts.depth]     1=shallow, 2=standard, 3=deep. Default 2.
+ * @param {string} [opts.scope='project']
+ * @param {string} [opts.agent]
+ * @returns {Promise<{
+ *   results: Array<{title, score, source, frontmatter, snippet?}>,
+ *   paths: Array<{from, to, via}>,
+ *   subQueries: string[],
+ *   converged: boolean,
+ *   recursionDepth: number,
+ *   perPassResults: Array<{query, depth, notesFound, newNotesAdded}>,
+ * }>}
+ */
+export async function explore(opts = {}) {
+  _ensureInit();
+  if (!opts.query || typeof opts.query !== 'string') {
+    throw new Error('memory.explore: query (string) required');
+  }
+  const scope = opts.scope || 'project';
+  const scopePaths = _resolveScopePaths(scope);
+
+  const snapshot = await buildSnapshot({
+    vaultRoot: scope === 'project' ? _state.vaultRoot : scopePaths.root,
+  });
+
+  if (snapshot.titles.length === 0) {
+    await eventLog.append(eventTypes.MemoryRetrieved, opts.agent || 'system', {
+      query: opts.query,
+      mode: 'explore',
+      scope,
+      results: [],
+    });
+    return {
+      results: [],
+      paths: [],
+      subQueries: [],
+      converged: true,
+      recursionDepth: 0,
+      perPassResults: [],
+    };
+  }
+
+  // Seed via the same single-pass pipeline retrieve() uses.
+  const seedResults = await runRetrieve(snapshot, opts.query, {
+    limit: (opts.limit ?? 8) * 2,
+    filter: opts.filter,
+  });
+
+  const { explore: rmhExplore, exploreRecursive } = await import('./rmh/explore.js');
+  const { classifyIntent } = await import('./rmh/intent.js');
+  const { makeLlmAdapter } = await import('./rmh/_koi-bridge.js');
+  // makeLlmAdapter() with no arg falls back to the bridge's wired _llmProvider
+  // (set by configureKoiBridge at init). If unwired, returns NullLLM and
+  // exploreRecursive degrades to single-pass internally via isNullLlm().
+  const llmAdapter = makeLlmAdapter();
+
+  const classified = classifyIntent(opts.query, snapshot.titles);
+  const exploreConfig = {
+    ...snapshot.config.explore,
+    default_limit: opts.limit ?? snapshot.config.explore.default_limit,
+  };
+  if (typeof opts.depth === 'number') {
+    const base = exploreConfig.ppr_iterations;
+    exploreConfig.ppr_iterations = opts.depth <= 1 ? Math.round(base * 0.5)
+      : opts.depth >= 3 ? Math.round(base * 1.67)
+      : base;
+  }
+
+  const reseed = async (subQuery) => {
+    const sub = await runRetrieve(snapshot, subQuery, {
+      limit: (opts.limit ?? 8) * 2,
+      filter: opts.filter,
+    });
+    return sub;
+  };
+
+  const exploreParams = {
+    query: opts.query,
+    classified,
+    linkGraph: snapshot.linkGraph,
+    notesDir: snapshot.paths.notes,
+    warmthSignals: new Map(),
+    flatResults: seedResults,
+    config: exploreConfig,
+    qValueLookup: () => 0.5,
+    seedResults,
+    llmProvider: llmAdapter,
+    allTitles: snapshot.titles,
+    reseed,
+  };
+
+  let result;
+  try {
+    result = await exploreRecursive(exploreParams);
+  } catch (err) {
+    // Fall back to single-pass on any explore error (LLM failure, etc.)
+    const single = await rmhExplore(exploreParams);
+    result = {
+      ...single,
+      recursionDepth: 0,
+      subQueries: [],
+      converged: false,
+      perPassResults: [{ query: opts.query, depth: 0, notesFound: single.results.length, newNotesAdded: single.results.length }],
+    };
+  }
+
+  // Hydrate frontmatter for caller
+  const hydrated = result.results.map((r) => {
+    const fm = snapshot.noteIndex.frontmatter.get(r.title) || {};
+    return { ...r, frontmatter: fm };
+  });
+
+  await eventLog.append(eventTypes.MemoryRetrieved, opts.agent || 'system', {
+    query: opts.query,
+    mode: 'explore',
+    scope,
+    sub_queries: result.subQueries,
+    converged: result.converged,
+    results: hydrated.map((r) => ({ title: r.title, score: r.score })),
+  });
+
+  return {
+    results: hydrated,
+    paths: result.paths || [],
+    subQueries: result.subQueries || [],
+    converged: !!result.converged,
+    recursionDepth: result.recursionDepth || 0,
+    perPassResults: result.perPassResults || [],
+  };
+}
+
+// ─── getStatus() — vault snapshot for orient/diagnostic ─────────────────
+//
+// Mirrors Ori's `health` / `status` output. Cheap enough to call at the
+// start of a task: counts notes, breaks them down by type and project,
+// surfaces the lowest-vitality notes ("fading"), and returns recent
+// memory writes from the event log.
+
+/**
+ * @param {object} [opts]
+ * @param {number} [opts.fadingLimit=5]
+ * @param {number} [opts.recentLimit=10]
+ * @param {string} [opts.scope='project']
+ * @returns {Promise<{
+ *   noteCount: number,
+ *   inboxCount: number,
+ *   types: Record<string, number>,
+ *   projects: Record<string, number>,
+ *   fading: Array<{title: string, vitality: number}>,
+ *   recent: Array<{title: string, type: string|null, agent: string, ts: string}>,
+ *   vaultRoot: string,
+ *   vaultSource: string,
+ * }>}
+ */
+export async function getStatus(opts = {}) {
+  _ensureInit();
+  const scope = opts.scope || 'project';
+  const scopePaths = _resolveScopePaths(scope);
+  const fadingLimit = opts.fadingLimit ?? 5;
+  const recentLimit = opts.recentLimit ?? 10;
+
+  // Note count + breakdowns
+  const titles = await listNoteTitles(scopePaths.notes);
+  const noteIndex = titles.length > 0
+    ? await buildNoteIndex(scopePaths.notes, titles)
+    : { frontmatter: new Map() };
+
+  const types = {};
+  const projects = {};
+  for (const title of titles) {
+    const fm = noteIndex.frontmatter.get(title) || {};
+    const t = fm.type || 'unspecified';
+    types[t] = (types[t] || 0) + 1;
+    const projs = Array.isArray(fm.project) ? fm.project : [];
+    for (const p of projs) projects[p] = (projects[p] || 0) + 1;
+  }
+
+  // Inbox count
+  let inboxCount = 0;
+  try {
+    const entries = await fs.readdir(scopePaths.inbox);
+    inboxCount = entries.filter((f) => f.endsWith('.md')).length;
+  } catch { /* inbox dir may not exist yet */ }
+
+  // Fading: notes whose `created` date is oldest and that have low or
+  // unknown confidence. A cheap proxy for ACT-R vitality without needing a
+  // full snapshot — vitality.computeAllVitality requires linkGraph + bridges
+  // + config + boost scores which is way too much for a status call.
+  // Returns notes sorted by created ASC; caller can interpret.
+  const fading = [];
+  if (titles.length > 0 && fadingLimit > 0) {
+    const candidates = [];
+    for (const title of titles) {
+      const fm = noteIndex.frontmatter.get(title) || {};
+      candidates.push({
+        title,
+        created: fm.created || '',
+        confidence: fm.confidence || null,
+      });
+    }
+    candidates.sort((a, b) => {
+      // Speculative first, then oldest created date.
+      const ca = a.confidence === 'speculative' ? 0 : 1;
+      const cb = b.confidence === 'speculative' ? 0 : 1;
+      if (ca !== cb) return ca - cb;
+      return a.created.localeCompare(b.created);
+    });
+    for (const c of candidates.slice(0, fadingLimit)) {
+      fading.push({ title: c.title, created: c.created, confidence: c.confidence });
     }
   }
-  return out;
+
+  // Recent writes from the event log (last N MemoryWritten events)
+  const recent = [];
+  try {
+    const sid = _state.sessionId;
+    if (sid) {
+      const events = await eventLog.load(_state.vaultRoot, sid, {
+        types: [eventTypes.MemoryWritten],
+        limit: recentLimit,
+      });
+      for (const e of events) {
+        recent.push({
+          title: e.payload?.title ?? '(unknown)',
+          type: e.payload?.type ?? null,
+          agent: e.actor || e.agent || 'system',
+          ts: e.ts || e.timestamp || '',
+        });
+      }
+    }
+  } catch { /* event log read is best-effort */ }
+
+  return {
+    noteCount: titles.length,
+    inboxCount,
+    types,
+    projects,
+    fading,
+    recent,
+    vaultRoot: _state.vaultRoot,
+    vaultSource: _state.vaultSource,
+  };
 }
 
 // Re-exports for convenience
