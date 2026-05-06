@@ -793,7 +793,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
       const desc = d && d.description ? ` — ${d.description}` : '';
       return `    • "${slug}"${desc}`;
     }).join('\n');
-    fields.push(`optional "label" — ranking preference. Soft hint only, never filters. Pick the slug whose description matches the task; omit when no specialisation is needed:\n${lines}`);
+    fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved reference image, look at it — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
   }
   fields.push('optional "saveTo" — absolute directory path where the tool will save the generated image(s). The real path is returned in images[].savedTo — use THAT in any downstream step, never fabricate paths.');
 

@@ -968,7 +968,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
       const desc = d && d.description ? ` — ${d.description}` : '';
       return `    • "${slug}"${desc}`;
     }).join('\n');
-    fields.push(`optional "label" — ranking preference. Soft hint only, never filters. Pick the slug whose description matches the task; omit when no specialisation is needed:\n${lines}`);
+    fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved source image/video, look at them — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
   }
   if (caps.anyExtend) {
     fields.push('optional "kind" — set to "extend" when the user wants to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated extension-tuned model. Combine with referenceVideos=[<source>] (or startFrame=<last frame>). Omit for fresh generations / restyles / edits.');
