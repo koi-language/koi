@@ -28,7 +28,70 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
-import { padIfNeeded, recoverFromPadded } from './_pad-and-recover.js';
+import { padIfNeeded, recoverFromPadded, pickEnvelopeResolution } from './_pad-and-recover.js';
+import { spawn as _spawnForProbe } from 'child_process';
+import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
+
+/** Probe a media file's dimensions so we can pick a model-supported
+ *  envelope BEFORE spending a padding round on a wrong target. Tries
+ *  ffprobe first, falls back to ffmpeg's stderr-summary. Returns
+ *  `{ width, height }` or null. Mirrors the helper in
+ *  `_pad-and-recover.js` but inlined here so we can probe ahead of
+ *  the padIfNeeded call without circular imports. */
+async function _probeRefDims(filePath) {
+  const envFf = process.env.KOI_FFMPEG_PATH;
+  const envFp = process.env.KOI_FFPROBE_PATH;
+  let bins = null;
+  if (envFf && envFp && fs.existsSync(envFf) && fs.existsSync(envFp)) {
+    bins = { ffmpeg: envFf, ffprobe: envFp };
+  } else if (envFf && fs.existsSync(envFf)) {
+    bins = { ffmpeg: envFf, ffprobe: null };
+  } else {
+    try { bins = await _ensureFfmpegForProbe(); } catch { return null; }
+  }
+  if (!bins?.ffmpeg) return null;
+  if (bins.ffprobe) {
+    const dims = await new Promise((resolve) => {
+      const proc = _spawnForProbe(bins.ffprobe, [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'csv=p=0',
+        filePath,
+      ]);
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.stderr.on('data', () => {});
+      proc.on('close', () => {
+        const m = out.trim().match(/^(\d+),(\d+)/);
+        if (!m) return resolve(null);
+        const w = parseInt(m[1], 10);
+        const h = parseInt(m[2], 10);
+        if (!w || !h) return resolve(null);
+        resolve({ width: w, height: h });
+      });
+      proc.on('error', () => resolve(null));
+    });
+    if (dims) return dims;
+  }
+  return await new Promise((resolve) => {
+    const proc = _spawnForProbe(bins.ffmpeg, [
+      '-hide_banner', '-i', filePath, '-f', 'null', '-frames:v', '1', '-',
+    ]);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.stdout.on('data', () => {});
+    proc.on('close', () => {
+      const m = err.match(/Stream #\d+:\d+(?:[^\n]*?Video:[^\n]*?)\b(\d{2,5})x(\d{2,5})\b/);
+      if (!m) return resolve(null);
+      const w = parseInt(m[1], 10);
+      const h = parseInt(m[2], 10);
+      if (!w || !h) return resolve(null);
+      resolve({ width: w, height: h });
+    });
+    proc.on('error', () => resolve(null));
+  });
+}
 
 /**
  * In-process job-id → generation-params cache for the async path.
@@ -236,6 +299,7 @@ const generateVideoAction = {
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
       kind:            { type: 'string',  enum: ['extend'], description: 'Set to "extend" when the user asks to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated `video_extend` model bucket (curated in the backoffice). Combine with referenceVideos=[<source>] (or startFrame=<last frame> via extract_frame). Omit for fresh generations / restyles / edits.' },
+      suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
     },
     required: ['prompt']
   },
@@ -283,16 +347,104 @@ const generateVideoAction = {
     // off the model's output post-generation. The whole dance is
     // INTERNAL to this tool — agents and the GUI never see padded media.
     //
-    // Recovery rect priority: referenceVideos[0] beats startFrame —
-    // diffusion video models anchor their output dims to the video
-    // input when both are present.
+    // ── Padding pipeline (deferred until we know the actual model) ──
+    // The router-level "auto" caps don't tell us which specific model
+    // will run the call — Kling video edit, Veo, Seedance and friends
+    // each have their own published `resolutions` list, and padding
+    // against the broad fallback (which advertises every resolution any
+    // active model has ever supported) lets us pick a candidate the
+    // chosen model actually rejects. Wait until the gateway's local
+    // router has resolved the slug, look up THAT model's caps in the
+    // catalog, and only then decide the pad envelope.
+    //
+    // We drive the resolution by peeking at the resolver: for video-to-
+    // video the agent already has `referenceVideos` set and the resolver
+    // takes that into account, so the pick is stable across the peek
+    // and the actual generate() call.
+    let envelope = null;
     let recoveryGeometry = null;
     let paddedRefVideos = action.referenceVideos;
+    let paddedStartFrame = action.startFrame;
+    let pickedModelSlug = null;
+
+    if (typeof instance.peekResolvedModel === 'function') {
+      // Build the same opts the resolver will see, so the pick is the
+      // one the actual generate() will land on. We don't have the
+      // loaded frame `data` blobs yet, so signal start/end frame
+      // PRESENCE via dummy `.data` truthy values — that's all the
+      // router checks. (For `referenceVideos`/`referenceImages` it
+      // counts the array length, so passing the raw paths is fine.)
+      try {
+        const peek = await instance.peekResolvedModel({
+          aspectRatio: action.aspectRatio,
+          resolution: action.resolution,
+          startFrame: action.startFrame ? { data: '_peek' } : undefined,
+          endFrame: action.endFrame ? { data: '_peek' } : undefined,
+          referenceImages: action.referenceImages,
+          referenceVideos: action.referenceVideos,
+          withAudio: !!action.withAudio,
+          shots: action.shots,
+          label: action.label,
+          excludeModels: action.excludeModels,
+          includeModels: action.includeModels,
+          preferQuality: action.preferQuality !== false,
+          kind: action.kind,
+        });
+        pickedModelSlug = peek?.slug || null;
+        const pickedCaps = peek?.caps || null;
+        if (pickedModelSlug) {
+          channel.log('pad', `resolver picked model: ${pickedModelSlug}`);
+        }
+        if (pickedCaps) {
+          channel.log(
+            'pad',
+            `picked-model caps: resolutions=[${(pickedCaps.resolutions || []).join(', ')}] `
+            + `aspectRatios=[${(pickedCaps.aspectRatios || []).join(', ')}]`,
+          );
+
+          // Pick the envelope + pad. ONLY uses the resolutions /
+          // aspectRatios the picked model actually accepts.
+          const probeTarget =
+            (Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0)
+              ? { path: action.referenceVideos[0], kind: 'video' }
+              : (action.startFrame
+                  ? { path: action.startFrame, kind: 'image' }
+                  : null);
+
+          if (probeTarget) {
+            const refDims = await _probeRefDims(probeTarget.path);
+            if (refDims) {
+              envelope = pickEnvelopeResolution({
+                contentWidth: refDims.width,
+                contentHeight: refDims.height,
+                resolutions: pickedCaps.resolutions,
+                aspectRatios: pickedCaps.aspectRatios,
+              });
+              if (envelope) {
+                channel.log(
+                  'pad',
+                  `envelope: source ${refDims.width}×${refDims.height} → ${envelope.resolution}+${envelope.aspectRatio} = ${envelope.w}×${envelope.h}`,
+                );
+                action.resolution = envelope.resolution;
+                action.aspectRatio = envelope.aspectRatio;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        channel.log('pad', `peekResolvedModel failed (continuing without padding): ${err.message}`);
+      }
+    }
+
+    const padOpts = envelope
+      ? { targetDims: { w: envelope.w, h: envelope.h } }
+      : {};
+
     if (caps.videoToVideo && Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
       const padded = [];
       for (let i = 0; i < action.referenceVideos.length; i++) {
         const rv = action.referenceVideos[i];
-        const r = await padIfNeeded(rv, 'video');
+        const r = await padIfNeeded(rv, 'video', padOpts);
         if (i === 0 && r.geometry?.needsPadding) {
           recoveryGeometry = { ...r.geometry, kind: 'video' };
         }
@@ -301,9 +453,8 @@ const generateVideoAction = {
       paddedRefVideos = padded;
     }
 
-    let paddedStartFrame = action.startFrame;
     if (!recoveryGeometry && caps.startFrame && action.startFrame) {
-      const r = await padIfNeeded(action.startFrame, 'image');
+      const r = await padIfNeeded(action.startFrame, 'image', padOpts);
       if (r.geometry?.needsPadding) {
         recoveryGeometry = { ...r.geometry, kind: 'video' /* output is still a video */ };
       }
@@ -574,7 +725,11 @@ const generateVideoAction = {
           channel.log('video', `recoverFromPadded failed (keeping padded): ${err.message}`);
         }
       }
-      if (savedTo && channel.canPresentResources?.()) {
+      // Skip the auto-present when the caller is staging the result for
+      // a specific clip (the GUI's timeline tab handles the visual swap;
+      // opening a separate work-area tab on top steals focus from the
+      // timeline the user is editing).
+      if (savedTo && !action.suppressPresent && channel.canPresentResources?.()) {
         channel.presentResource({ type: 'video', path: savedTo });
       }
       if (savedTo) {
@@ -610,7 +765,7 @@ const generateVideoAction = {
           });
           shotSavedTo = sr.path;
           shotSaveError = sr.error;
-          if (shotSavedTo && channel.canPresentResources?.()) {
+          if (shotSavedTo && !action.suppressPresent && channel.canPresentResources?.()) {
             channel.presentResource({ type: 'video', path: shotSavedTo });
           }
           if (shotSavedTo) {

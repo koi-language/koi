@@ -322,6 +322,42 @@ function _validateClip(c, settings) {
     const vps = _validateVolumePoints(c.volumePoints, dur);
     if (vps && vps.length > 0) out.volumePoints = vps;
   }
+  // Pass-through for GUI-only fields. The engine doesn't need to
+  // understand these but it MUST NOT strip them on every save —
+  // they belong to the GUI's per-clip state (color grading,
+  // transform-enable toggle, source dimensions, AI placeholder
+  // metadata). Without this block the user-reported "AI Video
+  // clip loses its AI state after generation" bug fires every time
+  // any tool touches the timeline (assign_generated_media_to_clip
+  // is the canonical trigger): _validateClip would drop `aiState`
+  // / `aiStartFrameClipId` / etc. on the way back out, and the
+  // GUI's reload sees a clip with no AI metadata.
+  //
+  // Listed explicitly (rather than a wildcard spread) so a typo
+  // or stale key from an old project file doesn't accidentally
+  // sneak through and pollute the canonical schema.
+  const _passthrough = [
+    'aiState',
+    'aiStartFrameClipId',
+    'aiEndFrameClipId',
+    'aiStartFrameMode',
+    'rotation',
+    'transformEnabled',
+    'hue',
+    'saturation',
+    'brightness',
+    'contrast',
+    'cornerRadiusPx',
+    'shadowBlurPx',
+    'shadowColorArgb',
+    'sourceWidthPx',
+    'sourceHeightPx',
+  ];
+  for (const key of _passthrough) {
+    if (c[key] !== undefined && c[key] !== null) {
+      out[key] = c[key];
+    }
+  }
   return out;
 }
 

@@ -1227,6 +1227,82 @@ export class GatewayVideoGen extends BaseVideoGen {
     };
   }
 
+  /**
+   * Resolve the specific model the router would pick for [opts] WITHOUT
+   * actually generating. Returns `{ slug, caps }` where `caps` is the
+   * picked model's row from the live `/gateway/models/video.json`
+   * catalog — `caps.aspectRatios` and `caps.resolutions` are the
+   * model-specific lists, NOT the generic union. Lets callers (e.g.
+   * the generate_video tool's padding stage) do model-specific work
+   * AFTER the auto-router has chosen, instead of guessing from the
+   * broad "model=auto" fallback caps.
+   *
+   * Throws the same routing errors as `generate()`. Idempotent: each
+   * call re-runs the router with the given opts, so passing different
+   * opts yields different picks.
+   */
+  async peekResolvedModel(opts = {}) {
+    const shots = Array.isArray(opts.shots) && opts.shots.length > 0 ? opts.shots : null;
+    const shotCount = shots ? shots.length : 1;
+    const slug = await _resolveMediaModel('video', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
+        try {
+          return pickVideoModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      {
+        resolution: opts.resolution,
+        aspectRatio: opts.aspectRatio,
+        hasStartFrame: !!opts.startFrame?.data || (shots ? shots.some((s) => s.startFrame?.data) : false),
+        hasEndFrame:   !!opts.endFrame?.data   || (shots ? shots.some((s) => s.endFrame?.data)   : false),
+        withAudio: !!opts.withAudio,
+        refsCount: opts.referenceImages?.length || 0,
+        videoRefsCount: Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0,
+        shotCount,
+        label: opts.label,
+        excludeModels: Array.isArray(opts.excludeModels) ? opts.excludeModels : undefined,
+        includeModels: Array.isArray(opts.includeModels) ? opts.includeModels : undefined,
+        preferQuality: opts.preferQuality !== false,
+        kind: opts.kind,
+      },
+    );
+    // Look the picked slug up in the LIVE media catalog (the same one
+    // the router consumed). Going through `_getMediaCaps` instead would
+    // hit `/gateway/models.json` (the cost-center catalog), which holds
+    // pricing data — its `mediaCaps` field is unset for video rows so
+    // the lookup silently returned null and the padding fell back to a
+    // generic 1080×1080 envelope.
+    let caps = null;
+    try {
+      const mediaCatalog = await fetchMediaCapabilities('video');
+      const row = Array.isArray(mediaCatalog?.models)
+        ? mediaCatalog.models.find((m) => m?.slug === slug)
+        : null;
+      if (row) {
+        caps = {
+          aspectRatios: row.aspectRatios || [],
+          resolutions: row.resolutions || [],
+          startFrame: !!row.startFrame,
+          endFrame: !!row.endFrame,
+          referenceImages: !!row.referenceImages,
+          maxRefImages: row.maxRefImages || 0,
+          videoToVideo: !!row.videoToVideo,
+          imageToVideo: !!row.imageToVideo,
+          withAudio: !!row.withAudio,
+          maxShots: row.maxShots || 1,
+          durations: row.durations || [],
+          maxDuration: row.maxDuration || 0,
+        };
+      }
+    } catch {
+      caps = null;
+    }
+    return { slug, caps };
+  }
+
   async generate(prompt, opts = {}) {
     // When shots[] is explicit, the shot count becomes a hard filter —
     // the router must pick a model with `maxShots >= shots.length`.
