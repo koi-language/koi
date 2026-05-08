@@ -420,13 +420,22 @@ export function targetDimsForResolutionAspect(resolution, aspectRatio) {
  *   - `minSide: N` — pad just enough to clear N on both axes (legacy /
  *     when output dims are unknown).
  *
+ * For videos, an OPTIONAL temporal pad: when `minDurationMs` is set
+ * and the source is shorter, append black frames at the end (via
+ * ffmpeg's `tpad` filter) to reach the minimum. Some providers
+ * reject inputs below a hard duration floor (Kling video-to-video
+ * edit observed: 3.0 s minimum vs. our 2.958 s cropper output).
+ * Recovery already trims back to `geometry.inputDurMs` so the
+ * black tail is invisible end-to-end — same pattern as the
+ * spatial pad → submit → recover dance.
+ *
  * Outputs land under `$TMPDIR/koi-padref/` keyed on a content hash
  * (path + mtime + envelope) so repeated calls in the same session
  * reuse the encode.
  *
  * @param {string} filePath
  * @param {'video'|'image'} kind
- * @param {{ targetDims?: { w: number, h: number }, minSide?: number }} [opts]
+ * @param {{ targetDims?: { w: number, h: number }, minSide?: number, minDurationMs?: number }} [opts]
  * @returns {Promise<{ paddedPath: string|null, geometry: object|null }>}
  */
 export async function padIfNeeded(filePath, kind, opts = {}) {
@@ -471,6 +480,23 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
       geom.inputDurMs = inputDurMs;
     }
   }
+  // Decide if we also need to pad the video TEMPORALLY (append black
+  // frames at the end) to clear a provider minimum. Same idea as the
+  // spatial pad: recovery (`-t inputDurMs/1000`) trims the tail off
+  // the model's output, so the user never sees the black filler.
+  let tailPadMs = 0;
+  let targetDurMs = null;
+  if (kind === 'video'
+      && Number.isFinite(opts.minDurationMs) && opts.minDurationMs > 0
+      && Number.isFinite(geom.inputDurMs) && geom.inputDurMs > 0
+      && geom.inputDurMs < opts.minDurationMs) {
+    tailPadMs = opts.minDurationMs - geom.inputDurMs;
+    targetDurMs = opts.minDurationMs;
+    geom.tailPadMs = tailPadMs;
+    geom.targetDurMs = targetDurMs;
+    geom.needsTemporalPad = true;
+    geom.needsPadding = true; // force a re-encode pass
+  }
   const envelopeLabel = geomOpts.targetWidth
     ? `target ${geomOpts.targetWidth}×${geomOpts.targetHeight}`
     : `minSide ${geomOpts.minSide || DEFAULT_MIN_SIDE}`;
@@ -478,7 +504,10 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
     channel.log('pad', `padIfNeeded: ${path.basename(filePath)} is ${dims.width}×${dims.height} (>= ${envelopeLabel}) — no padding needed`);
     return { paddedPath: null, geometry: geom };
   }
-  channel.log('pad', `padIfNeeded: ${path.basename(filePath)} is ${dims.width}×${dims.height} — padding to ${geom.paddedW}×${geom.paddedH} (${envelopeLabel})`);
+  const tempLabel = geom.needsTemporalPad
+    ? `, +${(tailPadMs / 1000).toFixed(3)}s tail (target ${(targetDurMs / 1000).toFixed(3)}s)`
+    : '';
+  channel.log('pad', `padIfNeeded: ${path.basename(filePath)} is ${dims.width}×${dims.height} — padding to ${geom.paddedW}×${geom.paddedH} (${envelopeLabel})${tempLabel}`);
   const bins = await _resolveFfmpeg();
   if (!bins?.ffmpeg) {
     channel.log('pad', `padIfNeeded: NO FFMPEG AVAILABLE — provider will receive un-padded ${dims.width}×${dims.height} input and may reject`);
@@ -491,24 +520,46 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
     String(stat.size),
     String(stat.mtimeMs | 0),
     `${geom.paddedW}x${geom.paddedH}`,
+    geom.needsTemporalPad ? `t${targetDurMs}` : 'tnone',
   ]);
   const ext = kind === 'video' ? 'mp4' : 'png';
   const out = path.join(dir, `${key}.padded.${ext}`);
   if (fs.existsSync(out) && fs.statSync(out).size > 0) {
     return { paddedPath: out, geometry: geom };
   }
-  const padFilter =
-    `pad=${geom.paddedW}:${geom.paddedH}:${geom.padX}:${geom.padY}:color=black`;
-  const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', padFilter];
+  // Build the video filter chain. `tpad=stop_duration=X` appends X
+  // seconds of black frames at the end (default `stop_mode=add`,
+  // default color=black). Combined with `-an` so we don't have to
+  // worry about audio-stream apad / silent-pad mismatch — providers
+  // doing video-to-video edits don't consume the audio anyway.
+  let vf = `pad=${geom.paddedW}:${geom.paddedH}:${geom.padX}:${geom.padY}:color=black`;
+  if (kind === 'video' && geom.needsTemporalPad) {
+    vf += `,tpad=stop_duration=${(tailPadMs / 1000).toFixed(3)}`;
+  }
+  const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', vf];
   if (kind === 'video') {
+    if (geom.needsTemporalPad) {
+      // Drop audio: simplest robust path. Avoids `-af apad` failing
+      // on inputs without an audio stream, and the model regenerates
+      // sound on its side regardless.
+      args.push('-an');
+    } else {
+      args.push('-c:a', 'copy');
+    }
     args.push(
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '18',
       '-pix_fmt', 'yuv420p',
-      '-c:a', 'copy',
       '-movflags', '+faststart',
     );
+    if (geom.needsTemporalPad) {
+      // Cap the output to the exact target duration. tpad would
+      // otherwise emit slightly more than requested in some ffmpeg
+      // builds (rounding to whole frames), and we want the file's
+      // reported duration to MATCH what we'll tell the provider.
+      args.push('-t', (targetDurMs / 1000).toFixed(3));
+    }
   }
   args.push('-y', out);
   const ok = await _runFfmpeg(bins, args);

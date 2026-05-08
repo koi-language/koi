@@ -1295,6 +1295,15 @@ export class GatewayVideoGen extends BaseVideoGen {
           maxShots: row.maxShots || 1,
           durations: row.durations || [],
           maxDuration: row.maxDuration || 0,
+          // Optional hard floor on INPUT video duration (video-to-video
+          // edit models like Kling reject inputs below ~3s even when
+          // their nominal `durations` array suggests otherwise). When
+          // the catalog declares it, `generate-video.js` uses it to
+          // black-pad short reference videos to the floor.
+          minInputDurationSec:
+            Number.isFinite(row.minInputDurationSec) && row.minInputDurationSec > 0
+              ? row.minInputDurationSec
+              : 0,
         };
       }
     } catch {

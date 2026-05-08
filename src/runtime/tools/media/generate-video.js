@@ -28,7 +28,12 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
-import { padIfNeeded, recoverFromPadded, pickEnvelopeResolution } from './_pad-and-recover.js';
+import {
+  padIfNeeded,
+  recoverFromPadded,
+  pickEnvelopeResolution,
+  targetDimsForResolutionAspect,
+} from './_pad-and-recover.js';
 import { spawn as _spawnForProbe } from 'child_process';
 import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
 
@@ -366,6 +371,7 @@ const generateVideoAction = {
     let paddedRefVideos = action.referenceVideos;
     let paddedStartFrame = action.startFrame;
     let pickedModelSlug = null;
+    let pickedCaps = null;
 
     if (typeof instance.peekResolvedModel === 'function') {
       // Build the same opts the resolver will see, so the pick is the
@@ -391,7 +397,7 @@ const generateVideoAction = {
           kind: action.kind,
         });
         pickedModelSlug = peek?.slug || null;
-        const pickedCaps = peek?.caps || null;
+        pickedCaps = peek?.caps || null;
         if (pickedModelSlug) {
           channel.log('pad', `resolver picked model: ${pickedModelSlug}`);
         }
@@ -436,9 +442,70 @@ const generateVideoAction = {
       }
     }
 
-    const padOpts = envelope
-      ? { targetDims: { w: envelope.w, h: envelope.h } }
+    // Decide the pad envelope. Two paths:
+    //   1. Caps-driven: `pickEnvelopeResolution` chose a resolution +
+    //      aspect from the model's catalog row that envelopes the
+    //      source. Use those dims AND align action.resolution/aspect
+    //      to them (already done above).
+    //   2. Caps-empty: the catalog row arrived under-populated
+    //      (`resolutions=[] aspectRatios=[]` — observed for the Kling
+    //      video-to-video edit row). The agent still set
+    //      action.aspectRatio + action.resolution from the GUI's
+    //      request. Pad the input to EXACTLY that output canvas
+    //      (`targetDimsForResolutionAspect`). Without this we'd fall
+    //      to the legacy `minSide=1080` square envelope (1080×1080,
+    //      1:1) and ask the model for a 1280×720 (16:9) output —
+    //      input/output dim mismatch breaks the recovery crop entirely.
+    let padTargetDims = null;
+    if (envelope) {
+      padTargetDims = { w: envelope.w, h: envelope.h };
+    } else if (action.resolution && action.aspectRatio) {
+      const dims = targetDimsForResolutionAspect(action.resolution, action.aspectRatio);
+      if (dims) {
+        padTargetDims = dims;
+        channel.log(
+          'pad',
+          `caps lacked resolutions/aspectRatios — padding to requested ${action.resolution}+${action.aspectRatio} = ${dims.w}×${dims.h}`,
+        );
+      }
+    }
+    const padOpts = padTargetDims
+      ? { targetDims: padTargetDims }
       : {};
+    // Some video-to-video providers reject inputs below a hard duration
+    // floor (Kling video edit observed: 3.0 s minimum). Resolution
+    // order:
+    //   1. Explicit `caps.minInputDurationSec` from the catalog row.
+    //   2. `caps.durations[0]` — smallest output length the model
+    //      offers, which in practice tracks its input floor.
+    //   3. Conservative 3 s fallback when the model is video-to-video
+    //      and the catalog row is missing duration data (we've
+    //      observed Kling's edit row arrive with `resolutions=[]
+    //      aspectRatios=[]` — clearly under-populated upstream).
+    //      Every video-to-video provider in the catalog requires
+    //      ≥3 s, so this is safe and explicit rather than guessing.
+    // When the cropper produced something shorter (e.g. 2.958 s),
+    // `padIfNeeded` extends with a black tail; recovery trims it
+    // back to the original duration so the user never sees the
+    // filler. Same pattern as the spatial pad → submit → recover.
+    let minDurSec = null;
+    let minDurSource = null;
+    if (pickedCaps) {
+      if (Number.isFinite(pickedCaps.minInputDurationSec) && pickedCaps.minInputDurationSec > 0) {
+        minDurSec = pickedCaps.minInputDurationSec;
+        minDurSource = 'caps.minInputDurationSec';
+      } else if (Array.isArray(pickedCaps.durations) && pickedCaps.durations.length > 0) {
+        minDurSec = pickedCaps.durations[0];
+        minDurSource = 'caps.durations[0]';
+      } else if (pickedCaps.videoToVideo) {
+        minDurSec = 3;
+        minDurSource = 'video-to-video catalog-row-empty fallback';
+      }
+    }
+    if (Number.isFinite(minDurSec) && minDurSec > 0) {
+      padOpts.minDurationMs = minDurSec * 1000;
+      channel.log('pad', `min input duration floor: ${minDurSec}s (${minDurSource})`);
+    }
 
     if (caps.videoToVideo && Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
       const padded = [];
