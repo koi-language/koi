@@ -19,7 +19,7 @@
  * (calling twice with the same value is a no-op besides the broadcast).
  */
 
-import { updateClip } from '../../state/timelines.js';
+import { assignGeneratedMedia } from '../../state/timelines.js';
 import { channel } from '../../io/channel.js';
 
 export default {
@@ -63,7 +63,7 @@ export default {
       if (!mediaPath || typeof mediaPath !== 'string') {
         throw new Error('mediaPath must be a non-empty string');
       }
-      const tl = updateClip(id, clipId, { path: mediaPath });
+      const tl = assignGeneratedMedia(id, clipId, { mediaPath, chatId });
       // Broadcast AFTER the state mutation succeeds so the GUI never sees
       // a "ready" event for a swap that didn't actually persist.
       channel.clipMediaGenerated({ clipId, mediaPath, chatId: chatId ?? null });

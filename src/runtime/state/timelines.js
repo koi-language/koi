@@ -885,6 +885,40 @@ export function updateClip(id, clipId, changes) {
   });
 }
 
+/**
+ * Land a freshly-generated media file on an AI-placeholder clip in a single
+ * write. Updates `path` AND `aiState.lastRenderedPath` (and `lastChatId`
+ * when provided) atomically so the on-disk JSON ALWAYS reflects "this clip
+ * has a rendered version available". Used by `assign_generated_media_to_clip`
+ * — keeps the GUI's AI ↔ Rendered toggle working across the inevitable
+ * file-watcher reload that follows the engine's write (without this, the
+ * GUI would set `lastRenderedPath` in memory only and lose it on reload).
+ *
+ * If `aiState` is missing on the clip (rare — the GUI mints it before
+ * dispatch) we mint one with `placeholderPath = clip.path` BEFORE the swap,
+ * so the toggle still has a placeholder to flip back to.
+ */
+export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
+  if (!mediaPath || typeof mediaPath !== 'string') {
+    throw new Error('assignGeneratedMedia.mediaPath must be a non-empty string');
+  }
+  return _withTimeline(id, (state) => {
+    const i = _findClipIndexById(state, clipId);
+    if (i < 0) throw new Error(`Clip not found: ${clipId}`);
+    const c = state.clips[i];
+    const prevPath = c.path;
+    if (!c.aiState || typeof c.aiState !== 'object') {
+      c.aiState = { placeholderPath: prevPath };
+    }
+    c.aiState.lastRenderedPath = mediaPath;
+    if (typeof chatId === 'string' && chatId) {
+      c.aiState.lastChatId = chatId;
+    }
+    c.path = mediaPath;
+    return state;
+  });
+}
+
 // ── Title clips (synthetic V-track overlays) ─────────────────────────
 
 /**
