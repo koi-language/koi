@@ -1604,6 +1604,82 @@ CRITICAL RULES:
       }
     }
 
+    // Inject MCP tool video results (e.g. read_file on an mp4) as
+    // multimodal content blocks. OpenRouter exposes a `video_url`
+    // content type for compatible models — see
+    // https://openrouter.ai/docs/guides/overview/multimodal/videos.
+    // Anthropic / OpenAI chat APIs do NOT accept raw video bytes, so we
+    // skip the injection entirely for those providers (the action that
+    // queued the video should have set _hasVideoAttachments → the auto-
+    // selector picks a model with inputVideo:true, i.e. Gemini, before
+    // we get here; if the user pinned a non-video provider we leave the
+    // text path through as-is and the agent sees the description but
+    // not the bytes).
+    if (session._pendingMcpVideos?.length > 0) {
+      const _videos = session._pendingMcpVideos;
+      const _supportsVideoUrl =
+        this.provider === 'gemini' ||
+        this.provider === 'openrouter' ||
+        this.provider === 'gateway';
+      if (_supportsVideoUrl) {
+        const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
+        if (lastUserIdx >= 0) {
+          const existing = messages[lastUserIdx].content;
+          const textContent = typeof existing === 'string'
+            ? existing
+            : Array.isArray(existing)
+              ? existing.find((p) => p.type === 'text')?.text ?? ''
+              : '';
+          const videoBlocks = _videos.flatMap((v) => {
+            const blocks = [];
+            if (v.caption) blocks.push({ type: 'text', text: v.caption });
+            blocks.push({
+              type: 'video_url',
+              video_url: { url: `data:${v.mimeType};base64,${v.data}` },
+            });
+            return blocks;
+          });
+          // Append at the END of the last user message — same order as
+          // images for consistency in the multimodal payload.
+          if (Array.isArray(existing)) {
+            messages[lastUserIdx] = {
+              role: 'user',
+              content: [...existing, ...videoBlocks],
+            };
+          } else {
+            messages[lastUserIdx] = {
+              role: 'user',
+              content: [
+                { type: 'text', text: textContent },
+                ...videoBlocks,
+              ],
+            };
+          }
+          try {
+            const _attachReport = _videos.map((v, i) => {
+              const kb = Math.round(((v.data?.length || 0) * 3 / 4) / 1024);
+              const file = (v._debugPath || '').split('/').pop() || `vid-${i}`;
+              return `${file} (${v.mimeType || 'video'}, ${kb}KB)`;
+            }).join(', ');
+            channel.log(
+              'llm',
+              `[vision] attaching ${_videos.length} video(s) to ${this.provider} request → ${_attachReport}`,
+            );
+          } catch { /* logging is best-effort */ }
+        }
+      } else {
+        channel.log(
+          'llm',
+          `[vision] skipping video attach — provider=${this.provider} does not accept raw video bytes via video_url`,
+        );
+      }
+      // Snapshot for the catch-retry path so the next attempt can re-
+      // inject the same bytes if this call fails (e.g. provider rejects
+      // the payload, transient 5xx, …). Cleared on successful return.
+      session._consumedVideosThisCall = [...session._pendingMcpVideos];
+      session._pendingMcpVideos = null;
+    }
+
     // Prune image blocks from all messages EXCEPT the last user message.
     // This prevents old screenshots from accumulating in the conversation
     // (e.g. from merged multimodal messages or batched image results).
@@ -1611,21 +1687,28 @@ CRITICAL RULES:
     {
       const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
       let _pruned = 0;
+      let _prunedVideos = 0;
       for (let i = 0; i < messages.length; i++) {
-        if (i === lastUserIdx) continue; // keep current images
+        if (i === lastUserIdx) continue; // keep current images / videos
         const c = messages[i].content;
         if (!Array.isArray(c)) continue;
-        const hasImages = c.some(p => p.type === 'image' || p.type === 'image_url');
-        if (!hasImages) continue;
-        // Strip image blocks, keep text
+        const hasMedia = c.some(p => p.type === 'image' || p.type === 'image_url' || p.type === 'video_url');
+        if (!hasMedia) continue;
+        // Strip image / video blocks, keep text
         const textOnly = c.filter(p => p.type === 'text');
-        const imgCount = c.length - textOnly.length;
+        const imgCount = c.filter(p => p.type === 'image' || p.type === 'image_url').length;
+        const vidCount = c.filter(p => p.type === 'video_url').length;
         _pruned += imgCount;
+        _prunedVideos += vidCount;
         const textContent = textOnly.map(p => p.text).join('\n');
-        messages[i] = { role: messages[i].role, content: textContent + ` [${imgCount} image(s) pruned]` };
+        const note = [
+          imgCount > 0 ? `${imgCount} image(s)` : null,
+          vidCount > 0 ? `${vidCount} video(s)` : null,
+        ].filter(Boolean).join(', ');
+        messages[i] = { role: messages[i].role, content: textContent + ` [${note} pruned]` };
       }
-      if (_pruned > 0 && process.env.KOI_DEBUG_LLM) {
-        console.error(`[image-prune] Stripped ${_pruned} old image(s) from conversation history`);
+      if ((_pruned > 0 || _prunedVideos > 0) && process.env.KOI_DEBUG_LLM) {
+        console.error(`[media-prune] Stripped ${_pruned} image(s) + ${_prunedVideos} video(s) from conversation history`);
       }
     }
 
@@ -2019,16 +2102,24 @@ CRITICAL RULES:
       });
 
       this.logResponse(response.text, `Reactive ${agentInfo}`, response.usage);
-      // Successful call — drop the retry snapshot so these images don't get
-      // re-injected on a future (unrelated) error.
-      if (session) session._consumedThisCall = null;
+      // Successful call — drop the retry snapshots so these media don't
+      // get re-injected on a future (unrelated) error.
+      if (session) {
+        session._consumedThisCall = null;
+        session._consumedVideosThisCall = null;
+      }
     } catch (_callErr) {
-      // Restore pending images so the retry re-injects them. Without this,
-      // a failed call (e.g. model rejects image payload) silently drops the
-      // attachment and the next iteration hallucinates about a different image.
+      // Restore pending media so the retry re-injects them. Without this,
+      // a failed call (e.g. model rejects payload) silently drops the
+      // attachment and the next iteration hallucinates about a different
+      // image / video.
       if (session?._consumedThisCall?.length && !session._pendingMcpImages?.length) {
         session._pendingMcpImages = [...session._consumedThisCall];
         channel.log('llm', `[auto] Restoring ${session._consumedThisCall.length} image(s) after LLM error for retry`);
+      }
+      if (session?._consumedVideosThisCall?.length && !session._pendingMcpVideos?.length) {
+        session._pendingMcpVideos = [...session._consumedVideosThisCall];
+        channel.log('llm', `[auto] Restoring ${session._consumedVideosThisCall.length} video(s) after LLM error for retry`);
       }
       // Resolve which model actually handled this call so the per-model
       // cooldown hits the specific failing model (e.g. gemini-3.1-pro-preview)

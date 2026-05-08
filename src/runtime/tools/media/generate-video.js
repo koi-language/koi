@@ -28,6 +28,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+import { padIfNeeded, recoverFromPadded } from './_pad-and-recover.js';
 
 /**
  * In-process job-id → generation-params cache for the async path.
@@ -273,9 +274,45 @@ const generateVideoAction = {
     const instance = resolved.instance;
     const caps = instance.capabilities;
 
+    // ── Pad-if-too-small for provider input minimums ─────────────────
+    // The user's reference inputs may come from the GUI's clip cropper
+    // honouring an arbitrary canvas rect — sometimes well under the
+    // provider's accepted dimensions (e.g. Kling rejects <720 height).
+    // We pad the primary input with solid black to reach the envelope,
+    // BIT-FOR-BIT preserving the original pixels, then crop the borders
+    // off the model's output post-generation. The whole dance is
+    // INTERNAL to this tool — agents and the GUI never see padded media.
+    //
+    // Recovery rect priority: referenceVideos[0] beats startFrame —
+    // diffusion video models anchor their output dims to the video
+    // input when both are present.
+    let recoveryGeometry = null;
+    let paddedRefVideos = action.referenceVideos;
+    if (caps.videoToVideo && Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
+      const padded = [];
+      for (let i = 0; i < action.referenceVideos.length; i++) {
+        const rv = action.referenceVideos[i];
+        const r = await padIfNeeded(rv, 'video');
+        if (i === 0 && r.geometry?.needsPadding) {
+          recoveryGeometry = { ...r.geometry, kind: 'video' };
+        }
+        padded.push(r.paddedPath || rv);
+      }
+      paddedRefVideos = padded;
+    }
+
+    let paddedStartFrame = action.startFrame;
+    if (!recoveryGeometry && caps.startFrame && action.startFrame) {
+      const r = await padIfNeeded(action.startFrame, 'image');
+      if (r.geometry?.needsPadding) {
+        recoveryGeometry = { ...r.geometry, kind: 'video' /* output is still a video */ };
+      }
+      if (r.paddedPath) paddedStartFrame = r.paddedPath;
+    }
+
     // ── Top-level (global) resolution — used directly for single-shot,
     //    and as fallback defaults for each entry in shots[] ──────────
-    const globalStartFrame = await _loadFrame(action.startFrame, caps.startFrame, resolved, 'start');
+    const globalStartFrame = await _loadFrame(paddedStartFrame, caps.startFrame, resolved, 'start');
     if (globalStartFrame?._error) return { success: false, error: globalStartFrame._error };
 
     const globalEndFrame = await _loadFrame(action.endFrame, caps.endFrame, resolved, 'end');
@@ -285,7 +322,8 @@ const generateVideoAction = {
     if (globalReferenceImages?._error) return { success: false, error: globalReferenceImages._error };
 
     // Videos are uploaded (not inlined) — see _uploadVideoRef above.
-    const globalReferenceVideos = await _resolveReferenceVideos(action.referenceVideos, caps, resolved);
+    // Padded variants flow through transparently.
+    const globalReferenceVideos = await _resolveReferenceVideos(paddedRefVideos, caps, resolved);
 
     const withAudio = action.withAudio || false;
     if (withAudio && !caps.withAudio) {
@@ -521,6 +559,21 @@ const generateVideoAction = {
       });
       savedTo = saveResult.path;
       saveError = saveResult.error;
+      // Strip the black borders we padded on at submit time (transparent
+      // to the agent — only fires when an input was actually padded). The
+      // model's output preserves the input envelope (diffusion video
+      // models anchor output dims to the dominant input), so cropping at
+      // the recorded content rect yields the original-sized media.
+      if (savedTo && recoveryGeometry?.needsPadding) {
+        try {
+          const recovered = await recoverFromPadded(savedTo, recoveryGeometry, 'video');
+          if (recovered && recovered !== savedTo) {
+            savedTo = recovered;
+          }
+        } catch (err) {
+          channel.log('video', `recoverFromPadded failed (keeping padded): ${err.message}`);
+        }
+      }
       if (savedTo && channel.canPresentResources?.()) {
         channel.presentResource({ type: 'video', path: savedTo });
       }

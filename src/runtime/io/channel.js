@@ -125,6 +125,19 @@ class Channel {
   /** Agent deactivated a skill. */
   skillDeactivated(info) {}
 
+  // ── AI clip generation ──────────────────────────────────────────────────
+  // Fire-and-forget broadcast emitted by the `assign_generated_media_to_clip`
+  // tool when a generation lands on a timeline clip. The GUI's timeline tab
+  // listens for this on the WS channel, looks up the clip by id, and swaps
+  // its placeholder for the rendered media (clearing the diagonal-stripes
+  // overlay and updating its `aiState.lastRenderedPath`). Terminal channels
+  // can leave the no-op default in place.
+  /**
+   * @param {{ clipId: string, mediaPath?: string|null, error?: string|null,
+   *           chatId?: string|null }} info
+   */
+  clipMediaGenerated(info) {}
+
   // ── Workflow lifecycle ─────────────────────────────────────────────────
   // `workflowActivating` fires BEFORE any tasks are created, giving the
   // GUI a chance to show a banner with a countdown and let the user

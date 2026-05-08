@@ -224,16 +224,29 @@ function _formatDuration(sec) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-/** Probe a video's duration in milliseconds via ffprobe. Returns null
- *  when ffprobe is missing or the file is unreadable — callers should
- *  treat that as "no signal" and degrade gracefully. */
+/** Probe a video's duration in milliseconds via the bundled ffprobe.
+ *  Falls through to the system PATH only when the bundled installer
+ *  fails to materialise (dev runs, tests). Returns null when neither is
+ *  reachable or the file is unreadable — callers should treat that as
+ *  "no signal" and degrade gracefully.
+ *
+ *  Important: the koi-cli binary doesn't ship ffprobe on the host's
+ *  PATH; it stages a copy at `~/.koi/bin/` via `ensureFfmpeg()`. Hard-
+ *  coding `'ffprobe'` here meant any user without a system install hit
+ *  "ffmpeg may be unavailable" on every video read. */
 async function _probeVideoDurationMs(filePath) {
+  let bin = 'ffprobe';
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    if (r?.ffprobe) bin = r.ffprobe;
+  } catch { /* fall back to PATH */ }
   try {
     const { execFile } = await import('child_process');
     const { promisify } = await import('util');
     const run = promisify(execFile);
     const { stdout } = await run(
-      'ffprobe',
+      bin,
       ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', filePath],
       { timeout: 3000 },
     );
@@ -520,7 +533,7 @@ export default {
 - Never read more than 200 lines at once
 - For large files, never omit offset/limit
 - For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
-- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them. For a frame at a SPECIFIC timestamp, call extract_frame instead.`,
+- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them as vision input — same UX as reading an image. Treat that as "you've now seen the video"; do not fall back to other tools to inspect it.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,
@@ -666,20 +679,23 @@ export default {
     }
 
     // --- Video support (vision) ---
-    // Two paths:
+    // Three paths in priority order:
     //   (1) Active working-area video → route through the bundle helper
     //       so per-frame annotation composites land at the LLM with
     //       `[ANNOTATIONS @ MM:SS.ms]` captions.
-    //   (2) Off-canvas video → ffmpeg-sample N evenly-spaced JPEG frames
-    //       and queue them as vision inputs. The chat models we target
-    //       (OpenAI / Anthropic / Gemini-via-OpenRouter) don't accept
-    //       raw video bytes through the multimodal chat interface, so a
-    //       sampled-frame mosaic is the provider-agnostic equivalent of
-    //       "attach this video": the agent sees enough of the visual
-    //       content to describe / analyse / write a follow-up prompt.
+    //   (2) Off-canvas video on a session that has video-input models
+    //       in the catalog → upload the whole file as a base64 data URL
+    //       (`video_url` content block per OpenRouter's multimodal
+    //       spec). Gemini 2.5/3.x picks it up natively; flagging the
+    //       session with `_hasVideoAttachments` forces the auto-
+    //       selector to pick a Gemini model on the next turn.
+    //   (3) Fallback: ffmpeg-sample N evenly-spaced JPEG frames if
+    //       (a) no session, (b) the bundled ffmpeg can't read the
+    //       file's metadata, or (c) the file is too big to upload as a
+    //       base64 video block (>20MB).
     if (_VIDEO_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
       // When we got here via the timeline redirect, skip the working-
-      // area-doc shortcut and go straight to ffmpeg sampling. Reason:
+      // area-doc shortcut and go straight to the upload path. Reason:
       // the redirect target is the underlying clip file, which OFTEN
       // also exists as a sibling video tab in the working area with
       // an empty bundle. The bundle helper would then return success
@@ -694,43 +710,89 @@ export default {
           if (doc) {
             return await _queueActiveDocumentForVision(doc, agent, filePath);
           }
-        } catch { /* store unavailable — fall through to sampling */ }
+        } catch { /* store unavailable — fall through to upload / sampling */ }
       }
 
       const session = agent?._activeSession;
       if (session) {
+        // (2) Try the native video-upload path first. The bytes go up
+        // as `data:video/...;base64,…` in a `video_url` content block;
+        // the auto-selector picks a Gemini model that natively
+        // understands video.
+        const totalDurMs = await _probeVideoDurationMs(resolvedPath);
+        const totalDurSec = totalDurMs != null ? (totalDurMs / 1000) : null;
+        const _MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB safety cap
+        try {
+          const stat = fs.statSync(resolvedPath);
+          if (stat.size <= _MAX_UPLOAD_BYTES) {
+            const ext = path.extname(resolvedPath).slice(1).toLowerCase();
+            const mimeType =
+              ext === 'mp4' ? 'video/mp4' :
+              ext === 'mov' ? 'video/mp4' : // OR sends mov as mp4-compat
+              ext === 'webm' ? 'video/webm' :
+              ext === 'mpeg' || ext === 'mpg' ? 'video/mpeg' :
+              `video/${ext}`;
+            const data = fs.readFileSync(resolvedPath).toString('base64');
+            if (!session._pendingMcpVideos) session._pendingMcpVideos = [];
+            session._pendingMcpVideos.push({
+              mimeType,
+              data,
+              _debugPath: resolvedPath,
+              role: 'video_full',
+            });
+            // Force the selector to pick a model with inputVideo:true
+            // (Gemini family) on the next turn.
+            session._hasVideoAttachments = true;
+            channel.log(
+              'read_file',
+              `Video attached for native video input (${Math.round(stat.size / 1024)}KB, ${mimeType}): ${filePath}` +
+              (totalDurSec != null ? ` — duration ${totalDurSec.toFixed(2)}s` : ''),
+            );
+            const durationHint = totalDurSec != null
+              ? ` Total video duration: **${totalDurSec.toFixed(2)} seconds** — use this exact value for any \`durationSeconds\` parameter on follow-up calls (generate_audio, etc.).`
+              : '';
+            return {
+              success: true,
+              path: filePath,
+              type: 'video',
+              attachedAs: 'video_url',
+              sizeBytes: stat.size,
+              ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
+              message: `Video attached natively for visual analysis on the next turn — you will see it as a single video block (motion + audio + frames intact).${durationHint}`,
+            };
+          }
+        } catch (e) {
+          channel.log('read_file', `[video] upload path failed (${e?.message || e}); falling back to frame sampling`);
+        }
+
+        // (3) Fallback: sampled frames. Triggered when the file is too
+        // big or the upload path threw.
         const sampledMs = await _queueVideoFramesForVision(resolvedPath, session, { count: 4 });
         if (sampledMs.length > 0) {
           const stamps = sampledMs.map((ms) => _formatDuration(ms / 1000)).join(', ');
-          // Probe duration up-front and surface it in the result so the
-          // agent never has to guess `durationSeconds` for follow-up
-          // calls (generate_audio sfx, etc.). Without this the agent
-          // routinely picks 10/12s for a 5s clip — the SFX runs past
-          // the end of the source.
-          const totalDurMs = await _probeVideoDurationMs(resolvedPath);
-          const totalDurSec = totalDurMs != null ? (totalDurMs / 1000) : null;
           channel.log(
             'read_file',
             `Video sampled for vision (${sampledMs.length} frames): ${filePath}` +
             (totalDurSec != null ? ` — duration ${totalDurSec.toFixed(2)}s` : ''),
           );
           const durationHint = totalDurSec != null
-            ? ` Total video duration: **${totalDurSec.toFixed(2)} seconds** — use this exact value for any \`durationSeconds\` parameter on follow-up calls (generate_audio, etc.). Do NOT guess; the source is ${totalDurSec.toFixed(2)}s long, audio that runs longer plays past the end.`
+            ? ` Total video duration: **${totalDurSec.toFixed(2)} seconds** — use this exact value for any \`durationSeconds\` parameter on follow-up calls (generate_audio, etc.).`
             : '';
           return {
             success: true,
             path: filePath,
             type: 'video',
+            attachedAs: 'frames',
             sampledFrames: sampledMs.length,
             sampledTimestampsMs: sampledMs,
             ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
-            message: `Video attached as ${sampledMs.length} sampled frames at ${stamps}. Use them as a visual summary of the video — they're evenly spaced, so reason about progression / motion / scene changes from the sequence.${durationHint} For per-frame inspection at a specific timestamp, call extract_frame.`,
+            message: `Video attached as ${sampledMs.length} sampled frames at ${stamps} (file too large for native upload). Reason about progression / motion from the sequence.${durationHint}`,
           };
         }
       }
       return {
         success: false,
-        error: `Could not sample frames from "${filePath}" — ffmpeg may be unavailable or the file is unreadable. For offline analysis call extract_frame at specific timestamps.`,
+        error: `Could not read "${filePath}" — the file is unreadable (corrupt, unsupported codec, or empty). Surface the failure to the user; do NOT fall back to a different tool.`,
       };
     }
 
