@@ -459,13 +459,32 @@ const generateVideoAction = {
     let padTargetDims = null;
     if (envelope) {
       padTargetDims = { w: envelope.w, h: envelope.h };
-    } else if (action.resolution && action.aspectRatio) {
-      const dims = targetDimsForResolutionAspect(action.resolution, action.aspectRatio);
+    } else {
+      // The agent doesn't always emit explicit `resolution` /
+      // `aspectRatio` — line 552 below applies `'720p'` / `'16:9'`
+      // defaults at the LATER `globalAspect` / `globalResolution`
+      // step. We need those same defaults HERE so we pad to whatever
+      // canvas the model will be asked to emit; otherwise (when the
+      // agent leaves them unset and we don't apply defaults), this
+      // branch falls through and `padIfNeeded` lands on the legacy
+      // `minSide=1080` square envelope while the model gets asked
+      // for 720p+16:9 — input/output dim mismatch the recovery
+      // crop can't realign. Apply the same defaults eagerly.
+      const padRes = action.resolution || '720p';
+      const padAsp = action.aspectRatio || '16:9';
+      const dims = targetDimsForResolutionAspect(padRes, padAsp);
       if (dims) {
         padTargetDims = dims;
+        // Mirror the defaults onto `action` so the model is asked for
+        // the SAME canvas we padded to (the later `globalAspect` /
+        // `globalResolution` step would also do this, but pinning
+        // them now makes the relationship explicit and removes any
+        // chance of drift if that fallback evolves separately).
+        action.resolution = padRes;
+        action.aspectRatio = padAsp;
         channel.log(
           'pad',
-          `caps lacked resolutions/aspectRatios — padding to requested ${action.resolution}+${action.aspectRatio} = ${dims.w}×${dims.h}`,
+          `caps lacked resolutions/aspectRatios — padding to requested ${padRes}+${padAsp} = ${dims.w}×${dims.h}`,
         );
       }
     }
