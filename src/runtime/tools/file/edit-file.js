@@ -270,7 +270,7 @@ function linesMatch(fileLines, oldLines, idx, normalize = false) {
 export default {
   type: 'edit_file',
   intent: 'edit_file',
-  description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Returns: { success, path }',
+  description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). The "path" field accepts an absolute or relative path OR a `@mention` handle (e.g. "@hero_script") that resolves via the cross-project MediaLibrary to the most recent file tagged with that handle — the same handle the user / agent set via tag_media. Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Returns: { success, path }',
   instructions: 'This is the ONLY correct way to modify existing files. NEVER use shell commands (sed, awk, echo >, python scripts, etc.) to edit files — always use edit_file instead.',
   thinkingHint: (action) => `Editing ${action.path || 'file'}`,
   permission: 'write',
@@ -279,7 +279,7 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'File path to edit' },
+      path: { type: 'string', description: 'File path to edit. Accepts an absolute or relative path, or a `@mention` handle (e.g. "@hero_script") resolved via the cross-project MediaLibrary to the most recent file tagged with that handle.' },
       diff: { type: 'string', description: 'Unified diff with @@ hunks. Lines: " " context, "-" remove, "+" add.' }
     },
     required: ['path', 'diff']
@@ -295,10 +295,28 @@ export default {
   ],
 
   async execute(action, agent) {
-    const filePath = action.path;
+    let filePath = action.path;
     let diffStr = action.diff;
 
     if (!filePath) throw new Error('edit_file: "path" field is required');
+
+    // Resolve `@mention` handles via the cross-project MediaLibrary —
+    // same contract as read_file / write_file. Done BEFORE the
+    // "infer-diff-from-content" fallback so both branches see the
+    // resolved path.
+    {
+      const { resolveMentionPath } = await import('./_resolve-mention-path.js');
+      const r = await resolveMentionPath(filePath);
+      if (!r.ok) return { success: false, error: `edit_file: ${r.error}` };
+      if (r.resolved) {
+        channel.log(
+          'edit_file',
+          `mention "${filePath}" → ${r.path}` +
+            (r.matchCount > 1 ? ` (newest of ${r.matchCount} matches)` : ''),
+        );
+        filePath = r.path;
+      }
+    }
 
     // Fallback: if the model sent full file content instead of a unified diff,
     // compute the diff automatically so the user sees the same approval flow.

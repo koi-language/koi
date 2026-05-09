@@ -526,14 +526,15 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. Fields: "path" (file path), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
+  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
   instructions: `read_file rules:
 - Always use offset + limit for text files
 - Prefer 50-150 lines per read
 - Never read more than 200 lines at once
 - For large files, never omit offset/limit
 - For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
-- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them as vision input — same UX as reading an image. Treat that as "you've now seen the video"; do not fall back to other tools to inspect it.`,
+- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them as vision input — same UX as reading an image. Treat that as "you've now seen the video"; do not fall back to other tools to inspect it.
+- \`@mention\` handles work directly: \`{"intent":"read_file","path":"@hero_script"}\` resolves the handle via the cross-project MediaLibrary to the most recent tagged asset. Do NOT enumerate the library by hand to look up the path first — the resolver does it for you. Same for \`@tom\` (image), \`@narrator\` (audio), etc.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,
@@ -541,7 +542,7 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'File path to read, or an attachment ID (e.g. att-1) to read an attached file' },
+      path: { type: 'string', description: 'File path to read. Accepts: an absolute or relative path; an attachment ID (e.g. "att-1") for an attached file; OR a `@mention` handle (e.g. "@hero_script", "@tom") resolved via the cross-project MediaLibrary to the most recent asset tagged with that handle. Use the `@`-form when you have already named an asset (via tag_media or right-click) — it is the stable identity across sessions and projects.' },
       offset: { type: 'number', description: 'Start reading from this line number (1-based, optional)' },
       limit: { type: 'number', description: 'Maximum number of lines to read (optional)' },
       pages: { type: 'string', description: 'Page range for PDF files (e.g. "1-5", "3", "10-20"). Only for .pdf files. Max 20 pages per request.' }
@@ -596,6 +597,26 @@ export default {
         filePath = resolved;
       } catch {
         return { success: false, error: `Could not resolve attachment ID: ${filePath}` };
+      }
+    }
+
+    // Resolve `@mention` handles transparently via the cross-project
+    // MediaLibrary. Same model the chat input bar's `@`-autocomplete
+    // uses: most-recent asset wins when several rows share the handle,
+    // so the agent and user share intuition. Helper centralised in
+    // `_resolve-mention-path.js` so write_file / edit_file etc. share
+    // the exact same contract.
+    {
+      const { resolveMentionPath } = await import('./_resolve-mention-path.js');
+      const r = await resolveMentionPath(filePath);
+      if (!r.ok) return { success: false, error: `read_file: ${r.error}` };
+      if (r.resolved) {
+        channel.log(
+          'read_file',
+          `mention "${filePath}" → ${r.mediaType || 'unknown'} ${r.path}` +
+            (r.matchCount > 1 ? ` (newest of ${r.matchCount} matches)` : ''),
+        );
+        filePath = r.path;
       }
     }
 

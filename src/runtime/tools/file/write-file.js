@@ -21,7 +21,7 @@ import { buildDiffPayloadFromContent, buildDiffPayloadFromNewFile } from '../../
 export default {
   type: 'write_file',
   intent: 'write_file',
-  description: 'Create a NEW file. Fields: "path" (file path), "content" (full file content). Returns: { success, path }. ONLY for creating files that do not exist yet. To modify existing files, use edit_file instead.',
+  description: 'Create a NEW file. Fields: "path" (file path — also accepts a `@mention` handle that resolves via MediaLibrary to overwrite a previously-tagged file; e.g. `path: "@hero_script"` overwrites whatever file is currently tagged @hero_script), "content" (full file content). Returns: { success, path }. ONLY for creating files that do not exist yet. To modify existing files (or to write to a `@mention` that already resolves to an existing file), use edit_file instead — write_file refuses to overwrite when the resolved path exists.',
   instructions: 'write_file is ONLY for creating NEW files. If the file already exists, you MUST use edit_file instead — even for large changes. Break big rewrites into multiple edit_file calls. NEVER use shell commands (cat >, echo >, tee, python scripts) to write files.',
   thinkingHint: 'Writing file',
   permission: 'write',
@@ -30,18 +30,38 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'File path to write' },
+      path: { type: 'string', description: 'File path to write. Accepts an absolute or relative path, or a `@mention` handle that resolves via MediaLibrary to a previously-tagged file (overwriting it). For brand-new files, pass a fresh path; for updating tagged ones, prefer edit_file.' },
       content: { type: 'string', description: 'Full file content to write' }
     },
     required: ['path', 'content']
   },
 
   async execute(action, agent) {
-    const filePath = action.path;
+    let filePath = action.path;
     const newContent = action.content;
 
     if (!filePath) throw new Error('write_file: "path" field is required');
     if (newContent === undefined) throw new Error('write_file: "content" field is required');
+
+    // Resolve `@mention` handles via the cross-project MediaLibrary —
+    // same contract read_file uses. When the handle is unknown we
+    // intentionally hard-fail rather than silently creating a file
+    // named `@xxx` in cwd; that file would NEVER be findable later
+    // because the rest of the system treats `@xxx` as a handle, not a
+    // filename.
+    {
+      const { resolveMentionPath } = await import('./_resolve-mention-path.js');
+      const r = await resolveMentionPath(filePath);
+      if (!r.ok) return { success: false, error: `write_file: ${r.error}` };
+      if (r.resolved) {
+        channel.log(
+          'write_file',
+          `mention "${filePath}" → ${r.path}` +
+            (r.matchCount > 1 ? ` (newest of ${r.matchCount} matches)` : ''),
+        );
+        filePath = r.path;
+      }
+    }
 
     const resolvedPath = path.resolve(filePath);
     const exists = fs.existsSync(resolvedPath);
