@@ -19,6 +19,27 @@ import { execFileSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { channel } from '../io/channel.js';
+import { scheduleConversationIndex, flushConversationIndex, backfillConversationIndex } from './conversations.js';
+
+// Slot for the LLM provider used by the conversations index pipeline
+// (title + summary + embedding for the "Recent Sessions" sidebar /
+// "Open Session…" search). Set ONCE per process, the first time an
+// agent binds its LLM provider — the conversations module needs the
+// same provider already in use elsewhere in the runtime, no point
+// minting a second one.
+let _conversationIndexProvider = null;
+// Set of projectRoots we've already kicked a backfill for in this
+// process. Backfill is a one-shot per (project × process) — running
+// it on every saveConversation would re-scan the disk endlessly.
+const _backfilledProjects = new Set();
+export function setConversationIndexProvider(provider) {
+  if (provider && !_conversationIndexProvider) {
+    _conversationIndexProvider = provider;
+  }
+}
+export function getConversationIndexProvider() {
+  return _conversationIndexProvider;
+}
 
 export class SessionTracker {
   constructor(sessionId, projectRoot) {
@@ -411,32 +432,6 @@ export class SessionTracker {
     }
   }
 
-  // ─── Commit Embeddings ────────────────────────────────────────────
-
-  /** Save a commit embedding to the index */
-  saveCommitEmbedding(hash, summary, embedding) {
-    try {
-      const filePath = path.join(this.gitDir, 'commit-embeddings.json');
-      let data = { commits: {} };
-      if (fs.existsSync(filePath)) {
-        data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      }
-      data.commits[hash] = { summary, embedding, date: new Date().toISOString() };
-      fs.writeFileSync(filePath, JSON.stringify(data), 'utf8');
-    } catch { /* non-fatal */ }
-  }
-
-  /** Load all commit embeddings */
-  loadCommitEmbeddings() {
-    try {
-      const filePath = path.join(this.gitDir, 'commit-embeddings.json');
-      if (!fs.existsSync(filePath)) return { commits: {} };
-      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
-      return { commits: {} };
-    }
-  }
-
   // ─── Image Storage ─────────────────────────────────────────────────
 
   /** Get the directory for session images */
@@ -590,6 +585,53 @@ export class SessionTracker {
       fs.writeFileSync(filePath, payload, 'utf8');
     } catch (err) {
       process.stderr.write(`[session-tracker] saveConversation(${agentName}) failed: ${err.message}\n`);
+    }
+    // Bump the conversations-index debounce. The index pipeline
+    // reads dialogue.jsonl (the canonical event log), not the
+    // per-agent conversation-*.json — but every saveConversation
+    // happens right after appendDialogue, so the indexer always
+    // sees fresh material when its 30s timer fires. Best-effort:
+    // a missing provider just means the row will catch up the
+    // next time the GUI / a build wires one in.
+    if (_conversationIndexProvider) {
+      try {
+        scheduleConversationIndex({
+          sessionId: this.sessionId,
+          projectRoot: this.projectRoot,
+          llmProvider: _conversationIndexProvider,
+          sessionDir: this.gitDir,
+        });
+      } catch (err) {
+        process.stderr.write(`[session-tracker] schedule index ${this.sessionId} failed: ${err.message}\n`);
+      }
+      // First write per-project also kicks a one-shot backfill of
+      // any pre-existing sessions whose summaries never landed in
+      // the conversations index (legacy sessions from before the
+      // RMH wire-up, or sessions touched without ever calling
+      // saveConversation here). Fire-and-forget — the backfill
+      // limits its own concurrency.
+      if (this.projectRoot && !_backfilledProjects.has(this.projectRoot)) {
+        _backfilledProjects.add(this.projectRoot);
+        backfillConversationIndex({
+          projectRoot: this.projectRoot,
+          llmProvider: _conversationIndexProvider,
+          maxConcurrency: 2,
+        }).catch((err) => {
+          process.stderr.write(`[session-tracker] backfill ${this.projectRoot} failed: ${err.message}\n`);
+        });
+      }
+    }
+  }
+
+  /** Force the pending conversations-index debounce to run NOW. Use
+   *  on session-close / app exit so the last debounce window doesn't
+   *  drop on the floor. Safe to call without a provider — the
+   *  underlying flush is a no-op when nothing is queued. */
+  async flushConversationIndex() {
+    try {
+      await flushConversationIndex(this.sessionId);
+    } catch (err) {
+      process.stderr.write(`[session-tracker] flush index ${this.sessionId} failed: ${err.message}\n`);
     }
   }
 

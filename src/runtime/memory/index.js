@@ -102,8 +102,8 @@ export function getVaultRoot() {
 }
 
 /**
- * Idempotent lazy init from an agent. Used by tool handlers (learn_fact,
- * recall_facts, …) so they can transparently use memory without the runtime
+ * Idempotent lazy init from an agent. Used by tool handlers (add_memory,
+ * recall_memory, …) so they can transparently use memory without the runtime
  * having to wire `memory.init()` at startup.
  *
  * Reads projectRoot from KOI_PROJECT_ROOT and sessionId from KOI_SESSION_ID
@@ -217,8 +217,8 @@ export async function write(note) {
 
 /**
  * List notes by filter (no ranking by query — just enumeration).
- * Used by callers that want all notes of a given type/project, e.g. legacy
- * `recall_facts` with no query. Sorted by `created` desc.
+ * Used by callers that want all notes of a given type/project, e.g.
+ * `recall_memory` with no query. Sorted by `created` desc.
  *
  * @param {object} [opts]
  * @param {object} [opts.filter]  { type, status, project }

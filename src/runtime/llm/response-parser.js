@@ -15,68 +15,6 @@ function logDebug(message) {
 }
 
 /**
- * Search commit embeddings for context relevant to user text.
- * Returns a string to inject into the LLM context, or '' if nothing relevant.
- *
- * @param {string} userText - The user's message text to match against commits.
- * @param {function(string): Promise<number[]|null>} getEmbeddingFn - Callback to get an embedding vector.
- * @returns {Promise<string>}
- */
-export async function searchRelevantCommits(userText, getEmbeddingFn) {
-  try {
-    const { sessionTracker } = await import('../state/session-tracker.js');
-    if (!sessionTracker) return '';
-
-    const { commits } = sessionTracker.loadCommitEmbeddings();
-    const hashes = Object.keys(commits);
-    if (hashes.length === 0) return '';
-
-    const userEmbedding = await getEmbeddingFn(userText);
-    if (!userEmbedding) return '';
-
-    const { SessionTracker } = await import('../state/session-tracker.js');
-
-    // Score each commit
-    const allScored = hashes.map(hash => ({
-      hash,
-      summary: commits[hash].summary,
-      score: SessionTracker.cosineSimilarity(userEmbedding, commits[hash].embedding)
-    }));
-
-    channel.log('llm', `Commit search: ${allScored.length} commits scored against "${userText.substring(0, 60)}"`);
-    for (const c of allScored) {
-      channel.log('llm', `  [${c.hash}] score=${c.score.toFixed(3)} ${c.score >= 0.35 ? '✓' : '✗'} "${c.summary}"`);
-    }
-
-    const matched = allScored
-      .filter(c => c.score >= 0.35)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 3);
-
-    if (matched.length === 0) {
-      channel.log('llm', `Commit search: no matches above threshold (0.35)`);
-      return '';
-    }
-
-    channel.log('llm', `Commit search: injecting ${matched.length} relevant commit(s)`);
-
-    // Build context with truncated diffs
-    const parts = matched.map(c => {
-      let diff = '';
-      try {
-        diff = sessionTracker.getCommitDiff(c.hash);
-      } catch { /* no diff */ }
-      return `[${c.hash}] "${c.summary}"${diff ? `\nDiff:\n${diff}` : ''}`;
-    });
-
-    return `\n\nRELEVANT SESSION CHANGES:\n${parts.join('\n\n')}`;
-  } catch (err) {
-    channel.log('llm', `Commit search failed: ${err.message}`);
-    return '';
-  }
-}
-
-/**
  * Parse the LLM response from reactive mode into a single action object.
  * Handles edge cases like markdown wrapping or legacy array format.
  * If parsing fails entirely, attempts a recovery call with a stronger model.

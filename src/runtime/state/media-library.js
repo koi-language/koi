@@ -51,13 +51,43 @@ const EMPTY_CATEGORIES_FILE = path.join(DB_DIR, 'empty-categories.json');
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.avi']);
 const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
+// Text-like artefacts the agent (or user) creates in a working dir and
+// wants to surface in the cajón alongside generated media. Stored
+// in-place — `MediaLibrary.save()` only persists the path, never copies.
+// The drawer renders these as an icon-tile with an excerpt; everything
+// else (search, mention, categories, favorite) is shared with regular
+// media. Keep this list focused on text-readable formats; binary docs
+// (.pdf, .docx) are a separate problem and stay `unknown` for now.
+const DOCUMENT_EXTS = new Set([
+  '.md', '.markdown', '.txt', '.json', '.yaml', '.yml',
+  '.js', '.ts', '.tsx', '.jsx', '.py', '.rb', '.go', '.rs',
+  '.c', '.h', '.cc', '.cpp', '.hpp', '.swift', '.kt', '.java',
+  '.html', '.css', '.scss', '.xml', '.csv', '.tsv',
+  '.sh', '.bash', '.zsh', '.toml', '.ini', '.env',
+]);
 
 function detectMediaType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (VIDEO_EXTS.has(ext)) return 'video';
   if (AUDIO_EXTS.has(ext)) return 'audio';
+  if (DOCUMENT_EXTS.has(ext)) return 'document';
   return 'unknown';
+}
+
+/** For documents, the fine-grained kind (markdown / json / code / text)
+ *  surfaced as `metadata.documentSubtype`. Lets the drawer pick the right
+ *  icon and the agent know "is this a JSON I can `JSON.parse`, or prose
+ *  I should summarise". */
+function detectDocumentSubtype(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'markdown';
+  if (ext === '.json') return 'json';
+  if (ext === '.yaml' || ext === '.yml' || ext === '.toml' || ext === '.ini' || ext === '.env') return 'config';
+  if (ext === '.csv' || ext === '.tsv') return 'data';
+  if (ext === '.txt') return 'text';
+  // Anything else in DOCUMENT_EXTS is source code.
+  return DOCUMENT_EXTS.has(ext) ? 'code' : 'text';
 }
 
 function detectMimeType(filePath, mediaType = null) {
@@ -68,6 +98,24 @@ function detectMimeType(filePath, mediaType = null) {
     '.svg': 'image/svg+xml', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
     '.webm': 'video/webm', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
     '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.flac': 'audio/flac',
+    '.md': 'text/markdown', '.markdown': 'text/markdown',
+    '.txt': 'text/plain', '.json': 'application/json',
+    '.yaml': 'application/yaml', '.yml': 'application/yaml',
+    '.html': 'text/html', '.css': 'text/css',
+    '.csv': 'text/csv', '.tsv': 'text/tab-separated-values',
+    '.xml': 'application/xml',
+    // Source code — text/x-* keeps it readable in browsers / quick-look.
+    '.js': 'text/javascript', '.ts': 'text/typescript',
+    '.tsx': 'text/typescript', '.jsx': 'text/javascript',
+    '.py': 'text/x-python', '.rb': 'text/x-ruby',
+    '.go': 'text/x-go', '.rs': 'text/x-rust',
+    '.c': 'text/x-c', '.h': 'text/x-c',
+    '.cc': 'text/x-c++', '.cpp': 'text/x-c++', '.hpp': 'text/x-c++',
+    '.swift': 'text/x-swift', '.kt': 'text/x-kotlin', '.java': 'text/x-java',
+    '.scss': 'text/x-scss',
+    '.sh': 'text/x-shellscript', '.bash': 'text/x-shellscript',
+    '.zsh': 'text/x-shellscript',
+    '.toml': 'application/toml', '.ini': 'text/plain', '.env': 'text/plain',
   };
   // Synthetic media types. Timelines are koi JSON documents — give
   // them a recognisable mime so the GUI side can distinguish "play this"
@@ -716,6 +764,163 @@ export class MediaLibrary {
       process.stderr.write(`[MediaLibrary] setMention(${id}) failed: ${e.message}\n`);
       return false;
     }
+  }
+
+  /** Look up rows by `@mention` handle. Match is case-insensitive, leading
+   *  `@` is stripped (mirroring the contract `setMention` writes with).
+   *  Returns rows newest-first so the natural "@tom" => the LATEST `@tom`
+   *  resolves to the most recent generation — same model the chat input
+   *  bar's `@`-autocomplete uses, so the agent and user share intuition.
+   *
+   *  Empty / missing mention returns `[]` (never the full library — easy
+   *  footgun if a caller forgets the falsy check). */
+  async findByMention(mention) {
+    if (!mention || typeof mention !== 'string') return [];
+    let needle = mention.trim();
+    if (needle.startsWith('@')) needle = needle.slice(1);
+    needle = needle.toLowerCase();
+    if (!needle) return [];
+
+    const table = await this._ensureTable();
+    let rows;
+    try {
+      // No SQL filter on JSON-embedded `mention` — LanceDB can't index
+      // into metadata_json. Pull the catalog in one shot (low thousands)
+      // and filter in JS, identical to how `list({category})` works.
+      rows = await table.query().limit(10000).toArray();
+    } catch {
+      return [];
+    }
+    const matches = [];
+    for (const r of rows) {
+      try {
+        const meta = r.metadata_json ? JSON.parse(r.metadata_json) : {};
+        const m = typeof meta.mention === 'string' ? meta.mention : '';
+        if (m && m.toLowerCase() === needle) matches.push(r);
+      } catch { /* malformed metadata — skip */ }
+    }
+    matches.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    return matches.map(r => this._deserialize(r));
+  }
+
+  /** List every distinct `@mention` handle in the library, with the
+   *  newest-tagged row per handle. Used by the runtime to seed the
+   *  agent's system prompt with "Known media handles: …" so the agent
+   *  knows what `@`-vocabulary it can reuse before deciding to invent
+   *  a new tag. Cheap enough to run on session start (single full-table
+   *  scan; same cost as `list()`). */
+  async listMentions() {
+    const table = await this._ensureTable();
+    let rows;
+    try {
+      rows = await table.query().limit(10000).toArray();
+    } catch {
+      return [];
+    }
+    const byMention = new Map();
+    for (const r of rows) {
+      try {
+        const meta = r.metadata_json ? JSON.parse(r.metadata_json) : {};
+        const m = typeof meta.mention === 'string' ? meta.mention.trim() : '';
+        if (!m) continue;
+        const existing = byMention.get(m);
+        if (!existing || (r.created_at || '') > (existing.row.created_at || '')) {
+          byMention.set(m, { row: r, count: (existing?.count || 0) + 1 });
+        } else {
+          existing.count += 1;
+        }
+      } catch { /* malformed metadata — skip */ }
+    }
+    return Array.from(byMention.entries())
+      .map(([mention, { row, count }]) => ({
+        mention,
+        count,
+        mediaType: row.media_type,
+        filePath: row.file_path,
+        createdAt: row.created_at,
+        id: row.id,
+      }))
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  }
+
+  /** Index a file that lives wherever the caller put it — no copy, no
+   *  move. The cajón is agnostic of storage: every row is just a path
+   *  pointer plus metadata, so this is the canonical entry point for
+   *  cataloguing in-cwd artefacts (scripts, prompts, drafts) without
+   *  duplicating bytes.
+   *
+   *  Idempotent: on content-hash hit returns the existing row (same
+   *  semantics as `save()`), so re-registering a file the agent already
+   *  catalogued just hands back the original id — useful for "tag, then
+   *  if not tagged yet, tag" flows in `tag_media`.
+   *
+   *  Returns `{ id, isNew, mediaType, item }` where `item` is the
+   *  deserialised row. */
+  async registerInPlace(filePath, opts = {}) {
+    if (!filePath || typeof filePath !== 'string') {
+      throw new Error('registerInPlace: filePath required');
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`registerInPlace: file not found: ${filePath}`);
+    }
+    const resolvedPath = path.resolve(filePath);
+    const detectedType = detectMediaType(resolvedPath);
+    const mediaType = opts.mediaType || detectedType;
+
+    let metadata = { ...(opts.metadata || {}) };
+    if (mediaType === 'document') {
+      // Document-specific fields the drawer uses for tile rendering.
+      // byteSize lives in metadata (not a column) so we don't need a
+      // schema migration; the drawer reads it for "12 KB · markdown"
+      // captions.
+      try {
+        const stat = fs.statSync(resolvedPath);
+        metadata.byteSize = stat.size;
+      } catch { /* stat failed — drop the hint */ }
+      metadata.documentSubtype = opts.documentSubtype || detectDocumentSubtype(resolvedPath);
+      // Source flag distinguishes "the agent generated this" from "the
+      // user dragged it in" — useful later if we want to GC orphan rows
+      // pointing at deleted cwd files.
+      metadata.source = metadata.source || opts.source || 'cwd';
+      // Cheap text excerpt (first ~10 lines, max 1KB) so the drawer can
+      // show a preview without re-reading the file each render. Skip
+      // for binary-ish documents (we already filtered to readable
+      // extensions, but stay defensive on size).
+      if (typeof opts.summary === 'string' && opts.summary.trim()) {
+        metadata.summary = opts.summary.trim().slice(0, 500);
+      }
+      if (!metadata.excerpt) {
+        try {
+          const stat = fs.statSync(resolvedPath);
+          if (stat.size > 0 && stat.size < 5_000_000) {
+            const buf = fs.readFileSync(resolvedPath);
+            // Detect rough binary-ness: if the first 4KB has many NUL
+            // bytes assume binary and skip the excerpt.
+            const probe = buf.subarray(0, Math.min(4096, buf.length));
+            let nulCount = 0;
+            for (let i = 0; i < probe.length; i++) if (probe[i] === 0) nulCount++;
+            if (nulCount * 100 < probe.length) {
+              const text = buf.toString('utf8');
+              const lines = text.split(/\r?\n/).slice(0, 10).join('\n');
+              metadata.excerpt = lines.slice(0, 1000);
+            }
+          }
+        } catch { /* read failed — drop the hint */ }
+      }
+    }
+    if (opts.mention) metadata.mention = opts.mention;
+
+    const description = opts.description || metadata.summary || metadata.excerpt || '';
+    const result = await this.save({
+      filePath: resolvedPath,
+      mediaType,
+      metadata,
+      categories: opts.categories,
+      description,
+      favorite: !!opts.favorite,
+    });
+    const item = await this.get(result.id);
+    return { id: result.id, isNew: result.isNew, mediaType, item };
   }
 
   /** Toggle the "hidden from Latest creations" flag on a row. The row

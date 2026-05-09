@@ -413,14 +413,15 @@ export function classifyFeedback(action, result, error) {
       };
     }
 
-    case 'learn_fact': {
-      const key = action.key || result?.key || '';
-      const value = action.value || result?.value || '';
-      const perm = `Fact: ${key} = ${value}`;
-      // Facts are already stored in session-knowledge (the shared, persistent store).
-      // Duplicating them in context-memory long-term is redundant and the main source
-      // of memory bloat (441+ permanent entries). Keep in short/medium for immediate
-      // visibility, then let them age to latent like everything else.
+    case 'add_memory': {
+      const title = action.title || result?.title || '';
+      const description = action.description || result?.description || '';
+      const noteType = action.type ? `[${action.type}] ` : '';
+      const perm = `Note: ${noteType}${title}${description ? ` — ${description}` : ''}`;
+      // Notes are already persisted in the project vault and surface
+      // automatically through the Context Compiler on the next turn.
+      // Duplicating in long-term memory is redundant; short-term only,
+      // then let it age to latent.
       return {
         immediate, shortTerm: perm, permanent: null,
         ...getTTL(intent),

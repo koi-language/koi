@@ -9,7 +9,7 @@ import { fireReaction } from './reactions.js';
 import { MessageInbox } from './message-inbox.js';
 import { createPhaseAccessor } from './phase-accessor.js';
 
-import { initSessionTracker, sessionTracker } from '../state/session-tracker.js';
+import { initSessionTracker, sessionTracker, setConversationIndexProvider } from '../state/session-tracker.js';
 import { ContextMemory, classifyFeedback } from '../state/context-memory.js';
 import { channel } from '../io/channel.js';
 
@@ -1027,6 +1027,30 @@ export class Agent {
   }
 
   async handle(eventName, args, _fromDelegation = false, _parentAnswerFn = null) {
+    // Stash a "what is this turn ABOUT?" hint so the Context Compiler
+    // (system-prompt-builder._runContextCompiler) can use it as the
+    // semantic query for RMH retrieval. Workers/Planners never have a
+    // `_lastUserMessage` (they don't talk to the user directly); their
+    // task brief is the next best thing. Falls back through:
+    //   args.description / args.subject / args.task / args.instruction /
+    //   args.intent / args.title — covers every shape delegates send
+    //   each other in the codebase. Plain strings (some legacy paths)
+    //   pass through too.
+    if (args != null) {
+      let txt = '';
+      if (typeof args === 'string') txt = args;
+      else if (typeof args === 'object') {
+        txt = args.description
+          || args.subject
+          || (typeof args.task === 'string' ? args.task : args.task?.description)
+          || args.instruction
+          || args.intent
+          || args.title
+          || '';
+      }
+      if (txt) this._currentTaskText = String(txt).slice(0, 800);
+    }
+
     // Bootstrap CLI layer (e.g. Ink) early — before any stdout writes.
     // When KOI_CLI_MODE is set, dynamically import the bootstrap module
     // which sets up providers on cliLogger, cliInput, cliSelect, and Agent.
@@ -1249,6 +1273,13 @@ export class Agent {
     // Initialize LLM provider if not already done
     if (!this.llmProvider) {
       this.llmProvider = new LLMProvider(this.llm);
+      // Register the provider so the conversations index pipeline
+      // (state/conversations.js, fed by session-tracker.saveConversation)
+      // can call simpleChat + getEmbedding without having to mint its
+      // own provider. setter is no-op once a provider is bound — we
+      // never want a delegate's secondary provider to override the
+      // root agent's.
+      setConversationIndexProvider(this.llmProvider);
     }
 
     // Prepare context with args and state
@@ -2785,7 +2816,7 @@ export class Agent {
             // Fire-and-forget: harvest durable artifacts (URLs visited,
             // files touched) from this delegate's session into the
             // shared session-knowledge store so sibling / follow-up
-            // tasks can recall_facts them instead of re-running the
+            // tasks can recall_memory them instead of re-running the
             // same web searches. Kept off the return path — any
             // failure is swallowed by the harvester and logged.
             import('./delegate-artifact-harvester.js')
@@ -3967,11 +3998,10 @@ export class Agent {
       }
 
       const commitResult = sessionTracker.commitChanges(summary);
-
-      // Fire-and-forget: embed the commit summary for semantic search
-      if (commitResult.success && commitResult.hash) {
-        this._embedCommitSummary(commitResult.hash, summary).catch(() => {});
-      }
+      // Note: legacy commit-embedding pipeline removed — RMH retrieval
+      // via the Context Compiler covers cross-session recall now, and
+      // the conversations index covers session-summary recall.
+      void commitResult;
       sessionTracker.lastCommitSummary = summary;
       return summary;
     } catch {
@@ -3994,23 +4024,6 @@ export class Agent {
       backgroundTaskManager.startSemanticIndexing(projectDir, this.llmProvider);
     } catch (err) {
       channel.log('background', `Indexing start failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * Embed a commit summary and save it for later semantic search.
-   * @private
-   */
-  async _embedCommitSummary(hash, summary) {
-    if (!this.llmProvider || !sessionTracker) return;
-    try {
-      const embedding = await this.llmProvider.getEmbedding(summary);
-      if (embedding) {
-        sessionTracker.saveCommitEmbedding(hash, summary, embedding);
-        channel.log('session', `Embedded commit [${hash}]: ${summary}`);
-      }
-    } catch (err) {
-      channel.log('session', `Embed commit failed: ${err.message}`);
     }
   }
 
@@ -5763,8 +5776,15 @@ Remember: null is the default and correct answer in ambiguous cases. A false pos
    * Execute action directly with LLM
    */
   async executeDirectly(action, context) {
-    // Check if this is a registered action with an executor
-    const actionDef = actionRegistry.get(action.type);
+    // Check if this is a registered action with an executor.
+    // The LLM almost always emits `{actionType:"direct", intent:"<name>"}`
+    // and never sets `type` explicitly — looking up by `type` alone meant
+    // every well-formed direct action fell through to the LLM-execute
+    // hallucination fallback. Try `intent` first (the index the registry
+    // also keeps), then `type` as a last resort.
+    const actionDef =
+      actionRegistry.get(action.intent) ||
+      actionRegistry.get(action.type);
 
     if (actionDef && actionDef.execute) {
       // Use the registered executor

@@ -440,7 +440,7 @@ const outpaintImageAction = {
       channel.log('image', `outpaint_image: original composite step failed: ${err.message}`);
     }
 
-    // Record provenance so `recall_facts` knows where each pixel came from.
+    // Record provenance so `recall_memory` knows where each pixel came from.
     try {
       const { recordImageOp } = await import('../../state/image-lineage.js');
       for (const img of result.images || []) {

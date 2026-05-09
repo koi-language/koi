@@ -111,7 +111,7 @@ const generateImageAction = {
   // ratios, resolutions, labels, max n, ref image support) pulled from the
   // /gateway/models/image.json catalog. Do NOT add specific values here —
   // they would become stale the moment the catalog changes.
-  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (accepts a plain path array OR objects with {alias, path} for named refs you can mention in the prompt), optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
+  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (accepts a plain path array OR objects with {alias, path}; entries that start with `@` resolve as cross-project mention handles via MediaLibrary — e.g. `referenceImages: ["@tom"]` reuses whatever was last tagged `@tom` via tag_media — and the chat input bar already expands `@`-handles the user types into attachments), optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -124,7 +124,7 @@ const generateImageAction = {
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
       referenceImages: {
         type: 'array',
-        description: 'Reference images. Each item is either a string (file path or attachment ID like "att-1") OR an object { alias, path } where `alias` is a short descriptive name you can mention in the prompt. Prefer objects with aliases when you have multiple refs — it lets you say "the boat" or "the style_reference" instead of "the FIRST reference" / "the SECOND reference". Use short, semantic aliases ("boat", "style", "placement_guide"), never generic ones ("ref1", "image1").',
+        description: 'Reference images. Each item is either a string (file path, attachment ID like "att-1", or a `@mention` handle like "@tom" resolved via MediaLibrary against whatever tag_media last pinned to that handle — most-recent-first when multiple match) OR an object { alias, path } where `alias` is a short descriptive name you can mention in the prompt. Prefer objects with aliases when you have multiple refs — it lets you say "the boat" or "the style_reference" instead of "the FIRST reference" / "the SECOND reference". Use short, semantic aliases ("boat", "style", "placement_guide"), never generic ones ("ref1", "image1"). When you pass `@name` without an alias, the alias defaults to the bare handle (`tom`).',
         items: {
           oneOf: [
             { type: 'string' },
@@ -665,7 +665,7 @@ const generateImageAction = {
     }
 
     // Record provenance so the coordinator can see what has already been
-    // applied to each output file via recall_facts. For generate_image a
+    // applied to each output file via recall_memory. For generate_image a
     // non-empty referenceImages[] treats the first reference as the
     // lineage source (best approximation of "derived from"); plain text-
     // to-image calls get no source and start a fresh chain.

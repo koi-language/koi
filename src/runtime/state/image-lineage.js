@@ -5,7 +5,7 @@
  * background_removal, upscale_image, …) it calls `recordImageOp(...)`.
  * The resulting note enters the project memory vault tagged with
  * `image-lineage`, so the System agent can see — via memory.list or
- * recall_facts — what operations have already been applied to the file
+ * recall_memory — what operations have already been applied to the file
  * currently in the user's working area.
  *
  * Why: after a mid-pipeline failure (e.g. a ProviderBlockedError) System

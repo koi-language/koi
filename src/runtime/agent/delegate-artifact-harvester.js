@@ -13,7 +13,7 @@
  * terminated the runtime calls `harvestAndPersist(agent, session)` —
  * fire-and-forget — which walks the action history, extracts the
  * artifacts, and writes one compact memory note per source / file in
- * the project vault. Future memory.retrieve() / recall_facts calls can
+ * the project vault. Future memory.retrieve() / recall_memory calls can
  * then surface those trails to any sibling or follow-up task without a
  * single extra LLM token being spent rediscovering them.
  *

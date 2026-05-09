@@ -42,7 +42,18 @@ const DEFAULT_BUDGET_TOKENS = 60_000;
  */
 export async function compile(opts) {
   if (!opts || !opts.agent) throw new Error('compile: agent required');
-  if (!opts.agentsRoot) throw new Error('compile: agentsRoot required');
+  // Three ways to get the slot map, in priority order:
+  //   1. Explicit override passed by the caller (system-prompt-builder
+  //      hands one in so the resolver doesn't re-load on every turn).
+  //   2. Built-in registry (System / Worker / Planner).
+  //   3. On-disk lookup (custom agents shipping their own slots.yaml).
+  // agentsRoot is only required for case 3.
+  if (!opts.slotMapOverride) {
+    const { getBuiltinSlotMap } = await import('./builtin-slot-maps.js');
+    if (!getBuiltinSlotMap(opts.agent) && !opts.agentsRoot) {
+      throw new Error('compile: agentsRoot required for non-builtin agents');
+    }
+  }
 
   const ctx = {
     agent: opts.agent,
@@ -56,8 +67,9 @@ export async function compile(opts) {
 
   const budgetTokens = opts.budgetTokens ?? DEFAULT_BUDGET_TOKENS;
 
-  // 1. Load slot map
-  const slotMap = await loadSlotMap(opts.agent, opts.agentsRoot);
+  // 1. Load slot map (or use the override the caller already resolved)
+  const slotMap = opts.slotMapOverride
+    || await loadSlotMap(opts.agent, opts.agentsRoot);
 
   // 2. Resolve slots in parallel where possible (each slot's source is independent)
   const resolved = await resolveSlots(slotMap, ctx);
@@ -67,17 +79,22 @@ export async function compile(opts) {
 
   // 4. Load template and render
   const tmplName = slotMap.template ?? 'template.md';
-  const tmplPath = path.join(opts.agentsRoot, opts.agent, tmplName);
+  // Skip the disk read entirely when there's no agentsRoot (slot map
+  // came from a builtin/override and was never associated with a
+  // template file). Falls straight to the generic render below.
   let template;
-  try {
-    template = await fs.readFile(tmplPath, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      // Fallback: render slots in declared order with a heading per slot.
-      template = budgeted.map((s) => `## ${s.id}\n{{${s.id}}}`).join('\n\n');
-    } else {
-      throw err;
+  if (opts.agentsRoot && tmplName) {
+    const tmplPath = path.join(opts.agentsRoot, opts.agent, tmplName);
+    try {
+      template = await fs.readFile(tmplPath, 'utf8');
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      template = null;
     }
+  }
+  if (!template) {
+    // Fallback: render slots in declared order with a heading per slot.
+    template = budgeted.map((s) => `## ${s.id}\n{{${s.id}}}`).join('\n\n');
   }
   const slotMap2 = Object.fromEntries(budgeted.map((s) => [s.id, s.included]));
   const system = render(template, slotMap2);

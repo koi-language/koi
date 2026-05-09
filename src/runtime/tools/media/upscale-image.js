@@ -263,7 +263,7 @@ const upscaleImageAction = {
       channel.log('image', `Media library save failed (non-fatal): ${mlErr.message}`);
     }
 
-    // Record provenance for the coordinator's recall_facts view.
+    // Record provenance for the coordinator's recall_memory view.
     try {
       const { recordImageOp } = await import('../../state/image-lineage.js');
       for (const img of saved) {

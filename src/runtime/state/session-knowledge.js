@@ -3,8 +3,8 @@
  *
  * The ephemeral in-memory fact store was replaced by the persistent Ori vault
  * (see `src/runtime/memory/`). All real reads/writes now go through
- * `memory.write()` / `memory.list()`. The `learn_fact` and `recall_facts`
- * tool actions already route to the new system.
+ * `memory.write()` / `memory.list()`. The `add_memory` and `recall_memory`
+ * tool actions are the only legitimate entry points.
  *
  * This file remains only so existing imports compile. Every method on the
  * exported singletons is a no-op or returns sensible empty values.

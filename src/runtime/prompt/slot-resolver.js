@@ -17,6 +17,8 @@ import * as memorySrc from './sources/memory.js';
 import * as eventLogSrc from './sources/event-log.js';
 import * as fileSrc from './sources/file.js';
 import * as runtimeSrc from './sources/runtime.js';
+import * as conversationsSrc from './sources/conversations.js';
+import { getBuiltinSlotMap } from './builtin-slot-maps.js';
 
 const SOURCES = {
   static: staticSrc,
@@ -25,6 +27,7 @@ const SOURCES = {
   event_log: eventLogSrc,
   file: fileSrc,
   runtime: runtimeSrc,
+  conversations: conversationsSrc,
 };
 
 const _slotMapCache = new Map(); // agent name → parsed slot map
@@ -37,6 +40,16 @@ const _slotMapCache = new Map(); // agent name → parsed slot map
  * @param {string} agentsRoot   Absolute path to the agents directory.
  */
 export async function loadSlotMap(agentName, agentsRoot) {
+  // Built-in maps win over disk: the core agents (System / Worker /
+  // Planner) ship their slot maps inside the bundle as static JS so
+  // they survive the pkg binary build (no FS-relative YAML lookup
+  // there). Project-defined agents continue to live on disk.
+  const builtin = getBuiltinSlotMap(agentName);
+  if (builtin) return builtin;
+
+  if (!agentsRoot) {
+    throw new Error(`No slot map for agent "${agentName}": agentsRoot not provided and no built-in entry`);
+  }
   const slotsPath = path.join(agentsRoot, agentName, 'slots.yaml');
   let stat;
   try { stat = await fs.stat(slotsPath); }

@@ -3,6 +3,10 @@ import path from 'path';
 
 import { actionRegistry } from '../agent/action-registry.js';
 import { getUserAgentsTeam } from '../agent/md-agent-loader.js';
+import { compile as compileContext } from '../prompt/compiler.js';
+import { getBuiltinSlotMap } from '../prompt/builtin-slot-maps.js';
+import { channel } from '../io/channel.js';
+import * as memory from '../memory/index.js';
 
 // =========================================================================
 // SYSTEM PROMPT BUILDER — standalone functions extracted from LLMProvider
@@ -945,6 +949,44 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
     }
   }
 
+  // ── Known media handles: cross-project `@mention` vocabulary ──
+  // Lists every distinct mention pinned via `tag_media` (or the GUI's
+  // right-click "Set @mention") so the agent knows up front what
+  // `@`-handles it can reuse — e.g. `referenceImages: ["@tom"]` —
+  // before deciding to invent a fresh one. Cheap (single full-table
+  // scan over the cajón). Lives in DYNAMIC because the catalog grows
+  // during a session; the cache rebuild is acceptable since the block
+  // only changes when the agent (or user) tags something new. Cap at
+  // 50 entries with a tail count so the prompt never explodes on a
+  // mature catalog.
+  let mentionVocabularyBlock = '';
+  try {
+    const { MediaLibrary } = await import('../state/media-library.js');
+    const lib = MediaLibrary.global();
+    if (lib) {
+      const all = await lib.listMentions();
+      if (Array.isArray(all) && all.length > 0) {
+        const limit = 50;
+        const shown = all.slice(0, limit);
+        const tail = all.length > limit ? `\n…and ${all.length - limit} more (use list_media or recall by partial mention to expand).` : '';
+        const lines = shown.map(m => {
+          const count = m.count > 1 ? ` ×${m.count}` : '';
+          const type = m.mediaType || 'unknown';
+          return `  • \`@${m.mention}\` — ${type}${count}`;
+        });
+        mentionVocabularyBlock = `\n# KNOWN MEDIA HANDLES\nMention handles already pinned in the cross-project library. Refer to any of these in \`referenceImages\` / \`referenceVideos\` / \`startFrame\` / \`endFrame\` etc. as \`"@name"\` — the runtime resolves to the most-recent file tagged with that handle. Tag new assets with \`tag_media\` to grow this vocabulary.\n\n${lines.join('\n')}${tail}\n`;
+      }
+    }
+  } catch (err) {
+    try {
+      const { channel: _ch } = await import('../io/channel.js');
+      _ch.log('prompt', `[mention-vocab] ERROR building block — block omitted: ${err?.stack || err?.message || err}`);
+    } catch {
+      // eslint-disable-next-line no-console
+      console.error('[prompt] [mention-vocab] ERROR building block — block omitted:', err);
+    }
+  }
+
   // Expanded tool schemas: full docs for every tool the agent has
   // already requested via `get_tool_info` this session. Lives in the
   // DYNAMIC section (not static) — the static prefix must stay stable
@@ -966,7 +1008,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
-${openDocumentsBlock}${nonInteractiveBlock}${expandedToolsBlock}
+${openDocumentsBlock}${mentionVocabularyBlock}${nonInteractiveBlock}${expandedToolsBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 
   return { static: staticPart, dynamic, koiMd };
@@ -1299,23 +1341,43 @@ export function buildExpandedResourceSection(resources, agent) {
  */
 export async function buildReactiveSystemPrompt(agent, playbook = null) {
   const { static: staticBase, dynamic, koiMd: projectSpec } = await buildSystemPrompt(agent);
-  // Layout:
-  //   1. BRAXIL.md / CLAUDE.md (project specification — MUST be first, always)
-  //   2. Agent playbook (agent's own instructions — what matters most)
-  //   3. Dynamic runtime context (timestamp, phase, task state)
-  //   4. Static generic rules (output contract, golden rule, action model, tools)
+  // Layout (optimized for prompt caching — STABLE prefix first, volatile suffix last):
+  //   1. BRAXIL.md / CLAUDE.md   (stable, project-level)
+  //   2. Agent playbook          (stable, agent-level)
+  //   3. Static generic rules    (stable, framework-level — output contract, tools, etc.)
+  //   4. RECALLED CONTEXT (RMH)  (changes when user message changes)
+  //   5. Dynamic runtime context (changes every turn — timestamp, phase, task state)
+  //
+  // Putting the volatile bits at the END is the cache-friendly order:
+  // most providers do byte-prefix caching (OpenAI, DeepSeek) and any
+  // mutation in earlier bytes invalidates everything after. Anthropic's
+  // explicit cache_control is honored separately by the structured
+  // path below.
 
-  // Structured cache-aware playbook from compiler taint analysis
+  // RMH retrieval — Recursive Memory Harness via the Context Compiler.
+  // Runs the agent's slot map (memory.retrieve over the project vault +
+  // KNN over the conversations index) BEFORE every turn. Cached per
+  // (agent, project, session, last-user-message) for ~60s so a single
+  // user turn that loops 4-6× through the LLM only pays the retrieval
+  // cost ONCE.
+  const retrieved = await _runContextCompiler(agent);
+
+  // Structured cache-aware playbook (Anthropic cache_control path).
+  // Static block carries the stable prefix; dynamic carries everything
+  // that changes per-turn. RECALLED CONTEXT is per-turn-volatile so it
+  // belongs in dynamic, NOT in static.
   if (typeof playbook === 'object' && playbook?._cacheKey !== undefined) {
     const _s = (v) => typeof v === 'string' ? v : (v == null ? '' : JSON.stringify(v));
     return {
       _cacheKey: playbook._cacheKey,
       static: [projectSpec, _s(playbook.static), staticBase].filter(Boolean).join('\n\n'),
-      dynamic: [_s(playbook.dynamic), dynamic].filter(Boolean).join('\n\n'),
+      dynamic: [_s(playbook.dynamic), retrieved, dynamic].filter(Boolean).join('\n\n'),
     };
   }
 
-  // Legacy: plain string playbook (or flatten object without _cacheKey)
+  // Legacy: plain string playbook (or flatten object without _cacheKey).
+  // Keep the SAME stable-first / volatile-last order as the structured
+  // path so byte-prefix caches still see a long stable prefix.
   let playbookStr = '';
   if (typeof playbook === 'string') {
     playbookStr = playbook.trim();
@@ -1327,9 +1389,202 @@ export async function buildReactiveSystemPrompt(agent, playbook = null) {
         : String(playbook);
   }
   const parts = [];
-  if (projectSpec) parts.push(projectSpec); // BRAXIL.md / CLAUDE.md — always first
-  if (playbookStr) parts.push(playbookStr);
-  parts.push(dynamic);
-  parts.push(staticBase);
+  if (projectSpec) parts.push(projectSpec); // BRAXIL.md / CLAUDE.md — stable
+  if (playbookStr) parts.push(playbookStr); // agent playbook — stable
+  parts.push(staticBase);                   // generic rules — most stable
+  if (retrieved) parts.push(retrieved);     // RECALLED CONTEXT — changes per user msg
+  parts.push(dynamic);                      // runtime state — changes per turn
   return parts.join('\n\n');
+}
+
+// ─── Context Compiler (RMH auto-retrieval) ───────────────────────────────
+
+/**
+ * Per-process LRU-ish cache for compile() output. Keyed by
+ *   `${agentName}|${projectRoot}|${sessionId}|${normalizedTask}`
+ * with a soft TTL. The killer use-case: a single user turn fans out
+ * into 4-6 LLM calls (initial → recall → exec → continue → …); the
+ * `lastUserMessage` doesn't change across those, so the same compile
+ * output is reused. Only when a NEW user message lands does the cache
+ * key change and we re-run RMH.
+ *
+ * Sized to bound memory in long-lived processes; stale entries are
+ * dropped on every read attempt.
+ */
+const _COMPILE_CACHE_TTL_MS = 60 * 1000;
+const _COMPILE_CACHE_MAX = 64;
+const _compileCache = new Map(); // key -> { value: string, expires: ms }
+
+function _compileCacheGet(key) {
+  const e = _compileCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expires) {
+    _compileCache.delete(key);
+    return null;
+  }
+  // LRU bump — re-insert to push to the back of the iteration order.
+  _compileCache.delete(key);
+  _compileCache.set(key, e);
+  return e.value;
+}
+
+function _compileCacheSet(key, value) {
+  if (_compileCache.size >= _COMPILE_CACHE_MAX) {
+    // Map iteration order is insertion order — drop the oldest.
+    const oldest = _compileCache.keys().next().value;
+    if (oldest !== undefined) _compileCache.delete(oldest);
+  }
+  _compileCache.set(key, { value, expires: Date.now() + _COMPILE_CACHE_TTL_MS });
+}
+
+/** Hand-tuned default slot map for agents WITHOUT a built-in entry
+ *  (custom md-loaded agents, project-defined planners, etc.). Same
+ *  shape as the System map but more conservative — no per-type
+ *  filters, just a generic relevant-notes pull plus previous-session
+ *  hint. Prevents the early-return that used to skip Context
+ *  Compiler entirely for non-builtin agents. */
+const _DEFAULT_SLOT_MAP = Object.freeze({
+  template: null,
+  slots: [
+    {
+      id: 'relevant_notes',
+      source: 'memory',
+      query: { semantic: '{{trigger.payload.task}}', limit: 6, scope: 'project' },
+      budget: 1800,
+    },
+    {
+      id: 'previous_sessions',
+      source: 'conversations',
+      query: { semantic: '{{trigger.payload.task}}', k: 3, projectScope: true },
+      budget: 800,
+    },
+  ],
+});
+
+/**
+ * Run the RMH Context Compiler for [agent]'s current turn. Returns a
+ * markdown block ready to splice into the system prompt, or '' when
+ * there's nothing relevant / the compiler isn't applicable.
+ *
+ * Failure mode is silent-with-log: a broken slot or missing vault
+ * never blocks the agent's turn — the prompt simply lands without
+ * the auto-retrieval block.
+ */
+async function _runContextCompiler(agent) {
+  if (!agent || !agent.name) return '';
+
+  const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+  const sessionId = process.env.KOI_SESSION_ID || agent.sessionId || null;
+
+  // Trigger payload that slot maps interpolate as `{{trigger.payload.task}}`.
+  // Order of fallbacks reflects "what is this turn ABOUT?":
+  //   1. agent._lastUserMessage  — the user just typed something (System path).
+  //   2. agent._currentTaskText  — set by delegates via _runContextCompiler
+  //                               from the parent task description (Worker /
+  //                               Planner path).
+  //   3. agent.displayName       — generic placeholder when nothing else
+  //                               applies (cold-start before first input).
+  const lastUser = agent._lastUserMessage
+    || agent._currentTaskText
+    || '';
+  const trigger = { payload: { task: lastUser } };
+
+  // ── Cache check ───────────────────────────────────────────────────
+  // Hash the trigger task into a compact key — content of the task
+  // string can be huge (a long delegate brief). The agent name +
+  // project + session pin the cache to the right scope (different
+  // sessions in the same project DO get different `previous_sessions`
+  // results because the slot filters out the current sessionId).
+  const cacheKey = `${agent.name}|${projectRoot}|${sessionId || ''}|${_djb2(lastUser)}`;
+  const cached = _compileCacheGet(cacheKey);
+  if (cached !== null) {
+    channel.log('memory', `Context Compiler: cache hit (${agent.name})`);
+    return cached;
+  }
+
+  // Lazy-init the memory subsystem if needed. Idempotent across
+  // turns; only the first call pays the cost. Skip gracefully when
+  // no embedding/llmProvider is wired yet — first turn of a fresh
+  // process can race with provider construction.
+  if (!memory.isInitialized()) {
+    try { await memory.ensureInit(agent); }
+    catch (err) {
+      channel.log('memory', `Context Compiler skipped (memory init failed): ${err.message}`);
+      _compileCacheSet(cacheKey, ''); // negative cache so we don't retry every turn
+      return '';
+    }
+  }
+
+  // Resolve the slot map: built-in first (System / Worker / Planner),
+  // then fall back to a default map so EVERY agent — including
+  // user-defined md-loaded ones — gets RMH auto-retrieval. The
+  // builtin-slot-maps module is the source of truth for tuned
+  // per-agent budgets; the default map is the safety net.
+  const slotMap = getBuiltinSlotMap(agent.name) || _DEFAULT_SLOT_MAP;
+
+  let compiled;
+  try {
+    compiled = await compileContext({
+      agent: agent.name,
+      agentObject: agent,
+      sessionId,
+      trigger,
+      projectRoot,
+      // agentsRoot only matters when the slot-resolver falls through to
+      // a disk lookup (no built-in entry); harmless to pass otherwise.
+      agentsRoot: process.env.KOI_AGENTS_ROOT || projectRoot,
+      // Inject the resolved slot map directly so the resolver doesn't
+      // have to re-load it (built-ins always hit memory; the default
+      // map is in-process). This also guarantees that compile() sees
+      // the default map even for agents the resolver doesn't know.
+      slotMapOverride: slotMap,
+    });
+  } catch (err) {
+    channel.log('memory', `Context Compiler failed: ${err.message}`);
+    _compileCacheSet(cacheKey, '');
+    return '';
+  }
+
+  // Drop empty slots (the resolver returns '' for misses). Render the
+  // remaining ones with their id as a heading so the LLM can tell
+  // sections apart.
+  const filledSlots = (compiled?.slots || []).filter(
+    (s) => s.included && String(s.included).trim().length > 0,
+  );
+  if (filledSlots.length === 0) {
+    _compileCacheSet(cacheKey, '');
+    return '';
+  }
+
+  const sections = filledSlots.map((s) => {
+    const title = _humanizeSlotId(s.id);
+    return `### ${title}\n${s.included.trim()}`;
+  });
+
+  // Lead with a short hint so the model treats the block as
+  // background context, not active instructions. The agent's
+  // playbook above already governs behaviour; this section is the
+  // "what do we already know" prelude.
+  const out = `## RECALLED CONTEXT (Recursive Memory Harness)\n\n${sections.join('\n\n')}`;
+  _compileCacheSet(cacheKey, out);
+  return out;
+}
+
+/** djb2 string hash — small, collision-rare for our scale (≤64 cache
+ *  entries), avoids pulling in crypto. Used purely as a cache-key
+ *  squashing function; never as a security primitive. */
+function _djb2(str) {
+  let h = 5381;
+  const s = String(str || '');
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
+function _humanizeSlotId(id) {
+  return String(id || '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim() || 'Section';
 }

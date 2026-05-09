@@ -6,6 +6,7 @@
 //   • absolute path:    "/Users/me/.koi/images/foo.png"
 //   • relative path:    "assets/refs/ref_image_2.png"
 //   • attachment id:    "att-1"  (resolved via attachmentRegistry)
+//   • mention handle:   "@tom"   (resolved via MediaLibrary.findByMention)
 //   • aliased object:   { alias: "boat", path: "att-1" }
 //
 // Every downstream call (provider upload, sharp decode, library save,
@@ -46,6 +47,31 @@ export async function absolutizeMediaRef(item) {
       const entry = attachmentRegistry.get(raw);
       if (entry?.path) return { alias, absPath: path.resolve(entry.path) };
     } catch { /* registry unavailable in some contexts — fall through */ }
+    return null;
+  }
+
+  // `@mention` handles — resolved against the cross-project MediaLibrary
+  // so the agent can write `referenceImages: ['@tom']` once it has tagged
+  // an asset (via `tag_media` or via the GUI right-click). Multiple rows
+  // with the same handle resolve to the most recent — same model the
+  // chat input bar's `@`-autocomplete uses, keeps user/agent intuition
+  // aligned. The leading `@` is the disambiguation prefix; we never use
+  // it as a fallback for raw filenames.
+  if (raw.startsWith('@') && raw.length > 1 && !raw.includes('/') && !raw.includes('\\')) {
+    try {
+      const { MediaLibrary } = await import('../../state/media-library.js');
+      const lib = MediaLibrary.global();
+      if (lib) {
+        const matches = await lib.findByMention(raw.slice(1));
+        if (matches.length > 0 && matches[0]?.filePath) {
+          // Use the mention itself as the alias when the caller didn't
+          // pass one — "@tom" → alias `tom` makes downstream prompt
+          // patches like "the `tom` reference" read naturally.
+          const fallbackAlias = alias || raw.slice(1);
+          return { alias: fallbackAlias, absPath: path.resolve(matches[0].filePath) };
+        }
+      }
+    } catch { /* MediaLibrary unavailable — fall through to null */ }
     return null;
   }
 

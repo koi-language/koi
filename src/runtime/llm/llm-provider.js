@@ -33,7 +33,7 @@ import { channel } from '../io/channel.js';
 import { formatDebugText, logRequest, logResponse, logDebug, logError } from './debug-logger.js';
 import { TaskClassifier } from './task-classifier.js';
 import { EmbeddingProvider } from './embedding-provider.js';
-import { parseReactiveResponse, normalizeReactiveAction, normalizeBatchItem, searchRelevantCommits } from './response-parser.js';
+import { parseReactiveResponse, normalizeReactiveAction, normalizeBatchItem } from './response-parser.js';
 import { buildReactiveSystemPrompt, buildSystemPrompt, loadKoiMd, buildSmartResourceSection } from './system-prompt-builder.js';
 import { executeCompose as _executeCompose, callJSONWithMessages as _callJSONWithMessages, inferProviderFromModel } from './compose-executor.js';
 import { StreamingPrintParser } from './streaming-print.js';
@@ -968,7 +968,9 @@ CRITICAL RULES:
         // Scan ALL new entries for prompt_user with attachments/images — not just the last one.
         // When the LLM returns a batch like [prompt_user, update_state], the last entry is
         // update_state but the images are on the prompt_user result.
-        let commitContext = '';
+        // (Legacy commit-search context injection removed — RMH retrieval
+        // via the Context Compiler is the canonical replacement and runs
+        // automatically during prompt build.)
         for (const entry of newEntries) {
           if (entry.error) continue;
           const _intent = entry.action.intent || entry.action.type;
@@ -977,7 +979,6 @@ CRITICAL RULES:
               ? entry.result.answer
               : (entry.result.answer?.text ?? '');
             if (_answerText) {
-              commitContext = await this._searchRelevantCommits(_answerText);
               await contextMemory.hydrate(_answerText);
             }
             // Capture attachments from the user prompt — they'll be passed
@@ -1026,7 +1027,7 @@ CRITICAL RULES:
           const _lastIntent = lastEntry.action?.intent || lastEntry.action?.type || '';
           const _terminalIntents = new Set(['prompt_user', 'print', 'return']);
           const _continueTag = _terminalIntents.has(_lastIntent) ? '' : '\nContinue.';
-          const immediate = `${classified.immediate}${_imgRef}${commitContext}${_continueTag}`;
+          const immediate = `${classified.immediate}${_imgRef}${_continueTag}`;
           const _shortWithImg = _imgShort
             ? `${classified.shortTerm || ''}${_imgShort}`
             : classified.shortTerm;
@@ -2285,7 +2286,6 @@ CRITICAL RULES:
   }
 
   // ── Response parsing (delegated to response-parser.js) ──────────────────
-  async _searchRelevantCommits(userText) { return searchRelevantCommits(userText, (t) => this.getEmbedding(t)); }
   async _parseReactiveResponse(responseText, agent = null) { return parseReactiveResponse(responseText, agent, (s, u, m) => this.callUtility(s, u, m)); }
   _normalizeBatchItem(item) { return normalizeBatchItem(item); }
   _normalizeReactiveAction(parsed) { return normalizeReactiveAction(parsed); }
