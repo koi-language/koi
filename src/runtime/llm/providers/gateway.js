@@ -1007,21 +1007,91 @@ export class GatewayAudioGen extends BaseAudioGen {
       );
     }
 
-    const res = await fetch(`${getGatewayBase()}/media/audio/sfx`, {
+    // Surface WHICH SFX model the router actually picked. The koi-cli
+    // log line above only shows the upstream alias `koi-gateway/auto`;
+    // the real model name (e.g. `fal-ai/mmaudio-v2`, `elevenlabs/sound-
+    // effects-2`, …) lives behind that and matters when the call
+    // fails with a 502/504 — different models have different proxy
+    // budgets and capabilities.
+    try {
+      console.log(
+        `[gateway/sfx] picked model: ${resolvedModel} ` +
+        `(videoRef=${usingVideoRef ? 'yes' : 'no'})`,
+      );
+    } catch (_) {}
+
+    // Build the request once and (if needed) re-issue without the
+    // videoUrl on a gateway-proxy timeout. Video-conditioned SFX
+    // (mmaudio-v2 on a multi-MB MP4) routinely exceeds the gateway
+    // proxy's ~100 s budget — observed as `502 Application failed to
+    // respond`. The proper fix is a submit+poll endpoint on the
+    // gateway (the image/video tools already use that pattern); until
+    // that lands, fall back to text-only SFX so the user still gets
+    // an audio file instead of a hard error.
+    //
+    // CRITICAL: always include `videoUrl` when the caller provided one,
+    // independent of `usingVideoRef`. The router's `usingVideoRef` flag
+    // only controls whether we ASK the catalog for a video-conditioned
+    // model — it does NOT mean "drop the video reference". Earlier we
+    // gated `videoUrl` on `usingVideoRef`, which silently stripped the
+    // field whenever the catalog couldn't surface a video-conditioned
+    // model (typical case: the row's `input_video` flag was stale,
+    // catch-block fell back to text-only routing). The fallback then
+    // landed on `controlfoley:audio` anyway — a model whose adapter
+    // requires `video_url` — and the request hit fal without the field
+    // it needed → 422 / 502. Letting the gateway-side adapter decide
+    // whether to use or ignore videoUrl is more robust: text-only
+    // adapters ignore unknown fields, video-aware adapters consume
+    // them. The video reference is ALWAYS valid information to forward
+    // when the user attached it.
+    const buildBody = (withVideo) => JSON.stringify({
+      model: resolvedModel,
+      prompt,
+      outputFormat: opts.outputFormat || 'mp3',
+      ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
+      ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
+      ...(typeof opts.loop === 'boolean' ? { loop: opts.loop } : {}),
+      ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+      // `withVideo` here means "the caller intends video-conditioning"
+      // (used to short-circuit the proxy-timeout fallback below). The
+      // actual videoUrl payload is gated on `opts.videoUrl` ONLY — if
+      // the caller uploaded a reference, forward it.
+      ...(opts.videoUrl ? { videoUrl: opts.videoUrl } : {}),
+    });
+
+    const postSfx = (withVideo) => fetch(`${getGatewayBase()}/media/audio/sfx`, {
       method: 'POST',
       headers: getAuthHeaders(),
-      body: JSON.stringify({
-        model: resolvedModel,
-        prompt,
-        outputFormat: opts.outputFormat || 'mp3',
-        ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
-        ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
-        ...(typeof opts.loop === 'boolean' ? { loop: opts.loop } : {}),
-        ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
-        ...(usingVideoRef ? { video_url: opts.videoUrl } : {}),
-      }),
+      body: buildBody(withVideo),
       signal: opts.abortSignal,
     });
+
+    // Diagnostic: log the body keys we're sending so we can pair this
+    // with the backend's `[sfx/route] body keys=…` log and see whether
+    // `videoUrl` survives the wire. Only the keys — not the values —
+    // since the videoUrl is a long fal-storage URL we don't want
+    // littering stdout.
+    try {
+      const dbgKeys = Object.keys(JSON.parse(buildBody(usingVideoRef)));
+      console.log(`[gateway/sfx] sending body keys=${JSON.stringify(dbgKeys)} usingVideoRef=${usingVideoRef}`);
+    } catch (_) {}
+    let res = await postSfx(usingVideoRef);
+    // 502 / 504 from the gateway with video-conditioning ON almost
+    // always means the proxy gave up waiting on mmaudio-v2 mid-job.
+    // Retry once without the video reference so the same call lands
+    // on a fast text-only SFX adapter (ElevenLabs / similar). The
+    // result loses the per-frame sync but is still on-prompt.
+    if (usingVideoRef && (res.status === 502 || res.status === 504)) {
+      console.warn(
+        `[gateway/sfx] gateway proxy timed out (HTTP ${res.status}) on a ` +
+        `video-conditioned SFX request — falling back to text-only SFX so ` +
+        `the agent still gets audio. Re-test once the gateway exposes a ` +
+        `submit+poll variant for /media/audio/sfx.`,
+      );
+      try { res.body?.cancel?.(); } catch (_) {}
+      usingVideoRef = false;
+      res = await postSfx(false);
+    }
 
     await throwIfQuotaExceeded(res);
     if (!res.ok) {

@@ -33,6 +33,7 @@ import {
   recoverFromPadded,
   pickEnvelopeResolution,
   targetDimsForResolutionAspect,
+  stripVideoEditList,
 } from './_pad-and-recover.js';
 import { spawn as _spawnForProbe } from 'child_process';
 import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
@@ -402,10 +403,19 @@ const generateVideoAction = {
           channel.log('pad', `resolver picked model: ${pickedModelSlug}`);
         }
         if (pickedCaps) {
+          // Defensive `.join`: malformed catalog rows have shipped
+          // these as strings instead of arrays (Veo3.1/extend-video
+          // observed: `aspectRatios: '16:9'`), which crashes the log
+          // line and short-circuits the rest of the peek flow. Wrap
+          // anything non-array in `[…]` so the log just shows the raw
+          // value verbatim instead of throwing.
+          const _fmtList = (v) =>
+            Array.isArray(v) ? v.join(', ') : (v == null ? '' : String(v));
           channel.log(
             'pad',
-            `picked-model caps: resolutions=[${(pickedCaps.resolutions || []).join(', ')}] `
-            + `aspectRatios=[${(pickedCaps.aspectRatios || []).join(', ')}]`,
+            `picked-model caps: resolutions=[${_fmtList(pickedCaps.resolutions)}] `
+            + `aspectRatios=[${_fmtList(pickedCaps.aspectRatios)}] `
+            + `durations=[${_fmtList(pickedCaps.durations)}]`,
           );
 
           // Pick the envelope + pad. ONLY uses the resolutions /
@@ -577,7 +587,54 @@ const generateVideoAction = {
       channel.log('video', `Provider ${resolved.provider}/${resolved.model} does not support audio generation — ignoring withAudio`);
     }
 
-    const globalDuration = action.duration || 5;
+    let globalDuration = action.duration || 5;
+    const requestedDurationSec = globalDuration;
+    // Duration clamp UP — same dance as spatial padding but on the
+    // time axis. When the agent asks for a duration BELOW the picked
+    // model's minimum supported length (e.g. clip is 5 s but the
+    // chosen model only emits 7 s outputs), bump the submission to
+    // the minimum the model accepts. Per user spec: "ampliaremos
+    // internamente a 7 segundos en la tool y devolveremos el clip
+    // completo". The output is returned in full — NOT trimmed back
+    // to the agent's request — so the caller (timeline / gallery)
+    // gets all the generated content and can decide what to do with
+    // the extra tail.
+    let durationClampedUp = false;
+    if (pickedCaps) {
+      // Catalog rows can ship `durations` as numbers, strings ("7s"),
+      // or — for legacy rows — a single string. Normalise to a sorted
+      // numeric list, then take the smallest as the model's minimum.
+      // Also honour an explicit `minDurationSec` if the row exposes it.
+      const _toNum = (v) => {
+        if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+        if (typeof v === 'string') {
+          const m = v.match(/^(\d+(?:\.\d+)?)/);
+          if (m) {
+            const parsed = parseFloat(m[1]);
+            if (Number.isFinite(parsed) && parsed > 0) return parsed;
+          }
+        }
+        return null;
+      };
+      let minSupported = null;
+      if (Number.isFinite(pickedCaps.minDurationSec) && pickedCaps.minDurationSec > 0) {
+        minSupported = pickedCaps.minDurationSec;
+      } else {
+        const raw = pickedCaps.durations;
+        const list = Array.isArray(raw) ? raw : (raw != null ? [raw] : []);
+        const nums = list.map(_toNum).filter((n) => n != null).sort((a, b) => a - b);
+        if (nums.length > 0) minSupported = nums[0];
+      }
+      if (minSupported != null && globalDuration < minSupported) {
+        channel.log(
+          'video',
+          `duration clamp: requested ${globalDuration}s < model minimum ${minSupported}s — `
+          + `submitting at ${minSupported}s; output returned in full (not trimmed back).`,
+        );
+        globalDuration = minSupported;
+        durationClampedUp = true;
+      }
+    }
     const globalAspect = action.aspectRatio || '16:9';
     const globalResolution = action.resolution || '720p';
     const globalQuality = action.quality || 'auto';
@@ -838,6 +895,23 @@ const generateVideoAction = {
           channel.log('video', `recoverFromPadded failed (keeping padded): ${err.message}`);
         }
       }
+      // Always strip the mov edit list from the final video. libx264
+      // (used by recovery AND by some providers' encoders) stamps an
+      // `edts/elst` atom that tells AVFoundation to skip the first
+      // 1-2 samples, so the AI clip plays 1-2 frames ahead of the
+      // linked source on the timeline — the user-reported "1/15s
+      // adelantado". Done as a separate re-mux pass (no re-encode)
+      // so this runs independently of whether recovery fired.
+      if (savedTo) {
+        try {
+          const stripped = await stripVideoEditList(savedTo);
+          if (stripped && stripped !== savedTo) {
+            savedTo = stripped;
+          }
+        } catch (err) {
+          channel.log('video', `stripVideoEditList failed (keeping with edts): ${err.message}`);
+        }
+      }
 
       // ── Hybrid chain (Case 3): edit → extend → concat ────────────
       // The GUI sets `extendAfterMs > 0` when the AI clip's range
@@ -924,6 +998,17 @@ const generateVideoAction = {
           });
           shotSavedTo = sr.path;
           shotSaveError = sr.error;
+          if (shotSavedTo) {
+            // Strip mov edit list — same fix as the primary path,
+            // applied to multishot outputs so they're frame-aligned
+            // when placed on the timeline.
+            try {
+              const stripped = await stripVideoEditList(shotSavedTo);
+              if (stripped && stripped !== shotSavedTo) shotSavedTo = stripped;
+            } catch (err) {
+              channel.log('video', `shot ${shot.index} stripVideoEditList failed: ${err.message}`);
+            }
+          }
           if (shotSavedTo && !action.suppressPresent && channel.canPresentResources?.()) {
             channel.presentResource({ type: 'video', path: shotSavedTo });
           }
@@ -968,6 +1053,17 @@ const generateVideoAction = {
       ...(savedTo ? { savedTo } : {}),
       ...(saveError ? { saveError } : {}),
       ...(savedShots ? { shots: savedShots } : {}),
+      // Surface duration clamping when it happened, so the caller
+      // (agent → user-facing report; or the timeline GUI later) can
+      // explain why the file is longer than what was asked. The full
+      // generated content is in `savedTo` — no trimming.
+      ...(durationClampedUp
+        ? {
+            requestedDurationSec,
+            generatedDurationSec: globalDuration,
+            durationClampedUp: true,
+          }
+        : {}),
       usage: final.usage,
     };
   }
@@ -1213,13 +1309,104 @@ async function _runHybridExtendChain({
       channel.log('video', `extend recoverFromPadded failed (keeping padded): ${err.message}`);
     }
   }
+  // Strip mov edit list (same fix as the main video flow — the extend
+  // output will be concatenated with the edit output, and the edit
+  // output is also strip-ed below; without this both halves would
+  // start ~67ms ahead of where they should be).
+  try {
+    const stripped = await stripVideoEditList(extendOutput);
+    if (stripped && stripped !== extendOutput) extendOutput = stripped;
+  } catch (err) {
+    channel.log('video', `extend stripVideoEditList failed: ${err.message}`);
+  }
 
-  // 6. Concatenate primary edit + extend.
+  // 6. Concatenate primary edit + extend — but ONLY when the extend
+  //    model returns a slice-only output. Modern extend endpoints
+  //    (fal-ai/veo3.1/extend-video, the only one we currently route
+  //    to) return the FULL concatenated video instead: `[source +
+  //    new 7s slice]`. Concatenating that with `primaryPath` again
+  //    duplicates the source at the start of the output AND makes
+  //    the seam land between "end of original" and "start of original"
+  //    (a wraparound), which the user noticed as "se pega el principio
+  //    del vídeo" + "no encaja el último fotograma con el primero
+  //    de la extensión".
+  //
+  //    Detect by probing durations: if the extend output is at least
+  //    as long as the primary, assume it already contains it and
+  //    return as-is. Otherwise fall back to the legacy concat path
+  //    (kept so a future slice-only adapter still works without code
+  //    changes here).
   reportProgress?.(0.99, 'Joining edit + extension…');
+  const primaryDurSec = await _probeVideoDurationSec(primaryPath);
+  const extendDurSec = await _probeVideoDurationSec(extendOutput);
+  if (
+    Number.isFinite(primaryDurSec) &&
+    Number.isFinite(extendDurSec) &&
+    extendDurSec >= primaryDurSec - 0.5
+  ) {
+    channel.log(
+      'video',
+      `extend output (${extendDurSec.toFixed(2)}s) ≥ primary (${primaryDurSec.toFixed(2)}s) → `
+      + 'model returned the full concatenated video; skipping our concat',
+    );
+    return extendOutput;
+  }
+  channel.log(
+    'video',
+    `extend output (${extendDurSec}s) < primary (${primaryDurSec}s) → `
+    + 'assuming slice-only; concatenating primary + extend',
+  );
   const outDir = path.dirname(primaryPath);
   const concatPath = await _concatVideoSegments([primaryPath, extendOutput], outDir);
   if (!concatPath) throw new Error('ffmpeg concat failed');
   return concatPath;
+}
+
+/** Probe the duration (in seconds, float) of a video file. Tries
+ *  ffprobe first, falls back to ffmpeg's stderr-summary `Duration:`
+ *  line. Returns NaN on failure so the caller can decide what to do. */
+async function _probeVideoDurationSec(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return NaN;
+  let bins = null;
+  try { bins = await _ensureFfmpegForProbe(); } catch { return NaN; }
+  if (!bins?.ffmpeg) return NaN;
+  if (bins.ffprobe) {
+    const dur = await new Promise((resolve) => {
+      const proc = _spawnForProbe(bins.ffprobe, [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'csv=p=0',
+        filePath,
+      ]);
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.stderr.on('data', () => {});
+      proc.on('close', () => {
+        const v = parseFloat(out.trim());
+        resolve(Number.isFinite(v) && v > 0 ? v : NaN);
+      });
+      proc.on('error', () => resolve(NaN));
+    });
+    if (Number.isFinite(dur)) return dur;
+  }
+  return await new Promise((resolve) => {
+    const proc = _spawnForProbe(bins.ffmpeg, [
+      '-hide_banner', '-i', filePath, '-f', 'null', '-frames:v', '1', '-',
+    ]);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.stdout.on('data', () => {});
+    proc.on('close', () => {
+      const m = err.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!m) return resolve(NaN);
+      const h = parseInt(m[1], 10);
+      const mi = parseInt(m[2], 10);
+      const s = parseFloat(m[3]);
+      const total = h * 3600 + mi * 60 + s;
+      resolve(Number.isFinite(total) && total > 0 ? total : NaN);
+    });
+    proc.on('error', () => resolve(NaN));
+  });
 }
 
 /**

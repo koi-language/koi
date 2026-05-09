@@ -581,6 +581,18 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
       '-preset', 'veryfast',
       '-crf', '18',
       '-pix_fmt', 'yuv420p',
+      // Frame-accurate seed MP4: no B-frames means each sample's
+      // DTS == PTS, so libx264 doesn't need an edit list to handle
+      // negative CTS offsets. Without `-bf 0`, the H.264 stream's
+      // first 1-2 PTS values are negative, libx264 stamps a 1-2
+      // frame `edts/elst` skip into the MP4, and any consumer that
+      // respects edit lists (AVFoundation, FFmpeg ≥ 4.0) starts
+      // playback 1-2 frames into the file. The model on fal then
+      // receives "input frame N+2" as its frame 0 — we observed
+      // exactly the "+2 frames adelantado" the user reports. The
+      // file-size hit (~10-20% larger seed) is irrelevant for a
+      // 5-10s clip uploaded to a model API.
+      '-bf', '0',
       // Explicit BT.709 SDR limited-range tags. The cropper already
       // tonemaps to BT.709 SDR, and `setparams` in the filter chain
       // stamps the frame metadata, so this just propagates to the
@@ -598,7 +610,10 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
       // Belt-and-braces: `setparams` filter + container `-color_*`
       // + bitstream `-x264-params`.
       '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv',
+      // Strip the mov edit list. With `-bf 0` above the bitstream
+      // has no negative CTS, so omitting the edts atom is safe.
       '-movflags', '+faststart',
+      '-movflags', '-use_edts',
     );
     if (geom.needsTemporalPad) {
       // Cap the output to the exact target duration. tpad would
@@ -890,5 +905,62 @@ export async function recoverFromPadded(filePath, geometry, kind) {
     `recovered ${path.basename(filePath)} → ${path.basename(out)} ` +
     `(${strategy} crop ${cropW}×${cropH} @ ${cropX},${cropY})`,
   );
+  return out;
+}
+
+/**
+ * Re-mux [filePath] with the mov edit list omitted. Returns the new
+ * file's path on success; null on failure (caller falls back to the
+ * unmodified [filePath]).
+ *
+ * Why this exists: libx264 + B-frames stamps an `edts/elst` atom on
+ * the output MP4 that tells consumers (AVFoundation, FFmpeg ≥ 4.0)
+ * to skip the first 1-2 samples — used to compensate for B-frame
+ * DTS-vs-PTS reordering. AVFoundation respects it and the AI clip
+ * ends up playing 1-2 frames ahead of the linked source on the
+ * timeline (the user-reported "1/15s adelantado").
+ *
+ * Implementation: `-c copy -movflags -use_edts` re-writes the moov
+ * atom WITHOUT the `edts/elst` skip, but keeps the H.264 bitstream
+ * (including B-frames) intact. The result is a frame-aligned file
+ * the player can read from sample 0 directly. Done as a separate
+ * pass (after recovery succeeds) so the recovery's filter graph
+ * stays untouched — adding the edit-list strip flags to the recovery
+ * ffmpeg call has been observed to fail silently on the bundled
+ * macOS build (recovery returns 0 bytes, the AI clip falls back to
+ * the padded model output and shows black bars).
+ *
+ * Fast (< 100 ms): no re-encode, just a moov rewrite.
+ *
+ * Returns:
+ *   - path to the stripped file on success
+ *   - null when input is missing / not a video / strip fails
+ *     (caller keeps the original path)
+ */
+export async function stripVideoEditList(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  if (!fs.existsSync(filePath)) return null;
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.mp4' && ext !== '.mov' && ext !== '.m4v') return null;
+  const bins = await _resolveFfmpeg();
+  if (!bins?.ffmpeg) return null;
+  const dir = path.dirname(filePath);
+  const stem = path.basename(filePath, path.extname(filePath));
+  const out = path.join(dir, `${stem}.noedts.mp4`);
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
+  const args = [
+    '-hide_banner', '-loglevel', 'error',
+    '-i', filePath,
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    '-movflags', '-use_edts',
+    '-y', out,
+  ];
+  const ok = await _runFfmpeg(bins, args);
+  if (!ok) {
+    channel.log('pad', `stripVideoEditList: re-mux failed — keeping original (${path.basename(filePath)})`);
+    return null;
+  }
+  channel.log('pad', `stripVideoEditList: ${path.basename(filePath)} → ${path.basename(out)} (no edts)`);
   return out;
 }
