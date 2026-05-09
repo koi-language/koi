@@ -2554,6 +2554,23 @@ export class Agent {
         const intent = action.intent || action.type || 'unknown';
         channel.log('action', `${this.name}: Executing ${intent}${action.id ? ' [' + action.id + ']' : ''}`);
 
+        // For delegate actions, log the FULL task spec the parent is
+        // handing over to the delegate — subject + complete description,
+        // never truncated. Useful when debugging "the delegate is doing
+        // the wrong thing": you can see EXACTLY what the parent told it
+        // to do (e.g. whether it forwarded user attachments, whether
+        // the description matches the user's actual ask, etc.).
+        if (action.actionType === 'delegate') {
+          const _taskSpec = action.data || action.task || {};
+          const _subj = _taskSpec.subject || _taskSpec.id || '(no subject)';
+          const _desc = typeof _taskSpec.description === 'string' ? _taskSpec.description : '(no description)';
+          channel.log(
+            'action',
+            `${this.name}: Delegating to ${intent} — subject="${_subj}"\n` +
+            `--- task description (full) ---\n${_desc}\n--- end task description ---`,
+          );
+        }
+
         if (process.env.KOI_DEBUG_LLM) {
           console.error(`[Agent:${this.name}] 🎯 Reactive step ${session.iteration + 1}: ${intent}`);
         }

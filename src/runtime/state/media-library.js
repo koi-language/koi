@@ -683,6 +683,41 @@ export class MediaLibrary {
     return this._writeCategories(id, next);
   }
 
+  /** Set (or clear) the user-defined `@mention` handle on a row. Stored
+   *  in `metadata_json` next to categories — same location pattern. The
+   *  GUI surfaces the field at the top level of the deserialised
+   *  GalleryItem, so callers don't have to peek into `metadata`.
+   *  Passing an empty / null mention clears the field; trims whitespace
+   *  and strips a leading `@` so the stored value is the bare handle.
+   *  Mentions are lowercase-normalised for matching consistency with
+   *  the GUI's `@` autocomplete (which lower-cases the prefix it
+   *  filters against). */
+  async setMention(id, mention) {
+    const table = await this._ensureTable();
+    try {
+      const escId = String(id).replace(/'/g, "''");
+      const rows = await table.query().where(`id = '${escId}'`).limit(1).toArray();
+      if (rows.length === 0) return false;
+      const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
+      let normalized = (mention == null ? '' : String(mention)).trim();
+      if (normalized.startsWith('@')) normalized = normalized.slice(1);
+      normalized = normalized.toLowerCase();
+      if (normalized.length === 0) {
+        delete meta.mention;
+      } else {
+        meta.mention = normalized;
+      }
+      await table.update({
+        values: { metadata_json: JSON.stringify(meta) },
+        where: `id = '${escId}'`,
+      });
+      return true;
+    } catch (e) {
+      process.stderr.write(`[MediaLibrary] setMention(${id}) failed: ${e.message}\n`);
+      return false;
+    }
+  }
+
   /** Toggle the "hidden from Latest creations" flag on a row. The row
    *  stays in the library (and in any user category it carries); the
    *  drawer's Latest tab filters these out client-side so removing an
@@ -837,6 +872,10 @@ export class MediaLibrary {
       // tile from Latest — the row still exists with its categories
       // intact, just hidden from the "everything" view.
       hiddenFromLatest: !!metadata.hidden_from_latest,
+      // User-defined `@mention` handle (e.g. `john` for an avatar the
+      // user wants to drop into prompts via @john autocomplete). Empty
+      // string when unset — same convention `description` uses.
+      mention: typeof metadata.mention === 'string' ? metadata.mention : '',
       sam2Masks: row.sam2_masks_json ? JSON.parse(row.sam2_masks_json) : null,
       // Embedding omitted from deserialization (large, not needed for display)
     };

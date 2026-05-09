@@ -641,6 +641,19 @@ const generateVideoAction = {
 
     const refFrame = action.startFrame || action.referenceImage || null;
     const refVideosCount = globalReferenceVideos?.length || 0;
+    const refImagesCount = Array.isArray(globalReferenceImages)
+      ? globalReferenceImages.length
+      : 0;
+    // What the AGENT actually passed in `action.referenceImages` —
+    // independent from `globalReferenceImages` (which may have been
+    // dropped by `_loadReferenceImages` if the picked model doesn't
+    // support reference images, or if the file was missing on disk).
+    // Surface both counts so the symptom "user attached image, log
+    // shows nothing" gets a clear cause: tool-level drop vs.
+    // agent-level drop.
+    const actionRefImagesCount = Array.isArray(action.referenceImages)
+      ? action.referenceImages.length
+      : 0;
     channel.log(
       'video',
       `generate_video: ${resolved.provider}/${resolved.model}, prompt="${prompt.substring(0, 150)}...", ` +
@@ -648,6 +661,9 @@ const generateVideoAction = {
       `quality=${globalQuality}` +
       (refFrame ? `, startFrame=${refFrame}` : '') +
       (refVideosCount ? `, refVideos=${refVideosCount}` : '') +
+      // Always print refImages — both the action's request and what
+      // actually reached the provider — so a silent drop is visible.
+      `, refImages=${refImagesCount}/${actionRefImagesCount}` +
       (globalCamera ? `, camera=${globalCamera}` : '') +
       (shots ? `, shots=${shots.length}(explicit)` : (numShots ? `, shots=${numShots}` : '')) +
       `, saveTo=${action.saveTo || 'default'}`,
@@ -786,6 +802,7 @@ const generateVideoAction = {
     // ── status === 'completed' from here ────────────────────────────
     let savedTo = null;
     let saveError = null;
+    let chainedExtend = false;
     if (final.url) {
       reportProgress?.(0.95, 'Downloading video…');
       const saveResult = await saveVideoFromUrl(final.url, {
@@ -811,10 +828,52 @@ const generateVideoAction = {
           channel.log('video', `recoverFromPadded failed (keeping padded): ${err.message}`);
         }
       }
+
+      // ── Hybrid chain (Case 3): edit → extend → concat ────────────
+      // The GUI sets `extendAfterMs > 0` when the AI clip's range
+      // overlaps the linked source's range AND extends past its end:
+      // we ran the EDIT just above, now extend that edit's output by
+      // `extendAfterMs` ms with the same prompt, then concatenate
+      // both into a single output. Only the concat lands in the
+      // gallery / presents to the GUI — the intermediate edit and
+      // extend files stay local.
+      const extendAfterMs = Number.isFinite(action.extendAfterMs)
+        ? Math.max(0, Math.floor(action.extendAfterMs))
+        : 0;
+      if (savedTo && extendAfterMs > 0) {
+        try {
+          reportProgress?.(0.97, 'Extending edited segment…');
+          const concatPath = await _runHybridExtendChain({
+            instance,
+            primaryPath: savedTo,
+            prompt,
+            extendAfterMs,
+            aspectRatio: globalAspect,
+            resolution: globalResolution,
+            quality: globalQuality,
+            action,
+            agent,
+            reportProgress,
+            resolved,
+          });
+          if (concatPath) {
+            channel.log('video', `Hybrid chain complete: edit + extend → ${path.basename(concatPath)}`);
+            savedTo = concatPath;
+            chainedExtend = true;
+          } else {
+            channel.log('video', `Hybrid chain returned no path; keeping primary edit only`);
+          }
+        } catch (err) {
+          channel.log('video', `Hybrid chain failed (returning primary edit only): ${err.message}`);
+        }
+      }
+
       // Skip the auto-present when the caller is staging the result for
       // a specific clip (the GUI's timeline tab handles the visual swap;
       // opening a separate work-area tab on top steals focus from the
-      // timeline the user is editing).
+      // timeline the user is editing). Run AFTER the optional hybrid
+      // chain so only the final concat (not the intermediate edit) is
+      // presented and saved to the gallery.
       if (savedTo && !action.suppressPresent && channel.canPresentResources?.()) {
         channel.presentResource({ type: 'video', path: savedTo });
       }
@@ -822,6 +881,10 @@ const generateVideoAction = {
         try {
           const params = { ...generationParams };
           if (final.model) params.model = final.model;
+          if (chainedExtend) {
+            params.extendAfterMs = extendAfterMs;
+            params.hybridChain = true;
+          }
           const { saveGeneratedVideo } = await import('../../state/media-library.js');
           await saveGeneratedVideo(savedTo, params, agent?.llmProvider || null);
           channel.log('video', `Saved to media library: ${savedTo}`);
@@ -985,6 +1048,223 @@ export async function _pollUntilTerminal(instance, submitted, { abortSignal, rep
 }
 
 // ── Internal helpers (hoisted so execute() reads top-down) ────────────
+
+/**
+ * Hybrid-extend chain (Case 3 in the GUI's video-op classification):
+ * runs after a successful EDIT generation. Takes the edit's output as
+ * a base and asks an extend-capable model to continue it for
+ * `extendAfterMs` ms with the SAME prompt. Concatenates the edit
+ * output with the extension into a single video and returns its path.
+ *
+ * Padding is applied to the base video for the extend model's input
+ * dimension constraints (mirrors what `execute()` does for the edit
+ * step). The extend output is recovered (un-padded) before concat.
+ *
+ * Returns null on any failure — the caller falls back to the primary
+ * edit output and surfaces a partial-success result.
+ */
+async function _runHybridExtendChain({
+  instance, primaryPath, prompt, extendAfterMs,
+  aspectRatio, resolution, quality, action, agent, reportProgress, resolved,
+}) {
+  if (!primaryPath || !fs.existsSync(primaryPath)) {
+    channel.log('video', `extend chain: primary path missing — ${primaryPath}`);
+    return null;
+  }
+
+  // 1. Peek the extend model's caps so we can pad the input correctly
+  //    (same dance as the primary edit — see execute()).
+  let extendCaps = null;
+  let extendAspect = aspectRatio;
+  let extendResolution = resolution;
+  if (typeof instance.peekResolvedModel === 'function') {
+    try {
+      const peek = await instance.peekResolvedModel({
+        aspectRatio,
+        resolution,
+        referenceVideos: [primaryPath],
+        kind: 'extend',
+        excludeModels: action.excludeModels,
+        includeModels: action.includeModels,
+        preferQuality: action.preferQuality !== false,
+      });
+      extendCaps = peek?.caps || null;
+      if (peek?.slug) channel.log('pad', `extend chain: resolver picked ${peek.slug}`);
+      if (extendCaps) {
+        channel.log(
+          'pad',
+          `extend chain caps: resolutions=[${(extendCaps.resolutions || []).join(', ')}] `
+          + `aspectRatios=[${(extendCaps.aspectRatios || []).join(', ')}]`,
+        );
+      }
+    } catch (err) {
+      channel.log('pad', `extend chain: peek failed (continuing without): ${err.message}`);
+    }
+  }
+
+  // 2. Build pad target dims + minDuration from the extend model's caps,
+  //    falling back to the primary's aspect/resolution when caps are empty.
+  let padTargetDims = null;
+  if (extendCaps) {
+    const refDims = await _probeRefDims(primaryPath);
+    if (refDims) {
+      const envelope = pickEnvelopeResolution({
+        contentWidth: refDims.width,
+        contentHeight: refDims.height,
+        resolutions: extendCaps.resolutions,
+        aspectRatios: extendCaps.aspectRatios,
+      });
+      if (envelope) {
+        padTargetDims = { w: envelope.w, h: envelope.h };
+        extendAspect = envelope.aspectRatio;
+        extendResolution = envelope.resolution;
+      }
+    }
+  }
+  if (!padTargetDims) {
+    const dims = targetDimsForResolutionAspect(extendResolution || '720p', extendAspect || '16:9');
+    if (dims) padTargetDims = dims;
+  }
+
+  const padOpts = padTargetDims ? { targetDims: padTargetDims } : {};
+  let minDurSec = null;
+  if (extendCaps) {
+    if (Number.isFinite(extendCaps.minInputDurationSec) && extendCaps.minInputDurationSec > 0) {
+      minDurSec = extendCaps.minInputDurationSec;
+    } else if (Array.isArray(extendCaps.durations) && extendCaps.durations.length > 0) {
+      minDurSec = extendCaps.durations[0];
+    } else if (extendCaps.videoToVideo || extendCaps.videoExtend) {
+      minDurSec = 3;
+    }
+  }
+  if (Number.isFinite(minDurSec) && minDurSec > 0) {
+    padOpts.minDurationMs = minDurSec * 1000;
+  }
+
+  // 3. Pad the primary as the extend model's seed.
+  const padResult = await padIfNeeded(primaryPath, 'video', padOpts);
+  const seedPath = padResult.paddedPath || primaryPath;
+  const seedRecoveryGeom = padResult.geometry?.needsPadding
+    ? { ...padResult.geometry, kind: 'video' }
+    : null;
+
+  // 4. Submit the extend job. Mirrors execute()'s instance.generate
+  //    call but pinned to `kind: 'extend'` so the router lands a
+  //    video-extend model (Veo3-extend, Kling motion-control, etc.).
+  reportProgress?.(0.975, 'Submitting extend job…');
+  const submitted = await instance.generate(prompt, {
+    duration: extendAfterMs / 1000,
+    aspectRatio: extendAspect,
+    resolution: extendResolution,
+    quality: quality || 'auto',
+    referenceVideos: [seedPath],
+    kind: 'extend',
+    excludeModels: Array.isArray(action.excludeModels) ? action.excludeModels : undefined,
+    includeModels: Array.isArray(action.includeModels) ? action.includeModels : undefined,
+    preferQuality: action.preferQuality !== false,
+  });
+
+  const final = await _pollUntilTerminal(instance, submitted, {
+    abortSignal: agent?.abortSignal,
+    reportProgress,
+    timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
+      ? action.timeoutMs
+      : DEFAULT_TIMEOUT_MS,
+    pollIntervalMs: typeof action.pollIntervalMs === 'number' && action.pollIntervalMs > 0
+      ? action.pollIntervalMs
+      : DEFAULT_POLL_INTERVAL_MS,
+  });
+
+  if (final.status !== 'completed' || !final.url) {
+    throw new Error(final.error || 'Extend pass did not complete');
+  }
+
+  // 5. Download the extend output to a temp path (no gallery — only
+  //    the final concat goes there). Recover any padding we applied.
+  const sr = await saveVideoFromUrl(final.url, {
+    saveTo: null, // → default tmp landing
+    provider: resolved.provider,
+    model: submitted.model || final.model,
+    id: `${final.id || submitted.id}-extend`,
+  });
+  let extendOutput = sr.path;
+  if (!extendOutput) throw new Error(sr.error || 'Failed to download extend output');
+  if (seedRecoveryGeom?.needsPadding) {
+    try {
+      const recovered = await recoverFromPadded(extendOutput, seedRecoveryGeom, 'video');
+      if (recovered && recovered !== extendOutput) extendOutput = recovered;
+    } catch (err) {
+      channel.log('video', `extend recoverFromPadded failed (keeping padded): ${err.message}`);
+    }
+  }
+
+  // 6. Concatenate primary edit + extend.
+  reportProgress?.(0.99, 'Joining edit + extension…');
+  const outDir = path.dirname(primaryPath);
+  const concatPath = await _concatVideoSegments([primaryPath, extendOutput], outDir);
+  if (!concatPath) throw new Error('ffmpeg concat failed');
+  return concatPath;
+}
+
+/**
+ * ffmpeg concat via the concat filter (re-encodes; safe across codecs).
+ * Drops audio — the AI clips we're chaining are visual-only by design
+ * and the model regenerates any soundscape on its own pass anyway.
+ *
+ * Returns the absolute path of the concatenated output, or null on
+ * failure. Output lives next to the inputs (under [outDir]).
+ */
+async function _concatVideoSegments(paths, outDir) {
+  if (!Array.isArray(paths) || paths.length < 2) return null;
+  let bins = null;
+  try {
+    bins = await _ensureFfmpegForProbe();
+  } catch (err) {
+    channel.log('video', `concat: ensureFfmpeg failed: ${err.message}`);
+    return null;
+  }
+  if (!bins?.ffmpeg) {
+    channel.log('video', 'concat: no ffmpeg binary available');
+    return null;
+  }
+  const outFile = path.join(outDir, `concat-${Date.now()}.mp4`);
+  const inputArgs = [];
+  for (const p of paths) {
+    inputArgs.push('-i', p);
+  }
+  // Build the filter graph: `[0:v][1:v]...[N-1:v]concat=n=N:v=1:a=0[outv]`
+  const filterParts = paths.map((_, i) => `[${i}:v]`).join('');
+  const filter = `${filterParts}concat=n=${paths.length}:v=1:a=0[outv]`;
+  const args = [
+    '-hide_banner', '-loglevel', 'error',
+    ...inputArgs,
+    '-filter_complex', filter,
+    '-map', '[outv]',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '18',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    '-y', outFile,
+  ];
+  return new Promise((resolve) => {
+    const proc = _spawnForProbe(bins.ffmpeg, args);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        channel.log('video', `concat exit=${code}: ${err.trim().slice(-300)}`);
+        resolve(null);
+      } else {
+        resolve(outFile);
+      }
+    });
+    proc.on('error', (e) => {
+      channel.log('video', `concat spawn failed: ${e.message}`);
+      resolve(null);
+    });
+  });
+}
 
 /** Load a single start/end frame image. Returns:
  *    - `{ data, mimeType }` when loaded successfully

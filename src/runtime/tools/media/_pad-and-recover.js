@@ -532,9 +532,22 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
   // default color=black). Combined with `-an` so we don't have to
   // worry about audio-stream apad / silent-pad mismatch — providers
   // doing video-to-video edits don't consume the audio anyway.
+  //
+  // `setparams` stamps explicit BT.709 SDR limited-range metadata on
+  // every frame as it leaves the filter graph. Without this the encoder
+  // can drop unspecified primaries/trc into the H.264 VUI even when we
+  // pass `-color_primaries`/`-color_trc` on the output side — observed
+  // on packaged ffmpeg builds where the recovered file came back
+  // tagged `color_space=bt709 color_range=tv` but `color_primaries=
+  // unknown color_transfer=unknown`. AVFoundation then falls back to
+  // a default decode that mismatches V1 (HDR-tonemapped natively),
+  // visible to the user as the AI clip looking lighter / washed.
   let vf = `pad=${geom.paddedW}:${geom.paddedH}:${geom.padX}:${geom.padY}:color=black`;
   if (kind === 'video' && geom.needsTemporalPad) {
     vf += `,tpad=stop_duration=${(tailPadMs / 1000).toFixed(3)}`;
+  }
+  if (kind === 'video') {
+    vf += ',setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
   }
   const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', vf];
   if (kind === 'video') {
@@ -551,6 +564,23 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
       '-preset', 'veryfast',
       '-crf', '18',
       '-pix_fmt', 'yuv420p',
+      // Explicit BT.709 SDR limited-range tags. The cropper already
+      // tonemaps to BT.709 SDR, and `setparams` in the filter chain
+      // stamps the frame metadata, so this just propagates to the
+      // output container's stream tags.
+      '-color_primaries', 'bt709',
+      '-color_trc', 'bt709',
+      '-colorspace', 'bt709',
+      '-color_range', 'tv',
+      // Force the H.264 bitstream's own VUI to declare the same
+      // tags. `-color_*` alone has been observed to write
+      // `color_space=bt709` + `color_range=tv` while leaving
+      // `color_primaries=unknown` / `color_transfer=unknown` in the
+      // muxed file (libx264 only emits VUI primaries/transfer when
+      // it sees them set explicitly via x264-params on some builds).
+      // Belt-and-braces: `setparams` filter + container `-color_*`
+      // + bitstream `-x264-params`.
+      '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv',
       '-movflags', '+faststart',
     );
     if (geom.needsTemporalPad) {
@@ -669,16 +699,30 @@ export async function recoverFromPadded(filePath, geometry, kind) {
   // cropdetect comes back with something that fails the aspect-ratio
   // sanity check (very dark scene → content not detectable as
   // "non-black", or detection found no padding at all).
-  let cropX = geometry.padX;
-  let cropY = geometry.padY;
-  let cropW = geometry.contentW;
-  let cropH = geometry.contentH;
-  let strategy = 'static';
-
   const outDims = await _probeDimensions(filePath);
   if (outDims) {
     channel.log('pad', `recoverFromPadded: ${path.basename(filePath)} model output is ${outDims.width}×${outDims.height} (input padded to ${geometry.paddedW}×${geometry.paddedH})`);
   }
+
+  // Compute the static crop in OUTPUT coordinate space. When the model
+  // preserved padded dims exactly, scale is 1:1 and this is identical
+  // to the raw geometry. When the model rescaled (e.g. Kling video edit
+  // 1280×720 → 1920×1080), this scales the crop rect so it lands on
+  // the actual content region — without it, the static fallback would
+  // sample 660×660 @ (310,30) on a 1920×1080 output and grab the wrong
+  // quadrant.
+  const scaleX = outDims ? outDims.width / geometry.paddedW : 1;
+  const scaleY = outDims ? outDims.height / geometry.paddedH : 1;
+  let cropX = Math.round(geometry.padX * scaleX);
+  let cropY = Math.round(geometry.padY * scaleY);
+  let cropW = Math.round(geometry.contentW * scaleX);
+  let cropH = Math.round(geometry.contentH * scaleY);
+  // Even-align for h264.
+  if (cropX % 2 !== 0) cropX -= 1;
+  if (cropY % 2 !== 0) cropY -= 1;
+  if (cropW % 2 !== 0) cropW -= 1;
+  if (cropH % 2 !== 0) cropH -= 1;
+  let strategy = (scaleX === 1 && scaleY === 1) ? 'static' : 'static-scaled';
 
   // If the model preserved the EXACT padded input dimensions, the
   // content is at the coordinates we drew — no need to run cropdetect
@@ -690,14 +734,42 @@ export async function recoverFromPadded(filePath, geometry, kind) {
       && outDims.width === geometry.paddedW
       && outDims.height === geometry.paddedH;
 
+  // Even when dims don't match exactly, the model often just RESIZES
+  // the padded input proportionally (same aspect, larger / smaller).
+  // The content's position in the output is then deterministic
+  // (padX × scale, padY × scale) and cropdetect would only INTRODUCE
+  // error: it sets a 9% luma threshold (limit=24/255), so faint edge
+  // bleed from the model's diffusion / encoding lands the bbox a few
+  // pixels off — the "black strip on the left" the user reported
+  // (e.g. padded input 1280×1050 → output 1588×1304: aspects 1.219
+  // vs 1.218, model just upscaled, but cropdetect put x=120 instead
+  // of the deterministic ~143). Use the static-scaled geometry
+  // whenever input/output aspects match within tolerance.
+  const inputAspect = geometry.paddedW > 0 && geometry.paddedH > 0
+      ? geometry.paddedW / geometry.paddedH
+      : null;
+  const outputAspect = outDims && outDims.width > 0 && outDims.height > 0
+      ? outDims.width / outDims.height
+      : null;
+  const aspectMatches = inputAspect != null && outputAspect != null
+      && Math.abs(outputAspect - inputAspect) / inputAspect < 0.02;
+
   if (dimsMatchExactly) {
     channel.log(
       'pad',
       `recoverFromPadded: output dims match padded input exactly — skipping cropdetect`,
     );
+  } else if (aspectMatches) {
+    channel.log(
+      'pad',
+      `recoverFromPadded: output aspect ${outputAspect.toFixed(3)} matches padded input ${inputAspect.toFixed(3)} `
+      + `(model upscaled proportionally) — skipping cropdetect, using static-scaled crop`,
+    );
   } else {
-    // Output dims differ from padded input → model rescaled / repositioned.
-    // cropdetect is the right tool for that scenario.
+    // Output dims differ AND aspect differs → model rescaled and
+    // repositioned. cropdetect is the right tool here (the
+    // deterministic geometry no longer applies); otherwise we keep
+    // the scaled static crop computed above.
     const detected = await _detectContentBbox(filePath);
     if (detected) {
       const expectedAspect = geometry.contentW / geometry.contentH;
@@ -712,27 +784,12 @@ export async function recoverFromPadded(filePath, geometry, kind) {
         cropW = detected.w;
         cropH = detected.h;
         strategy = 'cropdetect';
-      } else if (detectedFillsFrame && outDims) {
-        // Model didn't pad in its output (or content fills it) — fall
-        // through to static crop scaled to actual output dims.
-        const scaleX = outDims.width / geometry.paddedW;
-        const scaleY = outDims.height / geometry.paddedH;
-        cropX = Math.round(geometry.padX * scaleX);
-        cropY = Math.round(geometry.padY * scaleY);
-        cropW = Math.round(geometry.contentW * scaleX);
-        cropH = Math.round(geometry.contentH * scaleY);
-        // Even-align for h264.
-        if (cropX % 2 !== 0) cropX -= 1;
-        if (cropY % 2 !== 0) cropY -= 1;
-        if (cropW % 2 !== 0) cropW -= 1;
-        if (cropH % 2 !== 0) cropH -= 1;
-        strategy = 'static-scaled';
       } else {
         channel.log(
           'pad',
           `recoverFromPadded: cropdetect bbox ${detected.w}×${detected.h}@${detected.x},${detected.y} `
           + `aspect ${detectedAspect.toFixed(3)} differs from expected ${expectedAspect.toFixed(3)} `
-          + `(${(aspectDelta * 100).toFixed(0)}%) — falling back to static geometry`,
+          + `(${(aspectDelta * 100).toFixed(0)}%)${detectedFillsFrame ? ' (fills frame)' : ''} — falling back to ${strategy} geometry`,
         );
       }
     }
@@ -743,7 +800,17 @@ export async function recoverFromPadded(filePath, geometry, kind) {
     `recoverFromPadded: using ${strategy} crop ${cropW}×${cropH} @ ${cropX},${cropY}`,
   );
 
-  const cropFilter = `crop=${cropW}:${cropH}:${cropX}:${cropY}`;
+  // `setparams` stamps explicit BT.709 SDR limited-range metadata on
+  // every recovered frame BEFORE the encoder sees it. The model emits
+  // its output without color tags; passing `-color_*` only on the
+  // output side has been observed to write `color_space=bt709 +
+  // color_range=tv` while leaving `color_primaries=unknown` /
+  // `color_transfer=unknown` in the muxed file, which AVFoundation
+  // then decodes with a default that doesn't match V1 (HDR-tonemapped
+  // natively) — the user-reported "AI clip looks lighter / washed".
+  const cropFilter = kind === 'video'
+      ? `crop=${cropW}:${cropH}:${cropX}:${cropY},setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709`
+      : `crop=${cropW}:${cropH}:${cropX}:${cropY}`;
   const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', cropFilter];
   // Force the output to last EXACTLY as long as the input we sent the
   // model. Some video providers add a frame or two on the way out
@@ -766,6 +833,23 @@ export async function recoverFromPadded(filePath, geometry, kind) {
       '-preset', 'veryfast',
       '-crf', '18',
       '-pix_fmt', 'yuv420p',
+      // Same colorspace tags as the padding step. The cropper input
+      // is already BT.709 SDR limited-range; the model preserves
+      // pixel values but emits no metadata; we close the loop here
+      // so the final .unpadded.mp4 declares its colorspace and
+      // AVFoundation displays it consistently with the original
+      // (HDR-tonemapped) source pixels next to it on the timeline.
+      // Without these, AI clips read as visibly LIGHTER / washed-
+      // out compared to the unaltered V1 frames — the user-reported
+      // mismatch in skin tone and wall colour at the AI clip's edge.
+      '-color_primaries', 'bt709',
+      '-color_trc', 'bt709',
+      '-colorspace', 'bt709',
+      '-color_range', 'tv',
+      // Force the H.264 bitstream's own VUI to declare the same
+      // tags. Belt-and-braces with `setparams` + container `-color_*`
+      // — observed needed on the macOS ffmpeg builds we ship.
+      '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv',
       '-c:a', 'copy',
       '-movflags', '+faststart',
     );

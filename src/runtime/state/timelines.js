@@ -352,6 +352,26 @@ function _validateClip(c, settings) {
     'shadowColorArgb',
     'sourceWidthPx',
     'sourceHeightPx',
+    // AI placeholder canvas aspect — drives the rendered crop
+    // rectangle on the timeline player. Stripping these resets
+    // the AI clip's canvas after generation lands (user-visible
+    // bug: clip jumps from 1:1 back to 2:3 once the rendered
+    // file replaces the placeholder, and the fragment no longer
+    // fits its intended slot).
+    'aspectW',
+    'aspectH',
+    // Free-transform: position offset, scale, and feather. These
+    // are GUI-side per-clip overrides; the engine doesn't consume
+    // them but must round-trip them so the clip's framing is
+    // preserved across any tool that re-serialises the timeline.
+    'offsetX',
+    'offsetY',
+    'scale',
+    'featherPx',
+    'featherSides',
+    // Per-clip volume automation curve (audio clips). Same rule:
+    // engine doesn't read it, must not drop it.
+    'volumePoints',
   ];
   for (const key of _passthrough) {
     if (c[key] !== undefined && c[key] !== null) {

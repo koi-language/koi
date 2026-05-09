@@ -43,6 +43,19 @@ function _formatTimestamp(seconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(3).padStart(6, '0')}`;
 }
 
+/** Resolve the bundled ffprobe binary path. The pkg-built binary
+ *  doesn't ship ffprobe on the host's PATH; `ensureFfmpeg()` stages a
+ *  copy at `~/.koi/bin/`. Falls through to PATH lookup as a last
+ *  resort for dev runs / tests. */
+async function _resolveFfprobe() {
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    if (r?.ffprobe) return r.ffprobe;
+  } catch { /* fall back to PATH */ }
+  return 'ffprobe';
+}
+
 /** Probe a video's duration in milliseconds via ffprobe. Returns null
  *  on failure — caller falls back to the `-sseof` heuristic. */
 async function _probeDurationMs(filePath) {
@@ -50,14 +63,57 @@ async function _probeDurationMs(filePath) {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const run = promisify(execFile);
+    const ffprobe = await _resolveFfprobe();
     const { stdout } = await run(
-      'ffprobe',
+      ffprobe,
       ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', filePath],
       { timeout: 3000 },
     );
     const sec = JSON.parse(stdout)?.format?.duration ? Number(JSON.parse(stdout).format.duration) : null;
     return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : null;
   } catch { return null; }
+}
+
+/** Probe color metadata of the video's first stream. Used to decide
+ *  whether the extracted frame needs an HDR-to-SDR tonemap pass —
+ *  iPhone records HDR10 / HLG / Dolby Vision with BT.2020 primaries,
+ *  and saving its raw pixels straight to a JPEG/PNG (interpreted by
+ *  every downstream sRGB consumer as Rec.709) reads as washed-out /
+ *  desaturated. We tonemap when transfer is PQ (smpte2084) or HLG
+ *  (arib-std-b67) or when primaries / matrix are BT.2020. */
+async function _probeColorInfo(filePath) {
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const ffprobe = await _resolveFfprobe();
+    const { stdout } = await run(
+      ffprobe,
+      [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=color_primaries,color_transfer,color_space',
+        '-of', 'json',
+        filePath,
+      ],
+      { timeout: 3000 },
+    );
+    const stream = JSON.parse(stdout)?.streams?.[0];
+    if (!stream) return null;
+    return {
+      primaries: stream.color_primaries || null,
+      transfer: stream.color_transfer || null,
+      space: stream.color_space || null,
+    };
+  } catch { return null; }
+}
+
+function _isHdr(info) {
+  if (!info) return false;
+  if (info.transfer === 'smpte2084' || info.transfer === 'arib-std-b67') return true;
+  if (info.primaries === 'bt2020') return true;
+  if (info.space === 'bt2020nc' || info.space === 'bt2020c') return true;
+  return false;
 }
 
 export default {
@@ -191,6 +247,28 @@ export default {
       }
     } else {
       argv.push('-ss', _formatTimestamp(timeMs / 1000), '-i', resolvedVideo, '-frames:v', '1', '-an');
+    }
+    // HDR → SDR tone-map. iPhone selfie / 4K HDR records BT.2020 +
+    // PQ or HLG. Saving those pixels straight as JPEG/PNG without
+    // converting reads as desaturated / lavado in every downstream
+    // sRGB viewer (Photoshop, browsers, image_url multimodal blocks…).
+    // The `zscale → tonemap → zscale` chain is the canonical FFmpeg
+    // recipe: linearise via input primaries, tonemap to display-light,
+    // re-encode in BT.709. `format=rgb24` at the tail forces the
+    // image encoder onto a clean SDR pipe.
+    const colorInfo = await _probeColorInfo(resolvedVideo);
+    if (_isHdr(colorInfo)) {
+      const filter =
+        'zscale=t=linear:npl=100,format=gbrpf32le,' +
+        'zscale=p=bt709,tonemap=tonemap=hable:desat=0,' +
+        'zscale=t=bt709:m=bt709:r=tv,format=rgb24';
+      argv.push('-vf', filter);
+      channel.log(
+        'media',
+        `extract_frame: HDR source (transfer=${colorInfo?.transfer || '?'}, ` +
+        `primaries=${colorInfo?.primaries || '?'}, space=${colorInfo?.space || '?'}) ` +
+        '→ tonemapping to BT.709 SDR',
+      );
     }
     if (format === 'jpg') {
       // -q:v 2 ≈ "visually transparent" — the lowest JPEG quantizer
