@@ -602,6 +602,14 @@ export function pickVideoModel(models, req = {}) {
   // an existing video. Routes to the dedicated `video_extend` bucket
   // so a single backoffice tag controls which model owns extension.
   const wantsExtend = req.kind === 'extend';
+  // `kind: 'bg-remove'` (or 'background-removal') is the explicit
+  // "strip the background out of this clip" signal — pins the picker
+  // to models curated under the `video_background_removal` bucket
+  // (e.g. Bria's video matting), bypassing the generation / editing
+  // shops which would just generatively re-paint the scene instead.
+  const wantsBgRemove = req.kind === 'bg-remove'
+    || req.kind === 'background-removal'
+    || req.kind === 'background_removal';
 
   // Koi-owned purpose buckets (see model_prices.categories). When a
   // model row carries them, this is the SOLE membership signal we
@@ -617,9 +625,11 @@ export function pickVideoModel(models, req = {}) {
     ? 'video_avatar'
     : wantsExtend
       ? 'video_extend'
-      : wantsVideoToVideo
-        ? 'video_editing'
-        : 'video_generation';
+      : wantsBgRemove
+        ? 'video_background_removal'
+        : wantsVideoToVideo
+          ? 'video_editing'
+          : 'video_generation';
 
   const _filterVideo = (useLabel) => models.filter((m) => {
     if (m.pricePerUnit == null) return false;
@@ -662,6 +672,15 @@ export function pickVideoModel(models, req = {}) {
         if (!m.avatar && !hasOp && !slugLooksLikeAvatar) return false;
       }
       // Avatar models bypass the regular video-mode gates — return early.
+      return true;
+    }
+
+    if (wantsBgRemove) {
+      // Background-removal models run a video matting pipeline; they
+      // categorically don't fit the textToVideo / imageToVideo /
+      // videoToVideo capability taxonomy. The curated bucket is the
+      // sole truth — if we got here past the category gate the row
+      // belongs in this shop. Bypass the cap checks below.
       return true;
     }
 

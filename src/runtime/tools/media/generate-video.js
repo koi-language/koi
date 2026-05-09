@@ -303,7 +303,7 @@ const generateVideoAction = {
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
-      kind:            { type: 'string',  enum: ['extend'], description: 'Set to "extend" when the user asks to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated `video_extend` model bucket (curated in the backoffice). Combine with referenceVideos=[<source>] (or startFrame=<last frame> via extract_frame). Omit for fresh generations / restyles / edits.' },
+      kind:            { type: 'string',  enum: ['extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice instead of the default generation/edit shop. "extend" → continue / make-longer an existing video (`video_extend` bucket). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>]. Omit for fresh generations / restyles / regular edits.' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
     },
     required: ['prompt']
@@ -524,6 +524,16 @@ const generateVideoAction = {
     if (Number.isFinite(minDurSec) && minDurSec > 0) {
       padOpts.minDurationMs = minDurSec * 1000;
       channel.log('pad', `min input duration floor: ${minDurSec}s (${minDurSource})`);
+    }
+    // Project frame rate plumbed from the GUI's `selectedClipMeta`.
+    // Forwarded to padIfNeeded → recoverFromPadded so both the input
+    // we send the model AND the recovered output lock to the same
+    // fps grid as V1 on the timeline. Eliminates the AI-clip ↔ V1
+    // frame phase drift the user reported as "1-2 frames adelantado".
+    const projectFps = Number(action.projectFps);
+    if (Number.isFinite(projectFps) && projectFps > 0) {
+      padOpts.outputFps = projectFps;
+      channel.log('pad', `project fps: ${projectFps} (forced through pad/recover)`);
     }
 
     if (caps.videoToVideo && Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
@@ -1140,6 +1150,12 @@ async function _runHybridExtendChain({
   if (Number.isFinite(minDurSec) && minDurSec > 0) {
     padOpts.minDurationMs = minDurSec * 1000;
   }
+  // Same project-fps plumbing as the primary generate path — keeps
+  // the extend pipeline in lockstep with V1's frame grid too.
+  const extendProjectFps = Number(action?.projectFps);
+  if (Number.isFinite(extendProjectFps) && extendProjectFps > 0) {
+    padOpts.outputFps = extendProjectFps;
+  }
 
   // 3. Pad the primary as the extend model's seed.
   const padResult = await padIfNeeded(primaryPath, 'video', padOpts);
@@ -1471,11 +1487,20 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     delete props.label;
   }
 
-  // `kind: "extend"` only surfaces when at least one model in the
-  // catalog is tagged with the `video_extend` category. Without a
-  // backing model the parameter would just dead-end the picker.
-  if (!caps.anyExtend) {
-    delete props.kind;
+  // `kind` enum is curated dynamically: each value only appears when
+  // at least one model carries the matching `categories` tag.
+  // Without a backing model the parameter would just dead-end the
+  // picker, so we trim absent values from the enum (and drop the
+  // field altogether when neither bucket has a model).
+  {
+    const kinds = [];
+    if (caps.anyExtend) kinds.push('extend');
+    if (caps.anyBgRemove) kinds.push('bg-remove');
+    if (kinds.length === 0) {
+      delete props.kind;
+    } else {
+      props.kind = { ...props.kind, enum: kinds };
+    }
   }
 
   // Build the human-readable field list the agent actually reads. Values
@@ -1544,8 +1569,16 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     }).join('\n');
     fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved source image/video, look at them — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
   }
-  if (caps.anyExtend) {
-    fields.push('optional "kind" — set to "extend" when the user wants to CONTINUE / EXTEND / make-longer an existing video. Routes to the dedicated extension-tuned model. Combine with referenceVideos=[<source>] (or startFrame=<last frame>). Omit for fresh generations / restyles / edits.');
+  if (caps.anyExtend || caps.anyBgRemove) {
+    const parts = ['optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:'];
+    if (caps.anyExtend) {
+      parts.push('  • "extend" — CONTINUE / EXTEND / make-longer an existing video (`video_extend` bucket). Combine with referenceVideos=[<source>] (or startFrame=<last frame>).');
+    }
+    if (caps.anyBgRemove) {
+      parts.push('  • "bg-remove" — strip the background out of the input video, returning a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Pass referenceVideos=[<source>].');
+    }
+    parts.push('Omit for fresh generations / restyles / regular edits.');
+    fields.push(parts.join('\n'));
   }
   fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
   fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');

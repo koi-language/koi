@@ -184,6 +184,7 @@ function _aggregateVideo(models) {
   let anyFrameControl = false;
   let anyAudio = false;
   let anyExtend = false;
+  let anyBgRemove = false;
   let maxShots = 1;
   const cameraMovementSet = new Set();
   for (const m of models) {
@@ -196,6 +197,13 @@ function _aggregateVideo(models) {
     // tool parameter only when at least one model carries the tag.
     if (Array.isArray(m?.categories) && m.categories.includes('video_extend')) {
       anyExtend = true;
+    }
+    // Curated `video_background_removal` bucket — surfaces
+    // `kind: "bg-remove"` only when at least one matting model is
+    // active in the catalog (e.g. Bria's video background removal).
+    if (Array.isArray(m?.categories)
+        && m.categories.includes('video_background_removal')) {
+      anyBgRemove = true;
     }
     // Per-model `cameraMovements`: CSV of supported tokens like
     // "static,pan_left,zoom_in". Union across active models — tools then
@@ -217,6 +225,7 @@ function _aggregateVideo(models) {
     anyFrameControl,
     anyAudio,
     anyExtend,
+    anyBgRemove,
     hasRefImageSupport: anyImageToVideo || anyVideoToVideo,
     cameraMovements: [...cameraMovementSet].sort(),
     maxShots,

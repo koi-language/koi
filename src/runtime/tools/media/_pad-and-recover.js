@@ -467,6 +467,15 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
   }
   const geom = computePadGeometry(dims.width, dims.height, geomOpts);
   if (!geom) return { paddedPath: null, geometry: null };
+  // Project frame rate. Carried through `geom` so recoverFromPadded
+  // can force the recovered file's fps to match — without this the
+  // model's emitted fps (often unspecified, e.g. Kling can return
+  // 24/25/30 depending on internal heuristics) drifts away from the
+  // V1 timeline's frame cadence and the AI clip plays "1-2 frames
+  // adelantado" relative to V1.
+  if (Number.isFinite(opts.outputFps) && opts.outputFps > 0) {
+    geom.outputFps = opts.outputFps;
+  }
   // Probe duration for video inputs and bake it into the geometry.
   // Recovery uses this to cap the model's output to the SAME number
   // of milliseconds — Kling video edit (and similar) sometimes
@@ -548,6 +557,14 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
   }
   if (kind === 'video') {
     vf += ',setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
+    // Lock the padded file's frame rate to the project's fps. ffmpeg's
+    // `fps` filter handles up/down conversion (frame drop/duplicate)
+    // so the model receives input at exactly the rate we'll later
+    // expect from its output — closing the loop on the AI clip ↔ V1
+    // frame-grid alignment.
+    if (Number.isFinite(geom.outputFps) && geom.outputFps > 0) {
+      vf += `,fps=${geom.outputFps.toFixed(6)}`;
+    }
   }
   const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', vf];
   if (kind === 'video') {
@@ -808,9 +825,20 @@ export async function recoverFromPadded(filePath, geometry, kind) {
   // `color_transfer=unknown` in the muxed file, which AVFoundation
   // then decodes with a default that doesn't match V1 (HDR-tonemapped
   // natively) — the user-reported "AI clip looks lighter / washed".
-  const cropFilter = kind === 'video'
-      ? `crop=${cropW}:${cropH}:${cropX}:${cropY},setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709`
-      : `crop=${cropW}:${cropH}:${cropX}:${cropY}`;
+  let cropFilter = `crop=${cropW}:${cropH}:${cropX}:${cropY}`;
+  if (kind === 'video') {
+    cropFilter += ',setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
+    // Force the recovered file's frame rate back to the project's fps
+    // when the caller persisted it on the geometry. Closes the
+    // round-trip: GUI snaps the source crop to the project fps grid
+    // → padIfNeeded re-encodes at that fps → the model emits N
+    // frames at SOME fps → recovery restamps to the project fps so
+    // the AI clip's frames advance in lockstep with V1 on playback.
+    // No-op for `outputFps` not set (legacy callers / image kind).
+    if (Number.isFinite(geometry.outputFps) && geometry.outputFps > 0) {
+      cropFilter += `,fps=${geometry.outputFps.toFixed(6)}`;
+    }
+  }
   const args = ['-hide_banner', '-loglevel', 'error', '-i', filePath, '-vf', cropFilter];
   // Force the output to last EXACTLY as long as the input we sent the
   // model. Some video providers add a frame or two on the way out
