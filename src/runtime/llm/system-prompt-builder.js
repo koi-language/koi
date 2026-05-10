@@ -7,6 +7,7 @@ import { compile as compileContext } from '../prompt/compiler.js';
 import { getBuiltinSlotMap } from '../prompt/builtin-slot-maps.js';
 import { channel } from '../io/channel.js';
 import * as memory from '../memory/index.js';
+import { listWorkflowsCatalog } from '../state/workflows-catalog.js';
 
 // =========================================================================
 // SYSTEM PROMPT BUILDER — standalone functions extracted from LLMProvider
@@ -1372,6 +1373,24 @@ export function buildExpandedResourceSection(resources, agent) {
       }
       doc += '\n';
     }
+  }
+
+  // ── AVAILABLE WORKFLOWS ─────────────────────────────────────────────────
+  // Names only — mirrors the toolset-intents pattern. Workflows are
+  // pre-approved task plans; the agent calls describe_workflow(<name>)
+  // to read the description + body, then run_workflow(<name>) to
+  // instantiate. Only surfaced to agents with `delegate` permission
+  // (i.e. root coordinators) — delegates execute the tasks a workflow
+  // creates, they don't pick which workflow to run.
+  if (agent?.role?.can('delegate')) {
+    try {
+      const catalog = listWorkflowsCatalog();
+      if (catalog.length > 0) {
+        const names = catalog.map(w => w.name).join(', ');
+        doc += '## AVAILABLE WORKFLOWS\n\n';
+        doc += `Call **describe_workflow("<name>")** to read what a workflow does, then **run_workflow("<name>")** to invoke it: ${names}\n\n`;
+      }
+    } catch { /* non-fatal */ }
   }
 
   // ── AVAILABLE MCP SERVERS ───────────────────────────────────────────────

@@ -1,30 +1,22 @@
 /**
- * Activate Workflow Action — Instantiate a workflow's steps as concrete tasks.
+ * Run Workflow Action — Instantiate a workflow's steps as concrete tasks.
  *
- * Unlike skills (which inject a static text block into the system prompt), a
- * workflow is a pre-approved plan. Activating it:
- *   1. Reads WORKFLOW.md (frontmatter stripped).
- *   2. Runs a cheap LLM translator that adapts the prose script into concrete
- *      tasks given the user's current message. No research, no redesign — it
- *      just instantiates the already-designed plan.
- *   3. Creates each task via task_create (task-manager handles persistence).
- *   4. Marks state.activeWorkflow = name (GUI / telemetry).
- *   5. Fires `planner.result { success: true }` on the invoking agent so the
- *      System coordinator transitions into its running_plan phase and starts
- *      executing the tasks just like it would for a Planner-produced plan.
- *
- * If the translator decides no tasks apply (e.g. the workflow was matched by
- * mistake), it returns `{ fallback: true }` and the action reports failure so
- * the caller falls back to normal routing.
+ * Workflows surface to the agent as BARE NAMES in the system prompt
+ * (no description). Before invoking, the agent should call
+ * `describe_workflow(name)` to read the description and confirm intent.
+ * This tool then translates the workflow's prose script into concrete
+ * tasks via a cheap LLM and fires `planner.result` so the System
+ * coordinator transitions into running_plan.
  */
 
-import fs from 'fs';
 import { channel } from '../../io/channel.js';
 import { fireReaction } from '../../agent/reactions.js';
+import {
+  listWorkflowsCatalog,
+  readWorkflowBody,
+} from '../../state/workflows-catalog.js';
 
 async function runTranslator(agent, workflow, body, userMessage) {
-  // Mirrors the cheap-classifier pattern used by _autoActivateSkills:
-  // non-thinking, deterministic, short timeout. We just need a JSON list.
   const { getAllCandidates, createLLM, getAvailableProviders } = await import('../../llm/providers/factory.js');
 
   const providers = agent.llmProvider?._availableProviders || getAvailableProviders();
@@ -94,10 +86,10 @@ If the workflow does not actually match the user's request, return:
 }
 
 export default {
-  type: 'activate_workflow',
-  intent: 'activate_workflow',
-  description: 'Activate a workflow by name. Translates its WORKFLOW.md script into concrete tasks (via a cheap LLM), creates them, and fires planner.result to transition the System into running_plan. Fields: "name" (required). → Returns: { activated, name, taskCount, fallback?, reason? }',
-  thinkingHint: (action) => `Activating workflow: ${action.name || '...'}`,
+  type: 'run_workflow',
+  intent: 'run_workflow',
+  description: 'Run a workflow by name. Translates its WORKFLOW.md script into concrete tasks (via a cheap LLM), creates them, and fires planner.result to transition the System into running_plan. Call describe_workflow(name) FIRST to confirm the workflow matches your intent. Fields: "name" (required). → Returns: { activated, name, taskCount, fallback?, reason? }',
+  thinkingHint: (action) => `Running workflow: ${action.name || '...'}`,
   permission: 'write_tasks',
   hidden: true,
 
@@ -106,23 +98,24 @@ export default {
     properties: {
       name: {
         type: 'string',
-        description: 'The workflow name to activate (e.g. "generate-article")',
+        description: 'The workflow name to run (e.g. "generate-article")',
       },
     },
     required: ['name'],
   },
 
   examples: [
-    { actionType: 'direct', intent: 'activate_workflow', name: 'generate-article' },
+    { actionType: 'direct', intent: 'run_workflow', name: 'generate-article' },
   ],
 
   async execute(action, agent) {
     const name = action.name;
     if (!name) return { activated: false, error: 'Missing required field: name' };
 
-    const listResult = await agent.callAction('list_workflows', {});
-    const workflows = listResult?._fullWorkflows || listResult?.workflows;
-    if (!workflows) return { activated: false, error: 'Could not discover workflows' };
+    const workflows = listWorkflowsCatalog();
+    if (!workflows.length) {
+      return { activated: false, error: 'No workflows configured' };
+    }
 
     const workflow = workflows.find(w => w.name === name);
     if (!workflow) {
@@ -130,17 +123,11 @@ export default {
       return { activated: false, error: `Workflow "${name}" not found. Available: ${available}` };
     }
 
-    let body;
-    try {
-      const raw = fs.readFileSync(workflow.location, 'utf-8');
-      const fmEnd = raw.indexOf('\n---', 4);
-      body = fmEnd !== -1 ? raw.substring(fmEnd + 4).trim() : raw;
-    } catch (err) {
-      return { activated: false, error: `Failed to read ${workflow.location}: ${err.message}` };
+    const body = readWorkflowBody(workflow);
+    if (body == null) {
+      return { activated: false, error: `Failed to read ${workflow.location}` };
     }
 
-    // The System keeps the last user message on agent._lastUserMessage; delegates
-    // may receive it via args. Fall back gracefully.
     const userMessage =
       agent._lastUserMessage ||
       action.userMessage ||
@@ -159,8 +146,6 @@ export default {
       };
     }
 
-    // Create each task in-order via the task_create action so the task-manager
-    // handles persistence, dedup, and change notifications uniformly.
     const createdIds = [];
     for (const t of translated.tasks) {
       if (!t || !t.subject || !t.description) continue;
@@ -197,8 +182,6 @@ export default {
       taskIds: createdIds,
     });
 
-    // Fire planner.result so the System transitions into running_plan.
-    // Shape mirrors the payload fired by delegate returns (agent.js:2451).
     const resultPayload = {
       success: true,
       data: { workflow: name, taskIds: createdIds },

@@ -3184,17 +3184,19 @@ export class Agent {
               sessionTracker._lastUserRequest = this._lastUserMessage;
             }
 
-            // ── AUTO-MATCH WORKFLOW ────────────────────────────────────────────
-            // On every fresh user message in the root coordinator, check whether
-            // any workflow matches the request. If so, activate it — which
-            // instantiates its script as concrete tasks and fires planner.result
-            // so the System transitions into running_plan. Best-effort: any
-            // failure falls through to normal routing.
+            // ── FORCED-WORKFLOW HOOK ──────────────────────────────────────────
+            // No more LLM-classifier auto-match: workflows are now surfaced
+            // to the agent as bare names in the system prompt and invoked
+            // explicitly via the `run_workflow` tool. We still call into
+            // `_autoMatchWorkflow` here because the GUI Workflows tab's
+            // "Run" button drops a `_forceWorkflow` flag on the root agent
+            // plus a hidden user message; this hook reads the flag and
+            // runs the requested workflow without going through the LLM.
             if (!isDelegate && this._lastUserMessage) {
               try {
                 await this._autoMatchWorkflow(this._lastUserMessage);
               } catch (e) {
-                channel.log('workflow', `${this.name}: Auto-match workflow failed: ${e.message}`);
+                channel.log('workflow', `${this.name}: Forced-workflow hook failed: ${e.message}`);
               }
 
               // NOTE: the root coordinator (System) does NOT auto-activate
@@ -4238,7 +4240,7 @@ export class Agent {
 
       // ── PLAN-IN-FLIGHT GUARD ──────────────────────────────────────────
       // Workflows already instantiate their full task plan (see
-      // `activate_workflow`) and the System is told (in
+      // `run_workflow`) and the System is told (in
       // `has-pending-tasks.md`) to execute the existing tasks rather
       // than re-plan. If the LLM ignores that and tries to delegate to
       // the Planner anyway — or any other agent re-enters the planner
@@ -4471,7 +4473,7 @@ export class Agent {
         }
       }
 
-      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_memory', 'add_memory', 'list_skills', 'activate_skill', 'deactivate_skill', 'list_workflows', 'activate_workflow', 'deactivate_workflow', 'queue_add', 'queue_update']);
+      const _SELF_MANAGED = new Set(['shell', 'prompt_user', 'prompt_form', 'print', 'update_state', 'return', 'recall_memory', 'add_memory', 'list_skills', 'activate_skill', 'deactivate_skill', 'describe_workflow', 'run_workflow', 'deactivate_workflow', 'queue_add', 'queue_update']);
       if (_intent && !_SELF_MANAGED.has(_intent)) {
         channel.beginAction(_intent, action.url || action.path || action.pattern || action.query || action.subject || '');
       }
@@ -4886,207 +4888,51 @@ Return ONLY a JSON array of skill names to activate, e.g. ["mobile-development"]
   }
 
   /**
-   * Pick at most one workflow that matches the user's request, and activate it.
-   * Unlike _autoActivateSkills (which runs once at delegate start), this runs
-   * on every fresh user message at the root coordinator: workflows are
-   * dispatched per-request, not per-lifetime.
+   * Handle a forced-workflow activation initiated by the GUI's "Run" button
+   * on the Workflows tab. The button sets `_forceWorkflow` on the root agent
+   * and injects a hidden user message; this hook reads the flag and runs
+   * the workflow directly.
    *
-   * Best-effort: any failure here falls through silently — the System then
-   * handles the request via normal routing / delegation.
+   * The previous LLM-classifier branch (auto-match a workflow against every
+   * fresh user message) has been removed — workflows are now surfaced to the
+   * agent as bare names in the system prompt and invoked explicitly via the
+   * `run_workflow` tool. This function exists ONLY for the manual GUI Run
+   * path; with no `_forceWorkflow` set it returns immediately.
+   *
+   * Best-effort: any failure here falls through silently.
    */
-  async _autoMatchWorkflow(userMessage, options = {}) {
+  async _autoMatchWorkflow(userMessage, _options = {}) {
     const text = (userMessage || '').trim();
-    // Manual activation override: the GUI's "Run" button on the Workflows
-    // tab sets `_forceWorkflow` and injects a hidden user message to wake
-    // the agent. We recognise the override here and activate that workflow
-    // directly, skipping the LLM classifier entirely. This is why the Run
-    // button works even when the classifier wouldn't have matched the
-    // message on its own.
     const forced = this._forceWorkflow;
-    if (forced) {
-      this._forceWorkflow = null;
-      try {
-        const listed = await this.callAction('list_workflows', {});
-        const workflows = listed?._fullWorkflows || listed?.workflows || [];
-        const matched = workflows.find(w => w.name === forced);
-        if (!matched) {
-          channel.log('workflow', `${this.name}: forced workflow "${forced}" not found in catalog`);
-          return;
-        }
-        if (matched.requireConfirmation === true) {
-          const activationId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-          channel.workflowActivating({
-            activationId,
-            name: forced,
-            description: matched.description,
-            requireConfirmation: true,
-            cancelWindowMs: 0,
-          });
-          const verdict = await channel.waitForActivationDecision(activationId, 0);
-          if (verdict === 'cancel') return;
-        }
-        channel.log('workflow', `${this.name}: Forced workflow "${forced}" — activating`);
-        await this.callAction('activate_workflow', {
-          name: forced,
-          userMessage: text || `Run workflow "${forced}"`,
-        });
-      } catch (e) {
-        channel.log('workflow', `${this.name}: forced workflow activation failed: ${e.message}`);
+    if (!forced) return;
+    this._forceWorkflow = null;
+    try {
+      const { listWorkflowsCatalog } = await import('../state/workflows-catalog.js');
+      const workflows = listWorkflowsCatalog();
+      const matched = workflows.find(w => w.name === forced);
+      if (!matched) {
+        channel.log('workflow', `${this.name}: forced workflow "${forced}" not found in catalog`);
+        return;
       }
-      return;
-    }
-
-    if (!text) return;
-
-    // Skip if the agent is already running an active workflow or has pending
-    // tasks — we don't want to overwrite mid-execution state. Previously a
-    // `text.length < 12` shortcut lived here to dodge an LLM round-trip on
-    // "ok"/"sigue"/greetings, but it broke legitimate short requests like
-    // "test patata" and "run tests". The shortcut is redundant anyway: when
-    // no workflows are configured, `list_workflows` below returns an empty
-    // array and we bail at line `if (workflows.length === 0) return;` — at
-    // ZERO cost — so the guard only fired when workflows existed AND the
-    // user message was short, which is exactly the case where the user
-    // likely DID want a match.
-    if (this.state?.activeWorkflow) return;
-    // Mutual exclusion at PLAN level: if the root coordinator already
-    // activated a workflow for this user request, delegates MUST NOT
-    // match another. Without this, a nested delegate (Planner, Worker)
-    // sees a task description that fits a DIFFERENT workflow, activates
-    // it, and the two workflows' tasks collide in the task list —
-    // exactly the "infographic + generate-article" mix that shipped 25
-    // tangled tasks in the UI. Workflow match is a USER-REQUEST-level
-    // decision; only one workflow per request regardless of who routes
-    // what.
-    if (options._forDelegate) {
-      try {
-        const _root = Agent._rootAgent;
-        if (_root && _root !== this && _root.state?.activeWorkflow) {
-          channel.log('workflow', `${this.name}: skip delegate workflow match — root already activated "${_root.state.activeWorkflow}"`);
-          return;
-        }
-      } catch { /* non-fatal */ }
-    }
-    // Pending-tasks guard only applies to the root coordinator. Delegates
-    // ARE inside a running plan (their own delegation is the pending
-    // task), so this guard would block them from ever matching a
-    // workflow on their own in-flight work. The `_forDelegate` option is
-    // set by the task-start hook in handle() to bypass this check.
-    if (!options._forDelegate) {
-      try {
-        const { taskManager } = await import('../state/task-manager.js');
-        const pending = taskManager.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
-        if (pending.length > 0) return;
-      } catch { /* non-fatal */ }
-    }
-
-    let workflows;
-    try {
-      const result = await this.callAction('list_workflows', {});
-      workflows = result?._fullWorkflows || result?.workflows;
-    } catch (e) {
-      channel.log('workflow', `${this.name}: list_workflows failed: ${e.message}`);
-      return;
-    }
-    if (!workflows || workflows.length === 0) return;
-
-    const catalog = workflows.map(w => `- ${w.name}: ${w.description}`).join('\n');
-    const prompt = `You are a workflow matcher. A workflow is a pre-approved plan template for a SPECIFIC type of user request. Your job is to activate one ONLY when the request is precisely an instance of that workflow's described use case.
-
-STRICT RULES:
-1. A workflow matches ONLY when the user's request is a direct, unambiguous instance of what the workflow description says to use it for. Keyword overlap is NOT enough.
-2. If a workflow description mentions a specific input / context / platform (e.g. "a YouTube video URL", "a Slack message", "a Figma design file", "a product image"), the user's request MUST explicitly provide that exact input. If the input is absent, do NOT match.
-3. Activating a workflow creates a fixed task plan. A wrong match corrupts the agent's plan with tasks that don't belong. Prefer "null" over a loose match — normal routing / delegation can always handle the request afterwards.
-4. NEVER match just because the request is vaguely in the same domain as a workflow. Domain overlap is not instance match.
-5. Only one workflow can match at most. Pick the single best fit, or null.
-
-USER REQUEST:
-${text}
-
-AVAILABLE WORKFLOWS:
-${catalog}
-
-Examples of correct behavior:
-- Request "write an article from https://youtube.com/..." + workflow "generate-article: Turn a YouTube video into an article" → "generate-article" (request explicitly provides the YouTube URL the workflow requires)
-- Request "research the Artemis II mission" + same workflow → null (no YouTube URL — the workflow's required input is missing)
-- Request "animate this image" + workflow "slack-gif-creator: animated GIFs for Slack" → null (request is not about Slack)
-- Request "make an infographic about Artemis II" + workflow "infographic: infographics/data posters with factual research" → "infographic" (direct instance)
-- Request "hello" / "thanks" / "what time is it?" + any workflow → null (trivial requests never match workflows)
-
-Return ONLY a JSON object, no prose, no markdown fences:
-{ "workflow": "<workflow-name-or-null>" }
-
-Remember: null is the default and correct answer in ambiguous cases. A false positive here derails the entire plan.`;
-
-    try {
-      const { getAllCandidates, createLLM, getAvailableProviders } = await import('../llm/providers/factory.js');
-
-      const providers = this.llmProvider?._availableProviders || getAvailableProviders();
-      const candidates = getAllCandidates('reasoning', 40, providers);
-      if (candidates.length === 0) return;
-
-      const nonThinking = candidates.find(c => !c.thinking) || candidates[0];
-      const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : nonThinking.provider;
-      const client = this.llmProvider._getClient(effectiveProvider);
-      const llm = createLLM(effectiveProvider, client, nonThinking.model, {
-        temperature: 0,
-        maxTokens: 200,
-        useThinking: false,
-      });
-
-      const { text: raw } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 15000 });
-      const stripped = (raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      if (!stripped) return;
-
-      const objMatch = stripped.match(/\{[\s\S]*?\}/);
-      const parsed = JSON.parse(objMatch ? objMatch[0] : stripped);
-      const name = parsed?.workflow;
-
-      if (!name || typeof name !== 'string' || name.toLowerCase() === 'null') return;
-      const matched = workflows.find(w => w.name === name);
-      if (!matched) return;
-
-      // Two activation modes:
-      //
-      //   requireConfirmation: false (default) — activate immediately.
-      //     A persistent banner appears the moment tasks are created
-      //     (via the `workflowActivated` event fired inside
-      //     activate_workflow). The user can Cancel AT ANY TIME to
-      //     deactivate the workflow and abort the whole turn; the
-      //     banner stays visible until the workflow completes or is
-      //     cancelled.
-      //
-      //   requireConfirmation: true — block indefinitely waiting for
-      //     explicit Proceed / Cancel. Meant for workflows whose first
-      //     step is destructive (deploy, migration, etc.).
-      //
-      // The no-countdown default matches user expectation: a short
-      // banner that flashes and auto-proceeds doesn't give you time
-      // to read what's being activated.
-      const requireConfirmation = matched.requireConfirmation === true;
-      if (requireConfirmation) {
+      if (matched.requireConfirmation === true) {
         const activationId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
         channel.workflowActivating({
           activationId,
-          name,
+          name: forced,
           description: matched.description,
           requireConfirmation: true,
           cancelWindowMs: 0,
         });
         const verdict = await channel.waitForActivationDecision(activationId, 0);
-        if (verdict === 'cancel') {
-          channel.log('workflow', `${this.name}: workflow "${name}" cancelled by user`);
-          return;
-        }
+        if (verdict === 'cancel') return;
       }
-
-      channel.log('workflow', `${this.name}: Matched workflow "${name}" — activating`);
-      const activateResult = await this.callAction('activate_workflow', { name, userMessage: text });
-      if (!activateResult?.activated) {
-        channel.log('workflow', `${this.name}: activate_workflow("${name}") did not activate (fallback=${activateResult?.fallback}): ${activateResult?.reason || activateResult?.error || 'unknown'}`);
-      }
+      channel.log('workflow', `${this.name}: Forced workflow "${forced}" — running`);
+      await this.callAction('run_workflow', {
+        name: forced,
+        userMessage: text || `Run workflow "${forced}"`,
+      });
     } catch (e) {
-      channel.log('workflow', `${this.name}: Workflow matcher failed: ${e.message}`);
+      channel.log('workflow', `${this.name}: forced workflow activation failed: ${e.message}`);
     }
   }
 
