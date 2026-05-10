@@ -166,9 +166,37 @@ export class ContextMemory {
   // ── Persistence (no-ops — Event Log is the persistent layer) ─────────
 
   serialize() {
-    return { version: 3, systemPrompt: this.systemPrompt };
+    return {
+      version: 4,
+      systemPrompt: this.systemPrompt,
+      buffer: this._buffer.map((e) => ({ role: e.role, content: e.content })),
+    };
   }
-  restore(_data) { /* no-op — Event Log on disk replaces session-tracker persistence */ }
+  /**
+   * Repopulate the LLM-facing turn buffer from a serialized snapshot.
+   * The snapshot shape is `{version, systemPrompt, buffer:[{role,
+   * content}, …]}` — anything else is ignored (no legacy compat).
+   *
+   * Symptom that this fixes: app restart used to leave the agent with
+   * an empty buffer (the previous restore was a no-op), so the LLM
+   * saw zero conversation history on resume and "where were we?"
+   * defaulted to active-document / task-queue heuristics.
+   */
+  restore(data) {
+    if (!data || !Array.isArray(data.buffer)) return;
+    if (typeof data.systemPrompt === 'string') this.systemPrompt = data.systemPrompt;
+    this._buffer.length = 0;
+    for (const e of data.buffer) {
+      if (!e) continue;
+      const content = typeof e.content === 'string' ? e.content : null;
+      if (!content || _isScaffoldingMessage(content)) continue;
+      const role = e.role === 'assistant' ? 'assistant' : 'user';
+      this._buffer.push({ role, content });
+    }
+    // Mark as having history so callers gating on hasHistory() see
+    // the restored state instead of treating this as a cold start.
+    this._writeCount = (this._writeCount || 0) + this._buffer.length;
+  }
   hydrate() { /* no-op — latent pool removed */ }
 }
 

@@ -21,6 +21,7 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { absolutizeMediaRefs } from './_absolutize-media-ref.js';
+import { autoAttachMentions, listAvailableMentions } from './_auto-attach-mentions.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -241,7 +242,48 @@ const generateImageAction = {
     let referenceImages;
     const _savedRefIds = {}; // filePath → media library ID
     let _refAliases = []; // aligned with referenceImages order; empty string when unnamed
-    if (action.referenceImages?.length) {
+    // Auto-attach `@mention` handles found in the prompt that aren't
+    // already in `referenceImages`. The agent often writes
+    //   "Burrow identical to @storyboard_001"
+    // and forgets to wire `@storyboard_001` as a reference; without it
+    // the provider invents the burrow visually and breaks continuity.
+    // We resolve the gallery row for each handle and merge BEFORE the
+    // capacity slice so explicit refs always win the cap budget.
+    let _explicitRefs = action.referenceImages || [];
+    {
+      const _autoRes = await autoAttachMentions({
+        prompt,
+        refs: _explicitRefs,
+        mediaKind: 'image',
+        maxRefs: caps.referenceImages ? (caps.maxReferenceImages || 1) : 0,
+      });
+      // Hallucinated handles → fail fast. The model would otherwise
+      // invent visuals for a reference that doesn't exist (the
+      // "@storyboard_001 doesn't exist" failure mode reported in
+      // testing). Hand the agent the list of real handles so its
+      // retry can use one that actually resolves.
+      if (_autoRes.unknown.length > 0) {
+        const available = await listAvailableMentions({ limit: 60 });
+        const availableStr = (available && available.length)
+          ? available.join(', ')
+          : '(no @-handles tagged yet — use tag_media to assign one)';
+        return {
+          success: false,
+          error:
+            `Prompt references @-handles that DON'T exist in the gallery: ${_autoRes.unknown.join(', ')}.\n` +
+            `Either remove them from the prompt or replace them with a handle that actually exists.\n` +
+            `Currently tagged handles: ${availableStr}`,
+        };
+      }
+      if (_autoRes.added.length > 0 && caps.referenceImages) {
+        channel.log(
+          'image',
+          `Auto-attached @mentions from prompt: ${_autoRes.added.join(', ')}`,
+        );
+      }
+      _explicitRefs = _autoRes.merged;
+    }
+    if (_explicitRefs.length) {
       if (!caps.referenceImages) {
         channel.log('image', `Provider ${resolved.provider}/${resolved.model} does not support reference images — ignoring`);
       } else {
@@ -251,7 +293,7 @@ const generateImageAction = {
         // strings, {alias, path} objects, attachment IDs, and relative
         // paths). All downstream code — sharp decode, library save,
         // metadata persistence, GUI thumbnails — sees absolute paths.
-        const _resolvedRefs = await absolutizeMediaRefs(action.referenceImages);
+        const _resolvedRefs = await absolutizeMediaRefs(_explicitRefs);
 
         // Load + normalise image bytes, track alias alignment.
         for (const { alias, absPath: resolvedPath } of _resolvedRefs.slice(0, maxRef)) {

@@ -28,6 +28,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
+import { autoAttachMentions, listAvailableMentions } from './_auto-attach-mentions.js';
 import {
   padIfNeeded,
   recoverFromPadded,
@@ -343,6 +344,61 @@ const generateVideoAction = {
 
     const instance = resolved.instance;
     const caps = instance.capabilities;
+
+    // ── Auto-attach @mentions from the prompt ────────────────────────
+    // The agent often writes prompts like
+    //   "Continue the camera move from @hero_walk, matching @burrow_001"
+    // and forgets to wire those handles into referenceVideos /
+    // referenceImages. We resolve each @ in the prompt against the
+    // gallery and merge in the matching rows BEFORE the model picker
+    // peeks (so a video-kind handle correctly drives the picker
+    // toward a v2v model). Image-kind handles wire into
+    // referenceImages; video-kind ones wire into referenceVideos.
+    //
+    // Hallucinated handles (referenced in the prompt but missing
+    // from the gallery) → fail fast. The model would otherwise
+    // invent visuals for a non-existent reference.
+    {
+      const _refImgs = action.referenceImages || [];
+      const _refVids = action.referenceVideos || [];
+      const _imgRes = await autoAttachMentions({
+        prompt,
+        refs: _refImgs,
+        mediaKind: 'image',
+        maxRefs: caps.maxReferenceImages || (caps.referenceImages ? 4 : 0),
+      });
+      const _vidRes = await autoAttachMentions({
+        prompt,
+        refs: _refVids,
+        mediaKind: 'video',
+        maxRefs: caps.maxReferenceVideos || (caps.videoToVideo ? 2 : 0),
+      });
+      // `unknown` means "the handle resolves to ZERO rows in the
+      // gallery, regardless of kind" — invariant of mediaKind, so
+      // either pass returns the same set. Pick one.
+      const _trulyUnknown = _imgRes.unknown;
+      if (_trulyUnknown.length > 0) {
+        const available = await listAvailableMentions({ limit: 60 });
+        const availableStr = (available && available.length)
+          ? available.join(', ')
+          : '(no @-handles tagged yet — use tag_media to assign one)';
+        return {
+          success: false,
+          error:
+            `Prompt references @-handles that DON'T exist in the gallery: ${_trulyUnknown.join(', ')}.\n` +
+            `Either remove them from the prompt or replace them with a handle that actually exists.\n` +
+            `Currently tagged handles: ${availableStr}`,
+        };
+      }
+      if (_imgRes.added.length > 0) {
+        channel.log('video', `Auto-attached image @mentions from prompt: ${_imgRes.added.join(', ')}`);
+        action.referenceImages = _imgRes.merged;
+      }
+      if (_vidRes.added.length > 0) {
+        channel.log('video', `Auto-attached video @mentions from prompt: ${_vidRes.added.join(', ')}`);
+        action.referenceVideos = _vidRes.merged;
+      }
+    }
 
     // ── Pad-if-too-small for provider input minimums ─────────────────
     // The user's reference inputs may come from the GUI's clip cropper

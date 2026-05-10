@@ -1489,35 +1489,127 @@ export class Agent {
       contextMemory.restore(memoryState);
     }
 
-    // If resuming a session, try to restore from session tracker.
-    // Skip for delegates — they should always start fresh with only the task data.
-    if (sessionTracker && !memoryState && !isDelegate) {
-      try {
-        const history = sessionTracker.getHistory();
-        if (history.length > 0) {
-          context.sessionHistory = history.map(h => h.summary);
-        }
-      } catch { /* non-fatal */ }
+    // Conversation restore. Two cases:
+    //   • Top-level agent (System): always restore on cold-start so
+    //     "continue" / "sigue" after an app reopen has prior context.
+    //   • Delegate (Worker / Planner): the parent normally hands us a
+    //     `memoryState` so we inherit live context. But the FIRST
+    //     turn after an app restart, the parent re-delegates from a
+    //     cold restored state and may not pass memoryState (or pass
+    //     an empty one). In that case, fall back to disk so the
+    //     delegate isn't completely amnesic. We still skip restore
+    //     when memoryState IS provided — the parent's live context
+    //     wins over disk.
+    const _shouldRestoreFromDisk = sessionTracker && !memoryState;
+    if (_shouldRestoreFromDisk) {
+      if (!isDelegate) {
+        try {
+          const history = sessionTracker.getHistory();
+          if (history.length > 0) {
+            context.sessionHistory = history.map(h => h.summary);
+          }
+        } catch { /* non-fatal */ }
+      }
 
-      // Restore context memory from previous session
+      // Restore context memory from previous session.
       try {
         const savedState = sessionTracker.loadConversation(this.name);
-        if (savedState && (savedState.version >= 1 || (Array.isArray(savedState) && savedState.length > 0))) {
+        if (savedState && Array.isArray(savedState.buffer)) {
           contextMemory.restore(savedState);
-          const entryCount = contextMemory.entries.length;
-          channel.log('session', `Restored context memory for ${this.name} (${entryCount} entries, latent in LanceDB)`);
+          const entryCount = (contextMemory._buffer && contextMemory._buffer.length) || 0;
+          channel.log(
+            'session',
+            `Restored context memory for ${this.name} (${entryCount} buffered turns)`,
+          );
         }
       } catch { /* non-fatal */ }
 
-      // Restore input history from previous session
-      try {
-        const loadHistory = (await import('../io/channel.js')).channel.loadHistory;
-        const savedHistory = sessionTracker.loadInputHistory();
-        if (savedHistory.length > 0) {
-          loadHistory(savedHistory);
-          channel.log('session', `Restored ${savedHistory.length} input history entries`);
-        }
-      } catch { /* non-fatal */ }
+      // Input history is a top-level concern (the user's typing
+      // history in the chat input) — don't restore for delegates.
+      if (!isDelegate) {
+        try {
+          const loadHistory = (await import('../io/channel.js')).channel.loadHistory;
+          const savedHistory = sessionTracker.loadInputHistory();
+          if (savedHistory.length > 0) {
+            loadHistory(savedHistory);
+            channel.log('session', `Restored ${savedHistory.length} input history entries`);
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Cross-agent session log replay (delegates only).
+      //
+      // Per-agent `conversation-<name>.json` only carries what THAT
+      // agent saw — Worker spawned to handle task #2 has no access
+      // to the user input that System received and routed. Result:
+      // delegate re-asks questions the user already answered to
+      // System (the "Diluvio Repentino re-asked" failure mode).
+      //
+      // dialogue.jsonl is the canonical SESSION log: every
+      // user_input + every visible assistant message (`print`)
+      // across ALL agents, in chronological order. We tail the last
+      // ~12 entries and replay them into the delegate's buffer so
+      // it sees the recent multi-agent dialogue. Bounded so the
+      // prompt doesn't balloon on long sessions.
+      if (isDelegate) {
+        try {
+          const dialoguePath = path.join(sessionTracker.gitDir, 'dialogue.jsonl');
+          if (fs.existsSync(dialoguePath)) {
+            const raw = fs.readFileSync(dialoguePath, 'utf8');
+            const lines = raw.split('\n').filter(Boolean).slice(-40);
+            // Track existing buffer content to avoid duplicates from
+            // the per-agent restore above.
+            const existing = new Set(
+              (contextMemory._buffer || []).map((e) => `${e.role}|${(e.content || '').slice(0, 200)}`),
+            );
+            // Keep only meaningful events: user inputs (the user's
+            // actual words) and visible assistant text (`print` or
+            // `assistant_message` actions). Tool noise (shell,
+            // read_file, etc.) is intentionally excluded — the
+            // delegate doesn't need to relive every grep call to
+            // understand what the user wants.
+            const replay = [];
+            for (const line of lines) {
+              let entry;
+              try { entry = JSON.parse(line); } catch { continue; }
+              if (entry?.type === 'user_input') {
+                const text = String(entry.text || '').trim();
+                if (!text) continue;
+                replay.push({ role: 'user', content: text });
+              } else if (entry?.type === 'action') {
+                const intent = entry.intent || '';
+                if (intent !== 'print' && intent !== 'assistant_message' && intent !== 'show_result') continue;
+                let text = '';
+                try {
+                  const parsed = typeof entry.result === 'string' ? JSON.parse(entry.result) : entry.result;
+                  text = parsed?.message || parsed?.text || '';
+                } catch { /* ignore */ }
+                text = String(text || '').trim();
+                if (!text) continue;
+                replay.push({ role: 'assistant', content: text });
+              }
+            }
+            // Cap replay to the last 12 events so we surface "what
+            // just happened" without flooding the delegate's prompt
+            // with the entire session history.
+            const tail = replay.slice(-12);
+            let injected = 0;
+            for (const msg of tail) {
+              const key = `${msg.role}|${(msg.content || '').slice(0, 200)}`;
+              if (existing.has(key)) continue;
+              contextMemory.add(msg.role, msg.content);
+              existing.add(key);
+              injected++;
+            }
+            if (injected > 0) {
+              channel.log(
+                'session',
+                `Replayed ${injected} cross-agent dialogue events into ${this.name} (delegate session-log restore)`,
+              );
+            }
+          }
+        } catch { /* non-fatal — the delegate just won't see the cross-agent log */ }
+      }
     }
 
     // Connect MCPs eagerly so their tools appear in the system prompt

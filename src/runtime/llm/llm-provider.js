@@ -1528,6 +1528,49 @@ CRITICAL RULES:
     // Coordinators also need vision to look at images before deciding who to delegate to.
     // Images are ALSO preserved for propagation to delegates.
     if (session._pendingMcpImages?.length > 0) {
+      // Defensive payload-size cap: every modern vision endpoint enforces
+      // a per-request payload ceiling (Gemini ~20 MB, OpenAI ~20 MB,
+      // Claude ~5 MB per image). When a user (or the agent in parallel)
+      // calls `read_file` on multiple just-generated images, the
+      // accumulated base64 can blow past 25 MB and the gateway returns
+      // 413 "Payload Too Large" — the agent retries the same payload
+      // and loops forever.
+      //
+      // `read_file` already runs every image through the vision-tuned
+      // normaliser (max edge 2048, JPEG q=85), so this cap should never
+      // fire in practice. But leaving the door open for callers that
+      // pushed raw bytes (legacy paths, custom MCP tools, future
+      // additions) — the cap drops the OLDEST images first until the
+      // total fits, with a loud log so the user can trace why some
+      // images were skipped.
+      const _MAX_VISION_BYTES = 25 * 1024 * 1024;
+      try {
+        const imgs = session._pendingMcpImages;
+        let totalBytes = 0;
+        for (const p of imgs) totalBytes += Math.round(((p?.data?.length || 0) * 3) / 4);
+        if (totalBytes > _MAX_VISION_BYTES) {
+          // Drop oldest entries (front of array) until we fit. Newest
+          // attachments are usually the most relevant — if the agent
+          // just queued a screenshot for "look at this", that should
+          // win over a stale annotation overlay from earlier in the
+          // turn.
+          const dropped = [];
+          while (imgs.length > 1 && totalBytes > _MAX_VISION_BYTES) {
+            const removed = imgs.shift();
+            const removedBytes = Math.round(((removed?.data?.length || 0) * 3) / 4);
+            totalBytes -= removedBytes;
+            dropped.push({ path: removed?._debugPath || '(unknown)', bytes: removedBytes });
+          }
+          if (dropped.length > 0) {
+            const fmtMb = (n) => (n / (1024 * 1024)).toFixed(1);
+            channel.log(
+              'llm',
+              `[vision] payload exceeded ${fmtMb(_MAX_VISION_BYTES)} MB — dropped ${dropped.length} oldest image(s) to fit: ${dropped.map((d) => `${(d.path.split('/').pop() || '?')} (${fmtMb(d.bytes)}MB)`).join(', ')}`,
+            );
+          }
+        }
+      } catch { /* cap is best-effort, never block the call */ }
+
       const _canDelegate = agent?.hasPermission?.('delegate');
       if (_canDelegate) {
         // Preserve images for propagation to delegates as well.
@@ -2188,10 +2231,33 @@ CRITICAL RULES:
           const _s = globalThis.__koiStrings || {};
           throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
         }
-        // 413 = payload too large — drop pending images and retry (don't exclude provider)
-        if (_status === 413 && session?._promptAttachments?.length > 0) {
-          channel.log('llm', `[auto] 413 Payload Too Large — dropping ${session._promptAttachments.length} attachment(s) and retrying`);
-          session._promptAttachments = null;
+        // 413 = payload too large — drop pending images and retry
+        // (don't exclude provider). Two flavours:
+        //  (a) user attachments uploaded via the chat input bar →
+        //      `session._promptAttachments`. Dropping them is fine; the
+        //      agent loses access to the user's drag, surfaces that to
+        //      the user, retries text-only.
+        //  (b) tool-injected vision (read_file, get_screenshot, …) →
+        //      `session._consumedThisCall` was just snapshot-pushed
+        //      INSTEAD of `_pendingMcpImages` (line ~1604) before the
+        //      call, so the next retry would re-push the SAME bytes
+        //      and 413 again. Drop both buckets so the retry breaks
+        //      out of the loop.
+        if (_status === 413) {
+          // The catch handler above (line ~2160) already restored the
+          // vision snapshot into `_pendingMcpImages` for retry — undo
+          // that here too, otherwise the next iteration re-pushes the
+          // same oversize bytes and we loop on 413 forever.
+          const _atts = session?._promptAttachments?.length || 0;
+          const _visPending = session?._pendingMcpImages?.length || 0;
+          const _visSnapshot = session?._consumedThisCall?.length || 0;
+          if (_atts > 0) session._promptAttachments = null;
+          if (_visPending > 0) session._pendingMcpImages = null;
+          if (_visSnapshot > 0) session._consumedThisCall = null;
+          channel.log(
+            'llm',
+            `[auto] 413 Payload Too Large — dropped ${_atts} attachment(s) + ${Math.max(_visPending, _visSnapshot)} vision image(s); retrying without bytes`,
+          );
         }
         // Other 4xx (401, 403, 404) = invalid key or model — exclude provider entirely.
         // 413 = payload too large — NOT the provider's fault, don't exclude it.

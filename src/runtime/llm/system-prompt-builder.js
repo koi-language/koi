@@ -209,6 +209,112 @@ function _formatVideoTs(ms) {
   return `${mm}:${ss}.${mmm}`;
 }
 
+/** Render the user's text selection (if any) as a markdown block for the
+ *  WORKING AREA. The selection lives on the active doc payload as
+ *  `selectionStart` / `selectionEnd` (character offsets, not line/col),
+ *  pushed by the GUI on every workingAreaState broadcast.
+ *
+ *  Returns an array of lines to splice into the WORKING AREA, or `[]`
+ *  when there's nothing to render — caller iterates and pushes.
+ *
+ *  Why explicit lines vs a single-string block: callers already build
+ *  the WORKING AREA as a `lines.push(...)` rope, so returning a list
+ *  matches the surrounding style and the empty-array path is a clean
+ *  no-op.
+ *
+ *  Trade-offs:
+ *   - Reads the file SYNCHRONOUSLY each prompt build. The cost is one
+ *     fs read per turn for the active text doc — negligible vs the
+ *     LLM call latency. We could cache by mtime, but invalidation is
+ *     a separate problem to introduce when reads start to dominate.
+ *   - Caps the rendered snippet at MAX_SNIPPET chars. Multi-thousand-
+ *     char selections happen (a whole scene block); the agent only
+ *     needs an unambiguous reference, so truncation with a tail
+ *     marker is sufficient.
+ *   - Skips collapsed selections (caret only). A bare caret has no
+ *     text antecedent — adding "the user's caret is on line 42" to
+ *     EVERY prompt build would dilute the working-area block and
+ *     mislead "esto" resolution. The `read_file` `editor.summary`
+ *     path still reports caret position when the agent actually
+ *     reads the doc.
+ *   - Skips non-text docs. Image / video / pdf / web don't have a
+ *     character-offset selection in this sense; their per-doc
+ *     overlays use a different mechanism (DocumentBundle).
+ */
+function _renderTextSelection(active) {
+  try {
+    if (!active) return [];
+    const isText = active.type === 'text' || active.type === 'html';
+    if (!isText) return [];
+    const start = typeof active.selectionStart === 'number' ? active.selectionStart : null;
+    const end = typeof active.selectionEnd === 'number' ? active.selectionEnd : null;
+    if (start == null || end == null) return [];
+    const lo = Math.min(start, end);
+    const hi = Math.max(start, end);
+    if (lo === hi) return []; // collapsed caret — no antecedent
+    const filePath = active.path;
+    if (!filePath || !fs.existsSync(filePath)) return [];
+    const content = fs.readFileSync(filePath, 'utf8');
+    const len = content.length;
+    const a = Math.max(0, Math.min(lo, len));
+    const b = Math.max(0, Math.min(hi, len));
+    if (a === b) return [];
+
+    // Convert (offset → 1-based line/col) by walking once. Faster than
+    // splitting the whole file and works correctly with arbitrary line
+    // endings (only \n is treated as a break, matching the editor).
+    const offsetToLineCol = (off) => {
+      let line = 1;
+      let col = 1;
+      for (let i = 0; i < off; i++) {
+        if (content.charCodeAt(i) === 10 /* \n */) {
+          line++;
+          col = 1;
+        } else {
+          col++;
+        }
+      }
+      return { line, col };
+    };
+    const startPos = offsetToLineCol(a);
+    const endPos = offsetToLineCol(b);
+
+    const MAX_SNIPPET = 1500;
+    let snippet = content.slice(a, b);
+    let truncated = false;
+    if (snippet.length > MAX_SNIPPET) {
+      snippet = snippet.slice(0, MAX_SNIPPET);
+      truncated = true;
+    }
+    const sameLine = startPos.line === endPos.line;
+    const rangeDesc = sameLine
+      ? `line ${startPos.line}, columns ${startPos.col}–${endPos.col}`
+      : `line ${startPos.line} col ${startPos.col} → line ${endPos.line} col ${endPos.col}`;
+
+    const out = [''];
+    out.push(
+      `**The user has TEXT SELECTED** in this document — ${rangeDesc} (chars ${a}–${b} of ${len}).` +
+      ' When they say "esto / this / esa parte / cambia esto / replace this / shorten this / resume eso", they mean THIS exact selection — NOT the whole document. Apply edits to this range only.',
+    );
+    out.push('');
+    // Use a fenced code block with a hint of the file extension so the
+    // markdown renderer doesn't try to interpret backticks inside the
+    // snippet. Choice of `text` is conservative — every editor we
+    // care about handles it, and the agent doesn't need syntax
+    // highlighting to reason about prose.
+    out.push('```text');
+    out.push(snippet);
+    if (truncated) out.push(`… [selection truncated to ${MAX_SNIPPET} chars; full range is chars ${a}–${b}]`);
+    out.push('```');
+    return out;
+  } catch {
+    // Best-effort: a missing file or a malformed offset shouldn't
+    // crash prompt build. Drop the block and let the rest of the
+    // WORKING AREA still render.
+    return [];
+  }
+}
+
 /**
  * Build the system prompt for all agents.
  * Single unified prompt — only the available intents change per agent.
@@ -527,6 +633,20 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         // `playheadMs` onto the video doc payload at submit time.
         if (active.type === 'video' && typeof active.playheadMs === 'number') {
           lines.push(`Playhead paused at \`${_formatVideoTs(active.playheadMs)}\` (MM:SS.ms).`);
+        }
+
+        // Text selection: when the user has highlighted a range in a
+        // text-like active doc, that range IS the demonstrative
+        // antecedent ("esto / this / esa parte / change this"). Without
+        // surfacing the selected snippet here, the agent only learns
+        // about the highlight if it happens to call `read_file` —
+        // which it often skips when the request feels like a
+        // continuation ("resúmelo más corto", "cámbialo a tercera
+        // persona"). The selection block must reach the prompt the
+        // moment the user submits, not a turn later.
+        const _selBlock = _renderTextSelection(active);
+        if (_selBlock.length > 0) {
+          for (const line of _selBlock) lines.push(line);
         }
 
         // Timeline + selected clip: when the user has clicked a specific
@@ -915,7 +1035,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       lines.push('- **Write/edit text docs** → `edit_file` / `write_file` directly, inline — never delegate to a sub-agent for working-area edits. "continúa / sigue / añade" = append; "replace / rewrite" = replace. Never report success without a real tool call.');
       lines.push('- **Non-text active docs** (image/pdf/web) — dispatch to the right media tool (`generate_image`, `background_removal`, …); never claim to have edited in place.');
       lines.push('- **Ambiguity** between open text docs → `prompt_user` before writing.');
-      lines.push('- **Caret/selection** — if `read_file` returns an `editor.summary`, that selection is the anchor for "this / aquí / change this".');
+      lines.push('- **Text selection** — if a "**The user has TEXT SELECTED**" block appears above, that range IS the demonstrative antecedent ("esto / this / change this / shorten this") and the only thing your edit must touch. Do NOT replace the whole file.');
       if (active && (active.path || active.url)) {
         const activeLoc = active.path || active.url;
         const isText = active.type === 'text' || active.type === 'html';
@@ -1477,25 +1597,36 @@ async function _runContextCompiler(agent) {
   const sessionId = process.env.KOI_SESSION_ID || agent.sessionId || null;
 
   // Trigger payload that slot maps interpolate as `{{trigger.payload.task}}`.
-  // Order of fallbacks reflects "what is this turn ABOUT?":
-  //   1. agent._lastUserMessage  — the user just typed something (System path).
-  //   2. agent._currentTaskText  — set by delegates via _runContextCompiler
-  //                               from the parent task description (Worker /
-  //                               Planner path).
-  //   3. agent.displayName       — generic placeholder when nothing else
-  //                               applies (cold-start before first input).
-  const lastUser = agent._lastUserMessage
-    || agent._currentTaskText
-    || '';
-  const trigger = { payload: { task: lastUser } };
+  // The naive "use _lastUserMessage" fails for short/generic inputs
+  // ("continue", "sigue", "ok", "no", "y entonces…") — the embedding
+  // of those words against a project vault returns near-zero scores,
+  // so RMH retrieves nothing and the agent ends up amnesic.
+  //
+  // We enrich the trigger by combining (in priority order):
+  //   1. The current message if substantive (≥ ~25 chars, not in the
+  //      short-list of generic continuation words).
+  //   2. The last 2 substantive USER messages from contextMemory —
+  //      these are the actual conversation context the user just had
+  //      with the agent and are the strongest signal of "what is this
+  //      turn about".
+  //   3. agent._currentTaskText — the delegate task brief (Worker /
+  //      Planner path) when no user_input is in scope.
+  //   4. The active task description from task-manager — what the
+  //      agent was told to work on by the planner.
+  // Concatenated, deduped, capped — RMH gets a rich semantic query
+  // even when the user types a one-word follow-up.
+  const triggerInfo = await _buildTriggerTask(agent);
+  const triggerTask = triggerInfo.task;
+  const trigger = { payload: { task: triggerTask } };
 
   // ── Cache check ───────────────────────────────────────────────────
   // Hash the trigger task into a compact key — content of the task
-  // string can be huge (a long delegate brief). The agent name +
-  // project + session pin the cache to the right scope (different
-  // sessions in the same project DO get different `previous_sessions`
-  // results because the slot filters out the current sessionId).
-  const cacheKey = `${agent.name}|${projectRoot}|${sessionId || ''}|${_djb2(lastUser)}`;
+  // string can be huge (a long delegate brief plus enriched history).
+  // The agent name + project + session pin the cache to the right
+  // scope (different sessions in the same project DO get different
+  // `previous_sessions` results because the slot filters out the
+  // current sessionId).
+  const cacheKey = `${agent.name}|${projectRoot}|${sessionId || ''}|${_djb2(triggerTask)}`;
   const cached = _compileCacheGet(cacheKey);
   if (cached !== null) {
     channel.log('memory', `Context Compiler: cache hit (${agent.name})`);
@@ -1551,23 +1682,225 @@ async function _runContextCompiler(agent) {
   const filledSlots = (compiled?.slots || []).filter(
     (s) => s.included && String(s.included).trim().length > 0,
   );
-  if (filledSlots.length === 0) {
+
+  // CURRENT FOCUS header — the most recent substantive user message
+  // (or the most recent pivot / redirect, when present). This tells
+  // the LLM "this is what we are doing now" with no ambiguity, so a
+  // generic "continue / sigue / sigamos" doesn't drift back to the
+  // active document or a stale task-queue entry. The pivot detector
+  // catches "no, me referia…" / "wait, actually…" so a redirect
+  // overrides whatever was happening before.
+  const focus = (triggerInfo.focus || '').trim();
+  const focusBlock = focus
+    ? (triggerInfo.isPivot
+        ? `## CURRENT FOCUS — IMPORTANT\nThe user just redirected the conversation. The active topic is now:\n\n> ${focus.replace(/\n/g, ' ')}\n\nWhen the next user input is a continuation marker ("continue", "sigue", "sigamos", "ok", etc.), it refers to THIS topic — NOT to the active document, NOT to the task queue, NOT to any earlier thread.`
+        : `## CURRENT FOCUS\nThe user's most recent substantive message:\n\n> ${focus.replace(/\n/g, ' ')}\n\nWhen the next user input is a continuation marker ("continue", "sigue", "ok"), it refers to THIS topic.`)
+    : '';
+
+  // Nothing to emit at all — no slots filled AND no focus header.
+  if (filledSlots.length === 0 && !focusBlock) {
     _compileCacheSet(cacheKey, '');
     return '';
   }
 
-  const sections = filledSlots.map((s) => {
-    const title = _humanizeSlotId(s.id);
-    return `### ${title}\n${s.included.trim()}`;
-  });
-
-  // Lead with a short hint so the model treats the block as
-  // background context, not active instructions. The agent's
-  // playbook above already governs behaviour; this section is the
-  // "what do we already know" prelude.
-  const out = `## RECALLED CONTEXT (Recursive Memory Harness)\n\n${sections.join('\n\n')}`;
+  const parts = [];
+  if (focusBlock) parts.push(focusBlock);
+  if (filledSlots.length > 0) {
+    const sections = filledSlots.map((s) => {
+      const title = _humanizeSlotId(s.id);
+      return `### ${title}\n${s.included.trim()}`;
+    });
+    parts.push(`## RECALLED CONTEXT (Recursive Memory Harness)\n\n${sections.join('\n\n')}`);
+  }
+  const out = parts.join('\n\n');
   _compileCacheSet(cacheKey, out);
   return out;
+}
+
+/**
+ * Words / short phrases that mean "keep going with whatever we were
+ * doing" and carry zero semantic content for RMH retrieval. When
+ * `_lastUserMessage` matches one of these (case-insensitive, trimmed),
+ * we look back through contextMemory for the previous substantive
+ * input and use THAT as the semantic query instead.
+ */
+const _GENERIC_CONTINUATIONS = new Set([
+  // English
+  'continue', 'go on', 'go', 'ok', 'okay', 'yes', 'yeah', 'yep', 'sure',
+  'k', 'kk', 'no', 'nope', 'and', 'next', 'more', 'do it', 'proceed',
+  'thanks', 'thank you', 'pls', 'please',
+  // Spanish
+  'sigue', 'continúa', 'continua', 'continuar', 'sí', 'si', 'ok ya',
+  'vale', 'venga', 'dale', 'ya', 'no', 'siguiente', 'ahora', 'porfa',
+  // French
+  'continue', 'oui', 'non', 'ok', 'd\'accord', 'vas-y',
+]);
+
+const _MIN_SUBSTANTIVE_LEN = 25;
+
+function _isSubstantive(text) {
+  if (!text) return false;
+  const t = String(text).trim().toLowerCase();
+  if (t.length === 0) return false;
+  if (_GENERIC_CONTINUATIONS.has(t)) return false;
+  // Strip common punctuation-only prefixes / emojis before measuring length.
+  const stripped = t.replace(/[\s\p{P}\p{S}]+/gu, ' ').trim();
+  return stripped.length >= _MIN_SUBSTANTIVE_LEN;
+}
+
+/**
+ * Phrases that mark a CONVERSATIONAL PIVOT — the user is overriding
+ * the previous direction. Anything starting with these (case-insensitive,
+ * with optional leading spaces / punctuation) is the new "active topic"
+ * and must dominate the trigger over older history.
+ *
+ * Without this, "sigue/continue" after a redirect would fall back to
+ * the older task-queue / active-document state and pick the wrong
+ * thread (the bug the user hit on 2026-05-10: "sigamos, no?" picked
+ * Plano 006 instead of the burrow-consistency analysis the user had
+ * just redirected toward).
+ */
+const _PIVOT_PREFIXES = [
+  // English
+  'no,', 'no ', "no.", 'wait', 'actually', 'hold on', 'hang on',
+  'let me clarify', 'what i meant', "i meant", 'hmm', 'rather',
+  'instead', 'forget that', 'cancel that',
+  // Spanish
+  'no,', 'no ', 'no.', 'espera', 'espérate', 'esperate', 'en realidad',
+  'mejor', 'olvida', 'olvídalo', 'olvidalo', 'cancela', 'me referia',
+  'me refería', 'lo que quiero', 'lo que queria', 'lo que quería',
+  // French
+  'attends', 'en fait', 'oublie', 'plutôt',
+];
+
+function _isPivotMessage(text) {
+  if (!text) return false;
+  const t = String(text).trim().toLowerCase();
+  if (!t) return false;
+  for (const prefix of _PIVOT_PREFIXES) {
+    if (t.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/**
+ * Build the trigger task for RMH retrieval. Returns:
+ *   { task, pivot }
+ * where:
+ *   - task: concatenated/capped semantic-query string for embedding.
+ *   - pivot: the most recent SUBSTANTIVE user input that looks like a
+ *           conversational pivot (or the most recent substantive
+ *           input if none qualify), so the prompt builder can render
+ *           it as a CURRENT FOCUS header. Drives the LLM to read it
+ *           as authoritative for "what are we doing now" instead of
+ *           defaulting to active document / task queue.
+ *
+ * Combines current input, prior substantive user messages from
+ * contextMemory, the delegate task text, and any active task-manager
+ * task description. Capped at ~600 chars so the embedding stays
+ * focused and we don't waste tokens hashing the cache key.
+ */
+async function _buildTriggerTask(agent) {
+  const pieces = [];
+  const seen = new Set();
+  const push = (s) => {
+    if (!s) return;
+    const t = String(s).trim();
+    if (!t) return;
+    const key = t.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    pieces.push(t);
+  };
+
+  // Most-recent substantive user input — used both for the trigger
+  // and for the CURRENT FOCUS header. Walks the buffer / dialogue.
+  let mostRecentSubstantive = '';
+  let pivotCandidate = '';
+
+  // 1. Current user message (always include even if short — it IS
+  //    the active turn).
+  const lastUser = agent._lastUserMessage || '';
+  push(lastUser);
+  if (_isSubstantive(lastUser)) {
+    mostRecentSubstantive = lastUser;
+    if (_isPivotMessage(lastUser)) pivotCandidate = lastUser;
+  }
+
+  // Helper: scan a chronological list of user-input strings (most
+  // recent first) and add them to pieces while tracking the most
+  // recent substantive + pivot. Stops after `maxAdded` substantive
+  // adds so the trigger stays focused.
+  const _scanUserInputs = (textsNewestFirst, maxAdded = 2) => {
+    let added = 0;
+    for (const t of textsNewestFirst) {
+      if (added >= maxAdded) break;
+      if (!_isSubstantive(t)) continue;
+      if (!mostRecentSubstantive) mostRecentSubstantive = t;
+      if (!pivotCandidate && _isPivotMessage(t)) pivotCandidate = t;
+      push(t);
+      added++;
+    }
+    return added;
+  };
+
+  // 2. If the current message is short/generic, walk contextMemory
+  //    for the last substantive user inputs. We only need the last
+  //    two — they describe the active topic. Even if the current IS
+  //    substantive, still scan a couple back so the pivot detector
+  //    can find a recent redirect ("no, me referia a…") even when
+  //    the latest line is just "sigue".
+  const cm = _lookupContextMemory(agent);
+  const buffer = (cm && Array.isArray(cm._buffer)) ? cm._buffer : [];
+  const bufferUserTexts = [];
+  for (let i = buffer.length - 1; i >= 0; i--) {
+    const e = buffer[i];
+    if ((e?.role || '') !== 'user') continue;
+    const content = typeof e?.content === 'string' ? e.content : '';
+    if (content) bufferUserTexts.push(content);
+  }
+  let addedFromBuffer = 0;
+  if (!_isSubstantive(lastUser) || !pivotCandidate) {
+    addedFromBuffer = _scanUserInputs(bufferUserTexts, 3);
+  }
+
+  // 3. Delegate task brief (Workers / Planners).
+  push(agent._currentTaskText);
+
+  // 4. Active task from task-manager — what the planner / queue is
+  //    currently driving. Imported lazily so this file stays decoupled
+  //    from task-manager's own state machinery.
+  try {
+    const { taskManager } = await import('../state/task-manager.js');
+    if (taskManager?.getCurrentForAgent) {
+      const t = taskManager.getCurrentForAgent(agent.name);
+      if (t?.description) push(t.description);
+      else if (t?.subject) push(t.subject);
+    }
+  } catch { /* not all builds expose task-manager helpers; non-fatal */ }
+
+  // Cap each piece individually so a giant task description doesn't
+  // crowd out the others.
+  const capped = pieces.map((p) => p.length > 240 ? p.slice(0, 237) + '…' : p);
+  const out = capped.join(' \n ').trim();
+  // Final guard: cap to 600 chars so the embedding stays focused.
+  const task = out.length > 600 ? out.slice(0, 597) + '…' : out;
+  return {
+    task,
+    // Surface the most relevant single user message for the prompt
+    // header. Pivot wins over plain-recent if both exist (a pivot
+    // overrides whatever else was happening).
+    focus: pivotCandidate || mostRecentSubstantive || '',
+    isPivot: !!pivotCandidate,
+  };
+}
+
+/** Best-effort lookup of the agent's contextMemory instance. The
+ *  agent stashes the active one on `_activeContextMemory` (per-slot
+ *  copies live in `_contextMemoryBySlot` inside agent.js). For our
+ *  purposes the active one is what's currently being assembled. */
+function _lookupContextMemory(agent) {
+  return agent?._activeContextMemory ?? agent?._contextMemory ?? null;
 }
 
 /** djb2 string hash — small, collision-rare for our scale (≤64 cache

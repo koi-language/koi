@@ -355,19 +355,30 @@ async function _probeAudioMetadata(filePath) {
  *  the message but NEVER queued — they flow to generate_image as
  *  `referenceImages` separately, so the agent doesn't have to inspect
  *  each cutout source visually to reason about the edit. */
-function _queueAnnotationsForVision(bundle, doc, session) {
+async function _queueAnnotationsForVision(bundle, doc, session) {
   const anns = Array.isArray(bundle?.annotations) ? bundle.annotations : [];
   let note = '';
 
   // Image annotations — single composite-snapshot at most. Use the
   // legacy `[ANNOTATIONS OVERLAY]` caption so existing image-flow
   // behaviour is preserved verbatim.
+  const { readNormalisedImageForVision } = await import('../media/_normalize-image-for-vision.js');
   const imageAnns = anns.filter((a) => a && a.role !== 'video-frame-composite');
   for (const a of imageAnns) {
     if (!a.path || !fs.existsSync(a.path)) continue;
-    const ext = path.extname(a.path).toLowerCase().slice(1);
-    const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-    const b64 = fs.readFileSync(a.path).toString('base64');
+    let mime, b64;
+    try {
+      const norm = await readNormalisedImageForVision(a.path);
+      mime = norm.mimeType;
+      b64 = norm.base64;
+    } catch {
+      // If sharp can't read it (rare — annotation composites are
+      // generated PNGs), fall back to raw bytes so we don't drop the
+      // user's markup silently.
+      const ext = path.extname(a.path).toLowerCase().slice(1);
+      mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+      b64 = fs.readFileSync(a.path).toString('base64');
+    }
     const caption =
       '[ANNOTATIONS OVERLAY] The next image is NOT part of the original document. ' +
       'It is the user\'s hand-drawn markup (arrows, circles, boxes, freehand, text) ' +
@@ -402,9 +413,16 @@ function _queueAnnotationsForVision(bundle, doc, session) {
     );
     for (const a of sorted) {
       if (!a.path || !fs.existsSync(a.path)) continue;
-      const ext = path.extname(a.path).toLowerCase().slice(1);
-      const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-      const b64 = fs.readFileSync(a.path).toString('base64');
+      let mime, b64;
+      try {
+        const norm = await readNormalisedImageForVision(a.path);
+        mime = norm.mimeType;
+        b64 = norm.base64;
+      } catch {
+        const ext = path.extname(a.path).toLowerCase().slice(1);
+        mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        b64 = fs.readFileSync(a.path).toString('base64');
+      }
       const tsLabel = typeof a.frameTimestampMs === 'number'
         ? _formatVideoTs(a.frameTimestampMs)
         : '?';
@@ -493,9 +511,24 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
   const primaryExt = path.extname(primaryPath).toLowerCase();
   const primaryIsVideo = _VIDEO_EXTS.has(primaryExt);
   if (!primaryIsVideo) {
-    const srcExt = primaryExt.slice(1);
-    const srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
-    const srcB64 = fs.readFileSync(primaryPath).toString('base64');
+    let srcMime, srcB64;
+    try {
+      const { readNormalisedImageForVision } = await import('../media/_normalize-image-for-vision.js');
+      const norm = await readNormalisedImageForVision(primaryPath);
+      srcMime = norm.mimeType;
+      srcB64 = norm.base64;
+      if (norm.converted) {
+        const fmtMb = (n) => (n / (1024 * 1024)).toFixed(2);
+        channel.log(
+          'read_file',
+          `[bundle:${doc.id}] primary normalised for vision: ${primaryPath} (${fmtMb(norm.originalBytes)}MB → ${fmtMb(norm.normalisedBytes)}MB)${norm.fromCache ? ' [cache]' : ''}`,
+        );
+      }
+    } catch {
+      const srcExt = primaryExt.slice(1);
+      srcMime = srcExt === 'jpg' ? 'image/jpeg' : `image/${srcExt}`;
+      srcB64 = fs.readFileSync(primaryPath).toString('base64');
+    }
     session._pendingMcpImages.push({ mimeType: srcMime, data: srcB64, _debugPath: primaryPath });
     channel.log('read_file', `[bundle:${doc.id}] primary queued for vision: ${primaryPath}`);
   } else {
@@ -505,7 +538,7 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
     );
   }
 
-  const annotationNote = _queueAnnotationsForVision(bundle, doc, session);
+  const annotationNote = await _queueAnnotationsForVision(bundle, doc, session);
 
   const docKind = doc.url ? 'web' : (primaryIsVideo ? 'video' : 'image');
   const baseMsg = doc.url
@@ -871,20 +904,34 @@ export default {
     // "The image data you provided does not represent a valid image".
     const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.heic', '.heif', '.tif', '.tiff', '.avif'];
     if (IMAGE_EXTS.includes(path.extname(resolvedPath).toLowerCase())) {
-      const { normalizeImageForProvider } = await import('../media/_normalize-image-for-provider.js');
-      let normalized;
+      // Use the VISION-optimised normaliser (max edge 2048, JPEG q=85,
+      // alpha flattened, EXIF stripped). The earlier path used the
+      // GENERATION normaliser which preserves bytes — fine for image-
+      // gen providers, ruinous for vision: a 5504×3072 PNG straight out
+      // of generate_image is ~17 MB, four of them in one parallel
+      // read_file batch hit the LLM gateway as ~70 MB of base64 →
+      // 413 "Payload Too Large" → agent retries the same payload →
+      // infinite loop. The vision normaliser caps the payload at a
+      // size every modern endpoint can swallow without changing what
+      // the model sees (they downscale internally to ≤2048 anyway).
+      const { readNormalisedImageForVision } = await import('../media/_normalize-image-for-vision.js');
+      let normalised;
       try {
-        normalized = await normalizeImageForProvider(resolvedPath);
+        normalised = await readNormalisedImageForVision(resolvedPath);
       } catch (err) {
         return {
           success: false,
           error: `Could not read "${filePath}" as an image: ${err.message || err}. Common causes: the file is actually HTML (e.g. web_fetch saved an error page), the file is corrupt, or the format is unsupported. Inspect it with shell (\`file <path>\` / \`wc -c <path>\`) before retrying.`,
         };
       }
-      const b64 = fs.readFileSync(normalized.path).toString('base64');
-      const mime = normalized.mimeType;
-      if (normalized.converted) {
-        channel.log('read_file', `Image transcoded to PNG for vision: ${filePath}`);
+      const b64 = normalised.base64;
+      const mime = normalised.mimeType;
+      if (normalised.converted) {
+        const fmtMb = (n) => (n / (1024 * 1024)).toFixed(2);
+        channel.log(
+          'read_file',
+          `Image normalised for vision: ${filePath} (${fmtMb(normalised.originalBytes)}MB → ${fmtMb(normalised.normalisedBytes)}MB)${normalised.fromCache ? ' [cache]' : ''}`,
+        );
       }
 
       // Queue the image for the next LLM turn as a vision input.
@@ -909,7 +956,7 @@ export default {
                       openDocumentsStore.findInSnapshotByPathOrUrl(filePath);
           matchedDoc = doc;
           if (doc) {
-            annotationNote = _queueAnnotationsForVision(doc.bundle || null, doc, session);
+            annotationNote = await _queueAnnotationsForVision(doc.bundle || null, doc, session);
           }
         } catch { /* store unavailable — ignore */ }
 
@@ -1066,11 +1113,19 @@ export default {
           const autoAttach = _pdfImages.length <= _AUTO_ATTACH_MAX;
           if (autoAttach && session) {
             if (!session._pendingMcpImages) session._pendingMcpImages = [];
+            const { readNormalisedImageForVision } = await import('../media/_normalize-image-for-vision.js');
             for (const img of _pdfImages) {
               try {
-                const imgB64 = fs.readFileSync(img.path).toString('base64');
-                const imgExt = path.extname(img.path).toLowerCase().slice(1) || 'png';
-                const imgMime = imgExt === 'jpg' ? 'image/jpeg' : `image/${imgExt}`;
+                let imgB64, imgMime;
+                try {
+                  const norm = await readNormalisedImageForVision(img.path);
+                  imgB64 = norm.base64;
+                  imgMime = norm.mimeType;
+                } catch {
+                  imgB64 = fs.readFileSync(img.path).toString('base64');
+                  const imgExt = path.extname(img.path).toLowerCase().slice(1) || 'png';
+                  imgMime = imgExt === 'jpg' ? 'image/jpeg' : `image/${imgExt}`;
+                }
                 session._pendingMcpImages.push({ mimeType: imgMime, data: imgB64, _debugPath: img.path });
                 channel.log('read_file', `PDF p${img.page} image auto-attached: ${img.path}`);
               } catch { /* skip unreadable images */ }
