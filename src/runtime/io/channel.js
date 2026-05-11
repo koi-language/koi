@@ -138,6 +138,17 @@ class Channel {
    */
   clipMediaGenerated(info) {}
 
+  /**
+   * "Still generating" heartbeat — fires every few seconds while a
+   * long-running media job is being polled. The GUI uses this to keep
+   * its per-clip orphan watchdog alive past its 5 min default ceiling
+   * when the engine is genuinely still working. WS channel implements
+   * this with a real send; terminal channels leave the no-op default.
+   *
+   * @param {{ clipId: string, status?: string }} info
+   */
+  clipMediaGenerating(info) {}
+
   // ── Workflow lifecycle ─────────────────────────────────────────────────
   // `workflowActivating` fires BEFORE any tasks are created, giving the
   // GUI a chance to show a banner with a countdown and let the user

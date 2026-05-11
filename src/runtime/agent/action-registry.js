@@ -254,8 +254,36 @@ class ActionRegistry {
       'show_result',
     ]);
 
+    // Media tools get a dedicated "always-visible with one-liner"
+    // section, even though they live in the `media` toolset and still
+    // require `get_tool_info` before the agent can call them. Reason:
+    // when these intents only appear by name inside a toolset table,
+    // the LLM systematically reaches for `write_file` + a Python
+    // script (PIL, ffmpeg shell-out, etc.) when the user asks for
+    // visual edits — "modify image colors", "remove background",
+    // "animate this", "upscale". The dedicated AI tools win on every
+    // axis (quality, speed, no temp file plumbing, no Python deps)
+    // but the agent has to KNOW they exist to reach for them.
+    // Surfacing the description (not just the name) here closes that
+    // gap without violating the get_tool_info-first contract for
+    // parameter details.
+    const PROMOTED_MEDIA_INTENTS = new Set([
+      'generate_image',
+      'generate_video',
+      'generate_audio',
+      'generate_avatar_video',
+      'background_removal',
+      'upscale_image',
+      'outpaint_image',
+      'extract_frame',
+      'image_info',
+    ]);
+
     const coreActions = actions.filter(a => CORE_INTENTS.has(a.intent || a.type));
-    const toolsetActions = actions.filter(a => !CORE_INTENTS.has(a.intent || a.type));
+    const mediaActions = actions.filter(a => PROMOTED_MEDIA_INTENTS.has(a.intent || a.type));
+    const toolsetActions = actions.filter(a =>
+      !CORE_INTENTS.has(a.intent || a.type) && !PROMOTED_MEDIA_INTENTS.has(a.intent || a.type),
+    );
 
     // Group non-core by toolset
     const toolsets = new Map();
@@ -305,11 +333,12 @@ class ActionRegistry {
     }
     doc += '\n';
 
-    // Core tools — shown inline with params
-    doc += '### Core\n';
-    for (const action of coreActions) {
+    // Helper — render an action as a one-liner with its short
+    // description and a parameter signature. Shared between the Core
+    // and Media sections so they read consistently.
+    const _renderActionLine = (action) => {
       const intent = action.intent || action.type;
-      let desc = action.description || '';
+      const desc = action.description || '';
       const cut = [desc.indexOf('Fields:'), desc.indexOf('Returns:'), desc.indexOf('→'), desc.indexOf('. ', 30)].filter(i => i > 0);
       const shortDesc = desc.substring(0, cut.length > 0 ? Math.min(...cut) : desc.length).trim().replace(/[.,]\s*$/, '');
       let params = '';
@@ -318,9 +347,33 @@ class ActionRegistry {
         const req = new Set(action.schema.required || []);
         if (keys.length > 0) params = keys.map(k => req.has(k) ? `"${k}"` : `"${k}"?`).join(', ');
       }
-      doc += `- **${intent}**: ${shortDesc}`;
-      if (params) doc += ` | In: ${params}`;
-      doc += '\n';
+      let line = `- **${intent}**: ${shortDesc}`;
+      if (params) line += ` | In: ${params}`;
+      return line + '\n';
+    };
+
+    // Core tools — shown inline with params
+    doc += '### Core\n';
+    for (const action of coreActions) {
+      doc += _renderActionLine(action);
+    }
+
+    // ── Media tools (promoted from the `media` toolset) ────────────
+    // Shown with their short descriptions so the agent reaches for
+    // them by default on any media-editing request, instead of
+    // falling back to "write a Python script with PIL/ffmpeg" — the
+    // failure mode that prompted this promotion. Full parameter
+    // schemas still live behind get_tool_info (these tools take
+    // dozens of fields; dumping them all here would blow the prompt
+    // budget). The hard rule is in the banner: use these for ANY
+    // visual / audio transformation of a media file.
+    if (mediaActions.length > 0) {
+      doc += '\n### Media tools — ALWAYS use these for image / video / audio work\n';
+      doc += '**HARD RULE**: any time the user asks for a visual or audio transformation of a media file — change colours, swap a background, restyle, animate a still, extend or shorten a clip, upscale, outpaint, isolate a subject, add SFX, transcribe speech, generate a voice, lip-sync an avatar, ANY of those — you call the dedicated AI tool listed below. NEVER write a Python / shell / ffmpeg script to do it pixel-by-pixel or sample-by-sample. `write_file modify_color.py` with PIL is a category error for "make the letters white": the right answer is `generate_image` with the image as `referenceImages` and a prompt describing the change. Same for `ffmpeg` shell-outs to crop/concat/extract — the dedicated tools (`extract_frame`, `generate_video`, etc.) handle that internally with the right model picks and codec choices.\n\n';
+      doc += '**You still MUST call `get_tool_info("<tool>")` once before invoking any tool here** (parameters are rich and provider-specific). The descriptions below tell you WHEN to reach for each one; `get_tool_info` tells you HOW.\n\n';
+      for (const action of mediaActions) {
+        doc += _renderActionLine(action);
+      }
     }
 
     // Toolsets — grouped table

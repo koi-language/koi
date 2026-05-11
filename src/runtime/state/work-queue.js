@@ -35,6 +35,54 @@ import { channel } from '../io/channel.js';
 
 const VALID_STATUSES = ['pending', 'in_progress', 'completed', 'deleted'];
 
+// Engine-start queue cleanup. Runs ONCE per process the first time
+// any WorkQueue is touched. Wipes every `queue*.json` under the
+// active session directory, so a restored session always boots with
+// an empty queue regardless of what the previous engine left behind.
+//
+// Why: queue items persist on disk for the lifetime of the session
+// directory. If a previous run left items in `pending` (failed
+// delegate, network glitch, engine crashed mid-flight), the agent
+// picks them up on its first iteration in the new run and tries to
+// re-execute them — even when they're stale, no longer relevant, or
+// reference assets the user has moved on from. The user's bug:
+// finished bg-remove → agent saw `Generate ocean waves sound`
+// pending from an earlier flow → started chasing it.
+//
+// Plans (task-manager.tasks.json) are NOT touched — those have their
+// own restore-prompt flow (`checkRestoredFromDisk`) that asks the
+// user before resuming. Queues are an internal scratchpad and should
+// always start fresh.
+let _queueCleanupDone = false;
+function _clearAllQueueFilesOnce() {
+  if (_queueCleanupDone) return;
+  _queueCleanupDone = true;
+  const root = process.env.KOI_PROJECT_ROOT || process.cwd();
+  const sessionId = process.env.KOI_SESSION_ID;
+  if (!sessionId) return;
+  const sessionDir = path.join(root, '.koi', 'sessions', sessionId);
+  if (!fs.existsSync(sessionDir)) return;
+  let entries;
+  try { entries = fs.readdirSync(sessionDir); } catch { return; }
+  const removed = [];
+  for (const name of entries) {
+    if (!/^queue(-.+)?\.json$/.test(name)) continue;
+    try {
+      fs.unlinkSync(path.join(sessionDir, name));
+      removed.push(name);
+    } catch { /* non-fatal — keeps going for the rest */ }
+  }
+  if (removed.length > 0) {
+    try {
+      channel.log(
+        'queue',
+        `Engine boot: cleared ${removed.length} stale queue file(s) — ${removed.join(', ')}. ` +
+        `Restored sessions always start with empty queues.`,
+      );
+    } catch { /* channel may not be up yet */ }
+  }
+}
+
 class WorkQueue {
   /**
    * @param {string} [agentName] - Owner agent name. If omitted, uses 'system' (legacy singleton).
@@ -64,6 +112,11 @@ class WorkQueue {
   _loadIfNeeded() {
     if (this._loaded) return;
     this._loaded = true;
+    // Fire-once cleanup before reading: wipes every queue file under
+    // the active session dir, so this instance's `fs.existsSync(fp)`
+    // below always returns false on a restored session. New sessions
+    // (no files to wipe) are unaffected.
+    _clearAllQueueFilesOnce();
     const fp = this._getFilePath();
     if (!fs.existsSync(fp)) return;
     try {

@@ -88,6 +88,11 @@ const upscaleImageAction = {
   ],
 
   async execute(action, agent) {
+    // Guard — see generate-image.js for rationale.
+    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+    const _guard = await requireToolInfoFirst('upscale_image', agent);
+    if (_guard) return _guard;
+
     if (!action.image) {
       return { success: false, error: 'upscale_image: "image" is required (file path or attachment id)' };
     }

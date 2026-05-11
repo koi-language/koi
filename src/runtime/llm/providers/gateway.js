@@ -23,6 +23,7 @@
 import { BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen } from './base.js';
 import { lookupModel } from '../cost-center.js';
 import { parseQuotaExceededResponse } from '../quota-exceeded-error.js';
+import { channel } from '../../io/channel.js';
 
 /**
  * Throw a QuotaExceededError if the response is HTTP 402. Callers should
@@ -33,6 +34,90 @@ async function throwIfQuotaExceeded(res) {
   if (res.status === 402) {
     throw await parseQuotaExceededResponse(res);
   }
+}
+
+/**
+ * Exported so the per-tool actions (generate-video.js etc.) can run
+ * the same auto-retry classifier the gateway providers use internally
+ * — see `_isRouteableError` consumers.
+ */
+export { _isContentPolicyError, _isInputShapeError, _isRouteableError };
+
+/**
+ * True when the error message matches a known provider/model
+ * content-policy / safety-filter / moderation rejection. These are
+ * the cases where switching to a different slug in the same bucket
+ * can plausibly succeed (Imagen rejects → Seedream might accept).
+ *
+ * Patterns observed live across providers:
+ *  • OpenAI gpt-image-2: "content checker", "flagged by a content checker"
+ *  • Google Imagen / Gemini: "safety filter", "violates safety policy", "blocked by safety"
+ *  • Anthropic / Claude: "policy violation"
+ *  • fal generic: "moderation", "content policy", "not allowed", "refused"
+ *  • Seedance: "content could not be processed"
+ */
+function _isContentPolicyError(err) {
+  const msg = (err?.message || '').toLowerCase();
+  return (
+    msg.includes('content checker') ||
+    msg.includes('content policy') ||
+    msg.includes('content could not be processed') ||
+    msg.includes('safety policy') ||
+    msg.includes('safety filter') ||
+    msg.includes('blocked by safety') ||
+    msg.includes('flagged') ||
+    msg.includes('moderation') ||
+    msg.includes('policy violation') ||
+    msg.includes('violates our policies') ||
+    msg.includes('not allowed by') ||
+    msg.includes('refused due to content')
+  );
+}
+
+/**
+ * True when the error message matches an input-shape mismatch — the
+ * picker landed on a model whose adapter requires inputs the
+ * canonical request didn't carry. Same retry tactic as content
+ * policy: exclude the slug and try the next-best candidate (which
+ * may belong to a different input-shape family within the same
+ * category bucket).
+ *
+ * Real example from production: text-only `generate_video` lands on
+ * `fal-ai/wan/v2.7/image-to-video` (image-to-video model in the
+ * `video_generation` bucket); adapter rejects with
+ *   `body.image_url: At least one media input is required: provide
+ *    image_url (first frame), video_url (video continuation), or
+ *    audio_url (with image/video)`
+ * — clearly a shape mismatch, not a content policy issue. Without
+ * this detector the agent has to re-craft the call manually with
+ * excludeModels, which it rarely does correctly on a delegate's
+ * first retry.
+ */
+function _isInputShapeError(err) {
+  const msg = (err?.message || '').toLowerCase();
+  return (
+    msg.includes('at least one media input is required') ||
+    /\bimage_url\b[^\n]*\brequired\b/.test(msg) ||
+    /\bvideo_url\b[^\n]*\brequired\b/.test(msg) ||
+    /\bimage_urls\b[^\n]*\brequired\b/.test(msg) ||
+    /\baudio_url\b[^\n]*\brequired\b/.test(msg) ||
+    /\bstart_image_url\b[^\n]*\brequired\b/.test(msg) ||
+    /\bfirst_frame_url\b[^\n]*\brequired\b/.test(msg) ||
+    msg.includes('field required') ||
+    msg.includes('reference image required') ||
+    msg.includes('first frame required') ||
+    msg.includes('start frame required')
+  );
+}
+
+/**
+ * Single check for "this error is recoverable by re-routing to a
+ * different model in the same bucket". Used by the auto-retry loop
+ * in GatewayImageGen.generate / GatewayVideoGen.generate to decide
+ * whether to exclude+retry or surface the error verbatim.
+ */
+function _isRouteableError(err) {
+  return _isContentPolicyError(err) || _isInputShapeError(err);
 }
 
 // ── Gateway base URL ─────────────────────────────────────────────────────────
@@ -503,137 +588,232 @@ export class GatewayImageGen extends BaseImageGen {
   }
 
   async generate(prompt, opts = {}) {
-    const resolvedModel = await _resolveMediaModel('image', this.model, opts, (models, req) =>
-      import('./media-model-router.js').then(({ pickImageModel, MediaModelRoutingError }) => {
-        try {
-          return pickImageModel(models, req);
-        } catch (e) {
-          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
-          throw e;
-        }
-      }),
-      {
-        n: opts.n,
-        resolution: opts.resolution,
-        aspectRatio: opts.aspectRatio,
-        refsCount: opts.referenceImages?.length || 0,
-        label: opts.label,
-        // Agent-side intent — pickImageModel maps this to the curated
-        // category bucket (e.g. 'outpaint' → 'image_extend'). Tolerate
-        // the legacy `opts.operation` key during the rename rollout.
-        intent: opts.intent ?? opts.operation,
-      },
+    // Auto-retry on content-policy / safety-filter rejections.
+    //
+    // When the picker lands on a model whose moderation layer rejects
+    // the prompt (gpt-image-2's content checker, Imagen's safety
+    // filter, etc.) the failure is the model's choice, not the
+    // request's fault — a different model in the same bucket may well
+    // accept it. Without this loop the agent has to detect the
+    // rejection text, build `excludeModels` manually, and reissue —
+    // which it rarely does correctly (the log usually shows three
+    // identical retries that all land on the same blocked slug).
+    //
+    // The loop is bounded by MAX_POLICY_RETRIES so a prompt that
+    // EVERY model in the catalog rejects fails cleanly. Excluded
+    // slugs accumulate across iterations so the picker keeps cycling
+    // forward.
+    const MAX_POLICY_RETRIES = 5;
+    const _policyExcluded = new Set(
+      Array.isArray(opts.excludeModels) ? opts.excludeModels : [],
     );
+    let _policyAttempt = 0;
+    let _lastError = null;
 
-    // Only include fields that the gateway/fal understand — omit undefined/unsupported
-    const payload = { model: resolvedModel, prompt };
-    if (opts.n && opts.n > 1) payload.num_images = opts.n;
-    if (opts.aspectRatio) payload.aspect_ratio = opts.aspectRatio;
-    if (opts.outputFormat) payload.output_format = opts.outputFormat;
-    // resolution/quality are passed through to the Fal model as-is.
-    if (opts.resolution) payload.resolution = opts.resolution;
+    while (_policyAttempt < MAX_POLICY_RETRIES) {
+      const _attemptOpts = {
+        ...opts,
+        excludeModels: [..._policyExcluded],
+      };
 
-    if (opts.referenceImages?.length) {
-      payload.reference_images = opts.referenceImages.map(ref => ({
-        data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
-        mime_type: ref.mimeType || 'image/png',
-      }));
-    }
-    if (opts.maskImage) {
-      const m = opts.maskImage;
-      payload.mask_image = {
-        data: typeof m.data === 'string' ? m.data : m.data.toString('base64'),
-        mime_type: m.mimeType || 'image/png',
-      };
-    }
-    if (opts.sourceImage) {
-      const s = opts.sourceImage;
-      payload.source_image = {
-        data: typeof s.data === 'string' ? s.data : s.data.toString('base64'),
-        mime_type: s.mimeType || 'image/png',
-      };
-    }
-    if (opts.targetSize?.width && opts.targetSize?.height) {
-      payload.target_size = {
-        width: opts.targetSize.width,
-        height: opts.targetSize.height,
-      };
-    }
-    if (opts.sourceImageOffset
-        && typeof opts.sourceImageOffset.x === 'number'
-        && typeof opts.sourceImageOffset.y === 'number') {
-      payload.source_image_offset = {
-        x: opts.sourceImageOffset.x,
-        y: opts.sourceImageOffset.y,
-      };
-    }
+      let resolvedModel;
+      try {
+        resolvedModel = await _resolveMediaModel('image', this.model, _attemptOpts, (models, req) =>
+          import('./media-model-router.js').then(({ pickImageModel, MediaModelRoutingError }) => {
+            try {
+              return pickImageModel(models, req);
+            } catch (e) {
+              if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+              throw e;
+            }
+          }),
+          {
+            n: _attemptOpts.n,
+            resolution: _attemptOpts.resolution,
+            aspectRatio: _attemptOpts.aspectRatio,
+            refsCount: _attemptOpts.referenceImages?.length || 0,
+            label: _attemptOpts.label,
+            // Agent-side intent — pickImageModel maps this to the curated
+            // category bucket (e.g. 'outpaint' → 'image_extend'). Tolerate
+            // the legacy `opts.operation` key during the rename rollout.
+            intent: _attemptOpts.intent ?? _attemptOpts.operation,
+            excludeModels: _attemptOpts.excludeModels,
+          },
+        );
+      } catch (resolveErr) {
+        // Picker exhausted. Surface the original content-policy error
+        // (if any) so the agent sees WHY the catalog drained; the
+        // bare "no_model_matches" doesn't make the policy-cascade
+        // explicit. When no policy error preceded this (first
+        // resolve failed), rethrow the resolve error as-is.
+        if (_lastError) throw _lastError;
+        throw resolveErr;
+      }
 
-    // Submit + poll. The sync `/media/image/generate` endpoint exists for
-    // fast slugs, but Railway's edge proxy ~100s timeout cuts long calls
-    // (gpt-image-2 with refs) before fal returns — using the queue path
-    // avoids that entirely.
-    const submitRes = await fetch(`${getGatewayBase()}/media/image/submit`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify(payload),
-      signal: opts.abortSignal,
-    });
-
-    await throwIfQuotaExceeded(submitRes);
-    if (!submitRes.ok) {
-      const bodyText = await submitRes.text().catch(() => '');
-      let structured = null;
-      try { structured = JSON.parse(bodyText); } catch {}
-      const err = new Error(
-        structured?.error || `Gateway image submit error (${submitRes.status}): ${bodyText}`,
+      // Log the resolved slug BEFORE submitting, so a content-checker
+      // 4xx or any other downstream failure can be traced back to a
+      // specific slug. Retries get a marker so the cascade is obvious
+      // in the log.
+      channel.log(
+        'image',
+        _policyAttempt === 0
+          ? `Model resolved → ${resolvedModel}`
+          : `Model resolved → ${resolvedModel} (retry ${_policyAttempt} after content-policy rejection by [${[..._policyExcluded].join(', ')}])`,
       );
-      err.status = submitRes.status;
-      if (structured) err.details = structured;
+
+      // Only include fields that the gateway/fal understand — omit undefined/unsupported
+      const payload = { model: resolvedModel, prompt };
+      if (opts.n && opts.n > 1) payload.num_images = opts.n;
+      if (opts.aspectRatio) payload.aspect_ratio = opts.aspectRatio;
+      if (opts.outputFormat) payload.output_format = opts.outputFormat;
+      // resolution/quality are passed through to the Fal model as-is.
+      if (opts.resolution) payload.resolution = opts.resolution;
+
+      if (opts.referenceImages?.length) {
+        payload.reference_images = opts.referenceImages.map(ref => ({
+          data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
+          mime_type: ref.mimeType || 'image/png',
+        }));
+      }
+      if (opts.maskImage) {
+        const m = opts.maskImage;
+        payload.mask_image = {
+          data: typeof m.data === 'string' ? m.data : m.data.toString('base64'),
+          mime_type: m.mimeType || 'image/png',
+        };
+      }
+      if (opts.sourceImage) {
+        const s = opts.sourceImage;
+        payload.source_image = {
+          data: typeof s.data === 'string' ? s.data : s.data.toString('base64'),
+          mime_type: s.mimeType || 'image/png',
+        };
+      }
+      if (opts.targetSize?.width && opts.targetSize?.height) {
+        payload.target_size = {
+          width: opts.targetSize.width,
+          height: opts.targetSize.height,
+        };
+      }
+      if (opts.sourceImageOffset
+          && typeof opts.sourceImageOffset.x === 'number'
+          && typeof opts.sourceImageOffset.y === 'number') {
+        payload.source_image_offset = {
+          x: opts.sourceImageOffset.x,
+          y: opts.sourceImageOffset.y,
+        };
+      }
+
+      // Submit + poll. The sync `/media/image/generate` endpoint exists for
+      // fast slugs, but Railway's edge proxy ~100s timeout cuts long calls
+      // (gpt-image-2 with refs) before fal returns — using the queue path
+      // avoids that entirely.
+      try {
+        const submitRes = await fetch(`${getGatewayBase()}/media/image/submit`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify(payload),
+          signal: opts.abortSignal,
+        });
+
+        await throwIfQuotaExceeded(submitRes);
+        if (!submitRes.ok) {
+          const bodyText = await submitRes.text().catch(() => '');
+          let structured = null;
+          try { structured = JSON.parse(bodyText); } catch {}
+          const err = new Error(
+            structured?.error || `Gateway image submit error (${submitRes.status}): ${bodyText}`,
+          );
+          err.status = submitRes.status;
+          if (structured) err.details = structured;
+          throw err;
+        }
+
+        const { id } = await submitRes.json();
+        if (!id) throw new Error('Gateway image submit returned no id');
+
+        // Poll. Fal usually completes in a few seconds for fast slugs and
+        // 30–90s for gpt-image-2 + refs. Cap at ~5 min to bound runaway jobs.
+        const pollDeadline = Date.now() + 5 * 60 * 1000;
+        let pollDelay = 1500;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          if (Date.now() > pollDeadline) {
+            throw new Error(`Gateway image timeout after 5 min waiting on ${id}`);
+          }
+          await new Promise(r => setTimeout(r, pollDelay));
+          pollDelay = Math.min(pollDelay * 1.4, 5000);
+
+          const pollRes = await fetch(
+            `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
+            { headers: getAuthHeaders(), signal: opts.abortSignal },
+          );
+          await throwIfQuotaExceeded(pollRes);
+          if (!pollRes.ok) {
+            const bodyText = await pollRes.text().catch(() => '');
+            let structured = null;
+            try { structured = JSON.parse(bodyText); } catch {}
+            const err = new Error(
+              structured?.error || `Gateway image poll error (${pollRes.status}): ${bodyText}`,
+            );
+            err.status = pollRes.status;
+            if (structured) err.details = structured;
+            throw err;
+          }
+          const data = await pollRes.json();
+          if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') continue;
+          if (data.status === 'FAILED') {
+            const err = new Error(data.error || `Image generation failed (${id})`);
+            err.status = 502;
+            err.failedModel = resolvedModel;
+            throw err;
+          }
+          const images = _collectImages(data);
+          const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+          if (images.length === 0) ret.raw = data;
+          return ret;
+        }
+      } catch (callErr) {
+        if (_isRouteableError(callErr)) {
+          // Routeable failure on this slug — exclude it and try the
+          // next candidate. Covers BOTH content-policy rejections
+          // (provider's moderation) AND input-shape mismatches (the
+          // picker landed on a model whose adapter requires inputs
+          // the canonical request didn't carry). Same retry tactic
+          // works for both: re-resolve with the failed slug excluded
+          // and let the picker walk to the next-best.
+          _policyExcluded.add(resolvedModel);
+          _lastError = callErr;
+          _policyAttempt += 1;
+          const _shape = _isInputShapeError(callErr) ? 'input-shape' : 'content-policy';
+          channel.log(
+            'image',
+            `${_shape} reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model`,
+          );
+          continue;
+        }
+        // Any other failure (network, timeout, provider 500, …): don't
+        // retry. Switching models won't help and would burn quota.
+        throw callErr;
+      }
+    }
+
+    // All MAX_POLICY_RETRIES cycles exhausted with policy rejections.
+    // Surface the LAST policy error verbatim so the agent / user
+    // sees the actual reject message, not a generic "all retries failed".
+    if (_lastError) {
+      const err = new Error(
+        `Image generation refused by ${_policyExcluded.size} model(s) on content-policy grounds. ` +
+        `Last error: ${_lastError.message}. Excluded: [${[..._policyExcluded].join(', ')}].`,
+      );
+      err.cause = _lastError;
+      err.policyExhausted = true;
+      err.excludedModels = [..._policyExcluded];
       throw err;
     }
-
-    const { id } = await submitRes.json();
-    if (!id) throw new Error('Gateway image submit returned no id');
-
-    // Poll. Fal usually completes in a few seconds for fast slugs and
-    // 30–90s for gpt-image-2 + refs. Cap at ~5 min to bound runaway jobs.
-    const pollDeadline = Date.now() + 5 * 60 * 1000;
-    let pollDelay = 1500;
-    while (true) {
-      if (Date.now() > pollDeadline) {
-        throw new Error(`Gateway image timeout after 5 min waiting on ${id}`);
-      }
-      await new Promise(r => setTimeout(r, pollDelay));
-      pollDelay = Math.min(pollDelay * 1.4, 5000);
-
-      const pollRes = await fetch(
-        `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
-        { headers: getAuthHeaders(), signal: opts.abortSignal },
-      );
-      await throwIfQuotaExceeded(pollRes);
-      if (!pollRes.ok) {
-        const bodyText = await pollRes.text().catch(() => '');
-        let structured = null;
-        try { structured = JSON.parse(bodyText); } catch {}
-        const err = new Error(
-          structured?.error || `Gateway image poll error (${pollRes.status}): ${bodyText}`,
-        );
-        err.status = pollRes.status;
-        if (structured) err.details = structured;
-        throw err;
-      }
-      const data = await pollRes.json();
-      if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') continue;
-      if (data.status === 'FAILED') {
-        const err = new Error(data.error || `Image generation failed (${id})`);
-        err.status = 502;
-        throw err;
-      }
-      const images = _collectImages(data);
-      const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
-      if (images.length === 0) ret.raw = data;
-      return ret;
-    }
+    // Unreachable in practice (we either return on success or hit
+    // the throw above), but keep a safety throw.
+    throw new Error('Image generation failed: max retries exhausted without a recorded error');
   }
 
   /**
@@ -1366,6 +1546,12 @@ export class GatewayVideoGen extends BaseVideoGen {
         kind: opts.kind,
       },
     );
+
+    // Log the resolved slug BEFORE submitting, so a content-checker
+    // 4xx, an input-shape mismatch, an engine restart, or any other
+    // downstream failure can be traced back to a specific slug.
+    // Symmetric with the GatewayImageGen branch.
+    channel.log('video', `Model resolved → ${resolvedModel}`);
 
     const payload = {
       model: resolvedModel,

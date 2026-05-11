@@ -1280,6 +1280,16 @@ export class Agent {
       // never want a delegate's secondary provider to override the
       // root agent's.
       setConversationIndexProvider(this.llmProvider);
+      // Arm the pending-jobs recovery watcher (idempotent). Scans
+      // `~/.koi/pending-jobs/` for media-generation jobs whose poller
+      // died — picks them up, polls fal until terminal, downloads,
+      // and assigns the result to the original clip. Critical for
+      // long video generations where a hot-reload / engine crash /
+      // ws flap mid-poll would otherwise lose the job. See
+      // pending-jobs-watcher.js for the full design.
+      import('../state/pending-jobs-watcher.js')
+        .then(({ startPendingJobsWatcher }) => startPendingJobsWatcher())
+        .catch((err) => channel.log('jobs', `pending-jobs watcher init failed: ${err?.message || err}`));
     }
 
     // Prepare context with args and state

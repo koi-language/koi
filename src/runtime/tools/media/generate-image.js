@@ -21,6 +21,11 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { absolutizeMediaRefs } from './_absolutize-media-ref.js';
+import {
+  computeAspectCapGeometry,
+  padImageBuffer,
+  recoverImageFile,
+} from './_pad-and-recover.js';
 import { autoAttachMentions, listAvailableMentions } from './_auto-attach-mentions.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
@@ -174,6 +179,30 @@ const generateImageAction = {
   ],
 
   async execute(action, agent) {
+    // Guard: a blind first call returns docs instead of executing.
+    // Forces the agent to see labels (`erotic`, `porn`, …),
+    // excludeProviders/excludeModels, the live per-model catalog,
+    // and the aspect/resolution enums BEFORE wasting a round-trip
+    // on a default that might mismatch the intent.
+    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+    const _guard = await requireToolInfoFirst('generate_image', agent);
+    if (_guard) return _guard;
+
+    // Strip agent-supplied `model` — auto-picker decides. See the
+    // matching block in generate-video.js for the full rationale;
+    // tl;dr the agent pinning a slug routinely lands on something
+    // whose shape doesn't match the request (e.g. gpt-image-2 for
+    // an explicit prompt → content-policy reject). Use
+    // excludeModels / includeModels / label to bias instead.
+    if (action.model && action.model !== 'auto') {
+      channel.log(
+        'image',
+        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
+        `Use excludeModels / includeModels / label to bias instead.`,
+      );
+      action.model = undefined;
+    }
+
     const prompt = action.prompt;
     if (!prompt) throw new Error('generate_image: "prompt" is required');
 
@@ -242,6 +271,14 @@ const generateImageAction = {
     let referenceImages;
     const _savedRefIds = {}; // filePath → media library ID
     let _refAliases = []; // aligned with referenceImages order; empty string when unnamed
+    let _refSourcePaths = []; // aligned with referenceImages order; absolute path on disk
+    // Per-output recovery geometry. Set when pre-pad ran on at least
+    // one ref; consumed after saveTo to crop the model's output back
+    // to the original content rect. Single geometry instance — the
+    // common edit case is one base ref defining the canvas; rarer
+    // multi-ref cases would need per-output geometry but most models
+    // emit a single image at the FIRST ref's aspect anyway.
+    let _outputRecoveryGeom = null;
     // Auto-attach `@mention` handles found in the prompt that aren't
     // already in `referenceImages`. The agent often writes
     //   "Burrow identical to @storyboard_001"
@@ -333,6 +370,7 @@ const generateImageAction = {
           }
           referenceImages.push({ data, mimeType: normalized.mimeType });
           _refAliases.push(alias);
+          _refSourcePaths.push(resolvedPath);
 
           // Save reference image to media library (dedup by hash, non-blocking)
           try {
@@ -366,6 +404,59 @@ const generateImageAction = {
         `When the prompt below mentions a name in backticks (e.g. \`boat\`), it is referring to the reference image of that alias.\n\n` +
         prompt;
       channel.log('image', `Reference aliases: ${_refAliases.map((a, i) => `${i + 1}=${a || '-'}`).join(', ')}`);
+    }
+
+    // ── Aspect-ratio cap pre-pad ────────────────────────────────────
+    // Several edit models (notably gpt-image-2/edit) cap reference
+    // aspect ratio at 3:1 (long edge ≤ 3× short edge). Pre-pad the
+    // short edge with transparent borders so the input fits the
+    // envelope, and remember the content rect for the recovery crop
+    // below. The geometry math + sharp-based pad/crop primitives live
+    // in `_pad-and-recover.js` — same module video uses, so the two
+    // paths share code instead of duplicating the math.
+    //
+    // 3:1 is the conservative cap that satisfies every edit model
+    // we've shipped so far. If a future model has a tighter cap, the
+    // call still fails downstream with the same error and the
+    // gateway's auto-retry (`_isInputShapeError`) picks a different
+    // slug.
+    const MAX_REF_ASPECT_RATIO = 3;
+    if (referenceImages?.length > 0) {
+      try {
+        const sharp = (await import('sharp')).default;
+        for (let i = 0; i < referenceImages.length; i++) {
+          const ref = referenceImages[i];
+          const meta = await sharp(ref.data).metadata();
+          if (!meta?.width || !meta?.height) continue;
+          const geom = computeAspectCapGeometry(meta.width, meta.height, MAX_REF_ASPECT_RATIO);
+          if (!geom.needsPadding) continue;
+          const padded = await padImageBuffer(ref.data, geom, ref.mimeType);
+          referenceImages[i] = padded;
+          channel.log(
+            'image',
+            `Aspect-cap pad: ref[${i}] ${meta.width}×${meta.height} → ${geom.paddedW}×${geom.paddedH} ` +
+            `(content @ ${geom.padX},${geom.padY} ${geom.contentW}×${geom.contentH}; ` +
+            `ratio ${(Math.max(meta.width, meta.height) / Math.min(meta.width, meta.height)).toFixed(2)} > ${MAX_REF_ASPECT_RATIO})`,
+          );
+          // Record geometry for the FIRST padded ref only — the model's
+          // output normally matches the base ref's canvas, so recovering
+          // from the base ref's rect is the right strategy.
+          if (!_outputRecoveryGeom) {
+            _outputRecoveryGeom = geom;
+            // Pass the padded dims as the explicit target so any
+            // adapter that supports `{width, height}` (seedream family,
+            // etc.) emits at the same canvas we sent — making the
+            // recovery a static crop with NO scaling. Adapters that
+            // only accept enum presets (gpt-image-2/edit) ignore this
+            // and the recovery falls back to the proportional-crop +
+            // lanczos resize-back path. Either way the user sees the
+            // edit at the source dims.
+            action.targetSize = { width: geom.paddedW, height: geom.paddedH };
+          }
+        }
+      } catch (padErr) {
+        channel.log('image', `Aspect-cap pad failed (continuing without pad): ${padErr.message}`);
+      }
     }
 
     // Auto-detect aspectRatio AND resolution from the FIRST reference (the
@@ -660,6 +751,29 @@ const generateImageAction = {
         ...(img.width ? { width: img.width } : {}),
         ...(img.height ? { height: img.height } : {}),
       }));
+
+    // ── Aspect-cap recovery (mirror of pre-pad above) ──────────────
+    // Crop each output back to the original content rect via the
+    // shared `recoverImageFile` primitive (handles aspect-mismatch
+    // sanity check + proportional scaling internally — same code path
+    // video uses, just sharp-based instead of ffmpeg).
+    if (_outputRecoveryGeom?.needsPadding) {
+      for (const img of savedImages) {
+        if (!img.savedTo || !fs.existsSync(img.savedTo)) continue;
+        try {
+          const { width, height, recovered } = await recoverImageFile(
+            img.savedTo,
+            _outputRecoveryGeom,
+          );
+          if (recovered) {
+            img.width = width;
+            img.height = height;
+          }
+        } catch (recErr) {
+          channel.log('image', `Aspect-cap recovery failed on ${path.basename(img.savedTo)} (keeping padded): ${recErr.message}`);
+        }
+      }
+    }
 
     // Auto-save generated images to media library (non-blocking)
     try {

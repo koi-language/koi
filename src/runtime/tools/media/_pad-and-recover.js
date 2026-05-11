@@ -373,6 +373,205 @@ export function pickEnvelopeResolution({
   };
 }
 
+/**
+ * Compute the padding geometry needed to bring an input within an
+ * ASPECT-RATIO CAP — i.e. the maximum allowed long-edge : short-edge
+ * ratio a target provider accepts (gpt-image-2/edit caps at 3:1,
+ * other models at 2:1 or 4:1, etc.).
+ *
+ * Output shape mirrors `computePadGeometry`'s — `padX`, `padY`,
+ * `contentW`, `contentH`, `paddedW`, `paddedH`, `needsPadding` —
+ * so the same `recoverFromPadded` / sharp-based recovery can crop
+ * the model's output back to the original content rect regardless
+ * of how the padding was originally computed.
+ *
+ * Returns the geometry with `needsPadding: true` when the input
+ * exceeds the cap, or `{ needsPadding: false }` when it's already
+ * inside the envelope (no work to do).
+ *
+ * Pure math — no I/O, no fs, no sharp. The caller decides how to
+ * physically pad the asset (in-memory buffer via sharp, file-based
+ * via ffmpeg, etc.) given the returned geometry.
+ *
+ * @param {number} inWidth
+ * @param {number} inHeight
+ * @param {number} maxAspectRatio  long-edge : short-edge cap (e.g. 3)
+ * @returns {{
+ *   needsPadding: boolean,
+ *   paddedW: number, paddedH: number,
+ *   padX: number, padY: number,
+ *   contentW: number, contentH: number,
+ * }}
+ */
+export function computeAspectCapGeometry(inWidth, inHeight, maxAspectRatio) {
+  if (!Number.isFinite(inWidth) || !Number.isFinite(inHeight)
+      || inWidth <= 0 || inHeight <= 0
+      || !Number.isFinite(maxAspectRatio) || maxAspectRatio <= 0) {
+    return {
+      needsPadding: false,
+      paddedW: inWidth, paddedH: inHeight,
+      padX: 0, padY: 0,
+      contentW: inWidth, contentH: inHeight,
+    };
+  }
+  const longSide = Math.max(inWidth, inHeight);
+  const shortSide = Math.min(inWidth, inHeight);
+  if (longSide / shortSide <= maxAspectRatio) {
+    return {
+      needsPadding: false,
+      paddedW: inWidth, paddedH: inHeight,
+      padX: 0, padY: 0,
+      contentW: inWidth, contentH: inHeight,
+    };
+  }
+  // Grow the short edge so the ratio fits. Round up to even for
+  // codec friendliness (downstream tools sometimes re-encode and
+  // odd dims trip yuv420p).
+  let paddedShort = Math.ceil(longSide / maxAspectRatio);
+  if (paddedShort % 2 !== 0) paddedShort += 1;
+  const isLandscape = inWidth >= inHeight;
+  const paddedW = isLandscape ? inWidth : paddedShort;
+  const paddedH = isLandscape ? paddedShort : inHeight;
+  // Center the content within the padded canvas.
+  const padX = Math.floor((paddedW - inWidth) / 2);
+  const padY = Math.floor((paddedH - inHeight) / 2);
+  return {
+    needsPadding: true,
+    paddedW, paddedH,
+    padX, padY,
+    contentW: inWidth, contentH: inHeight,
+  };
+}
+
+/**
+ * Pad an in-memory image buffer to the given geometry. Sharp-based,
+ * no temp files. Returns a `{ data, mimeType }` pair — `mimeType` is
+ * always `'image/png'` for the output (alpha-friendly + lossless
+ * preserves the hard edges of logos / synthetic art that would
+ * otherwise get JPEG ringing on the padded boundary).
+ *
+ * Pass-through (no allocation, returns the input unchanged) when
+ * `geometry.needsPadding === false`.
+ *
+ * @param {Buffer} buffer       — source image bytes
+ * @param {object} geometry     — output of `computeAspectCapGeometry`
+ *                                 or `computePadGeometry`
+ * @param {string} [sourceMime] — input mime (informational only —
+ *                                 the output is always PNG)
+ */
+export async function padImageBuffer(buffer, geometry, sourceMime) {
+  if (!geometry?.needsPadding) {
+    return { data: buffer, mimeType: sourceMime || 'image/png' };
+  }
+  const sharp = (await import('sharp')).default;
+  const { paddedW, paddedH, padX, padY, contentW, contentH } = geometry;
+  const padded = await sharp(buffer)
+    .ensureAlpha()
+    .extend({
+      top: padY,
+      bottom: paddedH - contentH - padY,
+      left: padX,
+      right: paddedW - contentW - padX,
+      // Transparent borders. PNG alpha preserves the discontinuity;
+      // the model can still see the content uniformly surrounded by
+      // "empty" canvas. Provider-side this is read as "edit only the
+      // visible region" without leaking colour into the borders.
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+  return { data: padded, mimeType: 'image/png' };
+}
+
+/**
+ * Crop a SAVED image file back to its original content rect using
+ * the recorded geometry. Sharp-based, in-place rewrite (the file at
+ * `filePath` is replaced with the cropped bytes). Returns the new
+ * `{ width, height }` of the recovered image.
+ *
+ * Pass-through (returns probed dims without rewriting) when
+ * `geometry.needsPadding === false`.
+ *
+ * Handles the model upscaling the padded input proportionally: the
+ * crop rect is scaled by `(outW / paddedW, outH / paddedH)` so it
+ * lands on the correct region of the actual output. When the model
+ * doesn't preserve the envelope (output aspect differs from padded
+ * input aspect by >5%), recovery is skipped and the raw output is
+ * left intact — better than slicing the wrong region.
+ *
+ * @param {string} filePath
+ * @param {object} geometry — from `computeAspectCapGeometry` / `computePadGeometry`
+ * @returns {Promise<{ width: number, height: number, recovered: boolean }>}
+ */
+export async function recoverImageFile(filePath, geometry) {
+  if (!geometry?.needsPadding) {
+    const sharp = (await import('sharp')).default;
+    const m = await sharp(filePath).metadata();
+    return { width: m.width || 0, height: m.height || 0, recovered: false };
+  }
+  const sharp = (await import('sharp')).default;
+  const meta = await sharp(filePath).metadata();
+  if (!meta?.width || !meta?.height) {
+    return { width: 0, height: 0, recovered: false };
+  }
+  const inputAspect = geometry.paddedW / geometry.paddedH;
+  const outputAspect = meta.width / meta.height;
+  // Sanity check: model preserved the envelope within 5% tolerance.
+  // Outside that → it picked its own canvas (e.g. forced square) and
+  // a static crop would slice the wrong region.
+  if (Math.abs(outputAspect - inputAspect) / inputAspect > 0.05) {
+    channel.log(
+      'pad',
+      `recoverImageFile: skip on ${path.basename(filePath)} — ` +
+      `output aspect ${outputAspect.toFixed(2)} != padded input ${inputAspect.toFixed(2)}`,
+    );
+    return { width: meta.width, height: meta.height, recovered: false };
+  }
+  const scaleX = meta.width / geometry.paddedW;
+  const scaleY = meta.height / geometry.paddedH;
+  const cropX = Math.max(0, Math.round(geometry.padX * scaleX));
+  const cropY = Math.max(0, Math.round(geometry.padY * scaleY));
+  const cropW = Math.min(meta.width - cropX, Math.round(geometry.contentW * scaleX));
+  const cropH = Math.min(meta.height - cropY, Math.round(geometry.contentH * scaleY));
+  if (cropW <= 0 || cropH <= 0) {
+    return { width: meta.width, height: meta.height, recovered: false };
+  }
+  // Crop + resize-back to the ORIGINAL content dimensions. The model
+  // (gpt-image-2/edit etc.) emits at its own preset canvas — usually
+  // an UPSCALE of the input (e.g. 592×198 padded → 1024×342 out).
+  // The crop above gives us the right region, but at the model's
+  // canvas size, not the user's. For in-place edit flows (logo
+  // recolor, sticker tweak, etc.) the user expects bit-for-bit dim
+  // parity with the source: 592×138 in → 592×138 out, not 1024×239.
+  // The final resize collapses the model upscale away.
+  //
+  // We pick lanczos3 because it's the highest-quality downsample
+  // sharp offers and the edit content is usually sharp-edge synthetic
+  // (text, vector logos) where ringing artifacts of cheaper filters
+  // would be visible.
+  let pipeline = sharp(filePath)
+    .extract({ left: cropX, top: cropY, width: cropW, height: cropH });
+  const wantResize = cropW !== geometry.contentW || cropH !== geometry.contentH;
+  if (wantResize) {
+    pipeline = pipeline.resize(geometry.contentW, geometry.contentH, {
+      fit: 'fill',
+      kernel: 'lanczos3',
+    });
+  }
+  const cropped = await pipeline.toBuffer();
+  fs.writeFileSync(filePath, cropped);
+  const finalW = wantResize ? geometry.contentW : cropW;
+  const finalH = wantResize ? geometry.contentH : cropH;
+  channel.log(
+    'pad',
+    `recoverImageFile: ${path.basename(filePath)} ${meta.width}×${meta.height} → ${finalW}×${finalH} ` +
+    `(crop ${cropX},${cropY} ${cropW}×${cropH}` +
+    (wantResize ? `; resize-back to source dims ${geometry.contentW}×${geometry.contentH}` : '') +
+    `; model scale ${scaleX.toFixed(2)}×${scaleY.toFixed(2)})`,
+  );
+  return { width: finalW, height: finalH, recovered: true };
+}
+
 /** Map (resolution, aspectRatio) → output (w, h). Picks ffmpeg-friendly
  *  dimensions that match what the major video providers emit at the
  *  given combo. Returns null when either piece is missing or unparseable

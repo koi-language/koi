@@ -330,6 +330,77 @@ const generateVideoAction = {
   ],
 
   async execute(action, agent) {
+    // Guard — see generate-image.js for rationale.
+    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+    const _guard = await requireToolInfoFirst('generate_video', agent);
+    if (_guard) return _guard;
+
+    // ── Strip agent-supplied `model` ─────────────────────────────────
+    // The auto-picker (pickVideoModel + the live catalog) is the SOLE
+    // authority for model selection. Agents that pin a slug via
+    // `action.model` bypass the picker and routinely land on a slug
+    // whose adapter rejects the request shape (e.g. forcing
+    // `fal-ai/wan/v2.7/image-to-video` for a text-only prompt with no
+    // image input). Strip it loudly so the user sees the override
+    // happen in the log and the agent eventually stops doing it.
+    // `excludeModels` / `includeModels` / `label` remain the legit
+    // levers for biasing the picker.
+    if (action.model && action.model !== 'auto') {
+      channel.log(
+        'video',
+        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
+        `Use excludeModels / includeModels / label to bias instead.`,
+      );
+      action.model = undefined;
+    }
+
+    // ── Auto-correct misplaced image files in referenceVideos ────────
+    // `referenceVideos` is for MP4/MOV/WebM/AVI/M4V URLs or paths.
+    // Agents frequently confuse it with `referenceImages` / `startFrame`
+    // and shove a PNG path there ("the GUI gave me a file, it's
+    // referenceMedia, must be referenceVideos"). The downstream
+    // adapter then fails with "image_url required" because the actual
+    // image input is empty. Detect by extension and move:
+    //   • If `startFrame` is empty → first misplaced file lands there.
+    //   • Remaining (or all when startFrame is busy) → `referenceImages`.
+    const _IMG_EXTS = new Set([
+      '.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.heif', '.bmp', '.tif', '.tiff',
+    ]);
+    const _isImagePath = (p) => {
+      if (typeof p !== 'string' || p.length === 0) return false;
+      const dot = p.lastIndexOf('.');
+      if (dot < 0) return false;
+      return _IMG_EXTS.has(p.slice(dot).toLowerCase());
+    };
+    if (Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
+      const _keptVideos = [];
+      const _misplaced = [];
+      for (const entry of action.referenceVideos) {
+        if (_isImagePath(entry)) _misplaced.push(entry);
+        else _keptVideos.push(entry);
+      }
+      if (_misplaced.length > 0) {
+        action.referenceVideos = _keptVideos;
+        if (!action.startFrame) {
+          action.startFrame = _misplaced.shift();
+          channel.log(
+            'video',
+            `Auto-correct: moved 1 image file from referenceVideos → startFrame (${action.startFrame}).` +
+            (_misplaced.length > 0 ? ` Remaining ${_misplaced.length} → referenceImages.` : ''),
+          );
+        }
+        if (_misplaced.length > 0) {
+          action.referenceImages = Array.isArray(action.referenceImages)
+            ? [...action.referenceImages, ..._misplaced]
+            : [..._misplaced];
+          channel.log(
+            'video',
+            `Auto-correct: moved ${_misplaced.length} image file(s) from referenceVideos → referenceImages: ${_misplaced.join(', ')}`,
+          );
+        }
+      }
+    }
+
     const prompt = action.prompt;
     if (!prompt) throw new Error('generate_video: "prompt" is required');
 
@@ -870,12 +941,86 @@ const generateVideoAction = {
 
     if (submitted.id) _stashJobMetadata(submitted.id, generationParams);
 
+    // ── Persist the job to disk so it survives an engine crash ──────
+    // recordJob writes `~/.koi/pending-jobs/<jobId>.json`. The
+    // pending-jobs-watcher singleton (booted at engine startup) scans
+    // that dir on launch and resumes any job whose poller died — fal
+    // already has the result server-side, we just need somewhere to
+    // catch it. acquireLock is best-effort: if a watcher in some
+    // other engine already owns this job, we still proceed to poll
+    // (the lock is for the WATCHER's benefit, not the original
+    // submitter's). The poll's onTick callback below heartbeats the
+    // lock + mirrors the latest fal status to disk so the watcher
+    // can see this poller is alive and where the job stands.
+    let _persistedJob = null;
+    if (submitted.id) {
+      const { recordJob: _recordJob, acquireLock: _acquireLock } = await import('../../state/pending-jobs.js');
+      try {
+        _persistedJob = _recordJob({
+          jobId: submitted.id,
+          kind: 'video',
+          slug: submitted.model || resolved.model,
+          provider: resolved.provider,
+          prompt,
+          params: generationParams,
+          savePath: action.saveTo || null,
+          clipContext: (action.assignToClip && action.assignToClip.timelineId && action.assignToClip.clipId)
+            ? {
+                timelineId: action.assignToClip.timelineId,
+                clipId: action.assignToClip.clipId,
+                placeholderPath: action.assignToClip.placeholderPath || null,
+              }
+            : null,
+          status: submitted.status || 'submitted',
+        });
+        _acquireLock(submitted.id, process.pid);
+      } catch (err) {
+        // Persistence is a safety net; never fail the actual generation
+        // just because we couldn't write the recovery file.
+        channel.log('video', `pending-jobs: recordJob failed (${err.message}) — continuing without disk recovery`);
+      }
+    }
+
+    // Heartbeat / status-mirror callback for the poll loop. Three jobs:
+    //   1. Refresh the disk-state lock (so a recovery watcher in
+    //      another engine sees we're alive and doesn't try to steal).
+    //   2. Mirror the latest fal status into the job file (so a
+    //      watcher inheriting the job knows the last known state).
+    //   3. Emit a `clipMediaGenerating` ws event to the GUI so the
+    //      per-clip orphan watchdog (5 min ceiling) re-arms instead
+    //      of dropping the stripes overlay on a long but legitimate
+    //      generation (Veo 3.1 with refs, Kling 1080p, etc.).
+    let _onPollTick = null;
+    if (_persistedJob && submitted.id) {
+      const { updateJob: _updateJob, refreshLock: _refreshLock } = await import('../../state/pending-jobs.js');
+      _onPollTick = (latest) => {
+        try {
+          _refreshLock(submitted.id, process.pid);
+          _updateJob(submitted.id, {
+            lastSeenStatus: latest?.status || 'unknown',
+            lastPolledAt: new Date().toISOString(),
+          });
+        } catch { /* observability is best-effort */ }
+        // GUI heartbeat — only meaningful when this job was kicked
+        // off from a timeline placeholder (clipContext present).
+        try {
+          if (_persistedJob.clipContext?.clipId) {
+            channel.clipMediaGenerating({
+              clipId: _persistedJob.clipContext.clipId,
+              status: latest?.status || 'pending',
+            });
+          }
+        } catch { /* non-fatal */ }
+      };
+    }
+
     // Poll the provider until the job reaches a terminal state. Sync
     // providers return `status === 'completed'` straight away and the
     // loop exits immediately on the first iteration.
     const final = await _pollUntilTerminal(instance, submitted, {
       abortSignal,
       reportProgress,
+      onTick: _onPollTick,
       timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
         ? action.timeoutMs
         : DEFAULT_TIMEOUT_MS,
@@ -885,7 +1030,13 @@ const generateVideoAction = {
     });
 
     if (final.status === 'failed') {
-      if (submitted.id) clearJobMetadata(submitted.id);
+      if (submitted.id) {
+        clearJobMetadata(submitted.id);
+        try {
+          const { markFailed: _markFailed } = await import('../../state/pending-jobs.js');
+          _markFailed(submitted.id, final.error || 'Provider reported failure with no error message.');
+        } catch { /* non-fatal */ }
+      }
       // Prefix the error string with the resolved slug so the agent
       // sees WHICH model rejected the call — even when the action
       // result is summarised as a single line (`❌ generate_video
@@ -910,6 +1061,17 @@ const generateVideoAction = {
       // failure so the agent can retry (the provider's request id is
       // returned for advanced manual recovery, but the agent should
       // typically just call generate_video again).
+      //
+      // IMPORTANT: do NOT mark the persisted job as completed/failed
+      // here — the job is still in-flight on fal. Release our lock so
+      // the recovery watcher can pick it up on the next scan (or the
+      // next engine startup) and complete it when fal terminates.
+      if (submitted.id && _persistedJob) {
+        try {
+          const { releaseLock: _releaseLock } = await import('../../state/pending-jobs.js');
+          _releaseLock(submitted.id, process.pid);
+        } catch { /* non-fatal */ }
+      }
       const _pendingSlug = final.model || resolved.model;
       const _pendingMsg = final.error || `Timed out waiting for provider to finish.`;
       return {
@@ -1097,6 +1259,16 @@ const generateVideoAction = {
     if (submitted.id) clearJobMetadata(submitted.id);
     if (final.id && final.id !== submitted.id) clearJobMetadata(final.id);
 
+    // Disk recovery handoff complete — the job has been downloaded
+    // and (if the caller wired clipContext) the watcher's resume
+    // path is no longer needed. Delete the pending-jobs file.
+    if (submitted.id && _persistedJob) {
+      try {
+        const { markCompleted: _markCompleted } = await import('../../state/pending-jobs.js');
+        _markCompleted(submitted.id);
+      } catch { /* non-fatal */ }
+    }
+
     reportProgress?.(1, 'Done');
     return {
       success: true,
@@ -1149,18 +1321,33 @@ const _sleep = (ms, signal) => new Promise((resolve, reject) => {
  * Sync providers return `status: 'completed'` from the kick-off itself;
  * the loop returns on the first call without polling.
  */
-export async function _pollUntilTerminal(instance, submitted, { abortSignal, reportProgress, timeoutMs, pollIntervalMs }) {
+export async function _pollUntilTerminal(instance, submitted, { abortSignal, reportProgress, timeoutMs, pollIntervalMs, onTick }) {
   const pollMs = Math.min(MAX_POLL_INTERVAL_MS, Math.max(MIN_POLL_INTERVAL_MS, pollIntervalMs));
   const deadline = Date.now() + timeoutMs;
   const t0 = Date.now();
 
+  // `onTick(result)` — optional, fires after every successful poll
+  // iteration (and once on synchronous completion). The
+  // pending-jobs-aware caller uses this to refresh the heartbeat lock
+  // and persist the latest fal status to disk, so another engine
+  // (recovery watcher) can take over if this poller dies mid-loop.
+  // Errors inside onTick MUST NOT abort the poll — the loop is
+  // best-effort observability, not control flow.
+  const _tick = (r) => {
+    if (!onTick) return;
+    try { onTick(r); } catch { /* observability is best-effort */ }
+  };
+
   // Sync completion right out of the gate. Some providers omit `status`
   // and just return the URL — treat that as completed too.
   if (submitted.status === 'completed' || submitted.status === 'failed') {
+    _tick(submitted);
     return submitted;
   }
   if (!submitted.status && submitted.url) {
-    return { ...submitted, status: 'completed' };
+    const synthetic = { ...submitted, status: 'completed' };
+    _tick(synthetic);
+    return synthetic;
   }
 
   let result = submitted;
@@ -1177,6 +1364,7 @@ export async function _pollUntilTerminal(instance, submitted, { abortSignal, rep
     try {
       result = await instance.getStatus(jobId, { abortSignal });
       consecutiveErrors = 0;
+      _tick(result);
     } catch (err) {
       consecutiveErrors += 1;
       if (consecutiveErrors >= 5) {

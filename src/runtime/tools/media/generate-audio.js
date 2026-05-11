@@ -88,6 +88,22 @@ const generateAudioAction = {
   ],
 
   async execute(action, agent) {
+    // Guard — see generate-image.js for rationale.
+    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+    const _guard = await requireToolInfoFirst('generate_audio', agent);
+    if (_guard) return _guard;
+
+    // Strip agent-supplied `model` — auto-picker drives selection.
+    // See generate-video.js for the full rationale.
+    if (action.model && action.model !== 'auto') {
+      channel.log(
+        'audio',
+        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
+        `Use excludeModels / includeModels / label to bias instead.`,
+      );
+      action.model = undefined;
+    }
+
     // Normalise the gateway's canonical kind names back to this tool's
     // legacy mode names. The dynamic catalog refresh below republishes
     // `mode` as one of the gateway kinds (`tts`, `transcribe`, `sfx`)

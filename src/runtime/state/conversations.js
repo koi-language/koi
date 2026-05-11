@@ -440,10 +440,50 @@ function _readSessionStartedAt(sessionDir, turns) {
   }
 }
 
+/**
+ * Strip the GUI-prepended orchestration preamble from a user_input
+ * line. The video timeline's "Generate AI clip" / "AI extend" flows
+ * wrap the user's actual prompt in a long structured block that looks
+ * like:
+ *
+ *     # AI clip context
+ *     You are operating on a single AI-placeholder clip...
+ *     - Timeline id: ...
+ *     - Clip id: ...
+ *     ...
+ *     # Generation tool + reference wiring
+ *     ...
+ *     # User request
+ *     <THE USER'S ACTUAL PROMPT — this is what we want>
+ *
+ * The agent needs the whole preamble to route correctly, but the
+ * title/summary LLM only cares about the user's intent. Feeding it
+ * the raw preamble produced titles that didn't parse (the response
+ * had no `TITLE:` line because the LLM thought it was looking at a
+ * tool-orchestration log, not a chat), which surfaced as
+ * `(untitled session)` rows in the Recent Sessions dialog with the
+ * preamble bleeding into the description.
+ *
+ * We slice from the `# User request` marker and keep only what
+ * follows. If the marker isn't present, the text is already a plain
+ * user message and is returned untouched.
+ */
+function _stripUserInputPreamble(text) {
+  if (typeof text !== 'string' || text.length === 0) return text || '';
+  const marker = '# User request';
+  const idx = text.lastIndexOf(marker);
+  if (idx < 0) return text;
+  // Everything after the marker line is the actual prompt.
+  const after = text.slice(idx + marker.length);
+  return after.replace(/^\s*\n/, '').trim();
+}
+
 function _extractLastUserMsg(turns) {
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
-    if (t.type === 'user_input' && typeof t.text === 'string') return t.text;
+    if (t.type === 'user_input' && typeof t.text === 'string') {
+      return _stripUserInputPreamble(t.text);
+    }
   }
   return '';
 }
@@ -459,7 +499,7 @@ function _buildSummaryInput(turns) {
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
     let line;
-    if (t.type === 'user_input') line = `User: ${t.text || ''}`;
+    if (t.type === 'user_input') line = `User: ${_stripUserInputPreamble(t.text || '')}`;
     else if (t.type === 'action') line = `Assistant action ${t.intent || ''}: ${t.result || ''}`;
     else if (t.type === 'assistant_message' || t.type === 'assistant_response') line = `Assistant: ${t.text || ''}`;
     else continue;
@@ -474,9 +514,14 @@ function _buildSummaryInput(turns) {
 function _titleSummaryPrompt(transcript) {
   return [
     'You are summarising a chat transcript for a "Recent Sessions" sidebar (think ChatGPT history).',
-    'Output EXACTLY this format and nothing else:',
+    'Output EXACTLY this format and nothing else — TITLE and SUMMARY are MANDATORY, never omit them:',
     'TITLE: <a single short title, max 6 words, no quotes, no trailing punctuation, in the same language the user wrote>',
     'SUMMARY: <2-3 sentences describing what the user is trying to do and what was discussed; objective, not a recap of "the user asked X and the assistant replied Y">',
+    '',
+    'Rules:',
+    '- ALWAYS emit both lines, even if the transcript looks like automated tool orchestration, a refusal, an error trace, or is very short. Pick the best descriptor you can from whatever signal exists.',
+    '- If you only see user prompts (no assistant replies), title and summarise the user\'s intent across those prompts.',
+    '- Do NOT add explanations, apologies, or any text outside the TITLE/SUMMARY lines.',
     '',
     'Transcript:',
     transcript,
@@ -508,8 +553,13 @@ function _parseTitleSummary(raw) {
 function _degradedTitle(turns) {
   const firstUser = turns.find((t) => t.type === 'user_input');
   if (firstUser?.text) {
-    const t = firstUser.text.replace(/\s+/g, ' ').trim();
-    return t.length > 60 ? t.slice(0, 57) + '…' : t;
+    // Strip the GUI orchestration preamble first — without this, a
+    // fallback title for an AI-clip session would read
+    // "# AI clip context You are operating on a single AI-placeholder…"
+    // instead of the user's actual prompt.
+    const cleaned = _stripUserInputPreamble(firstUser.text);
+    const t = (cleaned || firstUser.text).replace(/\s+/g, ' ').trim();
+    if (t) return t.length > 60 ? t.slice(0, 57) + '…' : t;
   }
   return 'Session';
 }

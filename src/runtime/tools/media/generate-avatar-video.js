@@ -82,6 +82,11 @@ const generateAvatarVideoAction = {
   ],
 
   async execute(action, agent) {
+    // Guard — see generate-image.js for rationale.
+    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+    const _guard = await requireToolInfoFirst('generate_avatar_video', agent);
+    if (_guard) return _guard;
+
     const imagePath = action.image;
     const audioPath = action.audioFile;
     if (!imagePath) return { success: false, error: 'generate_avatar_video: "image" is required' };
