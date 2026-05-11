@@ -95,171 +95,100 @@ function _normLabel(l) {
 }
 
 function _collectCommon(models) {
-  // slug → description. Per-model entries with the same slug carry the same
-  // description (curated centrally), but if any model ships a non-empty
-  // description and another ships '', we keep the populated one.
+  // Aggregate ONLY Koi-owned signals:
+  //   • labels[]:    de-duped union of {slug, description} pairs across
+  //                  the active catalog. Tools surface the slug list as
+  //                  an agent-facing enum and the description in
+  //                  prompt-time guidance.
+  //   • categories[]: de-duped union of the Koi buckets present in the
+  //                  catalog. Lets tools surface a `kind` enum only for
+  //                  buckets that actually have at least one active
+  //                  model — no phantom options.
+  // Vendor-derived signals (resolutions, aspectRatios, durations,
+  // cameraMovements, maxShots, t2v/i2v/v2v flags, operations[],
+  // canEdit/canGenerate, maxRefImages, frameControl, hasAudio, lipsync,
+  // tts/sfx/music/transcribe/voiceSelect, inputImage/Video/Audio) are
+  // INTENTIONALLY not collected: the backend doesn't ship them in
+  // models.json anymore, and the runtime tools don't depend on them
+  // either. The per-slug adapter is the sole place that knows what a
+  // model physically accepts.
   const labelMap = new Map();
-  const resolutionSet = new Set();
-  const aspectRatioSet = new Set();
-  const durationSet = new Set();
+  const categorySet = new Set();
   for (const m of models) {
     if (Array.isArray(m?.labels)) {
       for (const raw of m.labels) {
         const norm = _normLabel(raw);
         if (!norm || !norm.slug) continue;
         const prev = labelMap.get(norm.slug);
-        if (!prev || (!prev && norm.description) || (prev && !prev.description && norm.description)) {
+        if (!prev || (prev && !prev.description && norm.description)) {
           labelMap.set(norm.slug, norm);
         }
       }
     }
-    for (const r of _splitCsv(m?.resolutions)) resolutionSet.add(r);
-    for (const a of _splitCsv(m?.aspectRatios)) aspectRatioSet.add(a);
-    for (const d of _splitCsv(m?.durations)) {
-      const n = Number(d);
-      if (Number.isFinite(n) && n > 0) durationSet.add(n);
+    if (Array.isArray(m?.categories)) {
+      for (const c of m.categories) {
+        if (typeof c === 'string' && c.trim()) categorySet.add(c.trim());
+      }
     }
   }
-  // Sorted slug list (keeps router/enum behaviour identical) plus a parallel
-  // map for callers that want descriptions for the description block.
   const labels = [...labelMap.keys()].sort();
   const labelDetails = labels.map((slug) => labelMap.get(slug));
   return {
     labels,
     labelDetails,
-    resolutions:  [...resolutionSet],
-    aspectRatios: [...aspectRatioSet],
-    durations:    [...durationSet].sort((a, b) => a - b),
+    categories: [...categorySet].sort(),
   };
 }
 
 function _aggregateImage(models) {
   const common = _collectCommon(models);
-  let anyCanGenerate = false;
-  let anyCanEdit = false;
-  let maxImages = 0;
-  let maxRefImages = 0;
-  let hasRefImageSupport = false;
-  // Union of per-model `operations: string[]`. Lets the runtime know which
-  // image-edit categories (bg-remove, upscale, inpaint, outpaint, …) are
-  // available so each tool can surface itself only when supported.
-  const operationSet = new Set();
-  for (const m of models) {
-    if (m?.canGenerate) anyCanGenerate = true;
-    if (m?.canEdit) anyCanEdit = true;
-    if (typeof m?.maxImages === 'number' && m.maxImages > maxImages) {
-      maxImages = m.maxImages;
-    }
-    if (m?.maxRefImages != null) {
-      hasRefImageSupport = true;
-      if (m.maxRefImages === 0) {
-        maxRefImages = Math.max(maxRefImages, 16);
-      } else if (typeof m.maxRefImages === 'number' && m.maxRefImages > maxRefImages) {
-        maxRefImages = m.maxRefImages;
-      }
-    }
-    if (Array.isArray(m?.operations)) {
-      for (const op of m.operations) {
-        if (typeof op === 'string' && op.trim()) operationSet.add(op.trim());
-      }
-    }
-  }
+  // Bucket-presence flags surface tool parameters only when the catalog
+  // actually carries the relevant Koi category. Sourced from
+  // `common.categories`, NOT from vendor flags.
+  const cats = new Set(common.categories);
   return {
     models,
     ...common,
-    anyCanGenerate,
-    anyCanEdit,
-    maxImages: maxImages || 1,
-    hasRefImageSupport,
-    maxRefImages,
-    operations: [...operationSet].sort(),
+    hasGenerate:        cats.has('image_generation'),
+    hasEdit:            cats.has('image_editing'),
+    hasBackgroundRemove: cats.has('image_background_removal'),
+    hasUpscale:         cats.has('image_upscaling'),
+    hasExtend:          cats.has('image_extend'),
   };
 }
 
 function _aggregateVideo(models) {
   const common = _collectCommon(models);
-  let anyTextToVideo = false;
-  let anyImageToVideo = false;
-  let anyVideoToVideo = false;
-  let anyFrameControl = false;
-  let anyAudio = false;
-  let anyExtend = false;
-  let anyBgRemove = false;
-  let maxShots = 1;
-  const cameraMovementSet = new Set();
-  for (const m of models) {
-    if (m?.textToVideo) anyTextToVideo = true;
-    if (m?.imageToVideo) anyImageToVideo = true;
-    if (m?.videoToVideo) anyVideoToVideo = true;
-    if (m?.frameControl) anyFrameControl = true;
-    if (m?.hasAudio) anyAudio = true;
-    // Curated `video_extend` bucket — surfaces the `kind: "extend"`
-    // tool parameter only when at least one model carries the tag.
-    if (Array.isArray(m?.categories) && m.categories.includes('video_extend')) {
-      anyExtend = true;
-    }
-    // Curated `video_background_removal` bucket — surfaces
-    // `kind: "bg-remove"` only when at least one matting model is
-    // active in the catalog (e.g. Bria's video background removal).
-    if (Array.isArray(m?.categories)
-        && m.categories.includes('video_background_removal')) {
-      anyBgRemove = true;
-    }
-    // Per-model `cameraMovements`: CSV of supported tokens like
-    // "static,pan_left,zoom_in". Union across active models — tools then
-    // expose the superset as an enum.
-    for (const c of _splitCsv(m?.cameraMovements)) cameraMovementSet.add(c);
-    // `maxShots`: how many independent clips the provider can emit in a
-    // single call. Multishot-capable models (Runway Gen-3, some Kling
-    // variants, Sora multishot) set this > 1; default 1 is "single clip".
-    if (typeof m?.maxShots === 'number' && m.maxShots > maxShots) {
-      maxShots = m.maxShots;
-    }
-  }
+  const cats = new Set(common.categories);
   return {
     models,
     ...common,
-    anyTextToVideo,
-    anyImageToVideo,
-    anyVideoToVideo,
-    anyFrameControl,
-    anyAudio,
-    anyExtend,
-    anyBgRemove,
-    hasRefImageSupport: anyImageToVideo || anyVideoToVideo,
-    cameraMovements: [...cameraMovementSet].sort(),
-    maxShots,
+    hasGenerate:        cats.has('video_generation'),
+    hasEditing:         cats.has('video_editing'),
+    hasExtend:          cats.has('video_extend'),
+    hasAvatar:          cats.has('video_avatar'),
+    hasBackgroundRemove: cats.has('video_background_removal'),
   };
 }
 
 function _aggregateAudio(models) {
   const common = _collectCommon(models);
-  let anyTts = false;
-  let anyTranscribe = false;
-  let anyMusic = false;
-  let anySfx = false;
-  let anyVoiceSelect = false;
-  for (const m of models) {
-    if (m?.tts) anyTts = true;
-    if (m?.transcribe) anyTranscribe = true;
-    if (m?.music) anyMusic = true;
-    if (m?.sfx) anySfx = true;
-    if (m?.voiceSelect) anyVoiceSelect = true;
-  }
+  const cats = new Set(common.categories);
   const kinds = [];
-  if (anyTts) kinds.push('tts');
-  if (anyTranscribe) kinds.push('transcribe');
-  if (anyMusic) kinds.push('music');
-  if (anySfx) kinds.push('sfx');
+  if (cats.has('audio_tts')) kinds.push('tts');
+  if (cats.has('audio_transcription')) kinds.push('transcribe');
+  if (cats.has('audio_music')) kinds.push('music');
+  if (cats.has('audio_sfx')) kinds.push('sfx');
+  if (cats.has('audio_voice_clone')) kinds.push('voice-clone');
   return {
     models,
     ...common,
     kinds,
-    anyTts,
-    anyTranscribe,
-    anyMusic,
-    anySfx,
-    anyVoiceSelect,
+    hasTts:        cats.has('audio_tts'),
+    hasTranscribe: cats.has('audio_transcription'),
+    hasMusic:      cats.has('audio_music'),
+    hasSfx:        cats.has('audio_sfx'),
+    hasVoiceClone: cats.has('audio_voice_clone'),
   };
 }
 
@@ -589,9 +518,10 @@ export class GatewayImageGen extends BaseImageGen {
         aspectRatio: opts.aspectRatio,
         refsCount: opts.referenceImages?.length || 0,
         label: opts.label,
-        // Intent flag — pickImageModel maps this to the curated
-        // category bucket (e.g. 'outpaint' → 'image_extend').
-        operation: opts.operation,
+        // Agent-side intent — pickImageModel maps this to the curated
+        // category bucket (e.g. 'outpaint' → 'image_extend'). Tolerate
+        // the legacy `opts.operation` key during the rename rollout.
+        intent: opts.intent ?? opts.operation,
       },
     );
 
@@ -708,11 +638,14 @@ export class GatewayImageGen extends BaseImageGen {
 
   /**
    * Run a semantic image operation (bg-remove, upscale, inpaint, …) against
-   * whichever active model advertises `operations.includes(<op>)`. Unlike
-   * `generate`, the input shape depends on the concrete Fal model — most
-   * take just `image_url` (no prompt, no aspect ratio). We post through
-   * /gateway/fal/raw which uploads a base64 data URI to Fal storage and
-   * forwards the call verbatim.
+   * whichever active model lives in the matching Koi category (mapped by
+   * pickImageModel: `bg-remove`/`background-removal`/`rembg` →
+   * `image_background_removal`, `upscale`/`upscaling` → `image_upscaling`,
+   * `outpaint`/`extend` → `image_extend`, `edit`/`inpaint` →
+   * `image_editing`). Unlike `generate`, the input shape depends on the
+   * concrete Fal model — most take just `image_url` (no prompt, no
+   * aspect ratio). We post through /gateway/fal/raw which uploads a
+   * base64 data URI to Fal storage and forwards the call verbatim.
    *
    * @param {string} operation - e.g. 'background-removal', 'upscale'
    * @param {string|Buffer} image - data URI ("data:image/png;base64,...")
@@ -741,7 +674,7 @@ export class GatewayImageGen extends BaseImageGen {
           throw e;
         }
       }),
-      { operation },
+      { intent: operation },
     );
 
     // /fal/raw expects { model, ...passthroughInput }. Most BG-remove /

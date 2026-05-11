@@ -1727,11 +1727,14 @@ export class Agent {
       // appears for delegate-level workflow activation, gate it with
       // explicit metadata on the workflow (e.g. `scope: task` in
       // WORKFLOW.md frontmatter) rather than heuristics.
-      try {
-        await this._autoActivateSkills(args);
-      } catch (e) {
-        channel.log('skills', `${this.name}: Auto-activate skills failed: ${e.message}`);
-      }
+      // Pre-task skill auto-activation was removed in favour of Claude
+      // Code's progressive-disclosure pattern: the catalog of ALL skills
+      // (name + description) is injected into the system prompt by
+      // `llm-provider.js`, and the agent itself calls `activate_skill`
+      // when it judges a skill applies — including following cross-
+      // references between skill bodies. One LLM, one decision surface,
+      // no classifier round-trip, no hidden pre-gating that obscured
+      // siblings.
     }
 
     let isFirstCall = true;
@@ -4320,6 +4323,66 @@ export class Agent {
             // Already in_progress but owner was never set — fix it now
             taskManager.update(String(_taskId), { owner: _intentAgentName });
           }
+
+          // ── PRIOR STEPS + WORKFLOW WORKSPACE INJECTION ────────────────
+          // When this task is part of a workflow run (`workflowRunId` set),
+          // prepend two blocks to the delegate's `data.description`:
+          //   • PRIOR STEPS — sibling tasks already completed in this run,
+          //     each with its truncated `result` so the delegate inherits
+          //     the work the previous steps did (no need to re-fetch the
+          //     same URL, re-run the same shell, etc.).
+          //   • WORKFLOW_WORKSPACE — absolute path to a per-run directory
+          //     where the delegate should save heavy artifacts (downloads,
+          //     HTML dumps, intermediate files) and reference them by path
+          //     so later steps read them instead of duplicating work.
+          // Reason this lives at the delegate site (not in run_workflow):
+          // the snapshot must be FRESH at the moment of delegation —
+          // siblings completed *after* run_workflow rendered the plan
+          // need to appear in the next task's spec.
+          if (_task?.workflowRunId) {
+            const _runId = _task.workflowRunId;
+            const _path = (await import('path')).default;
+            const _workspace = _path.join(
+              process.env.KOI_PROJECT_ROOT || process.cwd(),
+              '.koi', 'workflows', _runId,
+            );
+            const _siblings = taskManager.list()
+              .filter(t =>
+                t.workflowRunId === _runId &&
+                t.status === 'completed' &&
+                String(t.id) !== String(_taskId)
+              )
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            const _sections = [];
+            if (_siblings.length > 0) {
+              _sections.push('## PRIOR STEPS (already completed in this workflow run)');
+              for (const _s of _siblings) {
+                const _preview = typeof _s.result === 'string' && _s.result
+                  ? (_s.result.length > 1500 ? `${_s.result.slice(0, 1500)}\n…[truncated]` : _s.result)
+                  : '(no output recorded)';
+                _sections.push(`### Step #${_s.id} — ${_s.subject}\n${_preview}`);
+              }
+              _sections.push(
+                'Use these outputs to skip work already done. If a prior step saved an ' +
+                'artifact under WORKFLOW_WORKSPACE, read it from disk instead of re-fetching.',
+              );
+            }
+            _sections.push(
+              `## WORKFLOW_WORKSPACE\n${_workspace}\n\n` +
+              `Persist heavy outputs (downloaded pages, generated files, large blobs) ` +
+              `to this directory. Reference them by absolute path in your return summary ` +
+              `so subsequent steps can read them directly.`,
+            );
+            const _prelude = _sections.join('\n\n');
+            if (!resolvedAction.data) resolvedAction.data = {};
+            const _origDesc = resolvedAction.data.description
+              ?? resolvedAction.data.task
+              ?? resolvedAction.data.instruction
+              ?? '';
+            resolvedAction.data.description = `${_prelude}\n\n---\n\n${_origDesc}`;
+            resolvedAction.data.workflowRunId = _runId;
+            resolvedAction.data.workflowWorkspace = _workspace;
+          }
         } catch { /* non-fatal */ }
       }
 
@@ -4423,7 +4486,14 @@ export class Agent {
           const _task = taskManager.get(String(_taskId));
           if (_task && _task.status === 'in_progress') {
             const _failed = result && result.success === false;
-            if (!_failed) taskManager.update(String(_taskId), { status: 'completed' });
+            if (!_failed) {
+              // Persist the delegate's return value BEFORE marking
+              // completed: the next task in the workflow run will read
+              // it as PRIOR STEPS during its own delegation, and
+              // task-manager's auto-deactivate hook fires on completion.
+              try { taskManager.setResult(String(_taskId), result); } catch { /* non-fatal */ }
+              taskManager.update(String(_taskId), { status: 'completed' });
+            }
           }
         } catch { /* non-fatal */ }
       }
@@ -4792,100 +4862,6 @@ Many commands are inherently slow and produce little or no output for extended p
     }
   }
 
-  /**
-   * Auto-activate relevant skills at the start of a delegate's lifecycle.
-   * Uses the cheap classifier model to decide which skills match the task.
-   */
-  async _autoActivateSkills(args) {
-    // Everything in this method must be best-effort: a failure here
-    // (slow model, missing skill registry, JSON parse error) must NEVER
-    // prevent the delegate from starting its main loop. Wrap the whole
-    // body so even unexpected throws are swallowed.
-    let skills;
-    try {
-      const result = await this.callAction('list_skills', {});
-      skills = result?._fullSkills || result?.skills;
-    } catch (e) {
-      channel.log('skills', `${this.name}: list_skills failed: ${e.message} — skipping auto-activate`);
-      return;
-    }
-    if (!skills || skills.length === 0) return;
-
-    const taskText = args?.subject || args?.description || args?.userRequest || args?.instruction || '';
-    if (!taskText) return;
-
-    const skillList = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
-
-    const prompt = `You are a skill selector for an AI agent. Activate skills whose described domain clearly fits the task. A skill provides a specialised workflow that improves the agent's output when the task lives in its domain — so do activate it when there is a real domain match, but skip it when the overlap is only a shared keyword.
-
-RULES:
-1. Activate a skill when the task clearly falls within its described area of expertise (subject, technique, or output type). Exact wording is not required, but the domain must genuinely match — not just share a generic word.
-2. If a skill's description names a specific context / platform / output format (e.g. "for Slack", "with p5.js", "from YouTube transcripts", "mobile apps"), the task MUST match that context. A skill scoped to one platform does not apply to a generic version of the task.
-3. Default to one skill. Activate two or more only when the task genuinely spans distinct domains that different skills cover.
-4. When unsure between a skill and no skill, prefer activating it if its domain plausibly helps. When unsure between two similar skills, pick the one whose description fits more precisely.
-
-TASK:
-${taskText}
-
-AVAILABLE SKILLS:
-${skillList}
-
-Examples:
-- Task "build a mobile app called X" + skill "mobile-development: Building mobile apps with React Native" → ["mobile-development"]
-- Task "write an article about the Artemis II mission" + skill "long-form-writing: Researching and drafting long-form articles" → ["long-form-writing"]
-- Task "create an infographic about climate change" + skill "create-infographic: Designing infographics" → ["create-infographic"]
-- Task "animate this photo" + skill "slack-gif-creator: animated GIFs for Slack" → [] (task is not Slack-specific)
-- Task "translate this paragraph" + skills [mobile-development, frontend-design] → [] (no skill domain matches)
-
-Return ONLY a JSON array of skill names to activate, e.g. ["mobile-development"], or [] if no skill's domain fits the task.`;
-
-    try {
-      const { getAllCandidates } = await import('../llm/providers/factory.js');
-      const { createLLM, getAvailableProviders } = await import('../llm/providers/factory.js');
-
-      const providers = this.llmProvider?._availableProviders || getAvailableProviders();
-      const candidates = getAllCandidates('reasoning', 40, providers);
-      if (candidates.length === 0) return;
-
-      // Prefer a non-thinking model for this fast classification task.
-      // Thinking models with a small token budget starve and return empty,
-      // which then blows up JSON.parse. Fall back to candidates[0] if none.
-      const nonThinking = candidates.find(c => !c.thinking) || candidates[0];
-      const c = nonThinking;
-      const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : c.provider;
-      const client = this.llmProvider._getClient(effectiveProvider);
-      // Bump maxTokens to 1000: thinking-capable models reserve part of the
-      // budget for internal reasoning tokens even when useThinking=false, so
-      // 200 is too tight and causes empty responses.
-      const llm = createLLM(effectiveProvider, client, c.model, { temperature: 0, maxTokens: 1000, useThinking: false });
-      // 30s timeout — the cheapest classifier models on the gateway are
-      // sometimes slow (cold starts, queue depth). 8s was too tight and
-      // aborted valid requests, leaving delegates with no skills before
-      // they even started their main loop.
-      const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 30000 });
-
-      const stripped = (text || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      if (!stripped) {
-        channel.log('skills', `${this.name}: Skill classifier returned empty response — skipping`);
-        return;
-      }
-      // Extract the first JSON array from the response (some models add prose).
-      const arrayMatch = stripped.match(/\[[\s\S]*?\]/);
-      const jsonToParse = arrayMatch ? arrayMatch[0] : stripped;
-      const names = JSON.parse(jsonToParse);
-
-      if (Array.isArray(names)) {
-        for (const name of names) {
-          if (typeof name === 'string' && skills.some(s => s.name === name)) {
-            channel.log('skills', `${this.name}: Auto-activating skill: ${name}`);
-            await this.callAction('activate_skill', { name });
-          }
-        }
-      }
-    } catch (e) {
-      channel.log('skills', `${this.name}: Skill classifier failed: ${e.message}`);
-    }
-  }
 
   /**
    * Handle a forced-workflow activation initiated by the GUI's "Run" button

@@ -196,7 +196,7 @@ class TaskManager {
    * Prints: "  ☐ [id] subject"
    * Returns the created task object.
    */
-  create({ subject, description, activeForm } = {}) {
+  create({ subject, description, activeForm, workflowRunId } = {}) {
     this._loadIfNeeded();
     if (!subject) throw new Error('task_create: "subject" is required');
 
@@ -237,6 +237,12 @@ class TaskManager {
       status: 'pending',
       owner: null,
       blockedBy: [],
+      // result: delegate's return value (truncated by setResult). Lets the
+      // System inject PRIOR STEPS into sibling tasks of the same workflow.
+      result: null,
+      // workflowRunId: groups tasks created by the same run_workflow call so
+      // we can derive a shared workspace dir + chain summaries between steps.
+      workflowRunId: workflowRunId || null,
       createdAt: now,
       updatedAt: now,
     };
@@ -406,6 +412,37 @@ class TaskManager {
         }, 300);
       }
     }
+    return { ...task };
+  }
+
+  /**
+   * Persist a delegate's return value on a task. Truncates to ~4 KB so
+   * tasks.json stays bounded — full results live in event logs. Used by
+   * agent.js to chain workflow steps: completed siblings' results get
+   * injected as PRIOR STEPS into the next delegate's description.
+   */
+  setResult(id, result) {
+    this._loadIfNeeded();
+    const strId = String(id);
+    const task = this._tasks[strId];
+    if (!task) return null;
+    let text;
+    if (result == null) {
+      text = null;
+    } else if (typeof result === 'string') {
+      text = result;
+    } else {
+      try { text = JSON.stringify(result, null, 2); }
+      catch { text = String(result); }
+    }
+    if (text != null) {
+      const MAX = 4000;
+      task.result = text.length > MAX ? `${text.slice(0, MAX)}\n…[truncated]` : text;
+    } else {
+      task.result = null;
+    }
+    task.updatedAt = new Date().toISOString();
+    this._save();
     return { ...task };
   }
 

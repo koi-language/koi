@@ -435,11 +435,13 @@ const generateImageAction = {
     if (effectiveResolution) genOpts.resolution = effectiveResolution;
     if (action.n && action.n > 1) genOpts.n = action.n;
     if (action.label) genOpts.label = action.label;
-    // `operation` is the picker's primary intent signal (see
-    // pickImageModel.wantedImageBucket). outpaint_image passes
-    // 'outpaint' here so the router routes to the `image_extend`
-    // bucket instead of the generic edit pool.
-    if (action.operation) genOpts.operation = action.operation;
+    // `intent` is the picker's primary signal (see
+    // pickImageModel). outpaint_image passes 'outpaint' here so the
+    // router routes to the `image_extend` bucket instead of the
+    // generic edit pool. Legacy `operation` key tolerated for backward
+    // compatibility during the rename rollout.
+    const _intent = action.intent ?? action.operation;
+    if (_intent) genOpts.intent = _intent;
     // Inpaint/fill mask. Tools that own a precise fill region (outpaint_image)
     // pass it as { data: Buffer, mimeType }. Adapters that need a separate
     // mask URL (flux-pro/v1/fill) consume it from the canonical request.

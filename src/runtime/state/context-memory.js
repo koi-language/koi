@@ -166,10 +166,18 @@ export class ContextMemory {
   // ── Persistence (no-ops — Event Log is the persistent layer) ─────────
 
   serialize() {
+    // Persist only the DIALOGUE turns — strip the agent's internal
+    // plumbing (raw action JSON, `✅` feedback markers, `Continue.`
+    // nudges, runtime recovery messages). Keeping that noise meant
+    // that on resume the LLM saw a sopa of action JSONs and ended
+    // up regurgitating past `print` messages to the user as if they
+    // were a recap — the "wall of unformatted text after restore"
+    // bug. The clean buffer is also smaller on disk and cheaper to
+    // re-embed.
     return {
-      version: 4,
+      version: 5,
       systemPrompt: this.systemPrompt,
-      buffer: this._buffer.map((e) => ({ role: e.role, content: e.content })),
+      buffer: _cleanBufferForSerialize(this._buffer),
     };
   }
   /**
@@ -186,18 +194,121 @@ export class ContextMemory {
     if (!data || !Array.isArray(data.buffer)) return;
     if (typeof data.systemPrompt === 'string') this.systemPrompt = data.systemPrompt;
     this._buffer.length = 0;
-    for (const e of data.buffer) {
-      if (!e) continue;
-      const content = typeof e.content === 'string' ? e.content : null;
-      if (!content || _isScaffoldingMessage(content)) continue;
-      const role = e.role === 'assistant' ? 'assistant' : 'user';
-      this._buffer.push({ role, content });
+    // Defensive re-clean on restore. If the file was written by an
+    // older serialize that didn't strip scaffolding (≤ v4), this
+    // still drops the noise so the LLM never sees raw action JSON.
+    for (const e of _cleanBufferForSerialize(data.buffer)) {
+      this._buffer.push(e);
     }
     // Mark as having history so callers gating on hasHistory() see
     // the restored state instead of treating this as a cold start.
     this._writeCount = (this._writeCount || 0) + this._buffer.length;
   }
   hydrate() { /* no-op — latent pool removed */ }
+}
+
+/**
+ * Convert the live `_buffer` (which captures EVERY string the agent
+ * loop pushes — including its own action JSONs, feedback markers,
+ * runtime nudges) into a clean DIALOGUE-only sequence suitable for
+ * persistence + cross-session replay.
+ *
+ * Rules:
+ *   • USER entries that start with `✅`, `❌`, `📎` (feedback markers
+ *     emitted by classifyFeedback for action results) → DROPPED. The
+ *     human never typed those.
+ *   • USER entries that match scaffolding markers (`Continue.`,
+ *     `Task completed…`, `[INBOX]`, `Return your FIRST action.`,
+ *     etc.) → DROPPED.
+ *   • ASSISTANT entries whose content parses as JSON — we extract
+ *     the user-facing string from `print.message`,
+ *     `prompt_user.question`, `prompt_user.message`. If the action
+ *     has no user-visible content (queue_add, task_list, delegate,
+ *     update_state, return…) we DROP it. The LLM never needs to
+ *     re-see its own past tool calls; toMessages already collapses
+ *     them and they're noise on restore.
+ *   • Plain-text USER and ASSISTANT entries (real prose) → KEPT
+ *     as-is.
+ */
+function _cleanBufferForSerialize(buffer) {
+  if (!Array.isArray(buffer)) return [];
+  const out = [];
+  for (const e of buffer) {
+    if (!e || typeof e.content !== 'string') continue;
+    const role = e.role === 'assistant' ? 'assistant' : 'user';
+    const trimmed = e.content.trim();
+    if (!trimmed) continue;
+    if (_isScaffoldingMessage(trimmed)) continue;
+    if (role === 'user') {
+      // Drop action-feedback markers emitted by classifyFeedback /
+      // the runtime's recovery prompts — the human never typed
+      // these and they confuse the LLM on resume.
+      const head = trimmed.charAt(0);
+      if (head === '✅' || head === '❌' || head === '📎' || head === '⚠') continue;
+      if (/^(Continue\.?|Return your FIRST action|Task completed)/i.test(trimmed)) continue;
+      if (/^AUTO[- ]RECOVERY/i.test(trimmed)) continue;
+      out.push({ role, content: e.content });
+      continue;
+    }
+    // ASSISTANT — extract user-visible text from action JSON. Plain
+    // prose passes through.
+    const visible = _extractAssistantVisible(trimmed);
+    if (visible) {
+      out.push({ role: 'assistant', content: visible });
+    }
+  }
+  return out;
+}
+
+/**
+ * If `text` looks like an LLM-emitted action JSON, return ONLY the
+ * user-visible payload (print message, prompt_user question, …). If
+ * it's not JSON, return the original text. If it's JSON but carries
+ * nothing user-facing (queue_add, task_list, delegate, …) return
+ * null so the caller drops it entirely.
+ */
+function _extractAssistantVisible(text) {
+  // Fast path — not JSON-shaped.
+  if (text.charAt(0) !== '{' && text.charAt(0) !== '[') return text;
+  let parsed;
+  try {
+    // The LLM sometimes wraps responses in ```json fences — strip
+    // those before parsing. Also tolerate trailing whitespace.
+    const stripped = text
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+    parsed = JSON.parse(stripped);
+  } catch {
+    return text; // not JSON after all — treat as prose
+  }
+  // Normalise to a list of action objects (handles {batch:[…]},
+  // single action, or a top-level array).
+  let actions;
+  if (Array.isArray(parsed)) actions = parsed;
+  else if (Array.isArray(parsed?.batch)) actions = parsed.batch;
+  else actions = [parsed];
+
+  const pieces = [];
+  for (const a of actions) {
+    if (!a || typeof a !== 'object') continue;
+    const intent = a.intent || a.type || '';
+    if (intent === 'print' || intent === 'printCompact' || intent === 'show_result') {
+      const m = a.message || a.text || '';
+      if (typeof m === 'string' && m.trim()) pieces.push(m.trim());
+    } else if (intent === 'prompt_user' || intent === 'prompt_form') {
+      // Both the lead message and the question are user-facing.
+      if (typeof a.message === 'string' && a.message.trim()) pieces.push(a.message.trim());
+      if (typeof a.question === 'string' && a.question.trim()) pieces.push(a.question.trim());
+    }
+    // Every other intent (delegate, queue_add, task_list, return,
+    // update_state, get_tool_info, …) carries no chat-facing text.
+    // Skip — the LLM doesn't need to re-see its own past tool
+    // calls on restore, and they're the bulk of the noise that was
+    // showing up as the "wall" bug.
+  }
+  if (pieces.length === 0) return null;
+  return pieces.join('\n\n');
 }
 
 // ─── Event-log emission helper (was inside this file pre-Phase 8b.3) ────

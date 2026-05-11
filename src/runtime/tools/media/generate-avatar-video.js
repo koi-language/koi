@@ -240,23 +240,16 @@ const generateAvatarVideoAction = {
 };
 
 // Auto-disable when no avatar-capable model is active in the catalog.
-// We accept three signals (any one is enough): the explicit `m.avatar`
-// flag, an `'avatar'` entry in `m.operations`, or a recognisable
-// avatar slug (Kling AI Avatar, Hedra, etc.) — the slug fallback
-// avoids forcing the operator to manually retag every avatar row in
-// the backoffice when the runtime can already tell from the slug.
+// Sole signal: at least one model row carries the Koi-owned
+// `video_avatar` category. Vendor `m.avatar` flag, `operations[]`
+// containing 'avatar', and slug heuristics were retired — categories
+// is the authoritative source now (gateway aggregator exposes
+// `caps.hasAvatar` derived from `categories[]`).
 fetchMediaCapabilities('video').then((caps) => {
   if (!caps) return;
-  const looksLikeAvatarSlug = (s) =>
-    typeof s === 'string'
-    && /(?:^|[\/\-_])ai[-_]?avatar(?:$|[\/\-_])|(?:^|\/)avatar(?:$|\/)/i.test(s);
-  const hasAvatar = Array.isArray(caps.models)
-    && caps.models.some((m) => m?.avatar
-      || (Array.isArray(m?.operations) && m.operations.includes('avatar'))
-      || looksLikeAvatarSlug(m?.slug));
-  if (!hasAvatar) {
+  if (!caps.hasAvatar) {
     generateAvatarVideoAction.description =
-      'Unavailable: no active avatar-capable video model in the catalog.';
+      'Unavailable: no active model carries the `video_avatar` category.';
   }
 }).catch(() => {});
 

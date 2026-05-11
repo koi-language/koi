@@ -57,10 +57,15 @@ export default {
     // executes directly instead, it claims the task via `task_update
     // status=in_progress` — that's where skills activate, scoped to
     // whichever agent actually takes ownership. See task-update.js.
+    // workflowRunId is an internal field set by run_workflow when it
+    // instantiates a workflow's steps as tasks — NOT advertised in the
+    // schema so the LLM doesn't try to pass it. Lets agent.js group
+    // sibling tasks for PRIOR STEPS injection + shared workspace dir.
     const task = taskManager.create({
       subject: action.subject,
       description: action.description,
       activeForm: action.activeForm || null,
+      workflowRunId: action.workflowRunId || undefined,
     });
 
     return { id: task.id, subject: task.subject, status: task.status };

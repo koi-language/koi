@@ -1,10 +1,10 @@
 /**
  * Background Removal Action — removes the background from an image.
  *
- * Routes to a Fal model whose catalog entry advertises
- * `operations.includes('background-removal')`. Model selection happens client-side
- * via pickImageModel (operation: 'background-removal') and the concrete slug is sent
- * to the gateway — the backend never decides.
+ * Routes to a Fal model whose catalog entry carries
+ * `categories: ["image_background_removal"]`. Model selection happens
+ * client-side via pickImageModel (operation: 'background-removal') and
+ * the concrete slug is sent to the gateway — the backend never decides.
  *
  * Permission: 'generate_image' (reused — background removal is a form of
  * image creation, same billing category).
@@ -96,12 +96,12 @@ const backgroundRemovalAction = {
     const instance = resolved.instance;
 
     // Direct-API providers don't currently implement operation-specific
-    // routing — only gateway mode routes by operations[]. Surface a clear
+    // routing — only gateway mode routes by Koi categories. Surface a clear
     // error so the user knows to sign in (or run via the gateway).
     if (typeof instance.runOperation !== 'function') {
       return {
         success: false,
-        error: 'Background removal is only available when signed in (gateway mode). Current provider does not expose an operations-based router.',
+        error: 'Background removal is only available when signed in (gateway mode). Current provider does not expose category-based routing.',
         provider: resolved.provider,
       };
     }
@@ -129,7 +129,7 @@ const backgroundRemovalAction = {
           success: false,
           errorType: 'no_model_matches',
           error: errMsg,
-          hint: 'No active image model advertises operations.includes("background-removal"). Ask the backend admin to tag at least one background-removal model (e.g. bria-rmbg-2.0) with operations: ["background-removal"].',
+          hint: 'No active image model in the `image_background_removal` category. Ask the backend admin to tag at least one model (e.g. bria-rmbg-2.0) with `categories: ["image_background_removal"]`.',
         };
       }
       return { success: false, provider: resolved.provider, error: errMsg };

@@ -784,15 +784,62 @@ export class LLMProvider {
           }
         }
       }
-      // Inject active skill contents into the static part of the prompt.
-      // Skills are stable once activated — they belong in the cached prefix.
-      // Content is stored in agent.state._skillContents (per-invocation, not serialized to user prompt).
-      const _skillContents = agent.state?._skillContents;
-      const _skillBlock = _skillContents && Object.keys(_skillContents).length > 0
-        ? '\n\n# Active Skill Instructions\n\n' + Object.entries(_skillContents).map(
+      // Inject active skill contents AND the catalog of available skills
+      // into the static part of the prompt. Skills (active + catalog) are
+      // stable once a session starts — they belong in the cached prefix.
+      //
+      // Two blocks:
+      //   1. `# Available Skills` — the catalog of all skill names +
+      //      descriptions on disk. Always present so the LLM can decide
+      //      mid-task to activate one (e.g. when it reads a cross-reference
+      //      link `[firecrawl-cli](firecrawl-cli)` in the body of an
+      //      already-activated skill and recognises the name from this
+      //      catalog). This is the progressive-disclosure pattern Claude
+      //      Code's official Agent Skills uses: descriptions upfront, full
+      //      bodies on demand via `activate_skill`. Skills already active
+      //      are marked with ✓ so the LLM doesn't waste an activate_skill
+      //      call on something already in context.
+      //   2. `# Active Skill Instructions` — the FULL bodies of skills the
+      //      LLM has explicitly activated. Stored in agent.state._skillContents.
+      //
+      // The catalog is cached on `agent.state._skillCatalog` after the first
+      // build so we don't re-scan disk on every prompt rebuild.
+      const _activeContents = agent.state?._skillContents || {};
+      const _activeNames = new Set(Object.keys(_activeContents));
+      let _skillCatalog = agent.state?._skillCatalog;
+      if (!_skillCatalog) {
+        try {
+          const _listResult = await agent.callAction?.('list_skills', {});
+          const _allSkills = _listResult?.skills || [];
+          _skillCatalog = Array.isArray(_allSkills) ? _allSkills : [];
+          if (agent.state) agent.state._skillCatalog = _skillCatalog;
+        } catch {
+          _skillCatalog = [];
+        }
+      }
+      const _catalogBlock = _skillCatalog.length > 0
+        ? '\n\n# Available Skills\n\n'
+          + 'These skills exist on disk. Each one is identified by name+description. '
+          + 'The FULL body of a skill is NOT in context until you call '
+          + '`activate_skill({ name })` — that loads its instructions into the '
+          + '`# Active Skill Instructions` block below. Skills already loaded are '
+          + 'marked with ✓.\n\n'
+          + 'Activate a skill mid-task whenever a body you have loaded references '
+          + 'another skill by name (e.g. via a markdown link `[firecrawl-cli](firecrawl-cli)`) '
+          + 'AND that name appears in this catalog. The link itself is just text — you '
+          + 'are the one that decides whether to load the referenced skill\'s body.\n\n'
+          + _skillCatalog
+              .map(s => `- ${_activeNames.has(s.name) ? '✓ ' : ''}${s.name}: ${s.description}`)
+              .join('\n')
+        : '';
+
+      const _activeBlock = _activeNames.size > 0
+        ? '\n\n# Active Skill Instructions\n\n' + Object.entries(_activeContents).map(
             ([name, content]) => `## Skill: ${name}\n\n${content}`
           ).join('\n\n---\n\n')
         : '';
+
+      const _skillBlock = _catalogBlock + _activeBlock;
 
       // Structured cache-aware prompt: store boundary for cache_control injection
       if (typeof systemPromptResult === 'object' && systemPromptResult?._cacheKey !== undefined) {

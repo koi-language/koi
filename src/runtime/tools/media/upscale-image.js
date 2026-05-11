@@ -1,10 +1,10 @@
 /**
  * Upscale Image Action — increases an image's resolution.
  *
- * Routes to a Fal model whose catalog entry advertises
- * `operations.includes('upscale')`. Model selection happens client-side via
- * pickImageModel (operation: 'upscale') and the concrete slug is sent to the
- * gateway — the backend never decides.
+ * Routes to a Fal model whose catalog entry carries
+ * `categories: ["image_upscaling"]`. Model selection happens client-side
+ * via pickImageModel (operation: 'upscale') and the concrete slug is
+ * sent to the gateway — the backend never decides.
  *
  * The parameter surface is intentionally provider-neutral: only the knobs
  * that make sense across the whole upscaler ecosystem (Topaz, SeedVR2,
@@ -36,7 +36,7 @@ const IMAGE_EXT_TO_MIME = {
 const upscaleImageAction = {
   type: 'upscale_image',
   intent: 'upscale_image',
-  description: 'Upscale an existing image to a higher resolution. Routes to a Fal model tagged operations.includes("upscale"). In: "image" (path or attachment id, required), optional "upscaleFactor" (1–4, default 2), optional "prompt" (guides generative upscalers like Topaz Redefine / Clarity), optional "creativity" (0–1, normalized across providers), optional "faceEnhancement" (bool), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory path). Pass model-specific knobs (e.g. Topaz model variant) via "extra: {}". Returns: { success, provider, model, images: [{ savedTo }] }.',
+  description: 'Upscale an existing image to a higher resolution. Routes to a Fal model in the `image_upscaling` category. In: "image" (path or attachment id, required), optional "upscaleFactor" (1–4, default 2), optional "prompt" (guides generative upscalers like Topaz Redefine / Clarity), optional "creativity" (0–1, normalized across providers), optional "faceEnhancement" (bool), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory path). Pass model-specific knobs (e.g. Topaz model variant) via "extra: {}". Returns: { success, provider, model, images: [{ savedTo }] }.',
   thinkingHint: 'Upscaling image',
   permission: 'generate_image',
 
@@ -156,12 +156,12 @@ const upscaleImageAction = {
     const instance = resolved.instance;
 
     // Direct-API providers don't implement operation-specific routing —
-    // only gateway mode routes by operations[]. Surface a clear error so
-    // the user knows to sign in (or run via the gateway).
+    // only gateway mode routes by Koi categories. Surface a clear error
+    // so the user knows to sign in (or run via the gateway).
     if (typeof instance.runOperation !== 'function') {
       return {
         success: false,
-        error: 'Upscaling is only available when signed in (gateway mode). Current provider does not expose an operations-based router.',
+        error: 'Upscaling is only available when signed in (gateway mode). Current provider does not expose category-based routing.',
         provider: resolved.provider,
       };
     }
@@ -194,7 +194,7 @@ const upscaleImageAction = {
           success: false,
           errorType: 'no_model_matches',
           error: errMsg,
-          hint: 'No active image model advertises operations.includes("upscale"). Ask the backend admin to tag at least one upscaler model (e.g. fal-ai/topaz/upscale/image, clarity-upscaler) with operations: ["upscale"], then re-sync from Fal.',
+          hint: 'No active image model in the `image_upscaling` category. Ask the backend admin to tag at least one upscaler model (e.g. fal-ai/topaz/upscale/image, clarity-upscaler) with `categories: ["image_upscaling"]`.',
         };
       }
       return { success: false, provider: resolved.provider, error: errMsg };

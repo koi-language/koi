@@ -2,54 +2,35 @@
  * Format a per-category, per-model catalog summary block. Used by
  * generate-image / generate-video / generate-audio at import time to
  * append a "Catalog snapshot" section to the tool description, so the
- * agent can see — for the SAME tool call — which model handles each
- * category and what knobs each one accepts.
+ * agent can see — for the SAME tool call — which models live in each
+ * Koi-owned bucket and which labels (if any) bias them.
  *
- * The router auto-picks the cheapest capable model per request; this
- * block is purely informational, but it's the only way the agent can
- * reconcile errors like "this model doesn't support 1080p" with what
- * IS available before retrying.
+ * Per-line output is intentionally minimal:
+ *   `slug (displayName) [labels: ...] $X/unit`
+ *
+ * No vendor-derived knobs are surfaced (no aspectRatios, resolutions,
+ * durations, maxRefImages, frame-control, image-to-video, lipsync,
+ * tts/sfx/music/transcribe, ops, etc.). The router picks by category +
+ * label + price; the per-slug adapter is the sole authority on what
+ * each model physically accepts. If the picker lands on a model that
+ * can't handle the request's input shape, the adapter rejects at
+ * build-time with a clear error.
  */
 
-const _csv = (s) => {
-  if (typeof s !== 'string') return [];
-  return s.split(',').map((x) => x.trim()).filter(Boolean);
-};
+function _labelSlugs(m) {
+  if (!Array.isArray(m?.labels)) return [];
+  return m.labels.map((l) => {
+    if (typeof l === 'string') return l;
+    if (l && typeof l === 'object' && typeof l.slug === 'string') return l.slug;
+    return null;
+  }).filter(Boolean);
+}
 
-// Per-model labels are now `Array<{slug, description}>` (see backend
-// gateway.service.ts:getMediaModels). We list slugs only on the per-model
-// line — descriptions are rendered ONCE at the top of the catalog block to
-// avoid spamming the same blurb under every model that carries the label.
 function _modelLine(m) {
   const display = m.displayName && m.displayName !== m.slug ? ` (${m.displayName})` : '';
   const parts = [];
-  const labelSlugs = Array.isArray(m.labels)
-    ? m.labels.map((l) => (typeof l === 'string' ? l : l && typeof l === 'object' ? l.slug : null)).filter(Boolean)
-    : [];
-  if (labelSlugs.length) parts.push(`labels: ${labelSlugs.join(', ')}`);
-  const aspect = _csv(m.aspectRatios);
-  if (aspect.length) parts.push(`aspectRatios: ${aspect.join('/')}`);
-  const res = _csv(m.resolutions);
-  if (res.length) parts.push(`resolutions: ${res.join('/')}`);
-  const dur = _csv(m.durations);
-  if (dur.length) parts.push(`durations: ${dur.join('/')}s`);
-  const formats = _csv(m.outputFormats);
-  if (formats.length) parts.push(`outputFormats: ${formats.join('/')}`);
-  if (typeof m.maxImages === 'number' && m.maxImages > 0) parts.push(`maxImages: ${m.maxImages}`);
-  if (m.maxRefImages != null) parts.push(`maxRefImages: ${m.maxRefImages === 0 ? 'unbounded' : m.maxRefImages}`);
-  if (typeof m.maxShots === 'number' && m.maxShots > 1) parts.push(`maxShots: ${m.maxShots}`);
-  if (m.imageToVideo) parts.push('image-to-video');
-  if (m.videoToVideo) parts.push('video-to-video');
-  if (m.frameControl) parts.push('frame-control');
-  if (m.hasAudio) parts.push('with-audio');
-  if (m.lipsync) parts.push('lipsync');
-  if (m.tts) parts.push('tts');
-  if (m.transcribe) parts.push('transcribe');
-  if (m.sfx) parts.push('sfx');
-  if (m.music) parts.push('music');
-  if (m.voiceSelect) parts.push('voice-select');
-  const ops = Array.isArray(m.operations) ? m.operations.filter(Boolean) : [];
-  if (ops.length) parts.push(`ops: ${ops.join(',')}`);
+  const labels = _labelSlugs(m);
+  if (labels.length) parts.push(`labels: ${labels.join(', ')}`);
   if (typeof m.pricePerUnit === 'number' && m.pricePerUnit > 0) {
     parts.push(`$${m.pricePerUnit}/${m.unitType || 'unit'}`);
   }
@@ -57,11 +38,6 @@ function _modelLine(m) {
   return `      - "${m.slug}"${display}${tail}`;
 }
 
-/**
- * @param {Array<object>} models - rows from /gateway/models/{kind}.json
- * @returns {string} a leading-newline section listing every model grouped
- *   by category, or '' when the list is empty.
- */
 // Build a single global slug → description glossary from every model's
 // labels. Same slug appearing on multiple models is de-duped; we keep the
 // first non-empty description (curated centrally so they should agree).
@@ -83,6 +59,11 @@ function _collectLabelGlossary(models) {
   return out;
 }
 
+/**
+ * @param {Array<object>} models - rows from /gateway/models/{kind}.json
+ * @returns {string} a leading-newline section listing every model grouped
+ *   by Koi-owned category, or '' when the list is empty.
+ */
 export function formatModelCatalog(models) {
   if (!Array.isArray(models) || models.length === 0) return '';
   const groups = new Map();
@@ -122,9 +103,10 @@ export function formatModelCatalog(models) {
   }
 
   return (
-    '\n\nActive models in the catalog (the router auto-picks one per request; ' +
-    'each line lists the per-model knobs you can rely on, so you can match ' +
-    'your params to a model that supports them):\n' +
+    '\n\nActive models in the catalog (the router auto-picks one per request ' +
+    'based on Koi-owned category + label + price; per-model knobs are not ' +
+    'surfaced here — pass your params and the per-slug adapter handles ' +
+    'shape mismatches at execution time with a clear error):\n' +
     sections.join('\n') +
     glossaryBlock
   );

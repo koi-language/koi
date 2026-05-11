@@ -9,6 +9,8 @@
  * coordinator transitions into running_plan.
  */
 
+import fs from 'fs';
+import path from 'path';
 import { channel } from '../../io/channel.js';
 import { fireReaction } from '../../agent/reactions.js';
 import {
@@ -146,6 +148,20 @@ export default {
       };
     }
 
+    // Each workflow invocation gets a unique runId. Tasks created here
+    // are tagged with it so agent.js can (a) find sibling completed
+    // tasks for PRIOR STEPS injection and (b) point each step at a
+    // shared on-disk workspace where heavy artifacts (HTML dumps,
+    // downloads, intermediate files) persist between steps.
+    const runId = `wfr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    const workspaceDir = path.join(projectRoot, '.koi', 'workflows', runId);
+    try {
+      fs.mkdirSync(workspaceDir, { recursive: true });
+    } catch (err) {
+      channel.log('workflow', `Could not create workspace ${workspaceDir}: ${err.message}`);
+    }
+
     const createdIds = [];
     for (const t of translated.tasks) {
       if (!t || !t.subject || !t.description) continue;
@@ -154,6 +170,7 @@ export default {
           subject: String(t.subject),
           description: String(t.description),
           activeForm: t.activeForm ? String(t.activeForm) : undefined,
+          workflowRunId: runId,
         });
         if (result?.id) createdIds.push(result.id);
       } catch (err) {
@@ -171,7 +188,7 @@ export default {
     }
 
     await agent.callAction('update_state', {
-      updates: { activeWorkflow: name },
+      updates: { activeWorkflow: name, activeWorkflowRunId: runId },
     });
 
     channel.log('workflow', `Workflow activated: ${name} (${createdIds.length} tasks created)`);

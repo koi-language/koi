@@ -363,7 +363,11 @@ const outpaintImageAction = {
     try { originalBuffer = fs.readFileSync(resolvedPath); } catch { /* fall through; reframe models will fail loudly */ }
     const genAction = {
       prompt: effectivePrompt,
-      operation: 'outpaint',
+      // `intent` routes the picker to the `image_extend` bucket (see
+      // media-model-router.js:pickImageModel). The `operation` keys
+      // further down in this file are persistence/return metadata
+      // ("what was done"), NOT picker signals.
+      intent: 'outpaint',
       // outpaint_image already shows its own "Extendiendo imagen…" banner;
       // suppress generate_image's "Generando imagen…" so the user sees one
       // operation, not two stacked progress bars.
