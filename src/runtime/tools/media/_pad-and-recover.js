@@ -224,7 +224,23 @@ function _runFfmpeg(bins, args) {
     proc.stdout.on('data', () => {});
     proc.on('close', (code) => {
       if (code !== 0) {
-        channel.log('pad', `ffmpeg exit=${code}: ${err.trim().slice(-400)}`);
+        // Log enough of the tail to actually see the upstream complaint.
+        // We've been bitten by the previous `.slice(-400)` chopping the
+        // message right at the interesting bit (libx264 / setparams
+        // option parser errors run ~600-1500 chars when verbose). Also
+        // log the filter chain so a packaged-ffmpeg / older-libx264
+        // mismatch can be diagnosed without re-running.
+        const vfIdx = args.indexOf('-vf');
+        const vf = vfIdx >= 0 && args[vfIdx + 1] ? args[vfIdx + 1] : '(none)';
+        const x264Idx = args.indexOf('-x264-params');
+        const x264 = x264Idx >= 0 && args[x264Idx + 1] ? args[x264Idx + 1] : '(none)';
+        channel.log(
+          'pad',
+          `ffmpeg exit=${code}\n` +
+          `  -vf: ${vf}\n` +
+          `  -x264-params: ${x264}\n` +
+          `  stderr (last 2KB):\n${err.trim().slice(-2000)}`,
+        );
       }
       resolve(code === 0);
     });

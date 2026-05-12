@@ -51,6 +51,32 @@ export class SessionTracker {
     this.pendingFiles = new Set(); // files staged but not yet committed
   }
 
+  /**
+   * Re-point this tracker at a DIFFERENT session directory. Used by
+   * the WS resumeSession handler: the display-log writer is constructed
+   * once at engine startup with whatever `KOI_SESSION_ID` was set then,
+   * and is captured by every `WsChannel`/`TerminalChannel` instance via
+   * closure. When the user later resumes an older session the env var
+   * is updated but the captured writer keeps writing to the ORIGINAL
+   * directory — so new messages typed after the resume vanish from the
+   * resumed session's display-log.jsonl. Calling this on the same
+   * instance flips the underlying paths without breaking any of those
+   * captured references.
+   *
+   * Resets per-session state (init flag, tracked + pending file sets)
+   * so the lazy `_ensureInit()` re-runs against the resumed git repo
+   * and recovers the resumed session's tracked files from history.
+   */
+  repointToSession(newSessionId) {
+    if (!newSessionId || newSessionId === this.sessionId) return;
+    this.sessionId = newSessionId;
+    this.gitDir = path.join(this.projectRoot, '.koi', 'sessions', newSessionId);
+    this.initialized = false;
+    this.trackedFiles = new Set();
+    this.pendingFiles = new Set();
+    channel.log('session', `Re-pointed session tracker to: ${newSessionId}`);
+  }
+
   /** Run git with GIT_DIR/GIT_WORK_TREE pointing to our session repo.
    *  Uses execFileSync (no shell) to avoid pipe/special char issues. */
   _git(args, { noWorkTree = false } = {}) {

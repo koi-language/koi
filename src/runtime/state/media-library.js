@@ -332,11 +332,32 @@ export class MediaLibrary {
     embedding = null,
     favorite = false,
     replaceByPath = false,
+    visible,
   }) {
     const table = await this._ensureTable();
     const buffer = fs.readFileSync(filePath);
     const hash = contentHash(buffer);
     const escPath = String(filePath).replace(/'/g, "''");
+
+    // `visible` defaults to true for any user-visible creation. The
+    // composite-snapshot the GUI bakes on every annotation submit
+    // (filename `braxil-annotation-*.png`) gets auto-hidden — it's a
+    // generative-input artefact that the agent references via
+    // `usedForGeneration` metadata, but it shouldn't appear in the
+    // creations drawer / cajón. The user explicitly asked for this
+    // ("los screenshots de anotaciones … no deberían verse en
+    // creaciones ni en el cajón").
+    if (visible === undefined) {
+      const base = path.basename(filePath);
+      if (base.startsWith('braxil-annotation-')) {
+        visible = false;
+      } else {
+        visible = true;
+      }
+    }
+    if (visible === false) {
+      metadata = { ...metadata, visible: false };
+    }
 
     // Replace-by-path: the caller declares filePath is the authoritative
     // identity (timelines, voices). Drop any existing row at that path
@@ -496,7 +517,7 @@ export class MediaLibrary {
    * @param {number} [opts.limit=100]
    * @param {number} [opts.offset=0]
    */
-  async list({ favorite, mediaType, mediaTypes, category, limit = 100, offset = 0 } = {}) {
+  async list({ favorite, mediaType, mediaTypes, category, limit = 100, offset = 0, includeHidden = false } = {}) {
     // LanceDB is the single source of truth — no fallbacks, no disk scanning.
     const table = await this._ensureTable();
 
@@ -531,6 +552,20 @@ export class MediaLibrary {
           const cats = Array.isArray(meta.categories) ? meta.categories : [];
           return cats.some(c => typeof c === 'string' && c.toLowerCase() === target);
         } catch { return false; }
+      });
+    }
+
+    // Drop invisibly-flagged rows unless the caller explicitly asked
+    // for the full set. The drawer / cajón uses the default
+    // (includeHidden=false) so hidden artefacts (annotation
+    // composite-snapshots, soft-deleted images) stay out of sight
+    // but remain in the database for metadata trails.
+    if (!includeHidden) {
+      rows = rows.filter((r) => {
+        try {
+          const meta = r.metadata_json ? JSON.parse(r.metadata_json) : {};
+          return meta.visible !== false;
+        } catch { return true; }
       });
     }
 
@@ -641,7 +676,44 @@ export class MediaLibrary {
     return true;
   }
 
-  async remove(id) {
+  /** Set the `visible` flag on a row. False hides the item from the
+   *  drawer / cajón AND from `list()` results (the GUI relies on
+   *  list() being the visible-only view; hard-deletion would lose the
+   *  metadata trail that records what was used to create downstream
+   *  outputs). True restores the item to the drawer. Persisted in
+   *  `metadata.visible` so no schema migration is required. */
+  async setVisible(id, visible) {
+    const table = await this._ensureTable();
+    try {
+      const escId = String(id).replace(/'/g, "''");
+      const rows = await table.query().where(`id = '${escId}'`).limit(1).toArray();
+      if (rows.length === 0) return false;
+      const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
+      if (visible) {
+        delete meta.visible;
+      } else {
+        meta.visible = false;
+      }
+      await table.update({
+        values: { metadata_json: JSON.stringify(meta) },
+        where: `id = '${escId}'`,
+      });
+      return true;
+    } catch (e) {
+      process.stderr.write(`[MediaLibrary] setVisible(${id}, ${visible}) failed: ${e.message}\n`);
+      return false;
+    }
+  }
+
+  /** Remove a media item. Soft-delete by default: the row stays in
+   *  the library with `visible: false` so its metadata (especially
+   *  the "used to produce downstream output" trail) survives. Pass
+   *  `{ hard: true }` to actually destroy the row (used internally
+   *  by dedup / migration code; the GUI's delete UI uses the soft
+   *  variant). The user's wording: "si borro una imagen, debería
+   *  simplemente poner visible = false". */
+  async remove(id, { hard = false } = {}) {
+    if (!hard) return this.setVisible(id, false);
     const table = await this._ensureTable();
     try {
       await table.delete(`id = '${id}'`);
@@ -1077,6 +1149,12 @@ export class MediaLibrary {
       // tile from Latest — the row still exists with its categories
       // intact, just hidden from the "everything" view.
       hiddenFromLatest: !!metadata.hidden_from_latest,
+      // Soft-delete / hide-everywhere flag. Defaults to true so older
+      // rows that pre-date this field stay visible. False hides the
+      // item from the drawer (and from the default `list()` filter)
+      // — the row + metadata are preserved so "what was used to make
+      // X" trails survive.
+      visible: metadata.visible === false ? false : true,
       // User-defined `@mention` handle (e.g. `john` for an avatar the
       // user wants to drop into prompts via @john autocomplete). Empty
       // string when unset — same convention `description` uses.

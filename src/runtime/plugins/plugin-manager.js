@@ -166,6 +166,26 @@ class PluginManager {
       if (agents.length > 0) caps.agents = agents;
     }
 
+    // Workflows — same layout as skills: one subdirectory per workflow,
+    // each containing a `WORKFLOW.md` (frontmatter declares the
+    // workflow's `name` + `description`, body holds the prose script).
+    // Single workflow at the plugin root (just a `WORKFLOW.md`) is
+    // ALSO accepted so a one-trick plugin can skip the wrapping dir.
+    const workflowsDir = path.join(dir, 'workflows');
+    if (fs.existsSync(workflowsDir)) {
+      const workflows = [];
+      for (const name of fs.readdirSync(workflowsDir)) {
+        const wd = path.join(workflowsDir, name);
+        if (fs.statSync(wd).isDirectory() && fs.existsSync(path.join(wd, 'WORKFLOW.md'))) {
+          workflows.push({ name, path: path.join(wd, 'WORKFLOW.md'), dir: wd });
+        }
+      }
+      if (workflows.length > 0) caps.workflows = workflows;
+    }
+    if (!caps.workflows && fs.existsSync(path.join(dir, 'WORKFLOW.md'))) {
+      caps.workflows = [{ name: path.basename(dir), path: path.join(dir, 'WORKFLOW.md'), dir }];
+    }
+
     // Hooks
     const hooksFile = path.join(dir, 'hooks', 'hooks.json');
     if (fs.existsSync(hooksFile)) {
@@ -313,7 +333,7 @@ class PluginManager {
       // recorded in an install manifest so uninstall can remove them
       // cleanly instead of leaving orphaned files behind.
       const caps = this._detectCapabilities(baseDir);
-      const installedPaths = { skills: [], agents: [] };
+      const installedPaths = { skills: [], agents: [], workflows: [] };
       const isProject = scope === 'project' && projectRoot;
 
       let skillsCopied = 0;
@@ -351,6 +371,28 @@ class PluginManager {
         }
       }
 
+      // Workflows — copy each `workflows/<name>/` directory (containing a
+      // WORKFLOW.md) into the runtime's scanned location so
+      // workflows-catalog.js picks it up automatically (no restart).
+      // Same skip-if-exists policy as skills/agents: a re-install never
+      // clobbers a workflow the user (or another plugin) may have
+      // edited locally.
+      let workflowsCopied = 0;
+      if (caps.workflows) {
+        const workflowsTarget = isProject
+          ? path.join(projectRoot, '.koi', 'workflows')
+          : path.join(os.homedir(), '.koi', 'workflows');
+        if (!fs.existsSync(workflowsTarget)) fs.mkdirSync(workflowsTarget, { recursive: true });
+        for (const workflow of caps.workflows) {
+          const dest = path.join(workflowsTarget, workflow.name);
+          if (!fs.existsSync(dest)) {
+            this._copyRecursive(workflow.dir, dest);
+            installedPaths.workflows.push(dest);
+            workflowsCopied++;
+          }
+        }
+      }
+
       // Write install manifest so uninstall can reverse these copies.
       try {
         const manifestDir = path.join(baseDir, '.koi-plugin');
@@ -370,15 +412,16 @@ class PluginManager {
       const totalCaps = Object.keys(caps).length;
       channel.log(
         'plugins',
-        `Installed plugin "${pluginId}" (${totalCaps} capabilities, ${skillsCopied} skills, ${agentsCopied} agents)`,
+        `Installed plugin "${pluginId}" (${totalCaps} capabilities, ${skillsCopied} skills, ${agentsCopied} agents, ${workflowsCopied} workflows)`,
       );
 
       return {
         success: true,
         pluginId,
-        installed: skillsCopied,
+        installed: skillsCopied + workflowsCopied,
         skillsCopied,
         agentsCopied,
+        workflowsCopied,
         capabilities: caps,
         scope,
       };
@@ -400,16 +443,25 @@ class PluginManager {
   }
 
   /**
-   * Uninstall a plugin — remove cache dir, reverse any installed skills
-   * and agents recorded in the install manifest, and deactivate.
-   * Returns { success, skillsRemoved, agentsRemoved }.
+   * Uninstall a plugin — remove cache dir, reverse any installed
+   * skills, agents and workflows recorded in the install manifest, and
+   * deactivate. Returns { success, skillsRemoved, agentsRemoved,
+   * workflowsRemoved }.
    */
   uninstall(pluginId) {
     const entry = this._plugins.get(pluginId);
-    if (!entry) return { success: false, skillsRemoved: 0, agentsRemoved: 0 };
+    if (!entry) {
+      return {
+        success: false,
+        skillsRemoved: 0,
+        agentsRemoved: 0,
+        workflowsRemoved: 0,
+      };
+    }
 
     let skillsRemoved = 0;
     let agentsRemoved = 0;
+    let workflowsRemoved = 0;
 
     // Read manifest before removing the cache dir.
     try {
@@ -433,6 +485,14 @@ class PluginManager {
             }
           } catch { /* best effort */ }
         }
+        for (const p of (paths.workflows || [])) {
+          try {
+            if (fs.existsSync(p)) {
+              fs.rmSync(p, { recursive: true, force: true });
+              workflowsRemoved++;
+            }
+          } catch { /* best effort */ }
+        }
       }
     } catch { /* manifest missing or corrupt — skip reverse copies */ }
 
@@ -445,7 +505,7 @@ class PluginManager {
     this._plugins.delete(pluginId);
     this._activePlugins.delete(pluginId);
     this._saveConfig();
-    return { success: true, skillsRemoved, agentsRemoved };
+    return { success: true, skillsRemoved, agentsRemoved, workflowsRemoved };
   }
 
   // ── Activation ─────────────────────────────────────────────────────────

@@ -647,12 +647,23 @@ function _wrapWithBanner(action) {
       expectedDurationMs,
     });
     let ok = false;
+    let cancelled = false;
     try {
       const result = await _orig.call(this, act, agent);
-      ok = !!(result && result.success !== false);
+      // `_guardedAutoExpand: true` means the tool's `requireToolInfoFirst`
+      // guard fired and returned the documentation INSTEAD of actually
+      // generating media. The banner was started a few ms ago because
+      // the wrapper sees every call the same way — and without this
+      // branch it would close as a "✓ completed at 0s" bubble, which
+      // the user reported verbatim: a phantom success banner appearing
+      // alongside the real one when generation runs on the retry call.
+      // We flag it as cancelled so the GUI can REMOVE the banner
+      // entirely instead of showing a misleading completion.
+      cancelled = !!(result && result._guardedAutoExpand === true);
+      ok = !cancelled && !!(result && result.success !== false);
       return result;
     } finally {
-      channel.mediaToolEnd({ id, ok });
+      channel.mediaToolEnd({ id, ok, cancelled });
     }
   };
   action.__bannerWrapped = true;

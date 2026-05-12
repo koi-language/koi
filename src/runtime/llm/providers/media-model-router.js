@@ -53,7 +53,44 @@ const _modelHasLabel = (m, slug) => _labelSlugs(m).includes(slug);
 const _modelHasAnyLabel = (m) => _labelSlugs(m).length > 0;
 
 const _modelCategories = (m) => Array.isArray(m?.categories) ? m.categories : [];
-const _inCategory = (m, cat) => _modelCategories(m).includes(cat);
+
+// Legacy → canonical bucket aliases. The backoffice form vocabulary
+// (`audio_sfx`, `audio_music`, `audio_tts`, `audio_voice_clone`,
+// `image_background_removal`, …) was tightened up AFTER catalog rows
+// had already been tagged with the older short forms (`sfx`, `music`,
+// `tts`, `voice_clone`, `background-removal`, …). Rather than force a
+// data migration, the router treats both as the same bucket — a model
+// declaring either side of the alias is considered in-category for
+// the canonical form. Add new aliases here when the form vocabulary
+// changes; never branch on shape elsewhere.
+const _CATEGORY_ALIASES = {
+  audio_sfx: ['sfx'],
+  audio_music: ['music'],
+  audio_tts: ['tts'],
+  audio_voice_clone: ['voice_clone', 'voice-clone'],
+  audio_transcription: ['transcribe', 'transcription'],
+  image_background_removal: ['background-removal', 'background_removal', 'bg-remove', 'rembg'],
+  image_upscaling: ['upscale', 'upscaling', 'upscaler'],
+  image_extend: ['outpaint', 'outpainting', 'extend'],
+  image_editing: ['edit', 'editing', 'inpaint', 'inpainting'],
+  image_generation: ['generate', 'text-to-image'],
+  video_avatar: ['avatar', 'lipsync'],
+  video_extend: ['video-extend'],
+  video_background_removal: ['video-background-removal'],
+  video_editing: ['video-edit', 'video-to-video'],
+  video_generation: ['video-generate', 'text-to-video'],
+};
+const _bucketSynonyms = (cat) => {
+  const aliases = _CATEGORY_ALIASES[cat] || [];
+  return [cat, ...aliases];
+};
+const _inCategory = (m, cat) => {
+  const cats = _modelCategories(m);
+  for (const syn of _bucketSynonyms(cat)) {
+    if (cats.includes(syn)) return true;
+  }
+  return false;
+};
 
 /** Sort eligible candidates so the best pick lands at index 0. Ranks:
  *  1. Label match (when one was requested, matching wins; when none,

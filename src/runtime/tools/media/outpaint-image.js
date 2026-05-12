@@ -64,73 +64,6 @@ function _closestAspectRatio(width, height) {
   return best[0];
 }
 
-/// Pick a feather width (in pixels) for the alpha gradient at the
-/// boundary between original and outpainted regions. The ramp lives
-/// ENTIRELY inside the original (alpha falls 1→0 from `feather` pixels
-/// inside the boundary to the boundary itself), so we don't constrain
-/// by pad size — only by image size. Wider feather → smoother seam at
-/// the cost of more original detail being blended with the model's
-/// (possibly subtly different) painted output near the edge.
-///
-/// 1.5% / cap=32 was the original setting and produced visible cuts
-/// on full-HD inputs (a 16px ramp on a 1080px-tall scene reads as a
-/// hard line). 5% / cap=160 gives a ~50–100px gradient on typical
-/// scene-grade images, which is wide enough that exposure/colour
-/// drift between original and outpaint dissolves visually.
-function _computeFeather(origW, origH, pads) {
-  const anyPad = pads.top > 0 || pads.bottom > 0 || pads.left > 0 || pads.right > 0;
-  if (!anyPad) return 0;
-  const sizeBased = Math.floor(Math.min(origW, origH) * 0.05);
-  return Math.max(24, Math.min(160, sizeBased));
-}
-
-/// Build an RGBA buffer of the original image whose alpha channel is a
-/// soft mask: 255 in the bulk, fading to 0 over `feather` pixels at the
-/// sides that have padding. Sides without padding stay 255 (sharp). Used
-/// at composite time so the original blends gradient-smooth into the
-/// model's painted margins instead of being hard-stamped on top.
-async function _buildFeatheredOriginal(sharp, srcPath, origW, origH, pads, feather) {
-  const fT = pads.top    > 0 ? feather : 0;
-  const fB = pads.bottom > 0 ? feather : 0;
-  const fL = pads.left   > 0 ? feather : 0;
-  const fR = pads.right  > 0 ? feather : 0;
-
-  // Inset white rectangle representing the fully-opaque core. After
-  // gaussian blur with sigma = feather/2, the step at each padded side
-  // becomes a smooth ramp ~feather pixels wide, centred on the inset
-  // edge. Result: alpha ≈ 0 at the padded boundary, ≈ 255 a couple of
-  // feather widths inside the original.
-  const innerW = origW - fL - fR;
-  const innerH = origH - fT - fB;
-  if (innerW <= 0 || innerH <= 0) {
-    // Pathological case: feather wider than the image. Fall back to no feather.
-    return null;
-  }
-
-  // Sharp's `create` only accepts channels: 3 or 4 (no single-channel
-  // synthesis). Build the mask with 3 channels, then collapse to one
-  // via extractChannel after blur.
-  const innerWhite = await sharp({
-    create: { width: innerW, height: innerH, channels: 3, background: { r: 255, g: 255, b: 255 } },
-  }).png().toBuffer();
-
-  const blurredMask = await sharp({
-    create: { width: origW, height: origH, channels: 3, background: { r: 0, g: 0, b: 0 } },
-  })
-    .composite([{ input: innerWhite, left: fL, top: fT }])
-    .blur(Math.max(1, feather / 2))
-    .extractChannel(0)
-    .raw()
-    .toBuffer();
-
-  // Combine RGB from the original with the soft alpha mask.
-  const rgb = await sharp(srcPath).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  return await sharp(rgb.data, { raw: rgb.info })
-    .joinChannel(blurredMask, { raw: { width: origW, height: origH, channels: 1 } })
-    .png()
-    .toBuffer();
-}
-
 function _directionPhrase(pads) {
   const parts = [];
   if (pads.top > 0)    parts.push(`${pads.top}px upward (above the original scene)`);
@@ -408,46 +341,23 @@ const outpaintImageAction = {
       };
     }
 
-    // Pixel-identical preservation of the original: edit models (GPT-Image,
-    // Gemini 2.5 Flash Image, etc.) do not guarantee that a source region
-    // survives the round-trip — in practice they redraw everything, which
-    // surfaces as "the outpaint output looks similar but NOT the same".
-    // Here we force the guarantee: resize the generated canvas to the exact
-    // target dimensions, then composite the ORIGINAL image on top at the
-    // requested offset.
+    // We used to composite the ORIGINAL image back on top of the model's
+    // output (with feathered edges) to guarantee pixel-identical
+    // preservation of the source region. In practice modern edit models
+    // (GPT-Image, Gemini 2.5 Flash Image, Seedream Edit, …) already produce
+    // a continuous, well-blended outpaint when given a reference + padded
+    // canvas, and the stamp-on-top step was actively making the result
+    // WORSE: it introduced a visible rectangular seam wherever the
+    // model's natural rendering of the boundary differed from the
+    // original (lighting, contrast, lines crossing the edge). The user-
+    // reported failure mode was textbook — model returned a perfect
+    // wide-shot continuation, tool slapped the smaller original back in
+    // the middle, leaving an obvious hard-edged inset.
     //
-    // Edge feathering: a hard-edge stamp produces a visible seam on every
-    // padded side because the model's output near the boundary, no matter
-    // how well-conditioned, never matches the original byte-for-byte
-    // (lighting, exposure, lines crossing the boundary). We build a
-    // soft-alpha version of the original where the bulk stays fully
-    // opaque (preserved verbatim) but a narrow ring on the padded sides
-    // fades from opaque → transparent. The composite then naturally
-    // BLENDS the original with the model's painted boundary across that
-    // ring, so the transition reads as a smooth gradient instead of a
-    // hard cut. Sides without padding stay sharp (no fade) — those
-    // weren't extended and shouldn't lose any detail to a blend.
-    try {
-      const sharp = (await import('sharp')).default;
-      const featherPx = _computeFeather(origWidth, origHeight, pads);
-      const softOriginal = featherPx > 0
-        ? await _buildFeatheredOriginal(sharp, resolvedPath, origWidth, origHeight, pads, featherPx)
-        : null;
-      for (const img of result.images || []) {
-        if (!img.savedTo || !fs.existsSync(img.savedTo)) continue;
-        const resized = await sharp(img.savedTo)
-          .resize(newWidth, newHeight, { fit: 'fill' })
-          .toBuffer();
-        const overlay = softOriginal ?? resolvedPath;
-        const stamped = await sharp(resized)
-          .composite([{ input: overlay, left: pads.left, top: pads.top }])
-          .toFormat(action.outputFormat || 'png')
-          .toBuffer();
-        fs.writeFileSync(img.savedTo, stamped);
-      }
-    } catch (err) {
-      channel.log('image', `outpaint_image: original composite step failed: ${err.message}`);
-    }
+    // Trust the model's output. Pixel-identical preservation is the
+    // wrong default for outpainting — if the caller genuinely needs the
+    // source region untouched they can crop the original back in
+    // themselves on top of the result.
 
     // Record provenance so `recall_memory` knows where each pixel came from.
     try {

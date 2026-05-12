@@ -4490,6 +4490,68 @@ export class Agent {
         throw err;
       }
 
+      // ── Post-delegate clip-assignment guard ──────────────────────────
+      // When the delegate's task description targets a specific
+      // timeline clip (format: "id: tl-..., clipId: clip-...") AND the
+      // delegate returned success, verify the clip is actually no
+      // longer a placeholder. The Worker is supposed to call
+      // `assign_generated_media_to_clip` after a successful
+      // `generate_image` / `generate_video` / etc.; without it the
+      // file lands on disk but the timeline never gets the swap, and
+      // the user sees the stripey placeholder forever despite the
+      // agent saying "lo he asignado".
+      //
+      // We DON'T call assign_to_clip ourselves here — that hides the
+      // bug. We just downgrade the success result to failure with a
+      // clear message so the System layer surfaces the real state and
+      // can either retry or report honestly.
+      if (result && result.success !== false) {
+        try {
+          const _desc = resolvedAction?.data?.description || '';
+          const _timelineMatch = _desc.match(/(?:timelineId|id)\s*[:=]\s*['"`]?(tl-[a-zA-Z0-9-]+)['"`]?/);
+          const _clipMatch = _desc.match(/clipId\s*[:=]\s*['"`]?(clip-[a-zA-Z0-9]+)['"`]?/);
+          if (_timelineMatch && _clipMatch) {
+            const _tlId = _timelineMatch[1];
+            const _clipId = _clipMatch[1];
+            const { _findClipIndexById, _readTimeline } = await import('../state/timelines.js').catch(() => ({}));
+            // No exported helper for read-only access — go through fs.
+            const fs = (await import('fs')).default;
+            const path = (await import('path')).default;
+            const _tlPath = path.join(
+              process.env.HOME || '',
+              '.koi', 'timelines', `${_tlId}.json`,
+            );
+            if (fs.existsSync(_tlPath)) {
+              const _tl = JSON.parse(fs.readFileSync(_tlPath, 'utf8'));
+              const _clip = (_tl.clips || []).find((c) => c.id === _clipId);
+              if (_clip && typeof _clip.path === 'string' && _clip.path.startsWith('placeholder-')) {
+                channel.log(
+                  'agent',
+                  `Post-delegate guard: ${this.name} delegate claimed success on ${_clipId} ` +
+                  `but the clip is still '${_clip.path}'. assign_generated_media_to_clip was NOT called. ` +
+                  `Downgrading to failure so System surfaces the real state.`,
+                );
+                result = {
+                  ...result,
+                  success: false,
+                  error:
+                    `Delegate claimed completion for clip ${_clipId} but the clip is still at ` +
+                    `'${_clip.path}' (placeholder unchanged). The delegate either skipped ` +
+                    `\`assign_generated_media_to_clip\` or it failed silently. ` +
+                    `Re-issue the assignment with the generated mediaPath.`,
+                  guard: 'placeholder-unchanged',
+                };
+              }
+            }
+          }
+        } catch (guardErr) {
+          // Guard is best-effort; never fail the actual call because
+          // the check itself threw. Just log so we can debug if it
+          // misbehaves.
+          channel.log('agent', `Post-delegate clip guard threw (non-fatal): ${guardErr?.message || guardErr}`);
+        }
+      }
+
       if (_taskId) {
         try {
           const { taskManager } = await import('../state/task-manager.js');

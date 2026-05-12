@@ -305,7 +305,7 @@ const generateVideoAction = {
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
-      kind:            { type: 'string',  enum: ['extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice instead of the default generation/edit shop. "extend" → continue / make-longer an existing video (`video_extend` bucket). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>]. Omit for fresh generations / restyles / regular edits.' },
+      kind:            { type: 'string',  enum: ['extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice instead of the default generation/edit shop. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>]. Omit for fresh generations / restyles / regular edits.' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
     },
     required: ['prompt']
@@ -680,6 +680,24 @@ const generateVideoAction = {
         const r = await padIfNeeded(rv, 'video', padOpts);
         if (i === 0 && r.geometry?.needsPadding) {
           recoveryGeometry = { ...r.geometry, kind: 'video' };
+        }
+        if (!r.paddedPath && r.geometry?.needsPadding) {
+          // Pad was requested but ffmpeg failed. Falling back to the
+          // un-padded source — the model will get a smaller canvas
+          // than its expected envelope and may reject the request
+          // outright (or pad it server-side with whatever defaults
+          // it uses, drifting the output dims off our recovery
+          // crop). Make this explicit in the log so a downstream
+          // failure traces back here instead of looking like a
+          // mystery 504 / dimension mismatch.
+          channel.log(
+            'pad',
+            `pad failed for ref video #${i} — uploading ORIGINAL ` +
+            `(${r.geometry.contentW}×${r.geometry.contentH}) ` +
+            `instead of the requested ${r.geometry.paddedW}×${r.geometry.paddedH} envelope. ` +
+            `Downstream model may reject the size — see the ffmpeg ` +
+            `stderr block above for the underlying cause.`,
+          );
         }
         padded.push(r.paddedPath || rv);
       }
@@ -1128,6 +1146,85 @@ const generateVideoAction = {
           }
         } catch (err) {
           channel.log('video', `stripVideoEditList failed (keeping with edts): ${err.message}`);
+        }
+      }
+
+      // ── Pure-extend reconciliation: unify adapter return shapes ────
+      // Different extend providers return DIFFERENT slices of the
+      // timeline given the same `kind:'extend'` + `duration` request:
+      //
+      //   * Veo3.1 extend, Kling extend → return the FULL concatenated
+      //     video (source + new tail). `duration` to them means "add
+      //     this much beyond the source".
+      //   * Seedance reference-to-video → returns ONLY the new tail
+      //     ("the next N seconds of motion given this reference").
+      //     `duration` to it means the LENGTH OF THAT TAIL.
+      //
+      // Caller contract (single semantic): `duration` for an extend
+      // call is the EXTENSION length, and the returned file MUST be
+      // the full source-plus-extension video so the GUI / agent never
+      // has to know which adapter ran. To honour that contract we
+      // probe the model output here: if it's clearly shorter than the
+      // source (slice-only), we ffmpeg-concat source+output. If it
+      // already includes the source (full), we leave it alone.
+      //
+      // Detection: model_output_duration < source_duration - 0.5 s.
+      // The 0.5s slack absorbs ffmpeg duration rounding and providers
+      // that emit slightly-truncated keyframe boundaries. A strict
+      // equality check made Veo3.1 outputs (slightly-shorter than
+      // source+extension due to keyframe alignment) trip the concat
+      // path and end up with a duplicated head.
+      const _isPureExtend =
+        action.kind === 'extend' &&
+        Array.isArray(action.referenceVideos) &&
+        action.referenceVideos.length > 0 &&
+        action.referenceVideos[0];
+      if (savedTo && _isPureExtend) {
+        try {
+          const sourcePath = action.referenceVideos[0];
+          const srcDurSec = await _probeVideoDurationSec(sourcePath);
+          const outDurSec = await _probeVideoDurationSec(savedTo);
+          if (
+            Number.isFinite(srcDurSec) &&
+            Number.isFinite(outDurSec) &&
+            outDurSec < srcDurSec - 0.5
+          ) {
+            channel.log(
+              'video',
+              `extend reconcile: model output ${outDurSec.toFixed(2)}s < source ` +
+              `${srcDurSec.toFixed(2)}s → slice-only adapter; concatenating ` +
+              `source + extension to honour "full video" caller contract`,
+            );
+            const concatDir = path.dirname(savedTo);
+            const concatPath = await _concatVideoSegments(
+              [sourcePath, savedTo],
+              concatDir,
+            );
+            if (concatPath) {
+              savedTo = concatPath;
+              channel.log(
+                'video',
+                `extend reconcile: concat OK → ${path.basename(concatPath)}`,
+              );
+            } else {
+              channel.log(
+                'video',
+                `extend reconcile: ffmpeg concat failed — returning slice-only ` +
+                `output as-is (the GUI will show only the extension portion)`,
+              );
+            }
+          } else if (Number.isFinite(srcDurSec) && Number.isFinite(outDurSec)) {
+            channel.log(
+              'video',
+              `extend reconcile: model output ${outDurSec.toFixed(2)}s ≥ source ` +
+              `${srcDurSec.toFixed(2)}s → full-video adapter; using as-is`,
+            );
+          }
+        } catch (err) {
+          channel.log(
+            'video',
+            `extend reconcile failed (returning model output unchanged): ${err.message}`,
+          );
         }
       }
 
