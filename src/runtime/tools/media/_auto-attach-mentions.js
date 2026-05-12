@@ -170,6 +170,77 @@ export async function autoAttachMentions({ prompt, refs = [], mediaKind, maxRefs
 }
 
 /**
+ * Reconcile `unknown` handles (returned by [autoAttachMentions]) with
+ * already-attached references by treating each unresolved handle as a
+ * POSITIONAL ALIAS for the next ref without one. The agent often
+ * writes prompts like
+ *   "Edit @ref1 by removing the pedestrian, then use @ref2 as the
+ *    background"
+ * and intends `@ref1` / `@ref2` to refer to the references it
+ * already wired up via `referenceImages` / `referenceVideos`. Those
+ * handles aren't in the gallery — they're the agent's chosen names
+ * for the positional slots — so this helper takes the unresolved
+ * handles in prompt order and attaches them as aliases to the first
+ * unaliased entries in the ref list (also in order). Downstream code
+ * that builds a reference legend (system-prompt aliasing, model-
+ * specific @Image1/@Video1 mapping, etc.) then sees `{alias, path}`
+ * for those slots and the prompt's `@ref1` resolves correctly.
+ *
+ * @param {Array} refs         Ref list (mix of strings and {alias,path}).
+ * @param {string[]} unknown   Handles still unresolved after auto-attach
+ *                             (each prefixed with `@`).
+ * @returns {{ merged: Array, assigned: Array<{handle:string,path:string}>,
+ *             leftover: string[] }}
+ *   `merged`   — ref list with positional aliases applied.
+ *   `assigned` — handles successfully wired to a ref (with the path
+ *                they ended up bound to).
+ *   `leftover` — handles that couldn't be assigned (no unaliased refs
+ *                left). Callers decide whether to warn or fail —
+ *                typically these are hallucinated handles the agent
+ *                wrote with no underlying reference attached.
+ */
+export function assignPositionalAliases(refs, unknown) {
+  const merged = Array.isArray(refs) ? refs.slice() : [];
+  const assigned = [];
+  const leftover = [];
+  if (!Array.isArray(unknown) || unknown.length === 0) {
+    return { merged, assigned, leftover };
+  }
+  // Track which positions in `merged` already have an alias (set
+  // either by the agent or by autoAttachMentions). We only target
+  // plain-string slots — overwriting an existing alias would lose the
+  // agent's deliberate naming.
+  let cursor = 0;
+  const findNextUnaliased = () => {
+    for (; cursor < merged.length; cursor++) {
+      const item = merged[cursor];
+      const isPlain = typeof item === 'string';
+      const isObjectWithoutAlias =
+        item && typeof item === 'object' && !item.alias && typeof item.path === 'string';
+      if (isPlain || isObjectWithoutAlias) return cursor;
+    }
+    return -1;
+  };
+  for (const handleWithAt of unknown) {
+    const handle = typeof handleWithAt === 'string' && handleWithAt.startsWith('@')
+      ? handleWithAt.slice(1)
+      : String(handleWithAt || '');
+    if (!handle) continue;
+    const slot = findNextUnaliased();
+    if (slot < 0) {
+      leftover.push(`@${handle}`);
+      continue;
+    }
+    const item = merged[slot];
+    const path = typeof item === 'string' ? item : item.path;
+    merged[slot] = { alias: handle, path };
+    assigned.push({ handle: `@${handle}`, path });
+    cursor++;
+  }
+  return { merged, assigned, leftover };
+}
+
+/**
  * Build a friendly error message listing the gallery handles that DO
  * exist, so the agent can fix its prompt instead of guessing again.
  * Returns null when MediaLibrary isn't reachable (caller falls back

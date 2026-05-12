@@ -26,7 +26,7 @@ import {
   padImageBuffer,
   recoverImageFile,
 } from './_pad-and-recover.js';
-import { autoAttachMentions, listAvailableMentions } from './_auto-attach-mentions.js';
+import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -294,24 +294,6 @@ const generateImageAction = {
         mediaKind: 'image',
         maxRefs: caps.referenceImages ? (caps.maxReferenceImages || 1) : 0,
       });
-      // Hallucinated handles → fail fast. The model would otherwise
-      // invent visuals for a reference that doesn't exist (the
-      // "@storyboard_001 doesn't exist" failure mode reported in
-      // testing). Hand the agent the list of real handles so its
-      // retry can use one that actually resolves.
-      if (_autoRes.unknown.length > 0) {
-        const available = await listAvailableMentions({ limit: 60 });
-        const availableStr = (available && available.length)
-          ? available.join(', ')
-          : '(no @-handles tagged yet — use tag_media to assign one)';
-        return {
-          success: false,
-          error:
-            `Prompt references @-handles that DON'T exist in the gallery: ${_autoRes.unknown.join(', ')}.\n` +
-            `Either remove them from the prompt or replace them with a handle that actually exists.\n` +
-            `Currently tagged handles: ${availableStr}`,
-        };
-      }
       if (_autoRes.added.length > 0 && caps.referenceImages) {
         channel.log(
           'image',
@@ -319,6 +301,42 @@ const generateImageAction = {
         );
       }
       _explicitRefs = _autoRes.merged;
+
+      // Positional reconciliation for handles not in the gallery.
+      // The agent often writes prompts like
+      //   "Edit @ref1 to look like @ref2"
+      // and means "the first / second reference I just attached".
+      // Those aren't gallery handles — they're the agent's own labels
+      // for the slots — so bind each one as an alias on the next
+      // unaliased ref. Downstream prompt-aliasing then resolves
+      // `@ref1` → reference legend → model.
+      if (_autoRes.unknown.length > 0) {
+        const _fix = assignPositionalAliases(_explicitRefs, _autoRes.unknown);
+        if (_fix.assigned.length > 0) {
+          _explicitRefs = _fix.merged;
+          channel.log(
+            'image',
+            `Bound positional aliases to image refs: ${
+              _fix.assigned.map((a) => `${a.handle}→${a.path}`).join(', ')
+            }`,
+          );
+        }
+        // Whatever the gallery didn't have AND no ref slot accepts is
+        // a genuine hallucination — surface a clear error so the
+        // agent can fix the prompt.
+        if (_fix.leftover.length > 0) {
+          const available = await listAvailableMentions({ limit: 60 });
+          const availableStr = (available && available.length)
+            ? available.join(', ')
+            : '(no @-handles tagged yet — use tag_media to assign one)';
+          return {
+            success: false,
+            error:
+              `Prompt references @-handles that don't match any gallery item OR any attached reference slot: ${_fix.leftover.join(', ')}.\n` +
+              `Either remove them, attach matching references in referenceImages, or use one of the tagged handles: ${availableStr}`,
+          };
+        }
+      }
     }
     if (_explicitRefs.length) {
       if (!caps.referenceImages) {

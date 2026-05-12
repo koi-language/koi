@@ -28,7 +28,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
-import { autoAttachMentions, listAvailableMentions } from './_auto-attach-mentions.js';
+import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
 import {
   padIfNeeded,
   recoverFromPadded,
@@ -444,11 +444,61 @@ const generateVideoAction = {
         mediaKind: 'video',
         maxRefs: caps.maxReferenceVideos || (caps.videoToVideo ? 2 : 0),
       });
-      // `unknown` means "the handle resolves to ZERO rows in the
-      // gallery, regardless of kind" — invariant of mediaKind, so
-      // either pass returns the same set. Pick one.
-      const _trulyUnknown = _imgRes.unknown;
-      if (_trulyUnknown.length > 0) {
+      // Merge resolved (gallery) handles first so the post-attach
+      // ref lists are current before we try positional reconciliation.
+      if (_imgRes.added.length > 0) {
+        channel.log('video', `Auto-attached image @mentions from prompt: ${_imgRes.added.join(', ')}`);
+        action.referenceImages = _imgRes.merged;
+      } else if (_imgRes.merged.length !== (action.referenceImages || []).length) {
+        action.referenceImages = _imgRes.merged;
+      }
+      if (_vidRes.added.length > 0) {
+        channel.log('video', `Auto-attached video @mentions from prompt: ${_vidRes.added.join(', ')}`);
+        action.referenceVideos = _vidRes.merged;
+      } else if (_vidRes.merged.length !== (action.referenceVideos || []).length) {
+        action.referenceVideos = _vidRes.merged;
+      }
+
+      // Positional reconciliation: handles still unresolved in the
+      // gallery are interpreted as the agent's chosen names for the
+      // already-attached refs. We walk the unresolved list in prompt
+      // order and bind each handle as an alias to the next unaliased
+      // ref — images first, then videos. The downstream prompt-
+      // aliasing pass picks the alias up and the model resolves
+      // `@ref1` / `@whatever` correctly. Both worlds coexist: gallery
+      // handles bring in NEW refs from the catalogue; positional
+      // handles label EXISTING refs the agent already wired.
+      const _trulyUnknown = _imgRes.unknown; // invariant across mediaKind
+      let _leftover = _trulyUnknown;
+      if (_leftover.length > 0) {
+        const _imgFix = assignPositionalAliases(action.referenceImages || [], _leftover);
+        if (_imgFix.assigned.length > 0) {
+          action.referenceImages = _imgFix.merged;
+          channel.log(
+            'video',
+            `Bound positional aliases to image refs: ${
+              _imgFix.assigned.map((a) => `${a.handle}→${a.path}`).join(', ')
+            }`,
+          );
+        }
+        _leftover = _imgFix.leftover;
+      }
+      if (_leftover.length > 0) {
+        const _vidFix = assignPositionalAliases(action.referenceVideos || [], _leftover);
+        if (_vidFix.assigned.length > 0) {
+          action.referenceVideos = _vidFix.merged;
+          channel.log(
+            'video',
+            `Bound positional aliases to video refs: ${
+              _vidFix.assigned.map((a) => `${a.handle}→${a.path}`).join(', ')
+            }`,
+          );
+        }
+        _leftover = _vidFix.leftover;
+      }
+      // Only what we couldn't bind — neither gallery hit nor
+      // positional slot left — is treated as a true hallucination.
+      if (_leftover.length > 0) {
         const available = await listAvailableMentions({ limit: 60 });
         const availableStr = (available && available.length)
           ? available.join(', ')
@@ -456,18 +506,9 @@ const generateVideoAction = {
         return {
           success: false,
           error:
-            `Prompt references @-handles that DON'T exist in the gallery: ${_trulyUnknown.join(', ')}.\n` +
-            `Either remove them from the prompt or replace them with a handle that actually exists.\n` +
-            `Currently tagged handles: ${availableStr}`,
+            `Prompt references @-handles that don't match any gallery item OR any attached reference slot: ${_leftover.join(', ')}.\n` +
+            `Either remove them from the prompt, attach matching references in referenceImages/referenceVideos, or use one of the tagged handles: ${availableStr}`,
         };
-      }
-      if (_imgRes.added.length > 0) {
-        channel.log('video', `Auto-attached image @mentions from prompt: ${_imgRes.added.join(', ')}`);
-        action.referenceImages = _imgRes.merged;
-      }
-      if (_vidRes.added.length > 0) {
-        channel.log('video', `Auto-attached video @mentions from prompt: ${_vidRes.added.join(', ')}`);
-        action.referenceVideos = _vidRes.merged;
       }
     }
 
