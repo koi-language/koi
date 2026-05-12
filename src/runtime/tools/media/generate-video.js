@@ -1227,26 +1227,29 @@ const generateVideoAction = {
       // timeline given the same `kind:'extend'` + `duration` request:
       //
       //   * Veo3.1 extend, Kling extend → return the FULL concatenated
-      //     video (source + new tail). `duration` to them means "add
-      //     this much beyond the source".
+      //     video (source + new tail). For these, `duration` means
+      //     "add this much beyond the source" and the output length
+      //     is roughly `source + duration`.
       //   * Seedance reference-to-video → returns ONLY the new tail
-      //     ("the next N seconds of motion given this reference").
-      //     `duration` to it means the LENGTH OF THAT TAIL.
+      //     (`duration` seconds of new content). The output length is
+      //     roughly `duration` (NOT source + duration).
       //
-      // Caller contract (single semantic): `duration` for an extend
-      // call is the EXTENSION length, and the returned file MUST be
-      // the full source-plus-extension video so the GUI / agent never
-      // has to know which adapter ran. To honour that contract we
-      // probe the model output here: if it's clearly shorter than the
-      // source (slice-only), we ffmpeg-concat source+output. If it
-      // already includes the source (full), we leave it alone.
+      // Caller contract: the saved file is ALWAYS the full
+      // source-plus-extension video, so the GUI/agent never has to
+      // know which adapter ran. To honour that we probe both durations
+      // and decide by closeness:
       //
-      // Detection: model_output_duration < source_duration - 0.5 s.
-      // The 0.5s slack absorbs ffmpeg duration rounding and providers
-      // that emit slightly-truncated keyframe boundaries. A strict
-      // equality check made Veo3.1 outputs (slightly-shorter than
-      // source+extension due to keyframe alignment) trip the concat
-      // path and end up with a duplicated head.
+      //   expected_full  = source_duration + requested_extension
+      //   expected_slice = requested_extension
+      //
+      // Whichever the output duration is closer to wins. Previous
+      // heuristic compared `output < source - 0.5s` to detect slice,
+      // which misfired when the requested extension matched the
+      // source length (Seedance returned an N-second slice when the
+      // source happened to also be N seconds; `output < source - 0.5`
+      // was false, the tool assumed full, no concat, GUI showed the
+      // clip's AI-extend zone still missing the new frames — exactly
+      // the user-reported "no ha hecho nada" failure).
       const _isPureExtend =
         action.kind === 'extend' &&
         Array.isArray(action.referenceVideos) &&
@@ -1257,41 +1260,66 @@ const generateVideoAction = {
           const sourcePath = action.referenceVideos[0];
           const srcDurSec = await _probeVideoDurationSec(sourcePath);
           const outDurSec = await _probeVideoDurationSec(savedTo);
+          const reqExtSec = Number.isFinite(action.duration) && action.duration > 0
+            ? Number(action.duration)
+            : null;
           if (
+            Number.isFinite(srcDurSec) &&
+            Number.isFinite(outDurSec) &&
+            reqExtSec !== null
+          ) {
+            const expectedFull = srcDurSec + reqExtSec;
+            const expectedSlice = reqExtSec;
+            const distFull = Math.abs(outDurSec - expectedFull);
+            const distSlice = Math.abs(outDurSec - expectedSlice);
+            const isSliceOnly = distSlice < distFull;
+            channel.log(
+              'video',
+              `extend reconcile: output=${outDurSec.toFixed(2)}s, ` +
+              `source=${srcDurSec.toFixed(2)}s, req-ext=${reqExtSec.toFixed(2)}s, ` +
+              `expected-full=${expectedFull.toFixed(2)}s, ` +
+              `expected-slice=${expectedSlice.toFixed(2)}s ` +
+              `→ ${isSliceOnly ? 'SLICE-ONLY (concat)' : 'FULL (as-is)'}`,
+            );
+            if (isSliceOnly) {
+              const concatDir = path.dirname(savedTo);
+              const concatPath = await _concatVideoSegments(
+                [sourcePath, savedTo],
+                concatDir,
+              );
+              if (concatPath) {
+                savedTo = concatPath;
+                channel.log(
+                  'video',
+                  `extend reconcile: concat OK → ${path.basename(concatPath)}`,
+                );
+              } else {
+                channel.log(
+                  'video',
+                  `extend reconcile: ffmpeg concat failed — returning slice-only ` +
+                  `output as-is (the GUI will show only the extension portion)`,
+                );
+              }
+            }
+          } else if (
             Number.isFinite(srcDurSec) &&
             Number.isFinite(outDurSec) &&
             outDurSec < srcDurSec - 0.5
           ) {
+            // Fallback when `action.duration` is missing: the old
+            // "output shorter than source" heuristic still catches the
+            // common case (slice-only adapter, request was small).
             channel.log(
               'video',
-              `extend reconcile: model output ${outDurSec.toFixed(2)}s < source ` +
-              `${srcDurSec.toFixed(2)}s → slice-only adapter; concatenating ` +
-              `source + extension to honour "full video" caller contract`,
+              `extend reconcile (fallback, no req-ext): output ${outDurSec.toFixed(2)}s < ` +
+              `source ${srcDurSec.toFixed(2)}s → assuming slice-only; concatenating`,
             );
             const concatDir = path.dirname(savedTo);
             const concatPath = await _concatVideoSegments(
               [sourcePath, savedTo],
               concatDir,
             );
-            if (concatPath) {
-              savedTo = concatPath;
-              channel.log(
-                'video',
-                `extend reconcile: concat OK → ${path.basename(concatPath)}`,
-              );
-            } else {
-              channel.log(
-                'video',
-                `extend reconcile: ffmpeg concat failed — returning slice-only ` +
-                `output as-is (the GUI will show only the extension portion)`,
-              );
-            }
-          } else if (Number.isFinite(srcDurSec) && Number.isFinite(outDurSec)) {
-            channel.log(
-              'video',
-              `extend reconcile: model output ${outDurSec.toFixed(2)}s ≥ source ` +
-              `${srcDurSec.toFixed(2)}s → full-video adapter; using as-is`,
-            );
+            if (concatPath) savedTo = concatPath;
           }
         } catch (err) {
           channel.log(
