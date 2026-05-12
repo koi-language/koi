@@ -510,6 +510,38 @@ const generateVideoAction = {
             `Either remove them from the prompt, attach matching references in referenceImages/referenceVideos, or use one of the tagged handles: ${availableStr}`,
         };
       }
+      // `assignPositionalAliases` may have wrapped some entries as
+      // `{alias, path}` to carry a label for the prompt aliasing pass.
+      // Every downstream call here (padIfNeeded, _loadFrame,
+      // _loadReferenceImages, _uploadVideoRef) expects RAW string
+      // paths, so unwrap before anything else touches these fields.
+      // Without this `path.resolve(...)` throws ERR_INVALID_ARG_TYPE
+      // the first time it sees an object — the user-reported crash
+      // "TypeError: paths[0] must be of type string, received an
+      // instance of Object" in `_loadReferenceImages`.
+      const _toPathStr = (it) => {
+        if (typeof it === 'string') return it;
+        if (it && typeof it === 'object' && typeof it.path === 'string') {
+          return it.path;
+        }
+        return null;
+      };
+      if (Array.isArray(action.referenceImages)) {
+        action.referenceImages = action.referenceImages
+          .map(_toPathStr)
+          .filter((p) => typeof p === 'string' && p);
+      }
+      if (Array.isArray(action.referenceVideos)) {
+        action.referenceVideos = action.referenceVideos
+          .map(_toPathStr)
+          .filter((p) => typeof p === 'string' && p);
+      }
+      if (action.startFrame != null && typeof action.startFrame !== 'string') {
+        action.startFrame = _toPathStr(action.startFrame) || undefined;
+      }
+      if (action.endFrame != null && typeof action.endFrame !== 'string') {
+        action.endFrame = _toPathStr(action.endFrame) || undefined;
+      }
     }
 
     // ── Pad-if-too-small for provider input minimums ─────────────────
