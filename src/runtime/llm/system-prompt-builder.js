@@ -804,6 +804,44 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       const activeAnnsForBlock = activeIsImage && active.bundle?.annotations
         ? active.bundle.annotations.filter((a) => a?.role === 'composite-snapshot')
         : [];
+
+      // ── "Animate this image" — ALWAYS applies when the active doc is
+      // an image, with or without annotations. The photomontage block
+      // below only fires for annotated images, so without this general
+      // block the agent had no anchor for plain "anima esta imagen" /
+      // "give this life" / "make a video out of this" requests and
+      // would happily route the image through `referenceImages` (which
+      // sends it to seedance-2.0/reference-to-video — wrong shape, ends
+      // up generating an unrelated clip) or split the task into
+      // multiple `shots` / a generate_image → generate_video pipeline
+      // the user did not ask for. Both regressions were reported by
+      // the user as "$216 wasted on a random clip" and "no quiero
+      // múltiples clips ni montajes ni pollas si no lo especifica
+      // claramente el usuario". The block below makes the contract
+      // explicit and includes the verbatim call shape.
+      if (activeIsImage && active && (active.path || active.url)) {
+        const activeLoc = active.path || active.url;
+        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        lines.push('');
+        lines.push('## ⚠ Active document is an IMAGE — `generate_video` rules');
+        lines.push('');
+        lines.push('When the user asks to ANIMATE / move / "darle vida a" / "make a video out of" this image — or any similar request whose subject is the active image — the call MUST be:');
+        lines.push('');
+        lines.push('```json');
+        lines.push(`{ "intent": "generate_video", "startFrame": "${activeLoc}", "prompt": "<short, concrete motion brief — what moves, how, camera behaviour>", "duration": 5, "saveTo": "${saveDir}" }`);
+        lines.push('```');
+        lines.push('');
+        lines.push('Hard rules (violating any of these is a bug):');
+        lines.push('  • The active image goes in `startFrame`, NEVER in `referenceImages`. `startFrame` = the literal first frame of the video (image-to-video conditioning). `referenceImages` = unrelated style / subject sheets, which routes to a reference-to-video model that has no concept of a starting frame and will invent a clip unrelated to your image. This is a routing-changer, not a stylistic choice.');
+        lines.push('  • ONE SINGLE `generate_video` call. Do NOT split into multiple shots, do NOT chain `generate_image` → `generate_video`, do NOT propose a montage, do NOT add `shots[]` unless the user explicitly asked for several segments. "Animar" means a single image-to-video pass, full stop.');
+        lines.push('  • Do NOT pass `referenceVideos` here.');
+        lines.push('  • Do NOT pass `aspectRatio` or `resolution` — the model preserves the input dimensions; setting them forces a downsample/crop.');
+        lines.push('  • Pass `duration` only when the user named a length; otherwise omit and let the router use the model default.');
+        lines.push('');
+        lines.push('If the user explicitly asks for MORE than one clip, a sequence, a storyboard, or specific named shots, only then is multi-shot or pipelined generation appropriate.');
+        lines.push('');
+      }
+
       if (anyHasComposite && activeIsImage && active && (active.path || active.url) && (activeAnnsForBlock.length > 0 || (active.bundle?.references?.length ?? 0) > 0)) {
         const activeLoc = active.path || active.url;
         const activeBundle = active.bundle || {};

@@ -1554,46 +1554,84 @@ export class GatewayVideoGen extends BaseVideoGen {
     const shots = Array.isArray(opts.shots) && opts.shots.length > 0 ? opts.shots : null;
     const shotCount = shots ? shots.length : 1;
 
-    const resolvedModel = await _resolveMediaModel('video', this.model, opts, (models, req) =>
-      import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
-        try {
-          return pickVideoModel(models, req);
-        } catch (e) {
-          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
-          throw e;
-        }
-      }),
-      {
-        resolution: opts.resolution,
-        aspectRatio: opts.aspectRatio,
-        hasStartFrame: !!opts.startFrame?.data || (shots ? shots.some((s) => s.startFrame?.data) : false),
-        hasEndFrame:   !!opts.endFrame?.data   || (shots ? shots.some((s) => s.endFrame?.data)   : false),
-        withAudio: !!opts.withAudio,
-        refsCount: opts.referenceImages?.length || 0,
-        videoRefsCount: Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0,
-        shotCount,
-        label: opts.label,
-        // Auto-picker hints from the agent. excludeModels comes from the
-        // failed-response slug (the agent retries with the offender on
-        // the list); includeModels narrows the pool to a user-selected
-        // whitelist; preferQuality flips the price tiebreaker so a more
-        // expensive model wins ties when the user explicitly asked for
-        // better quality.
-        excludeModels: Array.isArray(opts.excludeModels) ? opts.excludeModels : undefined,
-        includeModels: Array.isArray(opts.includeModels) ? opts.includeModels : undefined,
-        // Default true — quality wins ties unless the caller passed an
-        // explicit `false` to opt into budget mode.
-        preferQuality: opts.preferQuality !== false,
-        // Extension intent → `video_extend` bucket in pickVideoModel.
-        kind: opts.kind,
-      },
+    // Auto-retry on content-policy / safety-filter rejections — same
+    // pattern as GatewayImageGen. Without this loop, the agent LLM has
+    // to detect a "blocked" response and reissue generate_video itself,
+    // and in practice it routinely DROPS referenceImages / startFrame
+    // when rewriting the action JSON — producing a second call that
+    // hits the same (or another) model with NO image context and
+    // returns whatever the model invents. The bug that prompted this:
+    // seedance-2.0/reference-to-video succeeded on retry but with
+    // `hasStart=false hasEnd=false` and no `image_urls`, because the
+    // agent's second JSON only carried `prompt` and `excludeModels`.
+    //
+    // Retrying HERE preserves opts across attempts (`...opts` spread)
+    // so referenceImages / startFrame / endFrame / referenceVideos /
+    // shots all stay intact — only the failed slug accumulates in
+    // _policyExcluded so the picker walks to the next candidate.
+    const MAX_POLICY_RETRIES = 5;
+    const _policyExcluded = new Set(
+      Array.isArray(opts.excludeModels) ? opts.excludeModels : [],
+    );
+    let _policyAttempt = 0;
+    let _lastError = null;
+
+    while (_policyAttempt < MAX_POLICY_RETRIES) {
+      const _attemptOpts = {
+        ...opts,
+        excludeModels: [..._policyExcluded],
+      };
+
+      let resolvedModel;
+      try {
+        resolvedModel = await _resolveMediaModel('video', this.model, _attemptOpts, (models, req) =>
+          import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
+            try {
+              return pickVideoModel(models, req);
+            } catch (e) {
+              if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+              throw e;
+            }
+          }),
+          {
+            resolution: _attemptOpts.resolution,
+            aspectRatio: _attemptOpts.aspectRatio,
+            hasStartFrame: !!_attemptOpts.startFrame?.data || (shots ? shots.some((s) => s.startFrame?.data) : false),
+            hasEndFrame:   !!_attemptOpts.endFrame?.data   || (shots ? shots.some((s) => s.endFrame?.data)   : false),
+            withAudio: !!_attemptOpts.withAudio,
+            refsCount: _attemptOpts.referenceImages?.length || 0,
+            videoRefsCount: Array.isArray(_attemptOpts.referenceVideos) ? _attemptOpts.referenceVideos.length : 0,
+            shotCount,
+            label: _attemptOpts.label,
+            excludeModels: _attemptOpts.excludeModels,
+            includeModels: Array.isArray(_attemptOpts.includeModels) ? _attemptOpts.includeModels : undefined,
+            preferQuality: _attemptOpts.preferQuality !== false,
+            kind: _attemptOpts.kind,
+          },
+        );
+      } catch (resolveErr) {
+        if (_lastError) throw _lastError;
+        throw resolveErr;
+      }
+
+    channel.log(
+      'video',
+      _policyAttempt === 0
+        ? `Model resolved → ${resolvedModel}`
+        : `Model resolved → ${resolvedModel} (retry ${_policyAttempt} after content-policy rejection by [${[..._policyExcluded].join(', ')}])`,
     );
 
-    // Log the resolved slug BEFORE submitting, so a content-checker
-    // 4xx, an input-shape mismatch, an engine restart, or any other
-    // downstream failure can be traced back to a specific slug.
-    // Symmetric with the GatewayImageGen branch.
-    channel.log('video', `Model resolved → ${resolvedModel}`);
+    // Log every reference modality the caller handed us, so we can
+    // confirm at a glance that the agent didn't drop referenceImages /
+    // startFrame on the way down. Mirrors the backend's expanded
+    // `[fal/video] submit` log so both sides report the same shape.
+    channel.log(
+      'video',
+      `[refs] caller opts: referenceImages=${opts.referenceImages?.length || 0}, ` +
+      `referenceVideos=${Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0}, ` +
+      `startFrame=${!!opts.startFrame?.data}, endFrame=${!!opts.endFrame?.data}, ` +
+      `shots=${shots ? shots.length : 0}`,
+    );
 
     const payload = {
       model: resolvedModel,
@@ -1695,34 +1733,79 @@ export class GatewayVideoGen extends BaseVideoGen {
       });
     }
 
-    const res = await fetch(`${getGatewayBase()}/media/video/generate`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify(payload),
-      signal: opts.abortSignal,
-    });
+      try {
+        const res = await fetch(`${getGatewayBase()}/media/video/generate`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify(payload),
+          signal: opts.abortSignal,
+        });
 
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway video error (${res.status}): ${body}`);
+        await throwIfQuotaExceeded(res);
+        if (!res.ok) {
+          const bodyText = await res.text().catch(() => '');
+          let structured = null;
+          try { structured = JSON.parse(bodyText); } catch {}
+          const err = new Error(
+            structured?.error || `Gateway video error (${res.status}): ${bodyText}`,
+          );
+          err.status = res.status;
+          if (structured) err.details = structured;
+          throw err;
+        }
+
+        const data = await res.json();
+        // The gateway encodes the resolved fal model into the composite id as
+        // `<model>|<request_id>` — surface it explicitly here when present so
+        // the caller doesn't have to pattern-match on the id string. Falls
+        // back to data.model (newer backends ship it as a top-level field).
+        const id = data.id || data.request_id || data.name;
+        const finalModel = data.model
+          || (typeof id === 'string' && id.includes('|') ? id.split('|', 1)[0] : resolvedModel);
+        return {
+          id,
+          status: _mapGatewayVideoStatus(data.status),
+          url: data.url || undefined,
+          model: finalModel,
+          usage: { durationSec: opts.duration || 5 },
+        };
+      } catch (callErr) {
+        if (_isRouteableError(callErr)) {
+          // Routeable failure on this slug — exclude it and try the
+          // next candidate. Same logic as the image branch: covers
+          // content-policy rejections and input-shape mismatches.
+          // CRITICAL: opts (and thus referenceImages / startFrame /
+          // referenceVideos / shots) is preserved across the retry —
+          // that's the whole point of looping here instead of letting
+          // the agent reissue with a stripped-down JSON.
+          _policyExcluded.add(resolvedModel);
+          _lastError = callErr;
+          _policyAttempt += 1;
+          const _shape = _isInputShapeError(callErr) ? 'input-shape' : 'content-policy';
+          channel.log(
+            'video',
+            `${_shape} reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model (refs preserved: images=${opts.referenceImages?.length || 0}, videos=${opts.referenceVideos?.length || 0}, startFrame=${!!opts.startFrame?.data}, endFrame=${!!opts.endFrame?.data})`,
+          );
+          continue;
+        }
+        // Any other failure (network, timeout, provider 500, …): don't
+        // retry. Switching models won't help and would burn quota.
+        throw callErr;
+      }
     }
 
-    const data = await res.json();
-    // The gateway encodes the resolved fal model into the composite id as
-    // `<model>|<request_id>` — surface it explicitly here when present so
-    // the caller doesn't have to pattern-match on the id string. Falls
-    // back to data.model (newer backends ship it as a top-level field).
-    const id = data.id || data.request_id || data.name;
-    const finalModel = data.model
-      || (typeof id === 'string' && id.includes('|') ? id.split('|', 1)[0] : resolvedModel);
-    return {
-      id,
-      status: _mapGatewayVideoStatus(data.status),
-      url: data.url || undefined,
-      model: finalModel,
-      usage: { durationSec: opts.duration || 5 },
-    };
+    // All MAX_POLICY_RETRIES cycles exhausted with policy rejections.
+    if (_lastError) {
+      const err = new Error(
+        `Video generation refused by ${_policyExcluded.size} model(s) on content-policy grounds. ` +
+        `Last error: ${_lastError.message}. Excluded: [${[..._policyExcluded].join(', ')}].`,
+      );
+      err.cause = _lastError;
+      err.policyExhausted = true;
+      err.excludedModels = [..._policyExcluded];
+      throw err;
+    }
+    throw new Error('Video generation failed: max retries exhausted without a recorded error');
   }
 
   async getStatus(jobId, opts = {}) {
