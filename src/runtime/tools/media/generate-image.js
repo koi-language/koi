@@ -80,16 +80,22 @@ const _RES_TO_PX = {
 };
 
 /**
- * Pick the smallest catalog resolution whose pixel ceiling is >= the
- * longest edge of the base image. Used to auto-fill `resolution` from
- * the base reference: if the user hands us a 2K photo to edit, returning
- * a 1K downsample is a quality regression — aspect ratio preservation
- * without resolution preservation is half the job.
+ * Pick the catalog resolution whose pixel ceiling is the SMALLEST one
+ * that is still >= the longest edge of the base image. Used to auto-fill
+ * `resolution` from the base reference.
  *
- * Falls back to the largest available bucket when the source exceeds
- * every catalog option, and returns null when the catalog doesn't use
- * a bucket name we can score (unknown → leave the field unset and let
- * the provider pick its default).
+ * Policy: never downsample. The output resolution must be equal to or
+ * larger than the source, never smaller — a downsample is a silent
+ * quality regression the user didn't ask for. We pick the next bucket
+ * up, not the absolute-closest one, so an 1100px source goes to 2K
+ * (not 1K) and a 2100px source goes to 4K (not 2K).
+ *
+ * Falls back to the LARGEST available bucket when the source exceeds
+ * every catalog option (e.g. a 6K input on a catalog whose ceiling is
+ * 4K) — that's the closest we can get without going under.
+ *
+ * Returns null when the catalog doesn't use a bucket name we can score
+ * (unknown → leave the field unset and let the provider pick).
  */
 function _closestResolution(pixelMax, available) {
   if (!pixelMax || !Array.isArray(available) || available.length === 0) return null;
@@ -146,7 +152,16 @@ const generateImageAction = {
         }
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
-      saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' }
+      saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
+      cameraAngles: {
+        type: 'object',
+        description: 'Discrete camera-control sliders for view-synthesis edit models (currently `fal-ai/qwen-image-edit-2511-multiple-angles`). Only set this when the user asks for a different camera angle / viewpoint of an existing image. The model rotates the camera around the subject and re-renders the scene from the new position — generic image-edit models will ignore this field. EACH slider is independently optional: include ONLY the axes the user moved. Omitted axes hit the model at its default (no change on that axis). At least one of horizontal / vertical / zoom must be present.',
+        properties: {
+          horizontal: { type: 'number', description: 'OPTIONAL. Horizontal camera rotation in degrees (0..360). 0 = front view, 90 = subject\'s right side, 180 = back view, 270 = subject\'s left side. Omit when the user did not rotate.' },
+          vertical:   { type: 'number', description: 'OPTIONAL. Vertical camera elevation in degrees (-30..90). -30 = low angle looking up, 0 = eye level, 90 = bird\'s-eye top-down. Omit when the user did not tilt.' },
+          zoom:       { type: 'number', description: 'OPTIONAL. Camera distance / framing (0..10). 0 = wide shot (far), 5 = medium / unchanged, 10 = close-up. Omit when the user did not change distance.' }
+        }
+      }
       // `model` and `excludeProviders` are intentionally NOT declared here.
       // Model selection is the auto-picker's job — the agent should describe
       // what it wants (aspectRatio, resolution, referenceImages, label) and
@@ -589,6 +604,24 @@ const generateImageAction = {
         y: action.sourceImageOffset.y,
       };
     }
+    // Camera-angle sliders for view-synthesis edit models (currently
+    // only `fal-ai/qwen-image-edit-2511-multiple-angles`). Each axis
+    // is INDEPENDENTLY optional — only forward the keys the agent
+    // actually sent. Omitted axes hit the model at its default (no
+    // change on that axis). At least one axis must be a number; if
+    // none are, drop the field entirely.
+    if (action.cameraAngles && typeof action.cameraAngles === 'object') {
+      const picked = {};
+      if (typeof action.cameraAngles.horizontal === 'number') picked.horizontal = action.cameraAngles.horizontal;
+      if (typeof action.cameraAngles.vertical === 'number') picked.vertical = action.cameraAngles.vertical;
+      if (typeof action.cameraAngles.zoom === 'number') picked.zoom = action.cameraAngles.zoom;
+      if (Object.keys(picked).length > 0) {
+        genOpts.cameraAngles = picked;
+        channel.log('image', `[cameraAngles] action → genOpts: ${JSON.stringify(picked)}`);
+      } else {
+        channel.log('image', `[cameraAngles] WARNING — action.cameraAngles present but no numeric fields: ${JSON.stringify(action.cameraAngles)}. Dropping the field.`);
+      }
+    }
 
     let result;
     try {
@@ -832,6 +865,18 @@ const generateImageAction = {
             guidanceScale: action.guidanceScale || null,
             width: img.width || null,
             height: img.height || null,
+            // Per-creation billing trail — credits charged by the
+            // backend + upstream provider job id (fal request_id).
+            // Forwarded by the gateway on the same response that
+            // delivered the image URL; we persist them in the saved
+            // media's metadata so the GUI's Info panel can show
+            // "Cost: X credits" without a separate roundtrip.
+            ...(typeof result?.creditsCost === 'number'
+                ? { creditsCost: result.creditsCost }
+                : {}),
+            ...(typeof result?.providerRequestId === 'string'
+                ? { providerRequestId: result.providerRequestId }
+                : {}),
           }, agent?.llmProvider || null);
           channel.log('image', `Saved to media library: ${img.savedTo}`);
         }

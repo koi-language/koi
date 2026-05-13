@@ -1159,6 +1159,19 @@ export class MediaLibrary {
       // user wants to drop into prompts via @john autocomplete). Empty
       // string when unset — same convention `description` uses.
       mention: typeof metadata.mention === 'string' ? metadata.mention : '',
+      // Per-creation billing trail — credits charged for this generation
+      // + the upstream provider's job id (fal request_id). Surfaced as
+      // top-level fields so the GUI's Info panel and any future
+      // creations view can render them without peeking inside
+      // `metadata`. Source of truth lives in the backend `creations`
+      // table; this is the local copy stamped at save time so the GUI
+      // doesn't need an extra roundtrip.
+      creditsCost: typeof metadata.creditsCost === 'number'
+          ? metadata.creditsCost
+          : (typeof metadata.credits_cost === 'number' ? metadata.credits_cost : null),
+      providerRequestId: typeof metadata.providerRequestId === 'string'
+          ? metadata.providerRequestId
+          : (typeof metadata.provider_request_id === 'string' ? metadata.provider_request_id : null),
       sam2Masks: row.sam2_masks_json ? JSON.parse(row.sam2_masks_json) : null,
       // Embedding omitted from deserialization (large, not needed for display)
     };

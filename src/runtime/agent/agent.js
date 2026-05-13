@@ -2590,6 +2590,54 @@ export class Agent {
             }
           }
 
+          // Hoist "instant" tools to run BEFORE the parallel batch.
+          // These are tools that only emit UI side-effects and
+          // return synchronously (print, message_user). Without
+          // hoisting, an LLM that emits e.g. [generate_image,
+          // print(...)] in parallel renders the generation banner
+          // above the print text — because Promise.all kicks off
+          // both at once and generate_image's banner is registered
+          // first by emission order. Running the instants first
+          // (await, in order) keeps the rendered chat intuitive:
+          // status line → progress banner → completion.
+          //
+          // The instants are still part of `parallelResults` so the
+          // LLM sees them in the same `_parallel_done` synthetic
+          // record as the slow tools — just executed sooner.
+          const _INSTANT_PARALLEL_INTENTS = new Set(['print', 'message_user']);
+          // First pass: pull instants OUT of `_syncGroup` while
+          // preserving their LLM-emission order. We walk right-to-
+          // left to safely splice, but build the queue with
+          // `unshift` so the final list matches original order.
+          const _instantQueue = [];
+          for (let _i = _syncGroup.length - 1; _i >= 0; _i--) {
+            const pa = _syncGroup[_i];
+            const paIntent = pa.intent || pa.type;
+            if (_INSTANT_PARALLEL_INTENTS.has(paIntent)) {
+              _instantQueue.unshift(pa);
+              _syncGroup.splice(_i, 1);
+            }
+          }
+          // Second pass: execute instants in original order, one by
+          // one, awaiting each so the channel emissions reach the
+          // UI before the slow batch even starts.
+          for (const pa of _instantQueue) {
+            const paIntent = pa.intent || pa.type || 'unknown';
+            try {
+              const { result } = await this._executeAction(pa, pa, session.actionContext);
+              if (pa.id) {
+                session.actionContext[pa.id] = { output: result };
+              }
+              const _pResult = JSON.stringify(result);
+              channel.log('result', `${this.name} [pre-parallel/${paIntent}]: ${_pResult.length > 300 ? _pResult.substring(0, 300) + '…' : _pResult}`);
+              parallelResults.push({ action: pa, result });
+            } catch (error) {
+              const failedIntent = pa?.intent || pa?.type || 'unknown';
+              channel.log('error', `${this.name}: Pre-parallel "${failedIntent}" failed: ${error.message}`);
+              parallelResults.push({ action: pa, result: null, error });
+            }
+          }
+
           channel.log('action', `${this.name}: Executing ${_syncGroup.length} actions in parallel${group.length !== _syncGroup.length ? ` (${group.length - _syncGroup.length} sent to background)` : ''}`);
           if (process.env.KOI_DEBUG_LLM) {
             console.error(`[Agent:${this.name}] ⚡ Parallel group (${_syncGroup.length}): ${_syncGroup.map(a => a.intent || a.type).join(', ')}`);
@@ -2601,7 +2649,7 @@ export class Agent {
           await this._preflightParallelPermissions(_syncGroup);
 
           // If all parallel actions are shell commands, group them under a single ⏺ Shell scope
-          const _allShells = _syncGroup.every(pa => pa.intent === 'shell');
+          const _allShells = _syncGroup.length > 0 && _syncGroup.every(pa => pa.intent === 'shell');
           if (_allShells && _syncGroup.length > 1) {
             channel.beginScope('Shell', `${_syncGroup.length} commands`);
           }

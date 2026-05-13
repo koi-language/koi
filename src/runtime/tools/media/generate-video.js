@@ -979,8 +979,31 @@ const generateVideoAction = {
     const abortSignal = agent?.abortSignal;
     const reportProgress = typeof agent?.reportProgress === 'function' ? agent.reportProgress : null;
 
+    // If any reference image or start frame is a user-annotation overlay
+    // (composite-snapshot baked by the GUI on every annotation submit —
+    // filename convention `braxil-annotation-*.png`, see media-library.js)
+    // the underlying video model sees the drawn marks as literal pixels and
+    // burns them into every output frame. Prepend an explicit disclaimer so
+    // the model treats arrows/circles/scribbles as intent, not content.
+    const _isAnnotationPath = (p) =>
+      typeof p === 'string' && /(^|[\\/])braxil-annotation-/.test(p);
+    const _annotationPaths = [
+      action.startFrame,
+      ...(Array.isArray(action.referenceImages) ? action.referenceImages : []),
+      ...((Array.isArray(action.shots) ? action.shots : []).flatMap((s) => [
+        s?.startFrame,
+        ...(Array.isArray(s?.referenceImages) ? s.referenceImages : []),
+      ])),
+    ].filter(_isAnnotationPath);
+    const finalPrompt = _annotationPaths.length > 0
+      ? `[ANNOTATION CONTEXT: One or more reference images contain user-drawn markup (red arrows, circles, lines, scribbles, handwritten notes) placed on top of the source image as guidance. These marks indicate intent — motion paths, areas of focus, things to add/move/remove — they are NOT content. DO NOT reproduce the arrows, circles, lines, or any drawn markup in the generated video; they must not appear in the output frames. Interpret what they mean and apply that intent instead.]\n\n${prompt}`
+      : prompt;
+    if (_annotationPaths.length > 0) {
+      channel.log('video', `Annotation overlay detected in inputs (${_annotationPaths.length}) — prepended disclaimer to prompt.`);
+    }
+
     reportProgress?.(0.02, 'Submitting to provider…');
-    const submitted = await instance.generate(prompt, {
+    const submitted = await instance.generate(finalPrompt, {
       duration: globalDuration,
       aspectRatio: globalAspect,
       resolution: globalResolution,
@@ -1384,6 +1407,18 @@ const generateVideoAction = {
           if (chainedExtend) {
             params.extendAfterMs = extendAfterMs;
             params.hybridChain = true;
+          }
+          // Per-creation billing trail — credits charged by the
+          // backend + upstream provider job id (fal request_id).
+          // These travel on the gateway response (`final.creditsCost`,
+          // `final.providerRequestId`) and we persist them in the
+          // saved media's metadata so the GUI's Info panel can show
+          // "Cost: X credits" without an extra roundtrip.
+          if (typeof final.creditsCost === 'number') {
+            params.creditsCost = final.creditsCost;
+          }
+          if (typeof final.providerRequestId === 'string') {
+            params.providerRequestId = final.providerRequestId;
           }
           const { saveGeneratedVideo } = await import('../../state/media-library.js');
           await saveGeneratedVideo(savedTo, params, agent?.llmProvider || null);

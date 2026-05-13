@@ -29,6 +29,8 @@
  * category so the agent can pivot instead of giving up.
  */
 
+import { channel } from '../../io/channel.js';
+
 export class MediaModelRoutingError extends Error {
   constructor(message, details) {
     super(message);
@@ -235,6 +237,38 @@ function _pickByBucket(kind, models, req, wantedBucket) {
  *  execution time.
  */
 export function pickImageModel(models, req = {}) {
+  // Camera-angle requests are deterministically routed to the only
+  // model whose LoRA understands the discrete (horizontal, vertical,
+  // zoom) sliders. Bypass the bucket logic entirely — running an
+  // image_editing bucket pick here could land on a generic edit
+  // model that has no concept of `cameraAngles` and would just
+  // return the input unchanged (the bug we hit before this short-circuit).
+  if (req?.cameraAngles
+      && (typeof req.cameraAngles.horizontal === 'number'
+          || typeof req.cameraAngles.vertical === 'number'
+          || typeof req.cameraAngles.zoom === 'number')) {
+    const QWEN_ANGLES_SLUG = 'fal-ai/qwen-image-edit-2511-multiple-angles';
+    const hit = (models || []).find((m) => m?.slug === QWEN_ANGLES_SLUG);
+    if (hit) {
+      channel.log(
+        'image',
+        `[cameraAngles] router short-circuit → ${QWEN_ANGLES_SLUG} (${JSON.stringify(req.cameraAngles)})`,
+      );
+      // pickImageModel's contract is to return the slug STRING (matches
+      // _pickByBucket's `return eligible[0].slug`). Returning the model
+      // object here surfaced as `Model resolved → [object Object]` and
+      // a downstream "Unknown model slug: [object Object]" error.
+      return hit.slug;
+    }
+    // Fall through to bucket selection if the slug isn't in the live
+    // catalog yet (e.g. admin hasn't added the model_prices row). The
+    // adapter will then throw a clear "cameraAngles required" error.
+    channel.log(
+      'image',
+      `[cameraAngles] WARNING — cameraAngles present but slug ${QWEN_ANGLES_SLUG} not in active catalog. Falling back to bucket selection; the picked model will likely ignore the camera sliders and return the input image unchanged. Action: add the slug to model_prices in the backoffice.`,
+    );
+  }
+
   const intent = typeof req.intent === 'string' ? req.intent.trim() : '';
   const refsCount = req.refsCount || 0;
   const wantedBucket =

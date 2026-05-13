@@ -18,15 +18,18 @@
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { getModelCaps, getFirstModelForProvider } from '../cost-center.js';
-import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch, OpenAIImageGen, OpenAIAudioGen, OpenAIVideoGen } from './openai.js';
+import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch, OpenAIAudioGen } from './openai.js';
 import { AnthropicLLM, AnthropicSearch } from './anthropic.js';
-import { GeminiLLM, GeminiEmbedding, GeminiImageGen, GeminiVideoGen } from './gemini.js';
+import { GeminiLLM, GeminiEmbedding } from './gemini.js';
 import { BraveSearch } from './brave.js';
 import { TavilySearch } from './tavily.js';
 import { GatewayEmbedding, GatewaySearch, GatewayImageGen, GatewayAudioGen, GatewayVideoGen } from './gateway.js';
-import { KlingVideoGen } from './kling.js';
-import { SeedanceVideoGen } from './seedance.js';
-import { NanoBanana2ImageGen } from './banana.js';
+// Image and video generation always go through the backend gateway.
+// There used to be direct-to-fal / direct-to-Google client adapters
+// here (banana.js, kling.js, seedance.js, OpenAIImageGen, etc.) — they
+// were removed: the backend is the only place that holds provider
+// secrets and the per-model adapters, so the client should never call
+// fal/Google/OpenAI directly for media generation.
 
 // ── Re-export from auto-model-selector (circuit breaker, provider discovery) ─
 // These are consumed by llm-provider.js for error handling.
@@ -258,44 +261,19 @@ function _resolveSearch(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _resolveImage(req) {
-  const { clients, model: requestedModel, excludeProviders } = req;
-  // `excluded` is a Set of provider family names the caller has asked us to
-  // skip — used on retry after a ProviderBlockedError surfaces. Empty set
-  // means "no exclusions". Compared against the provider string this
-  // function ultimately returns, so values are: 'openai', 'google',
-  // 'gemini', 'koi-gateway'.
-  const excluded = new Set(excludeProviders || []);
-
-  // Gateway mode — the gateway itself handles per-model routing; we can't
-  // usefully exclude by family here, so we honor the request as-is.
-  if (process.env.KOI_AUTH_TOKEN) {
-    const model = requestedModel || 'auto';
-    const instance = new GatewayImageGen(model);
-    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  const { model: requestedModel } = req;
+  // Image generation always goes through the backend gateway. The
+  // per-model adapters (fal nano-banana / fal qwen / fal seedream /
+  // openai-gpt-image / etc.) live in backend/src/modules/gateway/
+  // adapters/image/ — never in the client. KOI_AUTH_TOKEN is the
+  // proof the user is logged in to Braxil; without it there is no
+  // gateway and no image generation.
+  if (!process.env.KOI_AUTH_TOKEN) {
+    throw new Error('Image generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
   }
-
-  // Priority: Google/NanoBanana2 → OpenAI (gpt-image-1) → Gemini (gemini-2.5-flash-image)
-  // Nano Banana 2 is the fastest and supports up to 14 reference images.
-  if (!excluded.has('google') && process.env.GEMINI_API_KEY
-      && (!requestedModel || requestedModel.includes('3.1-flash-image') || requestedModel.includes('3-pro-image-preview'))) {
-    const model = requestedModel || 'gemini-3.1-flash-image-preview';
-    if (model.includes('3.1-flash-image') || model.includes('3-pro-image-preview')) {
-      const instance = new NanoBanana2ImageGen(null, model);
-      return { instance, provider: 'google', model, useThinking: false };
-    }
-  }
-  if (!excluded.has('openai') && clients?.openai && process.env.OPENAI_API_KEY) {
-    const model = requestedModel || 'gpt-image-1';
-    const instance = new OpenAIImageGen(clients.openai, model);
-    return { instance, provider: 'openai', model, useThinking: false };
-  }
-  if (!excluded.has('gemini') && process.env.GEMINI_API_KEY) {
-    const model = requestedModel || 'gemini-2.5-flash-image';
-    const instance = new GeminiImageGen(null, model);
-    return { instance, provider: 'gemini', model, useThinking: false };
-  }
-  const excludedHint = excluded.size ? ` (excluded: ${[...excluded].join(', ')})` : '';
-  throw new Error(`No image generation provider available${excludedHint} (need OPENAI_API_KEY or GEMINI_API_KEY)`);
+  const model = requestedModel || 'auto';
+  const instance = new GatewayImageGen(model);
+  return { instance, provider: 'koi-gateway', model, useThinking: false };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,38 +304,16 @@ function _resolveAudio(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _resolveVideo(req) {
-  const { clients, model: requestedModel } = req;
-
-  // Gateway mode
-  if (process.env.KOI_AUTH_TOKEN) {
-    const model = requestedModel || 'auto';
-    const instance = new GatewayVideoGen(model);
-    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  const { model: requestedModel } = req;
+  // Video generation always goes through the backend gateway, same
+  // reasoning as _resolveImage. Direct-to-fal client adapters (kling,
+  // seedance, OpenAIVideoGen, GeminiVideoGen) were removed.
+  if (!process.env.KOI_AUTH_TOKEN) {
+    throw new Error('Video generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
   }
-
-  // Priority: Kling → Seedance → OpenAI (Sora) → Gemini (Veo) → Google (Nano Banana)
-  if (process.env.KLING_ACCESS_KEY && process.env.KLING_SECRET_KEY) {
-    const model = requestedModel || 'kling-v3-0';
-    const instance = new KlingVideoGen(null, model);
-    return { instance, provider: 'kling', model, useThinking: false };
-  }
-  if (process.env.SEEDANCE_API_KEY) {
-    const model = requestedModel || 'seedance-2-0-lite';
-
-    const instance = new SeedanceVideoGen(null, model);
-    return { instance, provider: 'seedance', model, useThinking: false };
-  }
-  if (clients?.openai && process.env.OPENAI_API_KEY) {
-    const model = requestedModel || 'sora';
-    const instance = new OpenAIVideoGen(clients.openai, model);
-    return { instance, provider: 'openai', model, useThinking: false };
-  }
-  if (clients?.gemini || process.env.GEMINI_API_KEY) {
-    const model = requestedModel || 'veo-3.1-generate-preview';
-    const instance = new GeminiVideoGen(clients?.gemini, model);
-    return { instance, provider: 'gemini', model, useThinking: false };
-  }
-  throw new Error('No video generation provider available (need KLING_ACCESS_KEY+KLING_SECRET_KEY, SEEDANCE_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY)');
+  const model = requestedModel || 'auto';
+  const instance = new GatewayVideoGen(model);
+  return { instance, provider: 'koi-gateway', model, useThinking: false };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -508,15 +464,13 @@ export function createSearch(provider, opts = {}) {
 }
 
 /**
- * Create an ImageGen instance directly.
+ * Create an ImageGen instance directly. Only the gateway is supported;
+ * direct-to-provider client adapters were removed (the backend owns
+ * provider keys and per-model adapters).
  */
-export function createImageGen(provider, client, model) {
-  switch (provider) {
-    case 'openai':  return new OpenAIImageGen(client, model || 'gpt-image-1');
-    case 'gemini':  return new GeminiImageGen(client, model || 'gemini-2.5-flash-image');
-    case 'google':  return new NanoBanana2ImageGen(null, model || 'gemini-3.1-flash-image-preview');
-    default: throw new Error(`No image generation support for provider: ${provider}`);
-  }
+export function createImageGen(provider, _client, model) {
+  if (provider === 'koi-gateway') return new GatewayImageGen(model || 'auto');
+  throw new Error(`createImageGen: only "koi-gateway" is supported (got "${provider}"). Client-side image adapters were removed; all image generation goes through the backend.`);
 }
 
 /**
@@ -530,16 +484,12 @@ export function createAudioGen(provider, client, model) {
 }
 
 /**
- * Create a VideoGen instance directly.
+ * Create a VideoGen instance directly. Only the gateway is supported;
+ * direct-to-provider client adapters were removed.
  */
-export function createVideoGen(provider, client, model) {
-  switch (provider) {
-    case 'openai':   return new OpenAIVideoGen(client, model || 'sora');
-    case 'gemini':   return new GeminiVideoGen(client, model || 'veo-3.1-generate-preview');
-    case 'kling':    return new KlingVideoGen(null, model || 'kling-v3-0');
-    case 'seedance': return new SeedanceVideoGen(null, model || 'seedance-2-0-lite');
-    default: throw new Error(`No video generation support for provider: ${provider}`);
-  }
+export function createVideoGen(provider, _client, model) {
+  if (provider === 'koi-gateway') return new GatewayVideoGen(model || 'auto');
+  throw new Error(`createVideoGen: only "koi-gateway" is supported (got "${provider}"). Client-side video adapters were removed; all video generation goes through the backend.`);
 }
 
 /**

@@ -638,6 +638,11 @@ export class GatewayImageGen extends BaseImageGen {
             // the legacy `opts.operation` key during the rename rollout.
             intent: _attemptOpts.intent ?? _attemptOpts.operation,
             excludeModels: _attemptOpts.excludeModels,
+            // Forwarded so pickImageModel can short-circuit to the
+            // camera-angle LoRA when these sliders are present (any
+            // other image-edit model would ignore them and return the
+            // input unchanged).
+            cameraAngles: _attemptOpts.cameraAngles,
           },
         );
       } catch (resolveErr) {
@@ -702,6 +707,22 @@ export class GatewayImageGen extends BaseImageGen {
           x: opts.sourceImageOffset.x,
           y: opts.sourceImageOffset.y,
         };
+      }
+      // Camera-angle sliders for view-synthesis models. Forwarded as a
+      // typed object; the backend's `canonicalizeImagePayload` reads it
+      // and only the qwen-image-edit-2511-multiple-angles adapter
+      // currently consumes it. Other adapters ignore the field. Each
+      // axis is independently optional — only forward the keys actually
+      // present in opts.cameraAngles.
+      if (opts.cameraAngles && typeof opts.cameraAngles === 'object') {
+        const picked = {};
+        if (typeof opts.cameraAngles.horizontal === 'number') picked.horizontal = opts.cameraAngles.horizontal;
+        if (typeof opts.cameraAngles.vertical === 'number') picked.vertical = opts.cameraAngles.vertical;
+        if (typeof opts.cameraAngles.zoom === 'number') picked.zoom = opts.cameraAngles.zoom;
+        if (Object.keys(picked).length > 0) {
+          payload.camera_angles = picked;
+          channel.log('image', `[cameraAngles] gateway → backend payload: ${JSON.stringify(picked)}`);
+        }
       }
 
       // Submit + poll. The sync `/media/image/generate` endpoint exists for
@@ -770,6 +791,19 @@ export class GatewayImageGen extends BaseImageGen {
           }
           const images = _collectImages(data);
           const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+          // Forward per-creation billing fields verbatim — the backend's
+          // /media/image/result handler stamps `creditsCost` (USD × 100,
+          // 4-decimal precision) and `providerRequestId` (fal request id)
+          // on every COMPLETED payload. `generate-image.js` reads them
+          // off this return value and pins them into the saved media
+          // metadata so the GUI's Info panel can render "Cost: X
+          // credits" without an extra roundtrip. Dropping them here
+          // (the prior shape kept only images/usage/model) is exactly
+          // why generated images came back to the engine with no cost
+          // info — the data was there, the wrapper just didn't pass
+          // it through.
+          if (typeof data.creditsCost === 'number') ret.creditsCost = data.creditsCost;
+          if (typeof data.providerRequestId === 'string') ret.providerRequestId = data.providerRequestId;
           if (images.length === 0) ret.raw = data;
           return ret;
         }
@@ -927,7 +961,15 @@ export class GatewayImageGen extends BaseImageGen {
 
     const data = await res.json();
     const images = _collectImages(data);
-    return { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+    const ret = { images, usage: data.usage || { input: 0, output: 0 }, model: resolvedModel };
+    // Same billing forwarding as the queue path above — `/gateway/fal/raw`
+    // (the sync handler behind bg-remove / upscale / inpaint /
+    // gpt-image-2 edits) stamps `creditsCost` + `providerRequestId` on
+    // the response. Without this the operations branch ate the cost
+    // info too.
+    if (typeof data.creditsCost === 'number') ret.creditsCost = data.creditsCost;
+    if (typeof data.providerRequestId === 'string') ret.providerRequestId = data.providerRequestId;
+    return ret;
   }
 
 }
@@ -1712,6 +1754,12 @@ export class GatewayVideoGen extends BaseVideoGen {
       model: finalModel,
       error: data.error || undefined,
     };
+    // Forward billing fields the backend stamps on COMPLETED video jobs
+    // so generate-video.js can pin them into the saved video's metadata
+    // (Info panel's "Cost: X credits" + "Provider job"). Same reason as
+    // the image queue path above.
+    if (typeof data.creditsCost === 'number') out.creditsCost = data.creditsCost;
+    if (typeof data.providerRequestId === 'string') out.providerRequestId = data.providerRequestId;
     // Multishot: surface each shot's status so the tool can save every
     // URL as it completes. Each entry follows the same shape as the
     // top-level (id/status/url) but with an `index` so callers keep
