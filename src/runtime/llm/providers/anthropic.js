@@ -21,7 +21,7 @@ function _classifyAnthropicError(err) {
     return new ProviderBlockedError({ blockType: 'rate_limit', provider: 'anthropic', reason });
   }
   if (/permission_error|authentication_error/.test(type) || status === 401 || status === 403) {
-    return new ProviderBlockedError({ blockType: 'auth', provider: 'anthropic', reason });
+    return new ProviderBlockedError({ blockType: 'auth', provider: 'anthropic', reason, httpStatus: status || undefined });
   }
   // Anthropic surfaces policy refusals via stop_reason: 'refusal' (see
   // streaming/complete code below). On the rare path where it surfaces as

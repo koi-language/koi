@@ -56,7 +56,7 @@ function _classifyOpenAIError(err) {
   if (code === 'invalid_api_key' || type === 'invalid_request_error' && status === 401
       || status === 401 || status === 403) {
     return new ProviderBlockedError({
-      blockType: 'auth', provider: 'openai', reason,
+      blockType: 'auth', provider: 'openai', reason, httpStatus: status || undefined,
     });
   }
   return null;

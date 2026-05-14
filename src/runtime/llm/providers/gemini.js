@@ -36,7 +36,7 @@ function _classifyGeminiError(errOrBody) {
       });
     }
     if (status === 401 || status === 403) {
-      return new ProviderBlockedError({ blockType: 'auth', provider: 'gemini', reason });
+      return new ProviderBlockedError({ blockType: 'auth', provider: 'gemini', reason, httpStatus: status });
     }
     return null;
   }

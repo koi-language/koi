@@ -25,14 +25,19 @@ export class ProviderBlockedError extends Error {
    * @param {string} opts.provider  — Provider family name (e.g. 'openai'). NOT the model id.
    * @param {string} opts.reason    — Literal or summarized message from the provider.
    * @param {boolean} [opts.retryable]  — Override the blockType's default retryable hint.
+   * @param {number}  [opts.httpStatus] — Original HTTP status from the upstream provider.
+   *   Preserved here because `blockType` collapses several statuses (401 + 403 → 'auth',
+   *   429 → 'rate_limit', etc.); callers that need to distinguish — e.g. gateway-mode
+   *   logout on 401 vs. "model not in plan" on 403 — read this field.
    */
-  constructor({ blockType, provider, reason, retryable }) {
+  constructor({ blockType, provider, reason, retryable, httpStatus }) {
     super(reason || `Provider ${provider} blocked the request (${blockType})`);
     this.name = 'ProviderBlockedError';
     this.blockType = blockType;
     this.provider = provider;
     this.providerReason = reason;
     if (typeof retryable === 'boolean') this.retryable = retryable;
+    if (typeof httpStatus === 'number') this.httpStatus = httpStatus;
   }
 }
 

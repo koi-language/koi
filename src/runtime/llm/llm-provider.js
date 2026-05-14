@@ -2276,11 +2276,18 @@ CRITICAL RULES:
         // 401 in gateway mode = token expired/invalid — signal for re-auth.
         // The OpenAI provider wraps 401s into a ProviderBlockedError(blockType:'auth')
         // before they leave streamReactive, so `_status` is undefined for the
-        // OpenAI-compat path. Detect that shape too — otherwise the agent
-        // treats the auth failure as a "refused provider" and cycles through
-        // every model behind the same JWT, all returning 401.
-        const _isAuthBlocked = _callErr?.name === 'ProviderBlockedError' && _callErr.blockType === 'auth';
-        if ((_status === 401 || _isAuthBlocked) && this._gatewayMode) {
+        // OpenAI-compat path. We also peek at `httpStatus` preserved on the
+        // wrapped error — otherwise the agent treats the auth failure as a
+        // "refused provider" and cycles through every model behind the same
+        // JWT, all returning 401.
+        //
+        // CRITICAL: only 401 means "session JWT is dead". 403 (also classified
+        // as 'auth' upstream) means "this model/account isn't allowed" — that
+        // should NOT log the user out, just exclude the provider for this
+        // session. Same for `invalid_api_key` without a status.
+        const _blockedStatus = _callErr?.name === 'ProviderBlockedError' ? _callErr.httpStatus : undefined;
+        const _is401 = _status === 401 || _blockedStatus === 401;
+        if (_is401 && this._gatewayMode) {
           const _s = globalThis.__koiStrings || {};
           throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
         }
