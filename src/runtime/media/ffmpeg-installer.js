@@ -318,6 +318,41 @@ async function _fetchAndExtract(recipe, cacheDir, onProgress, fromPct, toPct) {
 
 // ── Public API ───────────────────────────────────────────────────────
 
+/** The pinned ffmpeg version this installer targets. Exported so build
+ *  scripts (e.g. the GH Actions step that bundles ffmpeg into the
+ *  Flutter .app) can stamp the version into manifests / file names. */
+export const FFMPEG_VERSION = PINNED_VERSION;
+
+/** Install the pinned ffmpeg/ffprobe pair into an arbitrary directory.
+ *  Used by `ensureFfmpeg()` for the cache, and by the bundle script in
+ *  CI to drop the binaries inside the Flutter `.app` before signing.
+ *
+ *  @param {{
+ *    outDir: string,
+ *    platformKey?: string,       // defaults to `<process.platform>-<process.arch>`
+ *    onProgress?: (pct: number, msg: string) => void,
+ *  }} opts
+ *  @returns {Promise<{ ffmpeg: string, ffprobe: string, version: string }>}
+ */
+export async function installPinnedFfmpeg({ outDir, platformKey, onProgress } = {}) {
+  if (!outDir) throw new Error('installPinnedFfmpeg: outDir is required');
+  const key = platformKey || _platformKey();
+  const recipe = ASSETS[key];
+  if (!recipe) throw new Error(`No pinned ffmpeg recipe for platform "${key}". Supported: ${Object.keys(ASSETS).join(', ')}.`);
+  fs.mkdirSync(outDir, { recursive: true });
+  onProgress?.(0, `Resolving ffmpeg ${PINNED_VERSION} for ${key}…`);
+  const n = recipe.parts.length;
+  for (let i = 0; i < n; i++) {
+    await _fetchAndExtract(recipe.parts[i], outDir, onProgress, i / n, (i + 1) / n);
+  }
+  const ff = path.join(outDir, `ffmpeg${_exe}`);
+  const fp = path.join(outDir, `ffprobe${_exe}`);
+  if (!fs.existsSync(ff) || !fs.existsSync(fp)) {
+    throw new Error(`ffmpeg install to ${outDir} produced an unexpected layout (missing ffmpeg or ffprobe).`);
+  }
+  return { ffmpeg: ff, ffprobe: fp, version: PINNED_VERSION };
+}
+
 /** Get the controlled ffmpeg/ffprobe binary paths. Idempotent.
  *  Downloads + installs the pinned version on first call; subsequent
  *  calls return cached paths in O(1). Concurrent first calls dedupe
@@ -346,27 +381,17 @@ export async function ensureFfmpeg({ onProgress } = {}) {
   // 3. Fresh install with sha256 verification.
   _installing = (async () => {
     try {
-      const key = _platformKey();
-      const recipe = ASSETS[key];
-      if (!recipe) throw new Error(`No pinned ffmpeg recipe for platform "${key}". Supported: ${Object.keys(ASSETS).join(', ')}.`);
-      onProgress?.(0, `Resolving ffmpeg ${PINNED_VERSION} for ${key}…`);
-      fs.mkdirSync(cacheDir, { recursive: true });
-      // Distribute progress evenly across the parts (1 or 2 downloads).
-      const n = recipe.parts.length;
-      for (let i = 0; i < n; i++) {
-        await _fetchAndExtract(recipe.parts[i], cacheDir, onProgress, i / n, (i + 1) / n);
-      }
-      // Trust sha256 + magic-byte check from the install (both already
-      // ran inside _fetchAndExtract) — do NOT call _looksRunnable here.
-      // On macOS the first execution of an evermeet binary triggers a
-      // synchronous Gatekeeper notarization lookup that can take 6-10 s,
-      // which would false-trip the 30 s timeout under bad network
-      // conditions and abort an otherwise-good install. The integrity
-      // checks already ran are sufficient.
-      if (!fs.existsSync(cacheFf) || !fs.existsSync(cacheFp)) {
-        throw new Error(`ffmpeg installed to ${cacheDir} but the expected binaries are missing.`);
-      }
-      _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
+      // Reuse the same install path the CI bundle step uses (single
+      // source of truth for download + verify + extract). Skips the
+      // post-install _looksRunnable check on macOS — first execution
+      // of an evermeet binary triggers a 6-10 s Gatekeeper notarization
+      // lookup that would false-trip the timeout. sha256 + magic-byte
+      // verification inside _fetchAndExtract is sufficient.
+      const { ffmpeg, ffprobe } = await installPinnedFfmpeg({
+        outDir: cacheDir,
+        onProgress,
+      });
+      _cached = { ffmpeg, ffprobe };
       _installing = null;
       return _cached;
     } catch (installErr) {
