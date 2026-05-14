@@ -1,46 +1,148 @@
 /**
- * ffmpeg / ffprobe locator — controlled-binary edition.
+ * ffmpeg / ffprobe locator — pinned-release edition.
  *
- * `ensureFfmpeg()` returns `{ ffmpeg, ffprobe }` (absolute paths). The
- * controlled binary ships as an npm dependency so it lands in
- * `node_modules/` at install time — no runtime download, identical
- * version across every machine that ran `npm install` against the
- * same `package.json`.
+ * `ensureFfmpeg()` returns `{ ffmpeg, ffprobe }` (absolute paths)
+ * pointing at a SPECIFIC, version-locked ffmpeg/ffprobe pair that
+ * is byte-identical on every machine. There is no "latest" — bumping
+ * the version is a deliberate edit of the ASSETS table below.
  *
- * Versions (PINNED — bump deliberately in package.json):
- *   - `ffmpeg-static@5.3.0`               → ffmpeg 6.0
- *   - `@ffprobe-installer/ffprobe@2.1.2`  → ffprobe 4.4.1
- *
- * Both packages use npm `optionalDependencies` keyed on the current
- * platform/arch, so `npm install` only fetches the binary for the
- * host (≈80 MB, not 240 MB). Re-running `npm install` on a
- * different OS pulls that OS's binary into the same lockfile.
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║  Pinned version: ffmpeg 8.1.1 (released 2025-11)              ║
+ * ║  macOS:    evermeet.cx versioned archives                      ║
+ * ║  Linux:    BtbN/FFmpeg-Builds release autobuild-2026-05-13-13-53 ║
+ * ║  Windows:  same BtbN release                                   ║
+ * ║  All assets pinned by URL AND verified by sha256 post-download. ║
+ * ║  Any drift on either side → integrity check fails → install     ║
+ * ║  aborts loudly (we don't silently fall back to a "best effort"  ║
+ * ║  version that could behave differently).                       ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
  * Resolution order:
  *   1. `KOI_FFMPEG_PATH` / `KOI_FFPROBE_PATH` env vars — Flutter GUI
- *      sets these to the path of the binaries it ships inside its
- *      own `.app` bundle (see `BundledBinaries` on the Dart side).
- *      Honoured ONLY when both point at files that exist; a stray
- *      `KOI_FFMPEG_PATH=ffmpeg` (bare command name) is ignored.
- *   2. The npm-shipped binary from `ffmpeg-static` /
- *      `@ffprobe-installer/ffprobe`. This is the canonical path —
- *      guaranteed to exist post-`npm install`, identical on every
- *      machine running the same lockfile.
- *   3. PATH lookup — LAST resort, only for the edge case where
- *      node_modules was nuked or the binary inside it got corrupted.
- *      Logs a warning because the version is then host-dependent
- *      and we've already been burned by that (brew ffmpeg 7.x
- *      removed `-movflags -use_edts` while older brew ffmpegs
- *      still accept it — same code, different result).
+ *      sets these when it ships its own bundled binaries inside the
+ *      `.app`. Honoured only when both point at existing files; a
+ *      bare `KOI_FFMPEG_PATH=ffmpeg` (Dart-side fallback when no
+ *      bundle is found) is rejected so we still hit the pinned path.
+ *   2. Pinned cache at `~/.koi/bin/ffmpeg-<version>/{ffmpeg,ffprobe}`.
+ *      Global (not per-project) so 5 koi projects share one ~80 MB
+ *      install instead of 5×80.
+ *   3. Download + verify + extract → populate the cache, then return.
+ *   4. PATH fallback — last-resort emergency lever, logs a warning.
+ *      A system ffmpeg's version varies host-to-host (we've been
+ *      bitten: brew ffmpeg 7.x removed `-movflags -use_edts` mid-
+ *      encode, while older brew ffmpegs still accept it). Only used
+ *      when the controlled install fails AND PATH has a runnable pair.
  */
 
 import fs from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawnSync, spawn } from 'node:child_process';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+
+// ── Pinned version + asset table ─────────────────────────────────────
+
+/** Pinned ffmpeg version. Bump via a coordinated edit of this constant
+ *  + the ASSETS table (URLs + sha256). Old cached versions sit alongside
+ *  on disk and aren't auto-cleaned — `rm -rf ~/.koi/bin/ffmpeg-*` if
+ *  you care about disk. */
+const PINNED_VERSION = '8.1.1';
+
+/** BtbN release tag (the `autobuild-YYYY-MM-DD-HH-MM` form is immutable;
+ *  the `latest` rolling tag is not). Linux + Windows assets resolve
+ *  against this tag. */
+const BTBN_TAG = 'autobuild-2026-05-13-13-53';
+const BTBN_FILE_STEM = 'ffmpeg-n8.1.1-1-g1068a26663';
+
+const BTBN_BASE = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
+
+/** Per-platform/arch download recipe. Each entry is processed by
+ *  `_fetchAndExtract()` below. Keys are `<platform>-<arch>`. */
+const ASSETS = {
+  // ── macOS — evermeet ships one binary per zip (universal x64+arm64). ──
+  'darwin-x64': {
+    parts: [
+      {
+        kind: 'binary-zip',
+        url: `https://evermeet.cx/ffmpeg/ffmpeg-${PINNED_VERSION}.zip`,
+        sha256: '4610988e2f54c243c50da73a09e4e2c36d9bb77546f9aa6c84cb328dcb1a98c1',
+        binaryName: 'ffmpeg',
+      },
+      {
+        kind: 'binary-zip',
+        url: `https://evermeet.cx/ffmpeg/ffprobe-${PINNED_VERSION}.zip`,
+        sha256: 'aeade29dee3c3844e9bcc974f4ae4b29cc4f87994177d77003a8589fa531009e',
+        binaryName: 'ffprobe',
+      },
+    ],
+  },
+  'darwin-arm64': null, // populated below — same as darwin-x64 (universal).
+
+  // ── Linux — BtbN tarball contains bin/{ffmpeg,ffprobe}. ──
+  'linux-x64': {
+    parts: [
+      {
+        kind: 'tar-xz',
+        url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linux64-gpl-8.1.tar.xz`,
+        sha256: 'c54d9aa134b7b9b63948256ad992eea83bf0c4d44665ed87b936c91c6f6dfbd5',
+        binariesIn: 'bin', // <archive-stem>/bin/{ffmpeg,ffprobe}
+      },
+    ],
+  },
+  'linux-arm64': {
+    parts: [
+      {
+        kind: 'tar-xz',
+        url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linuxarm64-gpl-8.1.tar.xz`,
+        sha256: 'd24ff68cd6580b738ec248256a01691ea44a990f5ac9468f823981dd0a39a386',
+        binariesIn: 'bin',
+      },
+    ],
+  },
+
+  // ── Windows — BtbN zip with bin/{ffmpeg,ffprobe}.exe. ──
+  'win32-x64': {
+    parts: [
+      {
+        kind: 'zip-binaries',
+        url: `${BTBN_BASE}/${BTBN_FILE_STEM}-win64-gpl-8.1.zip`,
+        sha256: '6f2470425037ebd047cbe6c028284d1f7f01302bc0e9149596ab5a7890a8cf27',
+        binariesIn: 'bin',
+      },
+    ],
+  },
+  'win32-arm64': {
+    parts: [
+      {
+        kind: 'zip-binaries',
+        url: `${BTBN_BASE}/${BTBN_FILE_STEM}-winarm64-gpl-8.1.zip`,
+        sha256: 'bfaccd3c6567aff265ee5229c15b4973cfc031c1ab820078ef9843836620a6a2',
+        binariesIn: 'bin',
+      },
+    ],
+  },
+};
+ASSETS['darwin-arm64'] = ASSETS['darwin-x64']; // evermeet's mac builds are universal
+
+// ── Internals ────────────────────────────────────────────────────────
 
 const _isWin = process.platform === 'win32';
 const _exe = _isWin ? '.exe' : '';
 
 let _cached = null;
+let _installing = null;
+
+function _platformKey() {
+  return `${process.platform}-${process.arch}`;
+}
+
+function _cacheDir() {
+  // Global, not per-project — one ~80 MB install shared across all
+  // koi projects on this user account.
+  return path.join(os.homedir(), '.koi', 'bin', `ffmpeg-${PINNED_VERSION}`);
+}
 
 function _which(cmd) {
   const probe = _isWin ? 'where' : 'which';
@@ -54,91 +156,243 @@ function _looksRunnable(p) {
   if (!p) return false;
   if (!fs.existsSync(p)) return false;
   try {
-    const r = spawnSync(p, ['-version'], { timeout: 5000 });
+    // 30 s, not 5 — macOS Gatekeeper runs a one-time notarization
+    // check the very first time a downloaded binary executes, which
+    // routinely takes 5-8 s on the evermeet builds. Subsequent runs
+    // cache the verdict and are ~30 ms. A short timeout here
+    // false-positives "not runnable" on every fresh install.
+    const r = spawnSync(p, ['-version'], { timeout: 30000 });
     return r.status === 0;
   } catch {
     return false;
   }
 }
 
-/** Resolve the path the `ffmpeg-static` npm dep ships. The package's
- *  default export IS the absolute path on the host's platform — or
- *  null when the platform's optional-dep wasn't installable. */
-async function _ffmpegStaticPath() {
+async function _sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  await pipeline(fs.createReadStream(filePath), hash);
+  return hash.digest('hex');
+}
+
+async function _downloadFile(url, dest, onProgress, fromPct = 0, toPct = 1) {
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`HTTP ${res.status} downloading ${url}`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  let received = 0;
+  const out = fs.createWriteStream(dest);
+  const reader = Readable.fromWeb(res.body);
+  reader.on('data', (chunk) => {
+    received += chunk.length;
+    if (total && onProgress) {
+      const pct = fromPct + (toPct - fromPct) * (received / total);
+      onProgress(pct, `Downloading ffmpeg ${PINNED_VERSION}… ${Math.round(received / 1e6)}/${Math.round(total / 1e6)} MB`);
+    }
+  });
+  await pipeline(reader, out);
+}
+
+function _runChild(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(-500)}`));
+    });
+  });
+}
+
+/** Extract a single named binary out of an evermeet-style zip whose
+ *  contents are just the binary at the root. */
+async function _extractMacZipBinary(zipPath, outPath) {
+  const dir = path.dirname(outPath);
+  // `unzip -p` streams a single file to stdout; we pipe it to disk so
+  // we don't depend on extracting + finding the right entry. The mac
+  // evermeet archive contains exactly one entry whose name matches the
+  // binary (e.g., "ffmpeg" or "ffprobe").
+  const child = spawn('unzip', ['-p', zipPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = fs.createWriteStream(outPath);
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+  await new Promise((resolve, reject) => {
+    child.on('error', reject);
+    out.on('error', reject);
+    out.on('finish', resolve);
+    child.stdout.pipe(out);
+    child.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`unzip ${path.basename(zipPath)} exited ${code}: ${stderr.slice(-300)}`));
+    });
+  });
+  fs.chmodSync(outPath, 0o755);
+  // Verify the extracted binary actually starts with a Mach-O magic — a
+  // partial-stream or wrong-entry extraction would produce garbage that
+  // _looksRunnable would catch later anyway, but failing here makes the
+  // error pinpoint the bad asset.
+  const head = fs.readFileSync(outPath, { length: 4 });
+  const magic = head.readUInt32BE(0);
+  // Mach-O 64-bit (universal & single-arch) magics
+  const ok = [0xFEEDFACF, 0xCFFAEDFE, 0xCAFEBABE, 0xBEBAFECA].includes(magic);
+  if (!ok) throw new Error(`extracted ${path.basename(outPath)} has wrong magic 0x${magic.toString(16)} — archive layout changed?`);
+}
+
+/** Extract bin/{ffmpeg,ffprobe} from a BtbN-style tar.xz. */
+async function _extractTarXzBinaries(tarPath, outDir, binariesIn) {
+  // System tar on macOS/Linux handles .tar.xz natively. Extract into
+  // a temp staging dir so we can pluck just the binaries we want.
+  const stage = path.join(outDir, `.stage-${path.basename(tarPath, '.tar.xz')}`);
+  fs.mkdirSync(stage, { recursive: true });
   try {
-    const mod = await import('ffmpeg-static');
-    const p = mod?.default || mod;
-    return typeof p === 'string' && p ? p : null;
-  } catch {
-    return null;
+    await _runChild('tar', ['-xJf', tarPath, '-C', stage]);
+    // Find the single top-level dir.
+    const top = fs.readdirSync(stage).find((n) => fs.statSync(path.join(stage, n)).isDirectory());
+    if (!top) throw new Error(`tar layout unexpected — no top-level dir in ${path.basename(tarPath)}`);
+    for (const name of ['ffmpeg', 'ffprobe']) {
+      const src = path.join(stage, top, binariesIn, name);
+      const dst = path.join(outDir, name);
+      if (!fs.existsSync(src)) throw new Error(`expected ${binariesIn}/${name} not found in ${path.basename(tarPath)}`);
+      fs.copyFileSync(src, dst);
+      fs.chmodSync(dst, 0o755);
+    }
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
 }
 
-/** Resolve the path `@ffprobe-installer/ffprobe` exposes. Same idea
- *  as above; the package returns `{ path, version }`. */
-async function _ffprobeInstallerPath() {
+/** Extract bin/{ffmpeg,ffprobe}.exe from a BtbN-style Windows zip. */
+async function _extractZipBinaries(zipPath, outDir, binariesIn) {
+  const stage = path.join(outDir, `.stage-${path.basename(zipPath, '.zip')}`);
+  fs.mkdirSync(stage, { recursive: true });
   try {
-    const mod = await import('@ffprobe-installer/ffprobe');
-    const p = mod?.default?.path || mod?.path;
-    return typeof p === 'string' && p ? p : null;
-  } catch {
-    return null;
+    if (_isWin) {
+      // Windows 10/11 ship `tar` (libarchive) that handles zip too —
+      // saves us a PowerShell process spin-up.
+      await _runChild('tar', ['-xf', zipPath, '-C', stage]);
+    } else {
+      await _runChild('unzip', ['-q', zipPath, '-d', stage]);
+    }
+    const top = fs.readdirSync(stage).find((n) => fs.statSync(path.join(stage, n)).isDirectory());
+    if (!top) throw new Error(`zip layout unexpected — no top-level dir in ${path.basename(zipPath)}`);
+    for (const name of [`ffmpeg${_exe}`, `ffprobe${_exe}`]) {
+      const src = path.join(stage, top, binariesIn, name);
+      const dst = path.join(outDir, name);
+      if (!fs.existsSync(src)) throw new Error(`expected ${binariesIn}/${name} not found in ${path.basename(zipPath)}`);
+      fs.copyFileSync(src, dst);
+      if (!_isWin) fs.chmodSync(dst, 0o755);
+    }
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
 }
 
-/** Public: get the binary paths. Idempotent.
- *
- * `onProgress` is accepted for backward compatibility with the old
- * downloader-based API but is never invoked — the npm-bundled binary
- * has nothing to download at runtime.
- */
-export async function ensureFfmpeg({ onProgress } = {}) {  /* eslint-disable-line no-unused-vars */
+async function _fetchAndExtract(recipe, cacheDir, onProgress, fromPct, toPct) {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const tmp = path.join(cacheDir, `.download-${crypto.randomBytes(4).toString('hex')}`);
+  try {
+    await _downloadFile(recipe.url, tmp, onProgress, fromPct, fromPct + (toPct - fromPct) * 0.85);
+    const got = await _sha256File(tmp);
+    if (got !== recipe.sha256) {
+      throw new Error(
+        `sha256 mismatch for ${path.basename(recipe.url)}\n` +
+        `  expected: ${recipe.sha256}\n  got:      ${got}\n` +
+        `Refusing to use a binary that doesn't match the pinned hash.`,
+      );
+    }
+    onProgress?.(fromPct + (toPct - fromPct) * 0.9, `Verifying ${path.basename(recipe.url)}…`);
+    if (recipe.kind === 'binary-zip') {
+      const outName = recipe.binaryName + _exe;
+      await _extractMacZipBinary(tmp, path.join(cacheDir, outName));
+    } else if (recipe.kind === 'tar-xz') {
+      await _extractTarXzBinaries(tmp, cacheDir, recipe.binariesIn);
+    } else if (recipe.kind === 'zip-binaries') {
+      await _extractZipBinaries(tmp, cacheDir, recipe.binariesIn);
+    } else {
+      throw new Error(`unknown recipe kind: ${recipe.kind}`);
+    }
+    onProgress?.(toPct, 'Installed');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  }
+}
+
+// ── Public API ───────────────────────────────────────────────────────
+
+/** Get the controlled ffmpeg/ffprobe binary paths. Idempotent.
+ *  Downloads + installs the pinned version on first call; subsequent
+ *  calls return cached paths in O(1). Concurrent first calls dedupe
+ *  on a shared promise so we don't trigger N parallel downloads. */
+export async function ensureFfmpeg({ onProgress } = {}) {
   if (_cached) return _cached;
+  if (_installing) return _installing;
 
-  // 1. Env-var override (Flutter bundle). Only respected when it
-  //    points at a real file — a bare "ffmpeg" string (the dart-side
-  //    BundledBinaries fallback when no bundled binary is found) is
-  //    rejected so we still hit the npm dep below.
+  // 1. Env-var override (Flutter bundle).
   const envFf = process.env.KOI_FFMPEG_PATH;
   const envFp = process.env.KOI_FFPROBE_PATH;
-  const envFfOk = envFf && fs.existsSync(envFf) && _looksRunnable(envFf);
-  const envFpOk = envFp && fs.existsSync(envFp) && _looksRunnable(envFp);
-  if (envFfOk && envFpOk) {
+  if (envFf && envFp && _looksRunnable(envFf) && _looksRunnable(envFp)) {
     _cached = { ffmpeg: envFf, ffprobe: envFp };
     return _cached;
   }
 
-  // 2. Controlled binary from the pinned npm deps. This is the
-  //    canonical path. Either side may fall back to the env-var
-  //    value when only one of the two is set.
-  const npmFf = await _ffmpegStaticPath();
-  const npmFp = await _ffprobeInstallerPath();
-  const ff = envFfOk ? envFf : (_looksRunnable(npmFf) ? npmFf : null);
-  const fp = envFpOk ? envFp : (_looksRunnable(npmFp) ? npmFp : null);
-  if (ff && fp) {
-    _cached = { ffmpeg: ff, ffprobe: fp };
+  // 2. Pinned cache.
+  const cacheDir = _cacheDir();
+  const cacheFf = path.join(cacheDir, `ffmpeg${_exe}`);
+  const cacheFp = path.join(cacheDir, `ffprobe${_exe}`);
+  if (_looksRunnable(cacheFf) && _looksRunnable(cacheFp)) {
+    _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
     return _cached;
   }
 
-  // 3. PATH fallback — only here because a corrupted or missing
-  //    node_modules shouldn't brick every media tool entirely.
-  //    Logged so we know we're outside the supported path.
-  const pathFf = ff || _which(`ffmpeg${_exe}`);
-  const pathFp = fp || _which(`ffprobe${_exe}`);
-  if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
-    console.warn(
-      `[ffmpeg-installer] Using system ffmpeg from PATH (${pathFf}, ${pathFp}). ` +
-      `The pinned npm binary (ffmpeg-static / @ffprobe-installer/ffprobe) was not ` +
-      `found in node_modules — re-run \`npm install\` to restore the controlled version. ` +
-      `Host-installed ffmpegs vary across machines and have caused non-reproducible failures.`,
-    );
-    _cached = { ffmpeg: pathFf, ffprobe: pathFp };
-    return _cached;
-  }
-
-  throw new Error(
-    'ffmpeg / ffprobe unavailable. Run `npm install` to fetch the pinned binaries ' +
-    '(ffmpeg-static + @ffprobe-installer/ffprobe), or set KOI_FFMPEG_PATH / ' +
-    'KOI_FFPROBE_PATH to absolute paths of existing binaries.',
-  );
+  // 3. Fresh install with sha256 verification.
+  _installing = (async () => {
+    try {
+      const key = _platformKey();
+      const recipe = ASSETS[key];
+      if (!recipe) throw new Error(`No pinned ffmpeg recipe for platform "${key}". Supported: ${Object.keys(ASSETS).join(', ')}.`);
+      onProgress?.(0, `Resolving ffmpeg ${PINNED_VERSION} for ${key}…`);
+      fs.mkdirSync(cacheDir, { recursive: true });
+      // Distribute progress evenly across the parts (1 or 2 downloads).
+      const n = recipe.parts.length;
+      for (let i = 0; i < n; i++) {
+        await _fetchAndExtract(recipe.parts[i], cacheDir, onProgress, i / n, (i + 1) / n);
+      }
+      // Trust sha256 + magic-byte check from the install (both already
+      // ran inside _fetchAndExtract) — do NOT call _looksRunnable here.
+      // On macOS the first execution of an evermeet binary triggers a
+      // synchronous Gatekeeper notarization lookup that can take 6-10 s,
+      // which would false-trip the 30 s timeout under bad network
+      // conditions and abort an otherwise-good install. The integrity
+      // checks already ran are sufficient.
+      if (!fs.existsSync(cacheFf) || !fs.existsSync(cacheFp)) {
+        throw new Error(`ffmpeg installed to ${cacheDir} but the expected binaries are missing.`);
+      }
+      _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
+      _installing = null;
+      return _cached;
+    } catch (installErr) {
+      // 4. PATH fallback — only when the controlled install fails AND
+      //    a runnable system pair exists. Warn loudly so the divergence
+      //    is visible in the logs.
+      const pathFf = _which(`ffmpeg${_exe}`);
+      const pathFp = _which(`ffprobe${_exe}`);
+      if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
+        console.warn(
+          `[ffmpeg-installer] Controlled install of ffmpeg ${PINNED_VERSION} failed (${installErr.message}). ` +
+          `Falling back to system ffmpeg on PATH (${pathFf}). ` +
+          `Version may differ from the pinned build; results are not reproducible. ` +
+          `Restore: ensure network access, then \`rm -rf ${cacheDir}\` and rerun.`,
+        );
+        _cached = { ffmpeg: pathFf, ffprobe: pathFp };
+        _installing = null;
+        return _cached;
+      }
+      _installing = null;
+      throw new Error(
+        `ffmpeg unavailable: pinned install failed (${installErr.message}) ` +
+        `and no system ffmpeg on PATH. Check network access or set ` +
+        `KOI_FFMPEG_PATH / KOI_FFPROBE_PATH to existing binaries.`,
+      );
+    }
+  })();
+  return _installing;
 }
