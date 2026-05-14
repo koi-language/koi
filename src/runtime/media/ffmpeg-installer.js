@@ -59,20 +59,28 @@ function _looksRunnable(p) {
   }
 }
 
-/** Public: get binaries, installing if needed. Idempotent / dedupes concurrent calls. */
+/** Public: get binaries, installing if needed. Idempotent / dedupes concurrent calls.
+ *
+ * Priority — controlled binary FIRST so the version is the same on every
+ * machine. Falling back to PATH last means a brew/apt ffmpeg on the host
+ * is only used when both the controlled cache AND a fresh download fail
+ * (offline machine behind a proxy, etc.) — those installs at least get
+ * SOMETHING to run with, but the user sees the warning log so we know
+ * they're outside the supported path.
+ *
+ * The historic ordering (PATH first) is exactly what produced the
+ * "works on my Mac, breaks on yours" failure mode: ffmpeg 7.0.1 from
+ * brew removed `-movflags -use_edts` while older system ffmpegs still
+ * accepted it, so the SAME code path padded videos on one machine and
+ * exit-234'd on another. Reordering keeps everyone on the same static
+ * build downloaded from evermeet.cx / johnvansickle / gyan.dev.
+ */
 export async function ensureFfmpeg({ onProgress } = {}) {
   if (_cached) return _cached;
   if (_installing) return _installing;
 
-  // 1. PATH lookup.
-  const pathFf = _which(`ffmpeg${_exe}`);
-  const pathFp = _which(`ffprobe${_exe}`);
-  if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
-    _cached = { ffmpeg: pathFf, ffprobe: pathFp };
-    return _cached;
-  }
-
-  // 2. Cached download.
+  // 1. Cached static build — this is the "controlled" binary we want
+  //    every install to converge on. Lives under `<project>/.koi/bin/`.
   const cacheDir = _cacheDir();
   const cacheFf = path.join(cacheDir, `ffmpeg${_exe}`);
   const cacheFp = path.join(cacheDir, `ffprobe${_exe}`);
@@ -81,23 +89,44 @@ export async function ensureFfmpeg({ onProgress } = {}) {
     return _cached;
   }
 
-  // 3. Fresh install.
+  // 2. Fresh install — fetch a fresh static build into the cache.
+  //    Tried BEFORE PATH so a one-time download per machine replaces
+  //    whatever ffmpeg the host happens to have. Done in a dedupe
+  //    promise so concurrent callers share a single download.
   _installing = (async () => {
     onProgress?.(0, 'Resolving ffmpeg download…');
     fs.mkdirSync(cacheDir, { recursive: true });
     try {
       await _installForCurrentPlatform(cacheDir, onProgress);
+      if (_looksRunnable(cacheFf) && _looksRunnable(cacheFp)) {
+        _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
+        _installing = null;
+        return _cached;
+      }
     } catch (err) {
-      _installing = null;
-      throw new Error(`Failed to install ffmpeg: ${err.message}`);
+      // Don't throw yet — fall through to PATH as a last resort so an
+      // offline / proxy'd machine still has SOMETHING to run.
+      console.warn(`[ffmpeg-installer] Controlled-binary install failed: ${err.message}`);
     }
-    if (!_looksRunnable(cacheFf) || !_looksRunnable(cacheFp)) {
+
+    // 3. PATH lookup — last-resort fallback. Logs a warning because
+    //    versions vary across hosts and we've been bitten by that
+    //    (see header comment).
+    const pathFf = _which(`ffmpeg${_exe}`);
+    const pathFp = _which(`ffprobe${_exe}`);
+    if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
+      console.warn(
+        `[ffmpeg-installer] Using system ffmpeg from PATH (${pathFf}) — ` +
+        `controlled binary unavailable. Behaviour may differ from other installs; ` +
+        `delete the cache and rerun online to install the bundled build.`,
+      );
+      _cached = { ffmpeg: pathFf, ffprobe: pathFp };
       _installing = null;
-      throw new Error('ffmpeg installed but binaries are not runnable — see .koi/bin/');
+      return _cached;
     }
-    _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
+
     _installing = null;
-    return _cached;
+    throw new Error('ffmpeg unavailable — controlled-binary install failed and no system ffmpeg on PATH.');
   })();
   return _installing;
 }

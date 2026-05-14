@@ -827,8 +827,14 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
       '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv',
       // Strip the mov edit list. With `-bf 0` above the bitstream
       // has no negative CTS, so omitting the edts atom is safe.
+      // Pre-7.0 ffmpeg used `-movflags -use_edts`, but that flag was
+      // removed (the only valid movflags-side toggle now is via the
+      // top-level `-use_editlist 0` option, which is what we use here).
+      // Passing `-use_edts` as a movflag through ffmpeg ≥ 7.0 falls
+      // into the eval engine and aborts the whole encode with
+      // "Undefined constant or missing '(' in 'use_edts'".
       '-movflags', '+faststart',
-      '-movflags', '-use_edts',
+      '-use_editlist', '0',
     );
     if (geom.needsTemporalPad) {
       // Cap the output to the exact target duration. tpad would
@@ -1135,8 +1141,8 @@ export async function recoverFromPadded(filePath, geometry, kind) {
  * ends up playing 1-2 frames ahead of the linked source on the
  * timeline (the user-reported "1/15s adelantado").
  *
- * Implementation: `-c copy -movflags -use_edts` re-writes the moov
- * atom WITHOUT the `edts/elst` skip, but keeps the H.264 bitstream
+ * Implementation: `-c copy -use_editlist 0` re-writes the moov atom
+ * WITHOUT the `edts/elst` skip, but keeps the H.264 bitstream
  * (including B-frames) intact. The result is a frame-aligned file
  * the player can read from sample 0 directly. Done as a separate
  * pass (after recovery succeeds) so the recovery's filter graph
@@ -1168,7 +1174,9 @@ export async function stripVideoEditList(filePath) {
     '-i', filePath,
     '-c', 'copy',
     '-movflags', '+faststart',
-    '-movflags', '-use_edts',
+    // See padded-encode notes above — `-use_editlist 0` replaces the
+    // legacy `-movflags -use_edts` which ffmpeg ≥ 7.0 no longer accepts.
+    '-use_editlist', '0',
     '-y', out,
   ];
   const ok = await _runFfmpeg(bins, args);
