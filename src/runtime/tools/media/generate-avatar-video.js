@@ -168,9 +168,32 @@ const generateAvatarVideoAction = {
 
     channel.log('video', `generate_avatar_video: queued id=${submitted.id} model=${submitted.model}`);
 
+    // Stream fal-status updates to the chat banner so the GUI can show
+    // IN_QUEUE / IN_PROGRESS instead of just an asymptotic timer. The
+    // emitter is set by the action-registry's banner wrapper.
+    const _emitBannerStatus = typeof action._emitMediaStatus === 'function'
+      ? action._emitMediaStatus
+      : null;
+    const _onPollTick = _emitBannerStatus
+      ? (latest) => {
+          const falStatus = latest?.status === 'pending' ? 'IN_QUEUE'
+            : latest?.status === 'processing' ? 'IN_PROGRESS'
+            : null;
+          if (falStatus) {
+            _emitBannerStatus({
+              falStatus,
+              queuePosition: typeof latest?.queuePosition === 'number'
+                ? latest.queuePosition
+                : undefined,
+            });
+          }
+        }
+      : null;
+
     const final = await _pollUntilTerminal(instance, submitted, {
       abortSignal,
       reportProgress,
+      onTick: _onPollTick,
       timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
         ? action.timeoutMs
         : DEFAULT_TIMEOUT_MS,

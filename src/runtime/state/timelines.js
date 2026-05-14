@@ -176,6 +176,32 @@ const _TITLE_PATH_RE = /^title:[A-Za-z0-9_-]{1,128}$/;
 function _isTitlePath(p) { return typeof p === 'string' && _TITLE_PATH_RE.test(p); }
 function _newTitlePath() { return `title:${randomBytes(4).toString('hex')}`; }
 
+// Nested-timeline clips reference another timeline by id. Path shape:
+// `timeline:tl-<...>` (the child's id). The actual sub-timeline lives on
+// disk as its own JSON; this clip is just a pointer. Resolution:
+//   - GUI editor: double-click → tabs.openFile(path) → routed to the
+//     timeline editor for the child id.
+//   - Native playback: a pre-flatten pass (Dart side) inlines the child
+//     clips into the parent composition before handing JSON to Swift.
+// The clip carries an optional `timelineRef` sidecar `{ id, name }` so
+// the editor can render the child's display name without re-reading the
+// child JSON on every paint. The id inside `timelineRef` must match the
+// id encoded in the path — `_validateClip` enforces this.
+const _TIMELINE_PATH_RE = /^timeline:[A-Za-z0-9_-]{3,128}$/;
+function _isTimelinePath(p) { return typeof p === 'string' && _TIMELINE_PATH_RE.test(p); }
+function _timelineIdFromPath(p) { return _isTimelinePath(p) ? p.slice('timeline:'.length) : null; }
+
+function _validateTimelineRef(ref, expectedId) {
+  if (ref == null) return null;
+  if (typeof ref !== 'object') throw new Error('clip.timelineRef must be an object');
+  if (typeof ref.id !== 'string' || ref.id !== expectedId) {
+    throw new Error(`clip.timelineRef.id (${ref.id}) must match the path id (${expectedId})`);
+  }
+  const out = { id: ref.id };
+  if (typeof ref.name === 'string') out.name = ref.name;
+  return out;
+}
+
 // Validate / normalise the props sidecar attached to a title clip. We
 // preserve every field the GUI knows (see TitleProps in
 // video_timeline_tab.dart) but only `text` is required; missing fields
@@ -284,6 +310,12 @@ function _validateClip(c, settings) {
   if (_isTitlePath(p) && !_isVideoTrack(track)) {
     throw new Error(`Title clip ${p} must live on a video track, not ${track}`);
   }
+  // Nested-timeline clips (path === 'timeline:<id>') live on V-tracks. A
+  // sub-timeline carries its own A-tracks internally and is expanded at
+  // playback time, so an A-track placement would be a category error.
+  if (_isTimelinePath(p) && !_isVideoTrack(track)) {
+    throw new Error(`Nested-timeline clip ${p} must live on a video track, not ${track}`);
+  }
   if (!Number.isFinite(startMs) || startMs < 0) throw new Error('clip.startMs must be ≥ 0');
   if (!Number.isFinite(durationMs) || durationMs < 50) throw new Error('clip.durationMs must be ≥ 50ms');
   const dur = Math.round(durationMs);
@@ -314,6 +346,15 @@ function _validateClip(c, settings) {
   if (_isTitlePath(p)) {
     const tp = _validateTitleProps(c.titleProps);
     if (tp) out.titleProps = tp;
+  }
+  // Nested-timeline sidecar. The child id encoded in the path is the
+  // source of truth; `timelineRef` is just a cache of display fields so
+  // the editor can render the clip without re-reading the child JSON.
+  if (_isTimelinePath(p)) {
+    const childId = _timelineIdFromPath(p);
+    const refIn = c.timelineRef ?? { id: childId };
+    const ref = _validateTimelineRef(refIn, childId);
+    if (ref) out.timelineRef = ref;
   }
   // Audio-clip volume automation curve. Same round-trip discipline as
   // titleProps — without explicit pass-through, any unrelated mutator
@@ -505,32 +546,29 @@ export function createTimeline({ name, settings, clips, state } = {}) {
   return toWrite;
 }
 
-/** List every timeline file across both the canonical home dir and the
- *  legacy project dir. Dedupes by id (home wins on collision — newer
- *  state lives there post-refactor). */
-export function listTimelines() {
-  const seenIds = new Set();
+/** List every timeline known to the media-library DB. No disk scan —
+ *  the DB is the authoritative index (every save mirrors a row via
+ *  `_mirrorToMediaLibrary`), so listing is a single SQL query against
+ *  `mediaType='timeline'`. The row metadata already carries the
+ *  summary fields, so we don't read the underlying JSON files. */
+export async function listTimelines() {
+  const { MediaLibrary } = await import('./media-library.js');
+  const items = await MediaLibrary.global().list({ mediaType: 'timeline', limit: 10000 });
   const entries = [];
-  for (const dir of [_dir(), _legacyProjectDir()]) {
-    if (!fs.existsSync(dir)) continue;
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.endsWith('.json')) continue;
-      const id = name.slice(0, -5);
-      if (seenIds.has(id)) continue;
-      seenIds.add(id);
-      try {
-        const data = _read(id);
-        if (!data) continue;
-        entries.push({
-          id: data.id,
-          name: data.name,
-          clipCount: Array.isArray(data.clips) ? data.clips.length : 0,
-          videoTracks: data.settings?.videoTracks ?? 0,
-          audioTracks: data.settings?.audioTracks ?? 0,
-          updatedAt: data.updatedAt,
-        });
-      } catch { /* skip corrupt */ }
-    }
+  const seenIds = new Set();
+  for (const it of items) {
+    const meta = it.metadata || {};
+    const id = meta.timelineId;
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    entries.push({
+      id,
+      name: meta.name || 'Timeline',
+      clipCount: meta.clipCount ?? 0,
+      videoTracks: meta.videoTracks ?? 0,
+      audioTracks: meta.audioTracks ?? 0,
+      updatedAt: meta.updatedAt || it.createdAt || null,
+    });
   }
   // Most-recently-edited first.
   entries.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
@@ -549,6 +587,14 @@ export function getTimeline(id) {
  */
 export function updateTimeline(id, state) {
   if (!_read(id)) throw new Error(`Timeline ${id} not found`);
+  // Cycle guard for bulk-replace: walk every nested reference in the
+  // incoming clips and reject if any path leads back to this timeline.
+  if (Array.isArray(state?.clips)) {
+    for (const c of state.clips) {
+      const childId = _timelineIdFromPath(c?.path);
+      if (childId) _assertNoTimelineCycle(id, childId);
+    }
+  }
   const merged = _normalise({ ...state, id, createdAt: state.createdAt });
   _write(merged);
   return merged;
@@ -631,6 +677,29 @@ function _withTimeline(id, mutator) {
   return normalised;
 }
 
+/// Walk every nested-timeline reference reachable from [startId] and
+/// throw if [ancestorId] appears anywhere in the closure. Cheap (one
+/// _read per visited timeline, dedup'd by [visited]); guards against
+/// cycles like A→B→A or A→B→C→A. Missing children are tolerated so a
+/// stale ref doesn't poison the check.
+function _assertNoTimelineCycle(ancestorId, startId, visited = new Set()) {
+  if (!startId || visited.has(startId)) return;
+  visited.add(startId);
+  if (startId === ancestorId) {
+    throw new Error(
+      `Cycle detected: timeline ${ancestorId} cannot contain itself ` +
+      `(transitively via ${[...visited].join(' → ')})`,
+    );
+  }
+  const child = _read(startId);
+  if (!child) return; // missing child — nothing further to follow
+  for (const c of child.clips || []) {
+    const nestedId = _timelineIdFromPath(c.path);
+    if (!nestedId) continue;
+    _assertNoTimelineCycle(ancestorId, nestedId, visited);
+  }
+}
+
 /**
  * Append a clip. Returns { clip, timeline } so the caller has the
  * minted id without re-scanning the timeline. `clip.linkId` is optional
@@ -638,6 +707,11 @@ function _withTimeline(id, mutator) {
  * so that move/trim/remove cascade across the pair.
  */
 export function addClip(id, clip) {
+  // Nested-timeline cycle guard: refuse the add BEFORE the write so a
+  // bad drop leaves the parent intact. Cheap when there's no nesting
+  // (single _read on the would-be child).
+  const childId = _timelineIdFromPath(clip?.path);
+  if (childId) _assertNoTimelineCycle(id, childId);
   let added;
   const tl = _withTimeline(id, (state) => {
     const validated = _validateClip(clip, state.settings);
@@ -857,6 +931,13 @@ export function setClipVolume(id, clipId, change) {
  * clear error rather than a silently-ignored field.
  */
 export function updateClip(id, clipId, changes) {
+  // Cycle guard before the write: if the path is being changed to a
+  // `timeline:<id>` reference, walk the closure first. Cheap no-op when
+  // the path isn't being touched or isn't a timeline path.
+  if (changes && typeof changes === 'object' && 'path' in changes) {
+    const childId = _timelineIdFromPath(changes.path);
+    if (childId) _assertNoTimelineCycle(id, childId);
+  }
   return _withTimeline(id, (state) => {
     const i = _findClipIndexById(state, clipId);
     if (i < 0) throw new Error(`Clip not found: ${clipId}`);

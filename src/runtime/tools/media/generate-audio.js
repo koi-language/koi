@@ -146,6 +146,14 @@ const generateAudioAction = {
 
     const instance = resolved.instance;
 
+    // Pipe fal-status updates from the audio submit+poll loop straight
+    // to the chat banner. The banner wrapper (action-registry) sets
+    // _emitMediaStatus on the action; absent for nested calls or tools
+    // run outside the GUI, in which case we no-op.
+    const _onStatus = typeof action._emitMediaStatus === 'function'
+      ? (info) => action._emitMediaStatus(info)
+      : undefined;
+
     // ── Speech mode (TTS) ─────────────────────────────────────────────
     if (mode === 'speech') {
       const text = action.text;
@@ -169,6 +177,7 @@ const generateAudioAction = {
         ...(typeof action.pitch === 'number' ? { pitch: action.pitch } : {}),
         ...(typeof action.volume === 'number' ? { volume: action.volume } : {}),
         ...(action.extra ? { extra: action.extra } : {}),
+        ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
       // Save to disk
@@ -252,6 +261,7 @@ const generateAudioAction = {
         ...(videoUrl ? { videoUrl } : {}),
         ...(action.label ? { label: action.label } : {}),
         ...(action.extra ? { extra: action.extra } : {}),
+        ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
       const savePath = path.resolve(action.saveTo);
@@ -301,6 +311,7 @@ const generateAudioAction = {
         ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
         ...(action.label ? { label: action.label } : {}),
         ...(action.extra ? { extra: action.extra } : {}),
+        ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
       const savePath = path.resolve(action.saveTo);

@@ -310,6 +310,11 @@ const outpaintImageAction = {
       // suppress generate_image's "Generando imagen…" so the user sees one
       // operation, not two stacked progress bars.
       _suppressBanner: true,
+      // Forward outpaint's own banner-status emitter so the IN_QUEUE /
+      // IN_PROGRESS updates from the nested image submit+poll loop still
+      // reach the chat banner the user is looking at.
+      _mediaBannerId: action._mediaBannerId,
+      _emitMediaStatus: action._emitMediaStatus,
       referenceImages: [paddedCanvasPath],
       maskImage: maskBuffer ? { data: maskBuffer, mimeType: 'image/png' } : undefined,
       sourceImage: originalBuffer ? { data: originalBuffer, mimeType: 'image/png' } : undefined,

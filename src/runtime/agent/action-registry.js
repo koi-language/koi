@@ -646,6 +646,22 @@ function _wrapWithBanner(action) {
       iconId: action.bannerIconId || action.intent || action.type,
       expectedDurationMs,
     });
+    // Make the banner id + a fal-status emitter available to the wrapped
+    // tool so its polling loop can pipe IN_QUEUE / IN_PROGRESS through to
+    // the GUI without re-resolving the channel. Tools that don't poll just
+    // ignore these — the wrapper still closes the banner via mediaToolEnd.
+    if (act && typeof act === 'object') {
+      act._mediaBannerId = id;
+      act._emitMediaStatus = (info) => {
+        try {
+          channel.mediaToolStatus({
+            id,
+            falStatus: info?.falStatus,
+            queuePosition: info?.queuePosition,
+          });
+        } catch { /* observability is best-effort */ }
+      };
+    }
     let ok = false;
     let cancelled = false;
     try {

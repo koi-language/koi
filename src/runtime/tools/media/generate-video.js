@@ -1105,26 +1105,47 @@ const generateVideoAction = {
     //      of dropping the stripes overlay on a long but legitimate
     //      generation (Veo 3.1 with refs, Kling 1080p, etc.).
     let _onPollTick = null;
-    if (_persistedJob && submitted.id) {
+    const _emitBannerStatus = typeof action._emitMediaStatus === 'function'
+      ? action._emitMediaStatus
+      : null;
+    if ((_persistedJob && submitted.id) || _emitBannerStatus) {
       const { updateJob: _updateJob, refreshLock: _refreshLock } = await import('../../state/pending-jobs.js');
       _onPollTick = (latest) => {
-        try {
-          _refreshLock(submitted.id, process.pid);
-          _updateJob(submitted.id, {
-            lastSeenStatus: latest?.status || 'unknown',
-            lastPolledAt: new Date().toISOString(),
-          });
-        } catch { /* observability is best-effort */ }
-        // GUI heartbeat — only meaningful when this job was kicked
-        // off from a timeline placeholder (clipContext present).
-        try {
-          if (_persistedJob.clipContext?.clipId) {
-            channel.clipMediaGenerating({
-              clipId: _persistedJob.clipContext.clipId,
-              status: latest?.status || 'pending',
+        if (_persistedJob && submitted.id) {
+          try {
+            _refreshLock(submitted.id, process.pid);
+            _updateJob(submitted.id, {
+              lastSeenStatus: latest?.status || 'unknown',
+              lastPolledAt: new Date().toISOString(),
+            });
+          } catch { /* observability is best-effort */ }
+          // GUI heartbeat — only meaningful when this job was kicked
+          // off from a timeline placeholder (clipContext present).
+          try {
+            if (_persistedJob.clipContext?.clipId) {
+              channel.clipMediaGenerating({
+                clipId: _persistedJob.clipContext.clipId,
+                status: latest?.status || 'pending',
+              });
+            }
+          } catch { /* non-fatal */ }
+        }
+        // Fal-status passthrough to the chat banner. The runtime normalizes
+        // fal's IN_QUEUE/IN_PROGRESS to 'pending'/'processing'; map back so
+        // the GUI sees the original fal vocabulary it already understands.
+        if (_emitBannerStatus) {
+          const falStatus = latest?.status === 'pending' ? 'IN_QUEUE'
+            : latest?.status === 'processing' ? 'IN_PROGRESS'
+            : null;
+          if (falStatus) {
+            _emitBannerStatus({
+              falStatus,
+              queuePosition: typeof latest?.queuePosition === 'number'
+                ? latest.queuePosition
+                : undefined,
             });
           }
-        } catch { /* non-fatal */ }
+        }
       };
     }
 

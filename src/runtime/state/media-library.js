@@ -230,12 +230,13 @@ export class MediaLibrary {
         // Delete seed
         try { await this._table.delete('id = "__seed__"'); } catch {}
       }
-      // One-shot migration of legacy on-disk artefacts (timeline JSONs
-      // and the cloned-voice registry) into the media library. Runs
-      // EVERY time the table is opened but is fully idempotent — the
-      // upsert-by-path semantics on saveTimelineEntry / saveVoiceEntry
-      // mean a re-run is equivalent to a refresh of the metadata.
-      // Fire-and-forget so the table-open path stays fast for callers.
+      // One-shot migration of the cloned-voice registry into the media
+      // library. Runs every table open but is fully idempotent — the
+      // upsert-by-path semantics on saveVoiceEntry mean a re-run is
+      // equivalent to a refresh of the metadata. Timelines used to be
+      // imported here too via a directory scan of `~/.koi/timelines/`;
+      // that scan has been removed — the DB is the only source of truth
+      // for timelines now, fed by `_mirrorToMediaLibrary` on every save.
       this._migrateLegacyArtefacts().catch((e) => {
         process.stderr.write(`[MediaLibrary] migration failed: ${e.message}\n`);
       });
@@ -245,39 +246,15 @@ export class MediaLibrary {
     return this._table;
   }
 
-  /** Pull existing timelines and voices from disk into the library so
-   *  the GUI drawer can rely on a single source of truth. Idempotent —
-   *  upserts by file_path, doesn't re-embed or duplicate. */
+  /** Pull voice registry entries into the library so the GUI drawer
+   *  can rely on a single source of truth. Idempotent — upserts by
+   *  file_path. Reads a single known JSON registry file, not a
+   *  directory scan. Timelines are no longer migrated here: every
+   *  timeline save mirrors itself into the DB via `_mirrorToMediaLibrary`,
+   *  so the DB is the authoritative index and we never re-scan the
+   *  timelines directory. */
   async _migrateLegacyArtefacts() {
-    let timelines = 0;
     let voices = 0;
-    // Timelines: scan ~/.koi/timelines/*.json in the project root if
-    // available (KOI_PROJECT_ROOT) AND the global home as a fallback.
-    const projectRoot = process.env.KOI_PROJECT_ROOT;
-    const candidates = [];
-    if (projectRoot) candidates.push(path.join(projectRoot, '.koi', 'timelines'));
-    candidates.push(path.join(os.homedir(), '.koi', 'timelines'));
-    const seen = new Set();
-    for (const dir of candidates) {
-      if (seen.has(dir)) continue;
-      seen.add(dir);
-      if (!fs.existsSync(dir)) continue;
-      try {
-        for (const name of fs.readdirSync(dir)) {
-          if (!name.endsWith('.json')) continue;
-          const fp = path.join(dir, name);
-          try {
-            const state = JSON.parse(fs.readFileSync(fp, 'utf8'));
-            const { saveTimelineEntry } = await import('./media-library.js');
-            await saveTimelineEntry(fp, state, null);
-            timelines++;
-          } catch (e) {
-            process.stderr.write(`[MediaLibrary] migrate timeline ${fp} skipped: ${e.message}\n`);
-          }
-        }
-      } catch { /* unreadable dir */ }
-    }
-    // Voices: a single registry file at ~/.koi/voices/voices.json
     const voicesJson = path.join(os.homedir(), '.koi', 'voices', 'voices.json');
     if (fs.existsSync(voicesJson)) {
       try {
@@ -299,8 +276,8 @@ export class MediaLibrary {
         process.stderr.write(`[MediaLibrary] migrate voices.json skipped: ${e.message}\n`);
       }
     }
-    if (timelines > 0 || voices > 0) {
-      process.stderr.write(`[MediaLibrary] migration: indexed ${timelines} timeline(s), ${voices} voice(s)\n`);
+    if (voices > 0) {
+      process.stderr.write(`[MediaLibrary] migration: indexed ${voices} voice(s)\n`);
     }
   }
 

@@ -782,7 +782,22 @@ export class GatewayImageGen extends BaseImageGen {
             throw err;
           }
           const data = await pollRes.json();
-          if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') continue;
+          if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') {
+            // Bubble the raw fal status up to the caller (the tool layer)
+            // so it can forward it to the chat banner. The callback is
+            // best-effort observability — errors must not abort the poll.
+            if (typeof opts.onStatus === 'function') {
+              try {
+                opts.onStatus({
+                  falStatus: data.status,
+                  queuePosition: typeof data.queuePosition === 'number'
+                    ? data.queuePosition
+                    : undefined,
+                });
+              } catch { /* non-fatal */ }
+            }
+            continue;
+          }
           if (data.status === 'FAILED') {
             const err = new Error(data.error || `Image generation failed (${id})`);
             err.status = 502;
@@ -985,6 +1000,106 @@ export class GatewayAudioGen extends BaseAudioGen {
 
   get providerName() { return 'koi-gateway'; }
 
+  /** Submit an audio job to the backend's queue endpoint, then poll
+   *  /media/audio/<kind>/result until COMPLETED or FAILED. Mirrors the
+   *  image submit+poll path in GatewayImageGen so the runtime can
+   *  surface fal's IN_QUEUE / IN_PROGRESS state to the chat banner.
+   *
+   *  `kind` is the URL fragment ('speech' / 'sfx' / 'music'). `body` is
+   *  the JSON payload — same canonical shape the legacy sync handlers
+   *  accept (so we share the kind→canonical mapping with the backend).
+   *  `opts.onStatus(info)` is invoked on every IN_QUEUE / IN_PROGRESS
+   *  poll so the tool layer can forward to the banner. Errors inside
+   *  onStatus MUST NOT abort the poll.
+   *
+   *  Returns: { buffer: Buffer, format: string, model: string,
+   *             durationMs?: number, creditsCost?, providerRequestId? }
+   */
+  async _submitAndPollAudio(kind, body, opts = {}) {
+    const submitRes = await fetch(`${getGatewayBase()}/media/audio/${kind}/submit`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(body),
+      signal: opts.abortSignal,
+    });
+    await throwIfQuotaExceeded(submitRes);
+    if (!submitRes.ok) {
+      const bodyText = await submitRes.text().catch(() => '');
+      let structured = null;
+      try { structured = JSON.parse(bodyText); } catch {}
+      const err = new Error(
+        structured?.error || `Gateway audio submit error (${submitRes.status}): ${bodyText}`,
+      );
+      err.status = submitRes.status;
+      if (structured) err.details = structured;
+      throw err;
+    }
+    const { id } = await submitRes.json();
+    if (!id) throw new Error('Gateway audio submit returned no id');
+
+    // Poll. Speech is usually < 10 s, sfx 5–30 s, music 30–90 s. Cap at
+    // 5 min so a stuck job doesn't dangle the tool indefinitely.
+    const pollDeadline = Date.now() + 5 * 60 * 1000;
+    let pollDelay = 1200;
+    while (true) {
+      if (Date.now() > pollDeadline) {
+        throw new Error(`Gateway audio timeout after 5 min waiting on ${id}`);
+      }
+      await new Promise(r => setTimeout(r, pollDelay));
+      pollDelay = Math.min(pollDelay * 1.4, 4000);
+
+      const pollRes = await fetch(
+        `${getGatewayBase()}/media/audio/${kind}/result?id=${encodeURIComponent(id)}`,
+        { headers: getAuthHeaders(), signal: opts.abortSignal },
+      );
+      await throwIfQuotaExceeded(pollRes);
+      if (!pollRes.ok) {
+        const bodyText = await pollRes.text().catch(() => '');
+        let structured = null;
+        try { structured = JSON.parse(bodyText); } catch {}
+        const err = new Error(
+          structured?.error || `Gateway audio poll error (${pollRes.status}): ${bodyText}`,
+        );
+        err.status = pollRes.status;
+        if (structured) err.details = structured;
+        throw err;
+      }
+      const data = await pollRes.json();
+      if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') {
+        if (typeof opts.onStatus === 'function') {
+          try {
+            opts.onStatus({
+              falStatus: data.status,
+              queuePosition: typeof data.queuePosition === 'number'
+                ? data.queuePosition
+                : undefined,
+            });
+          } catch { /* non-fatal */ }
+        }
+        continue;
+      }
+      if (data.status === 'FAILED') {
+        const err = new Error(data.error || `Audio generation failed (${id})`);
+        err.status = 502;
+        err.failedModel = data.model;
+        throw err;
+      }
+      // COMPLETED
+      if (!data.audioBase64) {
+        throw new Error(`Gateway audio result missing audioBase64 (${id})`);
+      }
+      const buffer = Buffer.from(data.audioBase64, 'base64');
+      return {
+        buffer,
+        format: data.format || 'audio/mpeg',
+        model: data.model,
+        ...(typeof data.durationMs === 'number' ? { durationMs: data.durationMs } : {}),
+        ...(typeof data.creditsCost === 'number' ? { creditsCost: data.creditsCost } : {}),
+        ...(typeof data.providerRequestId === 'string' ? { providerRequestId: data.providerRequestId } : {}),
+      };
+    }
+  }
+
   async speech(text, opts = {}) {
     const resolvedModel = await _resolveMediaModel('audio', this.model, opts, (models, req) =>
       import('./media-model-router.js').then(({ pickAudioModel, MediaModelRoutingError }) => {
@@ -998,31 +1113,31 @@ export class GatewayAudioGen extends BaseAudioGen {
       { kind: 'tts', label: opts.label },
     );
 
-    const res = await fetch(`${getGatewayBase()}/media/audio/speech`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({
-        model: resolvedModel,
-        text,
-        ...(opts.voice ? { voice: opts.voice } : {}),
-        outputFormat: opts.outputFormat || 'mp3',
-        ...(typeof opts.speed === 'number' ? { speed: opts.speed } : {}),
-        ...(opts.language ? { language: opts.language } : {}),
-        ...(opts.emotion ? { emotion: opts.emotion } : {}),
-        ...(typeof opts.pitch === 'number' ? { pitch: opts.pitch } : {}),
-        ...(typeof opts.volume === 'number' ? { volume: opts.volume } : {}),
-      }),
-      signal: opts.abortSignal,
+    const body = {
+      model: resolvedModel,
+      text,
+      ...(opts.voice ? { voice: opts.voice } : {}),
+      outputFormat: opts.outputFormat || 'mp3',
+      ...(typeof opts.speed === 'number' ? { speed: opts.speed } : {}),
+      ...(opts.language ? { language: opts.language } : {}),
+      ...(opts.emotion ? { emotion: opts.emotion } : {}),
+      ...(typeof opts.pitch === 'number' ? { pitch: opts.pitch } : {}),
+      ...(typeof opts.volume === 'number' ? { volume: opts.volume } : {}),
+    };
+    const result = await this._submitAndPollAudio('speech', body, {
+      onStatus: opts.onStatus,
+      abortSignal: opts.abortSignal,
     });
-
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway audio error (${res.status}): ${body}`);
-    }
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: text.length } };
+    const ret = {
+      audio: result.buffer,
+      format: opts.outputFormat || 'mp3',
+      usage: { characters: text.length },
+      model: result.model || resolvedModel,
+    };
+    if (typeof result.creditsCost === 'number') ret.creditsCost = result.creditsCost;
+    if (typeof result.providerRequestId === 'string') ret.providerRequestId = result.providerRequestId;
+    if (typeof result.durationMs === 'number') ret.durationMs = result.durationMs;
+    return ret;
   }
 
   /** Transcribe a speech sample. Two-step: upload bytes to fal storage,
@@ -1175,31 +1290,11 @@ export class GatewayAudioGen extends BaseAudioGen {
       );
     } catch (_) {}
 
-    // Build the request once and (if needed) re-issue without the
-    // videoUrl on a gateway-proxy timeout. Video-conditioned SFX
-    // (mmaudio-v2 on a multi-MB MP4) routinely exceeds the gateway
-    // proxy's ~100 s budget — observed as `502 Application failed to
-    // respond`. The proper fix is a submit+poll endpoint on the
-    // gateway (the image/video tools already use that pattern); until
-    // that lands, fall back to text-only SFX so the user still gets
-    // an audio file instead of a hard error.
-    //
-    // CRITICAL: always include `videoUrl` when the caller provided one,
-    // independent of `usingVideoRef`. The router's `usingVideoRef` flag
-    // only controls whether we ASK the catalog for a video-conditioned
-    // model — it does NOT mean "drop the video reference". Earlier we
-    // gated `videoUrl` on `usingVideoRef`, which silently stripped the
-    // field whenever the catalog couldn't surface a video-conditioned
-    // model (typical case: the row's `input_video` flag was stale,
-    // catch-block fell back to text-only routing). The fallback then
-    // landed on `controlfoley:audio` anyway — a model whose adapter
-    // requires `video_url` — and the request hit fal without the field
-    // it needed → 422 / 502. Letting the gateway-side adapter decide
-    // whether to use or ignore videoUrl is more robust: text-only
-    // adapters ignore unknown fields, video-aware adapters consume
-    // them. The video reference is ALWAYS valid information to forward
-    // when the user attached it.
-    const buildBody = (withVideo) => JSON.stringify({
+    // Build canonical body — videoUrl is always forwarded when the
+    // caller provided one, regardless of `usingVideoRef`. The router's
+    // `usingVideoRef` flag only controls model selection; the adapter
+    // server-side decides whether to consume or ignore the field.
+    const body = {
       model: resolvedModel,
       prompt,
       outputFormat: opts.outputFormat || 'mp3',
@@ -1207,55 +1302,33 @@ export class GatewayAudioGen extends BaseAudioGen {
       ...(typeof opts.promptInfluence === 'number' ? { promptInfluence: opts.promptInfluence } : {}),
       ...(typeof opts.loop === 'boolean' ? { loop: opts.loop } : {}),
       ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
-      // `withVideo` here means "the caller intends video-conditioning"
-      // (used to short-circuit the proxy-timeout fallback below). The
-      // actual videoUrl payload is gated on `opts.videoUrl` ONLY — if
-      // the caller uploaded a reference, forward it.
       ...(opts.videoUrl ? { videoUrl: opts.videoUrl } : {}),
-    });
-
-    const postSfx = (withVideo) => fetch(`${getGatewayBase()}/media/audio/sfx`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: buildBody(withVideo),
-      signal: opts.abortSignal,
-    });
-
-    // Diagnostic: log the body keys we're sending so we can pair this
-    // with the backend's `[sfx/route] body keys=…` log and see whether
-    // `videoUrl` survives the wire. Only the keys — not the values —
-    // since the videoUrl is a long fal-storage URL we don't want
-    // littering stdout.
+    };
     try {
-      const dbgKeys = Object.keys(JSON.parse(buildBody(usingVideoRef)));
-      console.log(`[gateway/sfx] sending body keys=${JSON.stringify(dbgKeys)} usingVideoRef=${usingVideoRef}`);
-    } catch (_) {}
-    let res = await postSfx(usingVideoRef);
-    // 502 / 504 from the gateway with video-conditioning ON almost
-    // always means the proxy gave up waiting on mmaudio-v2 mid-job.
-    // Retry once without the video reference so the same call lands
-    // on a fast text-only SFX adapter (ElevenLabs / similar). The
-    // result loses the per-frame sync but is still on-prompt.
-    if (usingVideoRef && (res.status === 502 || res.status === 504)) {
-      console.warn(
-        `[gateway/sfx] gateway proxy timed out (HTTP ${res.status}) on a ` +
-        `video-conditioned SFX request — falling back to text-only SFX so ` +
-        `the agent still gets audio. Re-test once the gateway exposes a ` +
-        `submit+poll variant for /media/audio/sfx.`,
+      console.log(
+        `[gateway/sfx] sending body keys=${JSON.stringify(Object.keys(body))} ` +
+        `usingVideoRef=${usingVideoRef}`,
       );
-      try { res.body?.cancel?.(); } catch (_) {}
-      usingVideoRef = false;
-      res = await postSfx(false);
-    }
+    } catch (_) {}
 
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway sfx error (${res.status}): ${body}`);
-    }
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: prompt.length } };
+    // submit+poll via /media/audio/sfx/submit + /result — bypasses the
+    // proxy timeout that bit video-conditioned SFX with the sync path,
+    // and pipes IN_QUEUE / IN_PROGRESS through opts.onStatus so the
+    // chat banner can pause its timer while queued.
+    const result = await this._submitAndPollAudio('sfx', body, {
+      onStatus: opts.onStatus,
+      abortSignal: opts.abortSignal,
+    });
+    const ret = {
+      audio: result.buffer,
+      format: opts.outputFormat || 'mp3',
+      usage: { characters: prompt.length },
+      model: result.model || resolvedModel,
+    };
+    if (typeof result.creditsCost === 'number') ret.creditsCost = result.creditsCost;
+    if (typeof result.providerRequestId === 'string') ret.providerRequestId = result.providerRequestId;
+    if (typeof result.durationMs === 'number') ret.durationMs = result.durationMs;
+    return ret;
   }
 
   /** Generate music from a text prompt. Distinct from sfx(): music is
@@ -1279,27 +1352,27 @@ export class GatewayAudioGen extends BaseAudioGen {
       { kind: 'music', label: opts.label },
     );
 
-    const res = await fetch(`${getGatewayBase()}/media/audio/music`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({
-        model: resolvedModel,
-        prompt,
-        outputFormat: opts.outputFormat || 'mp3',
-        ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
-        ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
-      }),
-      signal: opts.abortSignal,
+    const body = {
+      model: resolvedModel,
+      prompt,
+      outputFormat: opts.outputFormat || 'mp3',
+      ...(typeof opts.durationSeconds === 'number' ? { durationSeconds: opts.durationSeconds } : {}),
+      ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+    };
+    const result = await this._submitAndPollAudio('music', body, {
+      onStatus: opts.onStatus,
+      abortSignal: opts.abortSignal,
     });
-
-    await throwIfQuotaExceeded(res);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Gateway music error (${res.status}): ${body}`);
-    }
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    return { audio: buffer, format: opts.outputFormat || 'mp3', usage: { characters: prompt.length } };
+    const ret = {
+      audio: result.buffer,
+      format: opts.outputFormat || 'mp3',
+      usage: { characters: prompt.length },
+      model: result.model || resolvedModel,
+    };
+    if (typeof result.creditsCost === 'number') ret.creditsCost = result.creditsCost;
+    if (typeof result.providerRequestId === 'string') ret.providerRequestId = result.providerRequestId;
+    if (typeof result.durationMs === 'number') ret.durationMs = result.durationMs;
+    return ret;
   }
 
   /** Clone a voice from a sample. Two-step: upload the sample bytes to

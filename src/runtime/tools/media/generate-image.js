@@ -623,6 +623,14 @@ const generateImageAction = {
       }
     }
 
+    // Pipe fal-status updates from the gateway's submit+poll loop straight
+    // to the chat banner. The banner wrapper (action-registry) sets
+    // _emitMediaStatus on the action; when nested under another media tool
+    // (outpaint → generate_image) it stays undefined and we no-op silently.
+    if (typeof action._emitMediaStatus === 'function') {
+      genOpts.onStatus = (info) => action._emitMediaStatus(info);
+    }
+
     let result;
     try {
       result = await instance.generate(effectivePrompt, genOpts);

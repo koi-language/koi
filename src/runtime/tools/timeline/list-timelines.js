@@ -20,7 +20,7 @@ export default {
 
   async execute() {
     try {
-      return { success: true, timelines: listTimelines() };
+      return { success: true, timelines: await listTimelines() };
     } catch (e) {
       return { success: false, error: e.message };
     }
