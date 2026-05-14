@@ -1,46 +1,48 @@
 /**
- * ffmpeg / ffprobe locator + auto-installer.
+ * ffmpeg / ffprobe locator — controlled-binary edition.
  *
- * `ensureFfmpeg()` returns `{ ffmpeg, ffprobe }` (absolute paths) using
- * the first source that works:
+ * `ensureFfmpeg()` returns `{ ffmpeg, ffprobe }` (absolute paths). The
+ * controlled binary ships as an npm dependency so it lands in
+ * `node_modules/` at install time — no runtime download, identical
+ * version across every machine that ran `npm install` against the
+ * same `package.json`.
  *
- *   1. PATH lookup — system install (brew, apt, choco, …). Fastest path.
- *   2. Cached static build under `<projectRoot>/.koi/bin/`.
- *   3. Fresh download of a static build for the current OS+arch.
+ * Versions (PINNED — bump deliberately in package.json):
+ *   - `ffmpeg-static@5.3.0`               → ffmpeg 6.0
+ *   - `@ffprobe-installer/ffprobe@2.1.2`  → ffprobe 4.4.1
  *
- * Static builds are vendored from well-known mirrors:
- *   - macOS x64/arm64 → evermeet.cx (single universal binary per tool)
- *   - Linux x64/arm64 → johnvansickle.com (release-static tarballs)
- *   - Windows x64     → gyan.dev (release-essentials zip)
+ * Both packages use npm `optionalDependencies` keyed on the current
+ * platform/arch, so `npm install` only fetches the binary for the
+ * host (≈80 MB, not 240 MB). Re-running `npm install` on a
+ * different OS pulls that OS's binary into the same lockfile.
  *
- * The cache lives in the project's `.koi/bin/` so installs survive
- * across sessions and multiple koi projects don't fight over `/usr/local`.
+ * Resolution order:
+ *   1. `KOI_FFMPEG_PATH` / `KOI_FFPROBE_PATH` env vars — Flutter GUI
+ *      sets these to the path of the binaries it ships inside its
+ *      own `.app` bundle (see `BundledBinaries` on the Dart side).
+ *      Honoured ONLY when both point at files that exist; a stray
+ *      `KOI_FFMPEG_PATH=ffmpeg` (bare command name) is ignored.
+ *   2. The npm-shipped binary from `ffmpeg-static` /
+ *      `@ffprobe-installer/ffprobe`. This is the canonical path —
+ *      guaranteed to exist post-`npm install`, identical on every
+ *      machine running the same lockfile.
+ *   3. PATH lookup — LAST resort, only for the edge case where
+ *      node_modules was nuked or the binary inside it got corrupted.
+ *      Logs a warning because the version is then host-dependent
+ *      and we've already been burned by that (brew ffmpeg 7.x
+ *      removed `-movflags -use_edts` while older brew ffmpegs
+ *      still accept it — same code, different result).
  */
 
 import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import { spawnSync, spawn } from 'node:child_process';
-import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
-
-function _projectRoot() {
-  return process.env.KOI_PROJECT_ROOT || process.cwd();
-}
-
-function _cacheDir() {
-  return path.join(_projectRoot(), '.koi', 'bin');
-}
+import { spawnSync } from 'node:child_process';
 
 const _isWin = process.platform === 'win32';
 const _exe = _isWin ? '.exe' : '';
 
-let _cached = null;       // { ffmpeg, ffprobe }
-let _installing = null;   // Promise — dedupe concurrent installers
+let _cached = null;
 
 function _which(cmd) {
-  // Synchronous PATH probe. spawnSync('which'/'where') beats parsing
-  // PATH ourselves since the OS resolver respects PATHEXT/aliases.
   const probe = _isWin ? 'where' : 'which';
   const r = spawnSync(probe, [cmd], { encoding: 'utf8' });
   if (r.status !== 0) return null;
@@ -59,202 +61,84 @@ function _looksRunnable(p) {
   }
 }
 
-/** Public: get binaries, installing if needed. Idempotent / dedupes concurrent calls.
- *
- * Priority — controlled binary FIRST so the version is the same on every
- * machine. Falling back to PATH last means a brew/apt ffmpeg on the host
- * is only used when both the controlled cache AND a fresh download fail
- * (offline machine behind a proxy, etc.) — those installs at least get
- * SOMETHING to run with, but the user sees the warning log so we know
- * they're outside the supported path.
- *
- * The historic ordering (PATH first) is exactly what produced the
- * "works on my Mac, breaks on yours" failure mode: ffmpeg 7.0.1 from
- * brew removed `-movflags -use_edts` while older system ffmpegs still
- * accepted it, so the SAME code path padded videos on one machine and
- * exit-234'd on another. Reordering keeps everyone on the same static
- * build downloaded from evermeet.cx / johnvansickle / gyan.dev.
- */
-export async function ensureFfmpeg({ onProgress } = {}) {
-  if (_cached) return _cached;
-  if (_installing) return _installing;
+/** Resolve the path the `ffmpeg-static` npm dep ships. The package's
+ *  default export IS the absolute path on the host's platform — or
+ *  null when the platform's optional-dep wasn't installable. */
+async function _ffmpegStaticPath() {
+  try {
+    const mod = await import('ffmpeg-static');
+    const p = mod?.default || mod;
+    return typeof p === 'string' && p ? p : null;
+  } catch {
+    return null;
+  }
+}
 
-  // 1. Cached static build — this is the "controlled" binary we want
-  //    every install to converge on. Lives under `<project>/.koi/bin/`.
-  const cacheDir = _cacheDir();
-  const cacheFf = path.join(cacheDir, `ffmpeg${_exe}`);
-  const cacheFp = path.join(cacheDir, `ffprobe${_exe}`);
-  if (_looksRunnable(cacheFf) && _looksRunnable(cacheFp)) {
-    _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
+/** Resolve the path `@ffprobe-installer/ffprobe` exposes. Same idea
+ *  as above; the package returns `{ path, version }`. */
+async function _ffprobeInstallerPath() {
+  try {
+    const mod = await import('@ffprobe-installer/ffprobe');
+    const p = mod?.default?.path || mod?.path;
+    return typeof p === 'string' && p ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Public: get the binary paths. Idempotent.
+ *
+ * `onProgress` is accepted for backward compatibility with the old
+ * downloader-based API but is never invoked — the npm-bundled binary
+ * has nothing to download at runtime.
+ */
+export async function ensureFfmpeg({ onProgress } = {}) {  /* eslint-disable-line no-unused-vars */
+  if (_cached) return _cached;
+
+  // 1. Env-var override (Flutter bundle). Only respected when it
+  //    points at a real file — a bare "ffmpeg" string (the dart-side
+  //    BundledBinaries fallback when no bundled binary is found) is
+  //    rejected so we still hit the npm dep below.
+  const envFf = process.env.KOI_FFMPEG_PATH;
+  const envFp = process.env.KOI_FFPROBE_PATH;
+  const envFfOk = envFf && fs.existsSync(envFf) && _looksRunnable(envFf);
+  const envFpOk = envFp && fs.existsSync(envFp) && _looksRunnable(envFp);
+  if (envFfOk && envFpOk) {
+    _cached = { ffmpeg: envFf, ffprobe: envFp };
     return _cached;
   }
 
-  // 2. Fresh install — fetch a fresh static build into the cache.
-  //    Tried BEFORE PATH so a one-time download per machine replaces
-  //    whatever ffmpeg the host happens to have. Done in a dedupe
-  //    promise so concurrent callers share a single download.
-  _installing = (async () => {
-    onProgress?.(0, 'Resolving ffmpeg download…');
-    fs.mkdirSync(cacheDir, { recursive: true });
-    try {
-      await _installForCurrentPlatform(cacheDir, onProgress);
-      if (_looksRunnable(cacheFf) && _looksRunnable(cacheFp)) {
-        _cached = { ffmpeg: cacheFf, ffprobe: cacheFp };
-        _installing = null;
-        return _cached;
-      }
-    } catch (err) {
-      // Don't throw yet — fall through to PATH as a last resort so an
-      // offline / proxy'd machine still has SOMETHING to run.
-      console.warn(`[ffmpeg-installer] Controlled-binary install failed: ${err.message}`);
-    }
-
-    // 3. PATH lookup — last-resort fallback. Logs a warning because
-    //    versions vary across hosts and we've been bitten by that
-    //    (see header comment).
-    const pathFf = _which(`ffmpeg${_exe}`);
-    const pathFp = _which(`ffprobe${_exe}`);
-    if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
-      console.warn(
-        `[ffmpeg-installer] Using system ffmpeg from PATH (${pathFf}) — ` +
-        `controlled binary unavailable. Behaviour may differ from other installs; ` +
-        `delete the cache and rerun online to install the bundled build.`,
-      );
-      _cached = { ffmpeg: pathFf, ffprobe: pathFp };
-      _installing = null;
-      return _cached;
-    }
-
-    _installing = null;
-    throw new Error('ffmpeg unavailable — controlled-binary install failed and no system ffmpeg on PATH.');
-  })();
-  return _installing;
-}
-
-// ── Platform-specific install logic ──────────────────────────────────
-
-async function _installForCurrentPlatform(cacheDir, onProgress) {
-  const platform = process.platform;
-  const arch = process.arch;
-  if (platform === 'darwin') return _installMac(cacheDir, onProgress);
-  if (platform === 'linux') return _installLinux(cacheDir, arch, onProgress);
-  if (platform === 'win32') return _installWindows(cacheDir, onProgress);
-  throw new Error(`Unsupported platform: ${platform}/${arch}`);
-}
-
-async function _installMac(cacheDir, onProgress) {
-  // evermeet.cx serves universal (x64+arm64) static builds, one binary
-  // per tool, downloaded as zip.
-  await _downloadAndExtractZip(
-    'https://evermeet.cx/ffmpeg/getrelease/zip',
-    cacheDir,
-    'ffmpeg',
-    onProgress,
-    0.0, 0.5,
-  );
-  await _downloadAndExtractZip(
-    'https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip',
-    cacheDir,
-    'ffprobe',
-    onProgress,
-    0.5, 1.0,
-  );
-  fs.chmodSync(path.join(cacheDir, 'ffmpeg'), 0o755);
-  fs.chmodSync(path.join(cacheDir, 'ffprobe'), 0o755);
-}
-
-async function _installLinux(cacheDir, arch, onProgress) {
-  // johnvansickle.com hosts static gpl builds for amd64 and arm64.
-  const slug = arch === 'arm64' ? 'arm64' : (arch === 'arm' ? 'armhf' : 'amd64');
-  const url = `https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${slug}-static.tar.xz`;
-  const tmpFile = path.join(cacheDir, `ffmpeg-${slug}.tar.xz`);
-  await _downloadFile(url, tmpFile, onProgress, 0.0, 0.7);
-  onProgress?.(0.75, 'Extracting…');
-  // Use system tar — universally present on Linux distros.
-  const r = spawnSync('tar', ['-xJf', tmpFile, '-C', cacheDir], { stdio: 'inherit' });
-  if (r.status !== 0) throw new Error('tar extraction failed');
-  // Move the two binaries up out of the versioned subdir, drop the rest.
-  const subdirs = fs.readdirSync(cacheDir).filter((n) =>
-    n.startsWith('ffmpeg-') && fs.statSync(path.join(cacheDir, n)).isDirectory());
-  if (subdirs.length === 0) throw new Error('ffmpeg archive layout unexpected');
-  const subdir = path.join(cacheDir, subdirs[0]);
-  fs.renameSync(path.join(subdir, 'ffmpeg'), path.join(cacheDir, 'ffmpeg'));
-  fs.renameSync(path.join(subdir, 'ffprobe'), path.join(cacheDir, 'ffprobe'));
-  fs.rmSync(subdir, { recursive: true, force: true });
-  fs.unlinkSync(tmpFile);
-  fs.chmodSync(path.join(cacheDir, 'ffmpeg'), 0o755);
-  fs.chmodSync(path.join(cacheDir, 'ffprobe'), 0o755);
-  onProgress?.(1.0, 'Installed');
-}
-
-async function _installWindows(cacheDir, onProgress) {
-  // gyan.dev's "release essentials" zip contains ffmpeg.exe + ffprobe.exe
-  // (essentials drops ffplay and a few rarely-used codecs — half the
-  // size of the full build, all we need for our pipeline).
-  const url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip';
-  const tmpFile = path.join(cacheDir, 'ffmpeg-windows.zip');
-  await _downloadFile(url, tmpFile, onProgress, 0.0, 0.7);
-  onProgress?.(0.75, 'Extracting…');
-  await _extractZipNative(tmpFile, cacheDir);
-  // The zip extracts to ffmpeg-N.N.N-essentials_build/bin/{ffmpeg,ffprobe}.exe.
-  const subdirs = fs.readdirSync(cacheDir).filter((n) =>
-    n.startsWith('ffmpeg-') && fs.statSync(path.join(cacheDir, n)).isDirectory());
-  if (subdirs.length === 0) throw new Error('ffmpeg archive layout unexpected');
-  const subdir = path.join(cacheDir, subdirs[0]);
-  const binDir = path.join(subdir, 'bin');
-  fs.renameSync(path.join(binDir, 'ffmpeg.exe'), path.join(cacheDir, 'ffmpeg.exe'));
-  fs.renameSync(path.join(binDir, 'ffprobe.exe'), path.join(cacheDir, 'ffprobe.exe'));
-  fs.rmSync(subdir, { recursive: true, force: true });
-  fs.unlinkSync(tmpFile);
-  onProgress?.(1.0, 'Installed');
-}
-
-// ── Download / extraction helpers ────────────────────────────────────
-
-async function _downloadFile(url, dest, onProgress, fromPct = 0, toPct = 1) {
-  // Follow redirects (evermeet, johnvansickle, gyan all 302 to mirrors).
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} downloading ${url}`);
-  const total = Number(res.headers.get('content-length')) || 0;
-  let received = 0;
-  const out = fs.createWriteStream(dest);
-  const reader = Readable.fromWeb(res.body);
-  reader.on('data', (chunk) => {
-    received += chunk.length;
-    if (total && onProgress) {
-      const local = received / total;
-      onProgress(fromPct + (toPct - fromPct) * local,
-        `Downloading ffmpeg ${(received / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`);
-    }
-  });
-  await pipeline(reader, out);
-}
-
-async function _downloadAndExtractZip(url, cacheDir, expectedName, onProgress, fromPct, toPct) {
-  const tmp = path.join(cacheDir, `${expectedName}.zip`);
-  await _downloadFile(url, tmp, onProgress, fromPct, fromPct + (toPct - fromPct) * 0.7);
-  onProgress?.(fromPct + (toPct - fromPct) * 0.8, `Extracting ${expectedName}…`);
-  await _extractZipNative(tmp, cacheDir);
-  fs.unlinkSync(tmp);
-}
-
-async function _extractZipNative(zipPath, destDir) {
-  // Prefer system unzip (everywhere except minimal Windows containers).
-  // Fallback to PowerShell Expand-Archive on Windows.
-  if (_isWin) {
-    return new Promise((resolve, reject) => {
-      const ps = spawn(
-        'powershell.exe',
-        ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${destDir}' -Force`],
-        { stdio: 'inherit' },
-      );
-      ps.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`Expand-Archive exited ${code}`)));
-      ps.on('error', reject);
-    });
+  // 2. Controlled binary from the pinned npm deps. This is the
+  //    canonical path. Either side may fall back to the env-var
+  //    value when only one of the two is set.
+  const npmFf = await _ffmpegStaticPath();
+  const npmFp = await _ffprobeInstallerPath();
+  const ff = envFfOk ? envFf : (_looksRunnable(npmFf) ? npmFf : null);
+  const fp = envFpOk ? envFp : (_looksRunnable(npmFp) ? npmFp : null);
+  if (ff && fp) {
+    _cached = { ffmpeg: ff, ffprobe: fp };
+    return _cached;
   }
-  return new Promise((resolve, reject) => {
-    const cp = spawn('unzip', ['-oq', zipPath, '-d', destDir], { stdio: 'inherit' });
-    cp.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`unzip exited ${code}`)));
-    cp.on('error', reject);
-  });
+
+  // 3. PATH fallback — only here because a corrupted or missing
+  //    node_modules shouldn't brick every media tool entirely.
+  //    Logged so we know we're outside the supported path.
+  const pathFf = ff || _which(`ffmpeg${_exe}`);
+  const pathFp = fp || _which(`ffprobe${_exe}`);
+  if (_looksRunnable(pathFf) && _looksRunnable(pathFp)) {
+    console.warn(
+      `[ffmpeg-installer] Using system ffmpeg from PATH (${pathFf}, ${pathFp}). ` +
+      `The pinned npm binary (ffmpeg-static / @ffprobe-installer/ffprobe) was not ` +
+      `found in node_modules — re-run \`npm install\` to restore the controlled version. ` +
+      `Host-installed ffmpegs vary across machines and have caused non-reproducible failures.`,
+    );
+    _cached = { ffmpeg: pathFf, ffprobe: pathFp };
+    return _cached;
+  }
+
+  throw new Error(
+    'ffmpeg / ffprobe unavailable. Run `npm install` to fetch the pinned binaries ' +
+    '(ffmpeg-static + @ffprobe-installer/ffprobe), or set KOI_FFMPEG_PATH / ' +
+    'KOI_FFPROBE_PATH to absolute paths of existing binaries.',
+  );
 }
