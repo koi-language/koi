@@ -2118,6 +2118,7 @@ export class Agent {
                 });
               }
               session.consecutiveErrors = 0;
+              if (session._gateway401Providers) session._gateway401Providers.clear();
               channel.log('agent', `${this.name}: Auth refreshed — retrying`);
               continue;
             }

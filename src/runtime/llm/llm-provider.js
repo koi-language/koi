@@ -2273,23 +2273,33 @@ CRITICAL RULES:
         if (_status === 429) {
           markProviderTimeout(this.provider);
         }
-        // 401 in gateway mode = token expired/invalid — signal for re-auth.
-        // The OpenAI provider wraps 401s into a ProviderBlockedError(blockType:'auth')
-        // before they leave streamReactive, so `_status` is undefined for the
-        // OpenAI-compat path. We also peek at `httpStatus` preserved on the
-        // wrapped error — otherwise the agent treats the auth failure as a
-        // "refused provider" and cycles through every model behind the same
-        // JWT, all returning 401.
+        // 401 in gateway mode — could mean either:
+        //   (a) The session JWT is dead → we want a re-login.
+        //   (b) The gateway's API key for THIS specific upstream provider is
+        //       missing/dead, but the JWT itself is fine → we just want to
+        //       exclude this provider for the session and retry with another.
         //
-        // CRITICAL: only 401 means "session JWT is dead". 403 (also classified
-        // as 'auth' upstream) means "this model/account isn't allowed" — that
-        // should NOT log the user out, just exclude the provider for this
-        // session. Same for `invalid_api_key` without a status.
+        // We can't tell apart from a single 401, so we use the "≥ 2 distinct
+        // providers failed" heuristic: in gateway mode every provider shares
+        // the same JWT, so if two different providers both 401, the JWT is
+        // the common factor. A single 401 falls through to the existing
+        // exclusion path (line ~2329), which removes only that provider from
+        // the candidate list — preserving the pre-fix behaviour where a
+        // transient per-upstream 401 was silently routed around.
+        //
+        // The OpenAI-compat path wraps 401s into a ProviderBlockedError with
+        // no `.status`, so we also check `httpStatus` preserved on the wrap.
         const _blockedStatus = _callErr?.name === 'ProviderBlockedError' ? _callErr.httpStatus : undefined;
         const _is401 = _status === 401 || _blockedStatus === 401;
         if (_is401 && this._gatewayMode) {
-          const _s = globalThis.__koiStrings || {};
-          throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
+          if (!session._gateway401Providers) session._gateway401Providers = new Set();
+          session._gateway401Providers.add(this.provider);
+          if (session._gateway401Providers.size >= 2) {
+            const _s = globalThis.__koiStrings || {};
+            channel.log('llm', `[auto] AUTH_EXPIRED — ${session._gateway401Providers.size} distinct providers returned 401 (${[...session._gateway401Providers].join(', ')}); JWT is dead`);
+            throw new Error('AUTH_EXPIRED: ' + (_s.authExpired || 'Your session has expired. Please restart and log in again.'));
+          }
+          channel.log('llm', `[auto] 401 from ${this.provider} — excluding provider, retrying with sibling (JWT may still be valid)`);
         }
         // 413 = payload too large — drop pending images and retry
         // (don't exclude provider). Two flavours:
@@ -2350,8 +2360,11 @@ CRITICAL RULES:
     const _effectiveModel    = session._autoModel    || this.model;
     const _effectiveProvider = session._autoProvider || this.provider;
 
-    // Successful call — reset circuit breaker for this provider
+    // Successful call — reset circuit breaker for this provider and clear
+    // any prior 401-from-gateway tracking. A successful call proves the JWT
+    // is alive; previous 401s were upstream-key issues, not session expiry.
     if (this._autoMode) clearProviderCooldown(_effectiveProvider);
+    if (session._gateway401Providers) session._gateway401Providers.clear();
 
     // Include thinking tokens in cost tracking.
     // _thinkingTokens is our streaming estimate. Set usage.thinking so it's added to cost.
