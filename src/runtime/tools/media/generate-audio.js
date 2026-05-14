@@ -204,6 +204,20 @@ const generateAudioAction = {
         };
       }
 
+      // Guard: when a reference video is provided, the agent MUST have
+      // visually inspected it (via read_file) before getting here, so the
+      // prompt is grounded in what's on-screen rather than a guess from
+      // the filename. Applies regardless of whether the selected audio
+      // model is video-conditioned — the text-only fallback never sees
+      // frames, and even mmaudio-v2 needs a specific prompt to know
+      // which sounds to emphasise. See _require-video-seen.js for the
+      // full rationale.
+      if (action.videoFile) {
+        const { requireVideoSeen } = await import('../_require-video-seen.js');
+        const _videoGuard = requireVideoSeen('generate_audio', action.videoFile, agent);
+        if (_videoGuard) return _videoGuard;
+      }
+
       // Upload reference video FIRST. Threading the resulting URL into the
       // router (`hasVideoRef: true`) is what steers the picker to a video-
       // conditioned model (e.g. mmaudio-v2) instead of a text-only one.
