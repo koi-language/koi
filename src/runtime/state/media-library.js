@@ -653,6 +653,49 @@ export class MediaLibrary {
     return true;
   }
 
+  /** Replace a row's description text. Used by the vision-describe
+   *  auto-pipeline (saveGeneratedImage fires it after save) so the
+   *  rich AI-authored caption replaces the bare prompt that was
+   *  stamped at save time. Caller is expected to re-embed and call
+   *  [setEmbedding] separately so the search index stays in sync. */
+  async setDescription(id, description) {
+    const table = await this._ensureTable();
+    const escId = String(id).replace(/'/g, "''");
+    const escDesc = String(description ?? '').replace(/'/g, "''");
+    await table.update({
+      values: { description: escDesc },
+      where: `id = '${escId}'`,
+    });
+    return true;
+  }
+
+  /** Read a single row's metadata_json blob — used by the
+   *  auto-describe helper to mark `autoDescribed: true` so the next
+   *  save() call doesn't re-run the vision describe on the same row. */
+  async getMetadata(id) {
+    const table = await this._ensureTable();
+    const escId = String(id).replace(/'/g, "''");
+    const rows = await table.query().where(`id = '${escId}'`).limit(1).toArray();
+    if (rows.length === 0) return null;
+    const raw = rows[0].metadata_json;
+    if (!raw) return {};
+    try { return JSON.parse(raw); } catch { return {}; }
+  }
+
+  /** Set the entire `metadata_json` blob on a row. Used by the auto-
+   *  describe helper to flip the `autoDescribed` flag on after a
+   *  successful vision call so reruns short-circuit. */
+  async setMetadata(id, metadata) {
+    const table = await this._ensureTable();
+    const escId = String(id).replace(/'/g, "''");
+    const blob = JSON.stringify(metadata || {}).replace(/'/g, "''");
+    await table.update({
+      values: { metadata_json: blob },
+      where: `id = '${escId}'`,
+    });
+    return true;
+  }
+
   /** Set the `visible` flag on a row. False hides the item from the
    *  drawer / cajón AND from `list()` results (the GUI relies on
    *  list() being the visible-only view; hard-deletion would lose the
@@ -1187,18 +1230,34 @@ export async function saveGeneratedImage(filePath, generationParams, llmProvider
 
   if (llmProvider) {
     try {
-      embedding = await llmProvider.embedText(description);
+      embedding = await llmProvider.getEmbedding(description);
     } catch {
       // Embedding failed — save without it (can be added later)
     }
   }
 
-  return lib.save({
+  const saved = await lib.save({
     filePath,
     metadata: { ...generationParams, source: 'generated' },
     description,
     embedding,
   });
+
+  // Fire-and-forget vision-describe enrichment for image rows. The
+  // prompt-only embedding above is enough for "prompt-text"-style
+  // searches; vision-describe adds a paragraph of what the model
+  // ACTUALLY drew (composition, colours, mood…) so a query like
+  // "dinosaur in a city" hits an image whose prompt was just "T-Rex
+  // in NY". We don't await — the save returns immediately and the
+  // search index improves asynchronously. Skipped for non-images
+  // here: the alias `saveGeneratedVideo` calls this same function,
+  // but autoDescribeImage detects non-image extensions and exits.
+  if (llmProvider && saved?.id) {
+    autoDescribeImage(saved.id, filePath, description, llmProvider)
+      .catch(() => { /* best-effort; failures are logged inside */ });
+  }
+
+  return saved;
 }
 
 /**
@@ -1248,7 +1307,7 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider) {
     `Tracks: ${timeline?.settings?.videoTracks ?? 0} video / ${timeline?.settings?.audioTracks ?? 0} audio.`;
   let embedding = null;
   if (llmProvider) {
-    try { embedding = await llmProvider.embedText(description); } catch { /* tolerate */ }
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
   }
   const metadata = {
     source: 'timeline',
@@ -1289,7 +1348,7 @@ export async function saveVoiceEntry(filePath, voice, llmProvider) {
     (voice?.description ? voice.description : '');
   let embedding = null;
   if (llmProvider) {
-    try { embedding = await llmProvider.embedText(description); } catch { /* tolerate */ }
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
   }
   const metadata = {
     source: 'voice',
@@ -1309,4 +1368,138 @@ export async function saveVoiceEntry(filePath, voice, llmProvider) {
     embedding,
     replaceByPath: true,
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Vision-describe auto-pipeline
+// ─────────────────────────────────────────────────────────────────────
+//
+// When an image row lands in the library, the search index it produces
+// is only as rich as the prompt the user wrote. A prompt like
+// "T-Rex in NY" embeds well for "T-Rex" / "NY" hits but never for
+// "dinosaur in a city" or "kaiju attack". The auto-describe pipeline
+// asks a vision-capable LLM (model picked by the factory — no
+// hardcoded slug, honours the user's `requiresImage: true` capability
+// filter) to caption the rendered output, then UPDATES the row's
+// description + embedding so the semantic search sees both signals.
+//
+// The pipeline is fire-and-forget: failures here MUST NOT break the
+// save flow (the user's image already exists on disk and in the
+// library; a missing caption is a search-quality regression, not a
+// data-loss one). Idempotent via the `autoDescribed` flag stamped
+// into metadata_json after a successful run.
+
+/** Compose the final description stored alongside an image: prompt
+ *  first (preserves the user's intent + any negative prompt syntax),
+ *  then the vision caption on its own line. Both signals end up in
+ *  the embedding so a search hits either authored or generated
+ *  vocabulary. */
+function _composeAutoDescription(prompt, visionCaption) {
+  const cleanPrompt = (prompt || '').trim();
+  const cleanCaption = (visionCaption || '').trim();
+  if (!cleanCaption) return cleanPrompt;
+  if (!cleanPrompt) return cleanCaption;
+  return `${cleanPrompt}\n\n${cleanCaption}`;
+}
+
+/** True iff [filePath] looks like an image we can hand to a vision
+ *  model. Conservative — videos go through a frame-extraction path
+ *  that doesn't exist yet, and audio/timeline have nothing visual to
+ *  describe. */
+function _isVisionDescribable(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return ext === '.png' || ext === '.jpg' || ext === '.jpeg' ||
+         ext === '.webp' || ext === '.gif';
+}
+
+export async function autoDescribeImage(rowId, filePath, prompt, llmProvider) {
+  if (!rowId || !filePath || !llmProvider) return null;
+  if (!_isVisionDescribable(filePath)) return null;
+  if (!fs.existsSync(filePath)) return null;
+
+  const lib = MediaLibrary.global();
+
+  // Idempotency: skip if a previous auto-describe pass already ran on
+  // this row. The save() path can land the same content_hash twice
+  // (e.g. an image re-saved as a reference); without the flag we'd
+  // pay the vision call again and overwrite a possibly-edited
+  // description.
+  let meta = {};
+  try { meta = await lib.getMetadata(rowId) ?? {}; } catch { meta = {}; }
+  if (meta.autoDescribed === true) return null;
+
+  // Resolve a vision-capable model via the factory. `speed` task type
+  // + low difficulty steers the router to the cheapest tier (the
+  // auto-model-selector filters anything without `inputImage: true`,
+  // so we never accidentally pick a text-only model). The factory
+  // throws `NO_MODELS` when no vision-capable provider is configured
+  // — we tolerate that and just skip the enrichment.
+  let resolved;
+  try {
+    resolved = llmProvider._resolveModel('speed', 30, { requiresImage: true });
+  } catch (err) {
+    // No vision model available — keep the prompt-based description.
+    return null;
+  }
+  const visionInstance = resolved?.instance;
+  const visionProvider = resolved?.provider;
+  if (!visionInstance || !visionProvider) return null;
+
+  // Build a multimodal message. resolveAttachments() rewrites the
+  // `attachments` field into the provider's expected image-block
+  // shape (Anthropic `{type:'image', source:{...}}` vs OpenAI
+  // `{type:'image_url', image_url:{...}}`) so we don't have to
+  // branch by provider here.
+  const messages = [{
+    role: 'user',
+    content:
+      'Describe this image concisely in 1–2 sentences for semantic ' +
+      'search. Focus on subject, setting, mood, and notable visual ' +
+      'elements. Do not mention model names, file extensions, or the ' +
+      'fact that the image was generated.',
+    attachments: [{ type: 'image', path: filePath }],
+  }];
+
+  let captionText = '';
+  try {
+    const { resolveAttachments } = await import('../llm/message-builder.js');
+    await resolveAttachments(messages, visionProvider);
+    const out = await visionInstance.complete(messages, {
+      temperature: 0.1,
+      maxTokens: 180,
+      timeoutMs: 20000,
+    });
+    captionText = (out?.text || '').toString().trim();
+  } catch (err) {
+    // Provider rejected the call (rate limit, model timeout, malformed
+    // input…) — leave the prompt-only description in place.
+    return null;
+  }
+  if (!captionText) return null;
+
+  const combined = _composeAutoDescription(prompt, captionText);
+
+  // Re-embed the combined description so the search index reflects
+  // both the user's intent and the model's caption. If the embedding
+  // call fails we still update the text — at worst the row's vector
+  // stays the prompt-only one, which is what we had before this
+  // pipeline ran.
+  let newEmbedding = null;
+  try {
+    newEmbedding = await llmProvider.getEmbedding(combined);
+  } catch { /* tolerate */ }
+
+  try {
+    await lib.setDescription(rowId, combined);
+    if (Array.isArray(newEmbedding) && newEmbedding.length > 0) {
+      await lib.setEmbedding(rowId, newEmbedding);
+    }
+    await lib.setMetadata(rowId, { ...meta, autoDescribed: true });
+  } catch {
+    // Persistence failed — surface a noop. The original prompt-based
+    // row stays intact; the auto-describe pass will retry next time
+    // saveGeneratedImage() lands the same content.
+    return null;
+  }
+  return combined;
 }
