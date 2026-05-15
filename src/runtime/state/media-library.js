@@ -1280,6 +1280,24 @@ export async function saveGeneratedVideo(filePath, generationParams, llmProvider
 }
 
 /**
+ * Save a generated audio file (speech / sfx / music) to the media library.
+ *
+ * Thin alias over [saveGeneratedImage] — `MediaLibrary.save()` resolves the
+ * row's `media_type` from the file extension (`.mp3`, `.wav`, `.ogg`, `.m4a`,
+ * `.flac`) via `detectMediaType()`, so the row gets `media_type: 'audio'`
+ * automatically and the GUI's "creaciones" drawer picks it up.
+ *
+ * @param {string} filePath - Path to generated audio on disk.
+ * @param {Object} generationParams - All parameters used for generation
+ *   (mode, prompt/text, model, provider, voice, durationSeconds, …).
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider] - For
+ *   description embedding.
+ */
+export async function saveGeneratedAudio(filePath, generationParams, llmProvider) {
+  return saveGeneratedImage(filePath, generationParams, llmProvider);
+}
+
+/**
  * Save (or upsert) a TIMELINE entry — `~/.koi/timelines/<id>.json`.
  * Unlike images / videos, the file CONTENT changes over time at a
  * stable path, so this uses replace-by-path semantics: the row gets

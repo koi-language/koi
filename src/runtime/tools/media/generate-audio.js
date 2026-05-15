@@ -188,6 +188,30 @@ const generateAudioAction = {
 
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
+      try {
+        const { saveGeneratedAudio } = await import('../../state/media-library.js');
+        await saveGeneratedAudio(savePath, {
+          mode: 'speech',
+          text,
+          prompt: text,
+          voice,
+          outputFormat: result.format || outputFormat,
+          speed,
+          ...(action.language ? { language: action.language } : {}),
+          ...(action.emotion ? { emotion: action.emotion } : {}),
+          ...(typeof action.pitch === 'number' ? { pitch: action.pitch } : {}),
+          ...(typeof action.volume === 'number' ? { volume: action.volume } : {}),
+          provider: resolved.provider,
+          model: result?.model || resolved.model,
+          fileSize: result.audio.length,
+          ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
+          ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+        }, agent?.llmProvider || null);
+        channel.log('audio', `Saved to media library: ${savePath}`);
+      } catch (mlErr) {
+        channel.log('audio', `Media library save failed (non-fatal): ${mlErr.message}`);
+      }
+
       return {
         success: true,
         provider: resolved.provider,
@@ -270,6 +294,29 @@ const generateAudioAction = {
       fs.writeFileSync(savePath, result.audio);
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
+      try {
+        const { saveGeneratedAudio } = await import('../../state/media-library.js');
+        await saveGeneratedAudio(savePath, {
+          mode: 'sfx',
+          prompt,
+          outputFormat: result.format || outputFormat,
+          ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
+          ...(typeof action.promptInfluence === 'number' ? { promptInfluence: action.promptInfluence } : {}),
+          ...(typeof action.loop === 'boolean' ? { loop: action.loop } : {}),
+          ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
+          ...(action.videoFile ? { videoFile: action.videoFile } : {}),
+          ...(videoUrl ? { videoConditioned: true } : {}),
+          provider: resolved.provider,
+          model: result?.model || resolved.model,
+          fileSize: result.audio.length,
+          ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
+          ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+        }, agent?.llmProvider || null);
+        channel.log('audio', `Saved to media library: ${savePath}`);
+      } catch (mlErr) {
+        channel.log('audio', `Media library save failed (non-fatal): ${mlErr.message}`);
+      }
+
       return {
         success: true,
         provider: resolved.provider,
@@ -319,6 +366,25 @@ const generateAudioAction = {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(savePath, result.audio);
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
+
+      try {
+        const { saveGeneratedAudio } = await import('../../state/media-library.js');
+        await saveGeneratedAudio(savePath, {
+          mode: 'music',
+          prompt,
+          outputFormat: result.format || outputFormat,
+          ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
+          ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),
+          provider: resolved.provider,
+          model: result?.model || resolved.model,
+          fileSize: result.audio.length,
+          ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
+          ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+        }, agent?.llmProvider || null);
+        channel.log('audio', `Saved to media library: ${savePath}`);
+      } catch (mlErr) {
+        channel.log('audio', `Media library save failed (non-fatal): ${mlErr.message}`);
+      }
 
       return {
         success: true,
