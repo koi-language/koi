@@ -474,10 +474,37 @@ export function classifyFeedback(action, result, error) {
     default: {
       // Delegate action: surface the result clearly so the parent agent can answer the user
       if (action.actionType === 'delegate') {
-        const delegateResult = result?.output ?? result?.summary ?? result?.result ?? result;
-        const delegateStr = typeof delegateResult === 'string'
-          ? delegateResult
-          : JSON.stringify(delegateResult);
+        // Surface the delegate's FULL return value, not just a "headline"
+        // field. The previous version did `result.output ?? result.summary
+        // ?? result.result ?? result` and stopped at the first match — so
+        // a worker returning `{ success: true, summary: "...",
+        // finalImage: "/path.png" }` gave the caller only the summary
+        // string. The calling agent had no idea where the new asset
+        // lived; when asked to `show_result` it fell back to the WORKING
+        // AREA path (i.e. the image the user was already looking at,
+        // often from a prior session). User-visible symptom: "system
+        // muestra una imagen histórica de otra sesión que no tiene nada
+        // que ver".
+        //
+        // Each delegate decides its own return shape (finalImage,
+        // intermediateLogo, files, urls, metrics, …); the caller can't
+        // know which keys matter. Just pretty-print the whole object so
+        // every field is visible — the LLM parses JSON fine and this
+        // is a few hundred extra bytes at most per delegate return.
+        let delegateStr;
+        if (typeof result === 'string') {
+          delegateStr = result;
+        } else if (result == null) {
+          delegateStr = '(no result)';
+        } else if (typeof result === 'object') {
+          try {
+            delegateStr = JSON.stringify(result, null, 2);
+          } catch {
+            delegateStr = String(result);
+          }
+        } else {
+          delegateStr = String(result);
+        }
         // After a delegate returns, remind the LLM of ALL unfinished tasks.
         // Check BOTH in_progress (need to be marked completed) AND pending (need to be started).
         let taskReminder = '';

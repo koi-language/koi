@@ -488,11 +488,20 @@ export async function padImageBuffer(buffer, geometry, sourceMime) {
       bottom: paddedH - contentH - padY,
       left: padX,
       right: paddedW - contentW - padX,
-      // Transparent borders. PNG alpha preserves the discontinuity;
-      // the model can still see the content uniformly surrounded by
-      // "empty" canvas. Provider-side this is read as "edit only the
-      // visible region" without leaking colour into the borders.
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
+      // Solid WHITE borders. Originally this was transparent
+      // (`alpha: 0`) on the theory that PNG alpha would let the
+      // provider read "empty canvas" without leaking colour into the
+      // borders. In practice the larger edit models (gpt-image-2/edit
+      // and friends) DON'T respect alpha at submit time — they trim
+      // or re-process the input and end up reporting an aspect ratio
+      // outside the envelope we sent (642×214 padded → "2000:656" on
+      // the server side, ratio 3.05 → rejected with "exceeds 3:1").
+      // Solid pixels can't be trimmed, so the padded envelope is
+      // honoured bit-for-bit and the recovery crop afterwards
+      // restores the original content rect. White is the safest
+      // neutral for logo-on-light-background flows; the post-crop
+      // discards these pixels anyway.
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
     })
     .png()
     .toBuffer();

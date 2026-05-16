@@ -215,6 +215,20 @@ function _pickByBucket(kind, models, req, wantedBucket) {
     );
   }
   _rankSort(eligible, req);
+  // Log the decision so future "why did the picker land here?" debug
+  // doesn't require reconstructing the catalog state from memory. Each
+  // line includes the bucket, the winning slug, and the ranked
+  // competitors with their (labelRank, fallbackRank, priceRank) tuples.
+  try {
+    const winner = eligible[0].slug;
+    const competitors = eligible.slice(0, 5).map((m) => {
+      const labels = _labelSlugs(m);
+      const labelTag = labels.length > 0 ? `[${labels.join(',')}]` : '[-]';
+      const fb = m.isFallback ? ' fb' : '';
+      return `${m.slug}${labelTag}@${m.pricePerUnit ?? '?'}${fb}`;
+    }).join(' > ');
+    channel.log('media-router', `${kind}/${wantedBucket}${wantLabel ? `:${wantLabel}` : ''} → ${winner}  (ranked: ${competitors}${eligible.length > 5 ? ` +${eligible.length - 5} more` : ''})`);
+  } catch { /* logging is best-effort */ }
   return eligible[0].slug;
 }
 
@@ -279,10 +293,11 @@ export function pickImageModel(models, req = {}) {
     refsCount > 0 ? 'image_editing' :
     'image_generation';
 
-  // Shape filter: drop slugs whose `requires` declares mandatory inputs
-  // the request lacks, OR whose declaration doesn't cover an input the
-  // request carries (so the agent's data isn't silently ignored). Same
-  // contract as the video router — see [_filterByRequires].
+  // Shape filter: drop slugs whose `requires` lists a canonical input
+  // the request doesn't carry. Optional/soft inputs aren't tracked —
+  // the adapter handles them. The presence map enumerates every
+  // canonical input a per-slug `requires` *might* name (see
+  // backend/src/modules/gateway/adapters/_shared.ts::ImageRequired).
   const presence = {
     referenceImages: refsCount > 0,
     maskImage: !!req.hasMaskImage,
@@ -303,17 +318,15 @@ export function pickImageModel(models, req = {}) {
 
 /** Apply the declarative `requires` filter to a candidate pool.
  *
- *  Each model's `requires` map (populated server-side from its per-slug
- *  adapter) declares EVERY shape-distinguishing input the adapter
- *  understands:
- *    • `'required'` — input MUST be present on the request.
- *    • `'optional'` — input MAY be present; no filtering effect.
- *    • missing key  — input is FORBIDDEN; if the request DOES carry it,
- *                     this model is excluded.
+ *  Each model's `requires` is a STRING ARRAY listing only the canonical
+ *  inputs the adapter cannot work without. Optional inputs aren't
+ *  tracked — the adapter forwards them when supported and silently
+ *  ignores them when not. The router's only job is to drop slugs that
+ *  would 4xx or throw for lack of a mandatory input.
  *
- *  `presence` is a `{ inputName: true|false }` snapshot of which inputs
- *  the caller actually wired into the canonical request. Models whose
- *  `requires` is `null` / `undefined` (legacy / no registered adapter)
+ *  `presence` is a `{ inputName: true|false }` snapshot of which
+ *  canonical inputs the caller wired into the request. Models whose
+ *  `requires` is `null` / `undefined` (legacy or no registered adapter)
  *  always pass — the per-slug adapter will reject at execution time.
  */
 function _filterByRequires(models, presence) {
@@ -321,15 +334,9 @@ function _filterByRequires(models, presence) {
   return models.filter((m) => {
     const req = m?.requires;
     if (req == null) return true; // legacy: trust the adapter
-    // Rule 1: every required input must be present.
-    for (const key of Object.keys(req)) {
-      if (req[key] === 'required' && !presence[key]) return false;
-    }
-    // Rule 2: every present input must be at least 'optional' on this model.
-    for (const key of Object.keys(presence)) {
-      if (!presence[key]) continue;
-      const support = req[key];
-      if (support !== 'required' && support !== 'optional') return false;
+    if (!Array.isArray(req)) return true; // unknown shape: don't gate on it
+    for (const key of req) {
+      if (!presence[key]) return false;
     }
     return true;
   });
@@ -406,21 +413,13 @@ export function pickAudioModel(models, req = {}) {
     kind === 'sfx' ? 'audio_sfx' :
     'audio_tts';
 
-  // Shape filter — mirrors the image/video routers. AudioRequires keys:
-  // videoUrl (video-conditioned SFX), voice / language / emotion / pitch /
-  // volume / speed (TTS knobs), instrumental (music), loop (looping SFX).
-  // A request carrying `videoUrl` only matches an adapter whose requires
-  // lists it; pure text-to-sfx slugs (mmaudio-v2) are excluded.
+  // Shape filter — mirrors image/video. Only canonical inputs that some
+  // audio adapter lists as required need to appear here. Today only
+  // `videoUrl` qualifies (controlfoley REQUIRES a source video — without
+  // it it has nothing to score). Optional knobs (voice, language, pitch,
+  // volume, etc.) are handled by each adapter directly.
   const presence = {
     videoUrl: !!req.hasVideoUrl,
-    voice: !!req.hasVoice,
-    language: !!req.hasLanguage,
-    emotion: !!req.hasEmotion,
-    pitch: typeof req.pitch === 'number',
-    volume: typeof req.volume === 'number',
-    speed: typeof req.speed === 'number',
-    instrumental: typeof req.instrumental === 'boolean',
-    loop: typeof req.loop === 'boolean',
   };
   const filtered = _filterByRequires(models, presence);
   const pool = filtered.length > 0 ? filtered : models;
