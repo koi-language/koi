@@ -299,7 +299,7 @@ const generateVideoAction = {
         },
       },
       saveTo:          { type: 'string',  description: 'Directory to save the final video file in. Defaults to ~/.koi/videos/ when omitted.' },
-      timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 600000 = 10 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
+      timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
@@ -1553,7 +1553,7 @@ const generateVideoAction = {
 
 // ── Provider polling (collapsed from the old await_video_generation) ─
 const DEFAULT_POLL_INTERVAL_MS = 8000;
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — covers slow providers (Kling, Veo, Sora) on long durations
+const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min — seedance reference-to-video on 15s clips has been observed at ~11 min, Kling / Veo / Sora can run longer on high-res or extended durations
 const MIN_POLL_INTERVAL_MS = 2000;
 const MAX_POLL_INTERVAL_MS = 30000;
 

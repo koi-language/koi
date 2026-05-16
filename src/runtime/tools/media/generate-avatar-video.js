@@ -24,7 +24,7 @@ import { _stashJobMetadata, getJobMetadata, clearJobMetadata, saveVideoFromUrl, 
 import { channel } from '../../io/channel.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 8000;
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 
 const generateAvatarVideoAction = {
   type: 'generate_avatar_video',
@@ -45,7 +45,7 @@ const generateAvatarVideoAction = {
     '  - "seed": integer seed for reproducible output.\n' +
     '  - "saveTo": directory where the finished video is saved. Defaults to ~/.koi/videos/.\n' +
     '  - "label": ranking hint for the model picker.\n' +
-    '  - "timeoutMs" / "pollIntervalMs": tuning knobs for the internal poll loop (defaults: 600000 ms / 8000 ms).\n' +
+    '  - "timeoutMs" / "pollIntervalMs": tuning knobs for the internal poll loop (defaults: 1200000 ms / 8000 ms).\n' +
     '\n' +
     'Returns: { success, savedTo?, url?, error?, provider, model, status }. On failure, `error` carries the verbatim provider message.',
   thinkingHint: 'Generating avatar video',
@@ -60,7 +60,7 @@ const generateAvatarVideoAction = {
       aspectRatio:  { type: 'string', description: 'Aspect ratio: "1:1", "16:9", "9:16" (provider-dependent).' },
       seed:         { type: 'number', description: 'Optional seed for reproducible output.' },
       saveTo:       { type: 'string', description: 'Directory to save the final video. Defaults to ~/.koi/videos/.' },
-      timeoutMs:    { type: 'number', description: 'Max wall-clock to wait for the provider in ms (default 600000 = 10 min).' },
+      timeoutMs:    { type: 'number', description: 'Max wall-clock to wait for the provider in ms (default 1200000 = 20 min).' },
       pollIntervalMs: { type: 'number', description: 'Poll cadence in ms (default 8000, clamped to [2000, 30000]).' },
     },
     required: ['image', 'audioFile'],

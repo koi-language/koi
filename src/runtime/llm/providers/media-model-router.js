@@ -278,23 +278,80 @@ export function pickImageModel(models, req = {}) {
     (intent === 'edit' || intent === 'inpaint') ? 'image_editing' :
     refsCount > 0 ? 'image_editing' :
     'image_generation';
-  return _pickByBucket('image', models, req, wantedBucket);
+
+  // Shape filter: drop slugs whose `requires` declares mandatory inputs
+  // the request lacks, OR whose declaration doesn't cover an input the
+  // request carries (so the agent's data isn't silently ignored). Same
+  // contract as the video router — see [_filterByRequires].
+  const presence = {
+    referenceImages: refsCount > 0,
+    maskImage: !!req.hasMaskImage,
+    sourceImage: !!req.hasSourceImage,
+    targetSize: !!req.hasTargetSize,
+    sourceImageOffset: !!req.hasSourceImageOffset,
+    cameraAngles: !!(req.cameraAngles
+      && (typeof req.cameraAngles.horizontal === 'number'
+          || typeof req.cameraAngles.vertical === 'number'
+          || typeof req.cameraAngles.zoom === 'number')),
+  };
+  const filtered = _filterByRequires(models, presence);
+  const pool = filtered.length > 0 ? filtered : models;
+  return _pickByBucket('image', pool, req, wantedBucket);
 }
 
 // ── Video ───────────────────────────────────────────────────────────────────
 
-/** Map a video request to a Koi `categories[]` bucket.
+/** Apply the declarative `requires` filter to a candidate pool.
+ *
+ *  Each model's `requires` map (populated server-side from its per-slug
+ *  adapter) declares EVERY shape-distinguishing input the adapter
+ *  understands:
+ *    • `'required'` — input MUST be present on the request.
+ *    • `'optional'` — input MAY be present; no filtering effect.
+ *    • missing key  — input is FORBIDDEN; if the request DOES carry it,
+ *                     this model is excluded.
+ *
+ *  `presence` is a `{ inputName: true|false }` snapshot of which inputs
+ *  the caller actually wired into the canonical request. Models whose
+ *  `requires` is `null` / `undefined` (legacy / no registered adapter)
+ *  always pass — the per-slug adapter will reject at execution time.
+ */
+function _filterByRequires(models, presence) {
+  if (!Array.isArray(models) || models.length === 0) return models;
+  return models.filter((m) => {
+    const req = m?.requires;
+    if (req == null) return true; // legacy: trust the adapter
+    // Rule 1: every required input must be present.
+    for (const key of Object.keys(req)) {
+      if (req[key] === 'required' && !presence[key]) return false;
+    }
+    // Rule 2: every present input must be at least 'optional' on this model.
+    for (const key of Object.keys(presence)) {
+      if (!presence[key]) continue;
+      const support = req[key];
+      if (support !== 'required' && support !== 'optional') return false;
+    }
+    return true;
+  });
+}
+
+/** Map a video request to a Koi `categories[]` bucket AND filter the
+ *  candidate pool by declarative input-shape compatibility (per-slug
+ *  `requires` populated from the adapter, see
+ *  `backend/src/modules/gateway/adapters/_shared.ts::VideoRequires`).
+ *
+ *  Bucket selection:
  *   • `kind: 'avatar'`              → video_avatar
  *   • `kind: 'extend'`              → video_extend
  *   • `kind: 'bg-remove' | …`       → video_background_removal
  *   • `videoRefsCount > 0`          → video_editing  (video-to-video)
  *   • else                          → video_generation
  *
- *  Note: `hasStartFrame` and `refsCount` (image references) do NOT
- *  change the bucket — both image-to-video and reference-to-video
- *  models live under `video_generation`. The router does not gate
- *  by input shape; the per-slug adapter rejects payloads it can't
- *  honour at execution time.
+ *  Shape filter: applied INSIDE the chosen bucket. A model whose
+ *  `requires` declares an input as `'required'` is dropped when that
+ *  input is missing from the request; a model whose `requires` doesn't
+ *  list an input the request carries is dropped to avoid silently
+ *  ignoring the user's data. See [_filterByRequires].
  */
 export function pickVideoModel(models, req = {}) {
   const kind = req.kind || '';
@@ -305,7 +362,29 @@ export function pickVideoModel(models, req = {}) {
     (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
     videoRefsCount > 0 ? 'video_editing' :
     'video_generation';
-  return _pickByBucket('video', models, req, wantedBucket);
+
+  if (!Array.isArray(models) || models.length === 0) {
+    return _pickByBucket('video', models, req, wantedBucket);
+  }
+
+  // Build the presence snapshot mirroring the keys of VideoRequires.
+  const presence = {
+    startFrame: !!req.hasStartFrame,
+    endFrame: !!req.hasEndFrame,
+    referenceImages: (req.refsCount || 0) > 0,
+    referenceVideos: (req.videoRefsCount || 0) > 0,
+    imageUrl: !!req.hasImageUrl,
+    audioUrl: !!req.hasAudioUrl,
+    characterOrientation: !!req.characterOrientation,
+  };
+
+  const filtered = _filterByRequires(models, presence);
+  // If the filter empties the pool but candidates existed upstream,
+  // fall back to the unfiltered list. The per-slug adapter will reject
+  // and the agent can react — better than throwing `no_model_matches`
+  // with a misleading reason.
+  const pool = filtered.length > 0 ? filtered : models;
+  return _pickByBucket('video', pool, req, wantedBucket);
 }
 
 // ── Audio ───────────────────────────────────────────────────────────────────
@@ -326,5 +405,24 @@ export function pickAudioModel(models, req = {}) {
     kind === 'music' ? 'audio_music' :
     kind === 'sfx' ? 'audio_sfx' :
     'audio_tts';
-  return _pickByBucket('audio', models, req, wantedBucket);
+
+  // Shape filter — mirrors the image/video routers. AudioRequires keys:
+  // videoUrl (video-conditioned SFX), voice / language / emotion / pitch /
+  // volume / speed (TTS knobs), instrumental (music), loop (looping SFX).
+  // A request carrying `videoUrl` only matches an adapter whose requires
+  // lists it; pure text-to-sfx slugs (mmaudio-v2) are excluded.
+  const presence = {
+    videoUrl: !!req.hasVideoUrl,
+    voice: !!req.hasVoice,
+    language: !!req.hasLanguage,
+    emotion: !!req.hasEmotion,
+    pitch: typeof req.pitch === 'number',
+    volume: typeof req.volume === 'number',
+    speed: typeof req.speed === 'number',
+    instrumental: typeof req.instrumental === 'boolean',
+    loop: typeof req.loop === 'boolean',
+  };
+  const filtered = _filterByRequires(models, presence);
+  const pool = filtered.length > 0 ? filtered : models;
+  return _pickByBucket('audio', pool, req, wantedBucket);
 }

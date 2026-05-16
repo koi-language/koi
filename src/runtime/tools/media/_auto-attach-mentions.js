@@ -121,15 +121,35 @@ export async function autoAttachMentions({ prompt, refs = [], mediaKind, maxRefs
   const unknown = [];
 
   for (const handle of handles) {
+    // FIRST check: does this handle already match an alias on an
+    // already-attached ref? If yes, the agent is using @-syntax to
+    // refer to one of the refs they EXPLICITLY wired up — there's
+    // nothing to look up in the gallery, nothing to attach, and
+    // crucially nothing to report as "unknown". Skipping silently
+    // here also prevents `assignPositionalAliases` downstream from
+    // failing on a handle that's already correctly mapped via the
+    // agent's own `{alias, path}` entry.
+    //
+    // This check used to live AFTER the gallery probe — when the
+    // handle didn't exist in the gallery, it was pushed to `unknown`
+    // before the alias check ever ran. Result: an agent who passed
+    // `referenceImages: [{alias: "local", path: "..."}]` and wrote
+    // "@local" in the prompt got a hard rejection because `@local`
+    // wasn't a gallery handle, even though it WAS a valid alias.
+    if (existingAliases.has(handle.toLowerCase())) {
+      skipped.push(`@${handle}`); // already present by alias
+      continue;
+    }
+
     let matches;
     try { matches = await lib.findByMention(handle); }
     catch { matches = []; }
 
     // Hallucinated handle — the agent referenced something that
-    // doesn't exist in the gallery at all. Surface it so the caller
-    // can reject the request; we do NOT try to "be helpful" by
-    // dropping it silently (that's how models end up generating
-    // invented references).
+    // doesn't exist in the gallery at all AND isn't an alias of an
+    // attached ref. Surface it so the caller can reject the request;
+    // we do NOT try to "be helpful" by dropping it silently (that's
+    // how models end up generating invented references).
     if (!matches || matches.length === 0) {
       unknown.push(`@${handle}`);
       continue;
@@ -137,10 +157,6 @@ export async function autoAttachMentions({ prompt, refs = [], mediaKind, maxRefs
 
     if (merged.length >= maxRefs) {
       skipped.push(`@${handle}`);
-      continue;
-    }
-    if (existingAliases.has(handle.toLowerCase())) {
-      skipped.push(`@${handle}`); // already present by alias
       continue;
     }
     // Pick the first row whose mediaType matches the requested kind.

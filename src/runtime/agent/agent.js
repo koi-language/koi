@@ -1982,9 +1982,14 @@ export class Agent {
       // 1. GET ACTION(S) from LLM — or fast-start on iteration 0
       let response;
 
-      if (isFastStart && session.iteration === 0) {
+      if (isFastStart && session.iteration === 0 && !session._resumingTasks) {
         // Skip the LLM entirely — wait for the user's first message.
         // No greeting, no tokens wasted. Works for new AND restored sessions.
+        // EXCLUDES _resumingTasks: when the user just clicked "Yes" on the
+        // "Do you want to continue the plan?" prompt, we must call the LLM
+        // so it picks up the pending task list (injected by llm-provider.js
+        // when _resumingTasks is true). Otherwise the agent fires prompt_user
+        // again and the resume is silently dropped.
         channel.log('agent', `${this.name}: Fast-start (waiting for user input)`);
         if (!isDelegate) Agent._cliHooks?.onBusy?.(false);
         response = [

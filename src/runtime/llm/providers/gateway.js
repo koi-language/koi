@@ -643,6 +643,17 @@ export class GatewayImageGen extends BaseImageGen {
             // other image-edit model would ignore them and return the
             // input unchanged).
             cameraAngles: _attemptOpts.cameraAngles,
+            // Presence flags consumed by `_filterByRequires` to drop
+            // adapters whose declared `requires` map doesn't cover an
+            // input the caller wired into the request. Kept as booleans
+            // (not the values themselves) — the router doesn't need the
+            // payload, just the "is this present" signal.
+            hasMaskImage: !!_attemptOpts.maskImage,
+            hasSourceImage: !!_attemptOpts.sourceImage,
+            hasTargetSize: !!(_attemptOpts.targetSize?.width && _attemptOpts.targetSize?.height),
+            hasSourceImageOffset: !!(_attemptOpts.sourceImageOffset
+              && typeof _attemptOpts.sourceImageOffset.x === 'number'
+              && typeof _attemptOpts.sourceImageOffset.y === 'number'),
           },
         );
       } catch (resolveErr) {
@@ -903,7 +914,12 @@ export class GatewayImageGen extends BaseImageGen {
           throw e;
         }
       }),
-      { intent: operation },
+      // bg-remove / upscale flows: the source `image` IS a reference,
+      // just transported as `image_url` in the payload instead of
+      // `referenceImages[]`. Tell the router so adapters declaring
+      // `referenceImages: 'required'` (bria, pixelcut, recraft, topaz)
+      // aren't excluded.
+      { intent: operation, refsCount: 1 },
     );
 
     // /fal/raw expects { model, ...passthroughInput }. Most BG-remove /
@@ -1110,7 +1126,19 @@ export class GatewayAudioGen extends BaseAudioGen {
           throw e;
         }
       }),
-      { kind: 'tts', label: opts.label },
+      {
+        kind: 'tts',
+        label: opts.label,
+        // Presence flags for `_filterByRequires` (AudioRequires keys).
+        // Lets the router drop TTS adapters that don't honour the knob
+        // the caller actually wired up.
+        hasVoice: !!opts.voice,
+        hasLanguage: !!opts.language,
+        hasEmotion: !!opts.emotion,
+        pitch: opts.pitch,
+        volume: opts.volume,
+        speed: opts.speed,
+      },
     );
 
     const body = {
@@ -1246,7 +1274,19 @@ export class GatewayAudioGen extends BaseAudioGen {
             throw e;
           }
         }),
-        { kind: 'sfx', label: opts.label, hasVideoRef: usingVideoRef },
+        {
+          kind: 'sfx',
+          label: opts.label,
+          hasVideoRef: usingVideoRef,
+          // AudioRequires presence flags. `hasVideoUrl` lets the
+          // router drop pure text-to-sfx adapters (mmaudio text-only)
+          // when the caller wired up a reference video, AND drop
+          // video-conditioned-only adapters (controlfoley) when they
+          // didn't. `loop` lets it pick elevenlabs-sound-effects-v2
+          // specifically when the user asked for a seamless loop.
+          hasVideoUrl: !!usingVideoRef,
+          loop: opts.loop,
+        },
       );
     } catch (err) {
       // Graceful fallback: caller asked for video-conditioned SFX but no
@@ -1273,7 +1313,7 @@ export class GatewayAudioGen extends BaseAudioGen {
             throw e;
           }
         }),
-        { kind: 'sfx', label: opts.label, hasVideoRef: false },
+        { kind: 'sfx', label: opts.label, hasVideoRef: false, hasVideoUrl: false, loop: opts.loop },
       );
     }
 
@@ -1349,7 +1389,14 @@ export class GatewayAudioGen extends BaseAudioGen {
           throw e;
         }
       }),
-      { kind: 'music', label: opts.label },
+      {
+        kind: 'music',
+        label: opts.label,
+        // AudioRequires presence — instrumental only present when caller
+        // explicitly opted in/out; type:boolean check mirrors the body
+        // assembly below so the router's filter stays in sync.
+        instrumental: opts.instrumental,
+      },
     );
 
     const body = {
@@ -1568,6 +1615,13 @@ export class GatewayVideoGen extends BaseVideoGen {
         withAudio: !!opts.withAudio,
         refsCount: opts.referenceImages?.length || 0,
         videoRefsCount: Array.isArray(opts.referenceVideos) ? opts.referenceVideos.length : 0,
+        // Presence flags for `_filterByRequires` — kept in sync with
+        // the keys of `VideoRequires` on the adapter side. Without
+        // these, adapters declaring imageUrl / audioUrl / characterOrientation
+        // as required would silently be excluded.
+        hasImageUrl: !!opts.imageUrl,
+        hasAudioUrl: !!opts.audioUrl,
+        characterOrientation: !!opts.characterOrientation,
         shotCount,
         label: opts.label,
         excludeModels: Array.isArray(opts.excludeModels) ? opts.excludeModels : undefined,
@@ -1674,6 +1728,9 @@ export class GatewayVideoGen extends BaseVideoGen {
             withAudio: !!_attemptOpts.withAudio,
             refsCount: _attemptOpts.referenceImages?.length || 0,
             videoRefsCount: Array.isArray(_attemptOpts.referenceVideos) ? _attemptOpts.referenceVideos.length : 0,
+            hasImageUrl: !!_attemptOpts.imageUrl,
+            hasAudioUrl: !!_attemptOpts.audioUrl,
+            characterOrientation: !!_attemptOpts.characterOrientation,
             shotCount,
             label: _attemptOpts.label,
             excludeModels: _attemptOpts.excludeModels,
