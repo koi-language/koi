@@ -69,22 +69,49 @@ function workspaceBlock(workflow, files) {
 }
 
 async function runTranslator(agent, workflow, body, userMessage, files) {
-  const { getAllCandidates, createLLM, getAvailableProviders } = await import('../../llm/providers/factory.js');
+  const { resolve: resolveModel } = await import('../../llm/providers/factory.js');
 
-  const providers = agent.llmProvider?._availableProviders || getAvailableProviders();
-  const candidates = getAllCandidates('reasoning', 40, providers);
-  if (candidates.length === 0) {
-    return { tasks: [], fallback: true, reason: 'No LLM candidates available for translator' };
+  // Delegate model selection to the factory — same pattern as call-llm.js
+  // and the rest of the runtime. The factory handles:
+  //   • picking the best non-thinking candidate for taskType=reasoning at
+  //     this difficulty (preserves the old getAllCandidates intent),
+  //   • the gateway-mode `effectiveProvider='openai'` wrapping when
+  //     KOI_AUTH_TOKEN is set (so the original model name still routes
+  //     correctly through the gateway to its real backend),
+  //   • boost / cooldown / forced-model overrides automatically.
+  //
+  // Previously this site hand-rolled getAllCandidates + a manual
+  // `effectiveProvider = KOI_AUTH_TOKEN ? 'openai' : ...` shim that
+  // duplicated the factory's logic and drifted: under KOI_AUTH_TOKEN the
+  // manual pick landed on `gpt-5.1-codex` (gateway openai default for
+  // reasoning) which truncated the WORKFLOW.md translation to a single
+  // task with maxTokens=1500. Letting the factory pick + raising
+  // maxTokens to 3000 restores the full multi-task plan.
+  await agent.llmProvider._ensureClients();
+  let resolved;
+  try {
+    resolved = resolveModel({
+      type: 'llm',
+      taskType: 'reasoning',
+      difficulty: 40,
+      profile: { reasoningEffort: 'none' }, // force non-thinking — translator must be fast
+      availableProviders: agent.llmProvider._availableProviders,
+      clients: agent.llmProvider._gatewayMode
+        ? agent.llmProvider._gatewayClients()
+        : { openai: agent.llmProvider._oa, anthropic: agent.llmProvider._ac, gemini: agent.llmProvider._gc },
+      temperature: 0,
+      // 12K is the practical middle ground: 3K truncated JSON mid-string
+      // on plans with rich Step-body descriptions, 16K pushed gpt-5.1
+      // past the 30s default timeout (now 90s, but generation latency
+      // still grows with maxTokens), 8K left no headroom for longer
+      // workflows. 12K accommodates ~8 tasks with full descriptions
+      // while keeping streaming time well inside 90s.
+      maxTokens: 12000,
+    });
+  } catch (err) {
+    return { tasks: [], fallback: true, reason: `No LLM candidates available for translator: ${err.message}` };
   }
-
-  const nonThinking = candidates.find(c => !c.thinking) || candidates[0];
-  const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : nonThinking.provider;
-  const client = agent.llmProvider._getClient(effectiveProvider);
-  const llm = createLLM(effectiveProvider, client, nonThinking.model, {
-    temperature: 0,
-    maxTokens: 1500,
-    useThinking: false,
-  });
+  const llm = resolved.instance;
 
   const filesBlock = files.length === 0
     ? '(none beyond WORKFLOW.md)'
@@ -93,6 +120,10 @@ async function runTranslator(agent, workflow, body, userMessage, files) {
   const prompt = `You are a workflow translator. A pre-approved workflow describes the ordered steps to complete a type of task. Your job is to INSTANTIATE those steps as concrete tasks for the user's current request.
 
 Rules:
+- One workflow step → one created task. Keep tasks at the same semantic
+  granularity as the workflow's Step headings — never break a step into
+  procedural sub-tasks like "fetch tool schema" or "look up parameter shape"
+  (those are implementation details the executing agent handles inside the task).
 - Do NOT invent new steps that are not present in the workflow.
 - Do NOT research, explore, or redesign — the plan is already validated.
 - You MAY omit a step if the user's message explicitly opts out of it.
@@ -131,7 +162,12 @@ If the workflow does not actually match the user's request, return:
 { "tasks": [], "fallback": true, "reason": "<short explanation>" }`;
 
   try {
-    const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 30000 });
+    // 90s timeout: with maxTokens=16000 the translator can take well over
+    // 30s on slower reasoning models (gpt-5.1 with a 14k input prompt
+    // routinely overshoots 30s and gets aborted mid-stream, killing the
+    // whole activation). One-time call per activation — no reason to
+    // race the clock.
+    const { text } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 90000 });
     const stripped = (text || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
     if (!stripped) return { tasks: [], fallback: true, reason: 'Empty translator response' };
 

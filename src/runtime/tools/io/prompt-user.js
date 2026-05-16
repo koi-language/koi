@@ -80,12 +80,16 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     let message = action.message || action.data?.message || '';
     let question = action.question || action.data?.question || '';
     const options = action.options || action.data?.options || null;
-    // LLM rescue: smaller models occasionally emit prompt_user with ONLY
-    // a `message` field (treating it like print). The schema says message
-    // is for context and `question` is the ask — but rather than reject
-    // and loop, promote message → question when it's the only signal
-    // present. The user still sees a question; the agent moves on.
-    if (!question && message && !options && !action.prompt && !action.data?.prompt) {
+    // LLM rescue: smaller models routinely emit prompt_user with only
+    // `message` (treating it like print) — both for plain prompts AND
+    // for select menus where `options` is also set. The schema says
+    // `message` is context and `question` is the ask, but rather than
+    // reject + loop (observed: the model retries the same shape three
+    // times in a row, the loop detector kicks in, the workflow stalls),
+    // promote message → question whenever question is missing and we
+    // have something usable. The user still sees a question; the agent
+    // moves on.
+    if (!question && message && !action.prompt && !action.data?.prompt) {
       question = message;
       message = '';
     }

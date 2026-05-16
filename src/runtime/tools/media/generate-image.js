@@ -449,7 +449,10 @@ const generateImageAction = {
     // paths share code instead of duplicating the math.
     //
     // 3:1 is the conservative cap that satisfies every edit model
-    // we've shipped so far. If a future model has a tighter cap, the
+    // we've shipped so far. computeAspectCapGeometry aligns BOTH dims
+    // to multiples of 16 so the model's own pre-validation floor
+    // doesn't re-break the ratio (see DIM_ALIGNMENT in
+    // _pad-and-recover.js). If a future model has a tighter cap, the
     // call still fails downstream with the same error and the
     // gateway's auto-retry (`_isInputShapeError`) picks a different
     // slug.

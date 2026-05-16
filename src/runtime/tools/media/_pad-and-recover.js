@@ -419,6 +419,17 @@ export function pickEnvelopeResolution({
  *   contentW: number, contentH: number,
  * }}
  */
+// Diffusion edit models (gpt-image-2/edit and friends) silently floor
+// both input dims to a multiple of this stride before they validate the
+// aspect ratio. Sending 642×214 (ratio 3.0 exact) gets resized to
+// 2000×666.67 and floored to 2000×656 → ratio 3.048 → rejected with
+// "Image aspect ratio 2000:656 exceeds the maximum allowed ratio 3:1".
+// We pre-align BOTH padded dims to the same stride here so the model's
+// floor is a no-op and our ratio survives bit-for-bit.
+const DIM_ALIGNMENT = 16;
+
+const _ceilToStride = (n, stride) => Math.ceil(n / stride) * stride;
+
 export function computeAspectCapGeometry(inWidth, inHeight, maxAspectRatio) {
   if (!Number.isFinite(inWidth) || !Number.isFinite(inHeight)
       || inWidth <= 0 || inHeight <= 0
@@ -432,7 +443,11 @@ export function computeAspectCapGeometry(inWidth, inHeight, maxAspectRatio) {
   }
   const longSide = Math.max(inWidth, inHeight);
   const shortSide = Math.min(inWidth, inHeight);
-  if (longSide / shortSide <= maxAspectRatio) {
+  // Already inside the envelope AND already stride-aligned → no work.
+  // If only one of the two holds, fall through and pad the missing bit.
+  if (longSide / shortSide <= maxAspectRatio
+      && inWidth % DIM_ALIGNMENT === 0
+      && inHeight % DIM_ALIGNMENT === 0) {
     return {
       needsPadding: false,
       paddedW: inWidth, paddedH: inHeight,
@@ -440,19 +455,21 @@ export function computeAspectCapGeometry(inWidth, inHeight, maxAspectRatio) {
       contentW: inWidth, contentH: inHeight,
     };
   }
-  // Grow the short edge so the ratio fits. Round up to even for
-  // codec friendliness (downstream tools sometimes re-encode and
-  // odd dims trip yuv420p).
-  let paddedShort = Math.ceil(longSide / maxAspectRatio);
-  if (paddedShort % 2 !== 0) paddedShort += 1;
   const isLandscape = inWidth >= inHeight;
-  const paddedW = isLandscape ? inWidth : paddedShort;
-  const paddedH = isLandscape ? paddedShort : inHeight;
+  // Long edge: round UP to the stride so the model's post-receive floor
+  // doesn't trim it (which would shrink the long-side budget and break
+  // ratio). Short edge: the smaller of (long / cap, our current short)
+  // also rounded up — we must clear the cap AND the stride alignment.
+  const paddedLong = _ceilToStride(longSide, DIM_ALIGNMENT);
+  const minShortForCap = Math.ceil(paddedLong / maxAspectRatio);
+  const paddedShort = _ceilToStride(Math.max(minShortForCap, shortSide), DIM_ALIGNMENT);
+  const paddedW = isLandscape ? paddedLong : paddedShort;
+  const paddedH = isLandscape ? paddedShort : paddedLong;
   // Center the content within the padded canvas.
   const padX = Math.floor((paddedW - inWidth) / 2);
   const padY = Math.floor((paddedH - inHeight) / 2);
   return {
-    needsPadding: true,
+    needsPadding: paddedW !== inWidth || paddedH !== inHeight,
     paddedW, paddedH,
     padX, padY,
     contentW: inWidth, contentH: inHeight,
