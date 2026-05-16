@@ -871,6 +871,13 @@ const generateImageAction = {
             // attachment IDs ("att-1") into the metadata, and the GUI's
             // viewer can't display thumbnails for those after the fact.
             referenceImagePaths: Object.keys(_savedRefIds),
+            // Optional pointer to the underlying "original" the caller is
+            // editing (e.g. outpaint_image passes its source path here so
+            // the Info panel can show a Source-image thumbnail instead of
+            // a now-deleted temp padded-canvas). Plain generate_image
+            // calls don't set this — referenceImagePaths above carries
+            // their refs.
+            sourceImagePath: action._sourceImagePath || null,
             seed: action.seed || null,
             steps: action.steps || null,
             guidanceScale: action.guidanceScale || null,

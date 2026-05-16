@@ -318,6 +318,14 @@ const outpaintImageAction = {
       referenceImages: [paddedCanvasPath],
       maskImage: maskBuffer ? { data: maskBuffer, mimeType: 'image/png' } : undefined,
       sourceImage: originalBuffer ? { data: originalBuffer, mimeType: 'image/png' } : undefined,
+      // Persist the ORIGINAL image path on the saved media's metadata so
+      // the GUI's Info panel can render a "Source image" thumbnail for
+      // outpainted results. Without this the only references the metadata
+      // carries are the (temporary) padded canvas + the source-buffer we
+      // upload to fal — neither survives on disk after the tool returns,
+      // so the Info panel falls back to "no references" even though the
+      // user clearly had an original image they were outpainting from.
+      _sourceImagePath: resolvedPath,
       targetSize: { width: newWidth, height: newHeight },
       // Where the original sits inside the new canvas. bria/expand uses
       // this to position the source for asymmetric outpaint (e.g.
