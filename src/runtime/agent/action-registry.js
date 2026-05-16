@@ -252,6 +252,12 @@ class ActionRegistry {
       'delegate', 'open_toolset', 'get_tool_info',
       'add_memory', 'recall_memory',
       'show_result',
+      // Workflow control surfaces here so the coordinator sees them as
+      // first-class callable intents. The AVAILABLE WORKFLOWS section of
+      // the prompt advertises both names, but hiding them behind a
+      // toolset (or behind `get_tool_info`) meant the agent treated the
+      // names as suggestion-only and defaulted to planner::do_plan.
+      'describe_workflow', 'run_workflow',
     ]);
 
     // Media tools get a dedicated "always-visible with one-liner"

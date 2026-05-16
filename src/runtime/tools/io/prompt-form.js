@@ -14,7 +14,7 @@ import { channel } from '../../io/channel.js';
 export default {
   type: 'prompt_form',
   intent: 'prompt_form',
-  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Returns: { answers: { [fieldLabel]: string } }',
+  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/options fields, array of absolute paths for `files` fields).',
   thinkingHint: 'Waiting for your input',
   permission: null,
 
@@ -60,6 +60,21 @@ export default {
             allowFreeText: {
               type: 'boolean',
               description: 'When options are provided, also append a "Type something." free-text entry at the bottom. Default: false.'
+            },
+            files: {
+              type: 'object',
+              description: 'When present, this field renders the inline file-picker (drop zone + Browse + thumbnails) instead of a text input or select. Use to ask the user to attach images, audio, video, PDFs, etc. The answer for this field is an array of absolute paths. Mutually exclusive with `options` — supplying both is a contract error.',
+              properties: {
+                multiple: {
+                  type: 'boolean',
+                  description: 'Allow more than one file. Default: true.'
+                },
+                extensions: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Optional whitelist of extensions WITHOUT the leading dot (e.g. ["png","jpg","svg"]). When set, the native browse dialog filters by these and the drop zone rejects files outside the list.'
+                }
+              }
             }
           },
           required: ['label']
@@ -97,6 +112,30 @@ export default {
           label: 'Merchant ID',
           question: 'What is your Coinflow merchant ID?',
           hint: 'Found in Coinflow dashboard → Settings → API'
+        }
+      ]
+    },
+    {
+      intent: 'prompt_form',
+      title: 'A few details for the restaurant ad:',
+      fields: [
+        {
+          label: 'Style',
+          question: 'Visual style for the ad?',
+          options: [
+            { title: 'Photorealistic', recommended: true },
+            { title: 'Stylized' }
+          ]
+        },
+        {
+          label: 'References',
+          question: 'Drop a few reference photos of the restaurant.',
+          hint: 'Dining room, plates, ambient. PNG/JPG.',
+          files: { multiple: true, extensions: ['png', 'jpg', 'jpeg'] }
+        },
+        {
+          label: 'Voiceover',
+          question: 'Pitch line for the narration:'
         }
       ]
     }

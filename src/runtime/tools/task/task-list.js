@@ -25,7 +25,7 @@ export default {
     const tasks = taskManager.list();
 
     if (tasks.length === 0) {
-      return { tasks: [], summary: { total: 0, completed: 0, in_progress: 0, pending: 0, blocked: 0 } };
+      return { tasks: [], summary: { total: 0, completed: 0, in_progress: 0, pending: 0, cancelled: 0, blocked: 0 } };
     }
 
     // Build a lookup map for blocked-state computation
@@ -41,7 +41,7 @@ export default {
       return isBlocked ? 'blocked' : 'pending';
     };
 
-    const counts = { completed: 0, in_progress: 0, pending: 0, blocked: 0 };
+    const counts = { completed: 0, in_progress: 0, pending: 0, cancelled: 0, blocked: 0 };
     for (const task of tasks) {
       const eff = getEffectiveStatus(task);
       counts[eff] = (counts[eff] || 0) + 1;
@@ -54,6 +54,12 @@ export default {
         completed: counts.completed || 0,
         in_progress: counts.in_progress || 0,
         pending: counts.pending || 0,
+        // `cancelled` plans were paused via the Stop button and can be
+        // RESUMED by calling `task_update` with status='pending' (or
+        // 'in_progress', restored from `task.cancelledFrom`) on each
+        // cancelled task. See has-pending-tasks.md / system.koi for the
+        // resume-on-user-cue flow.
+        cancelled: counts.cancelled || 0,
         blocked: counts.blocked || 0,
       },
     };

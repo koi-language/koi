@@ -20,8 +20,8 @@ export default {
       },
       status: {
         type: 'string',
-        enum: ['pending', 'in_progress', 'completed', 'deleted'],
-        description: 'New status for the task',
+        enum: ['pending', 'in_progress', 'completed', 'cancelled', 'deleted'],
+        description: 'New status for the task. `cancelled` is reserved for plans paused by the Stop button — it is RESUMABLE: transitioning a `cancelled` task back to `pending` or `in_progress` is how the agent resumes the plan. `deleted` is permanent dismissal (user declined the plan).',
       },
       owner: {
         type: 'string',
@@ -81,7 +81,9 @@ export default {
       // the activation above: whatever was activated because the task
       // started gets deactivated on completion/deletion so the prompt
       // doesn't accumulate stale skill instructions between tasks.
-      if (updates.status === 'completed' || updates.status === 'deleted') {
+      if (updates.status === 'completed' ||
+          updates.status === 'cancelled' ||
+          updates.status === 'deleted') {
         const scoped = taskManager.popScopedSkills(taskId);
         if (scoped.length > 0 && agent && typeof agent.callAction === 'function') {
           for (const { skillName } of scoped) {

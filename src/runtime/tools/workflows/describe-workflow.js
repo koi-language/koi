@@ -1,33 +1,34 @@
 /**
- * Describe Workflow Action — Look up the description (and optional body) of
- * a single workflow by name.
+ * Describe Workflow Action — Look up METADATA for a single workflow by name.
  *
- * Workflows surface to the agent as bare names in the system prompt; the
- * agent calls this tool to confirm what a workflow does before invoking
- * `run_workflow`. Mirrors the "list-by-name + describe-on-demand" pattern
- * used for non-core toolsets.
+ * Returns ONLY metadata (name, description, scope, directory, sibling files).
+ * The WORKFLOW.md body is NEVER returned by this tool: when the body was
+ * exposed here, agents read the body and treated its instructions as their
+ * own for the current turn — silently skipping `run_workflow`. The body is
+ * the property of `run_workflow` and the per-step task descriptions it
+ * generates. Use this tool only when the agent needs to confirm the
+ * workflow exists / its scope / its sibling files before invoking
+ * `run_workflow`.
  */
 
-import { listWorkflowsCatalog, readWorkflowBody } from '../../state/workflows-catalog.js';
+import fs from 'fs';
+import path from 'path';
+import { listWorkflowsCatalog } from '../../state/workflows-catalog.js';
 
 export default {
   type: 'describe_workflow',
   intent: 'describe_workflow',
-  description: 'Describe a workflow by name. Returns the workflow\'s short description and full WORKFLOW.md body so you can decide whether it matches the user\'s intent before invoking it via run_workflow. Read-only — no state change. Fields: "name" (required), "verbose" (optional bool, defaults true — set false to skip the body). → Returns: { name, description, scope, requireConfirmation?, body? }',
-  thinkingHint: (action) => `Describing workflow: ${action.name || '...'}`,
+  description: 'Look up METADATA for a workflow by name — its description, scope, directory, and sibling files. Does NOT return the WORKFLOW.md body (that is internal to run_workflow). Use this only when you need to confirm a workflow\'s identity before invoking run_workflow — usually the name + description in the AVAILABLE WORKFLOWS section is already enough. Read-only. Fields: "name" (required). → Returns: { name, description, scope, directory, files?, requireConfirmation?, compatibility? }',
+  thinkingHint: (action) => `Inspecting workflow: ${action.name || '...'}`,
   permission: null,
-  hidden: true,
+  hidden: false,
 
   schema: {
     type: 'object',
     properties: {
       name: {
         type: 'string',
-        description: 'The workflow name to describe (matches the names listed in the AVAILABLE WORKFLOWS section of the system prompt).',
-      },
-      verbose: {
-        type: 'boolean',
-        description: 'When true (default), include the full WORKFLOW.md body. Set false for just the one-line description + metadata.',
+        description: 'The workflow name to inspect (matches the names listed in the AVAILABLE WORKFLOWS section of the system prompt).',
       },
     },
     required: ['name'],
@@ -51,19 +52,32 @@ export default {
       };
     }
 
-    const verbose = action.verbose !== false;
     const result = {
       found: true,
       name: workflow.name,
       description: workflow.description,
       scope: workflow.scope,
+      // Absolute directory + sibling files (like `activate_skill`'s
+      // `directory` + `resources`) so the coordinator can pre-resolve
+      // any file the workflow references. NEVER the WORKFLOW.md body
+      // itself — that's the run_workflow translator's input only.
+      directory: workflow.directory || null,
     };
+    if (workflow.directory) {
+      try {
+        const entries = fs.readdirSync(workflow.directory, { withFileTypes: true });
+        const files = [];
+        for (const ent of entries) {
+          if (ent.name === 'WORKFLOW.md') continue;
+          if (ent.name.startsWith('.')) continue;
+          const abs = path.join(workflow.directory, ent.name);
+          files.push(ent.isDirectory() ? `${abs}/` : abs);
+        }
+        if (files.length > 0) result.files = files;
+      } catch { /* unreadable — omit `files` */ }
+    }
     if (workflow.requireConfirmation) result.requireConfirmation = true;
     if (workflow.compatibility) result.compatibility = workflow.compatibility;
-    if (verbose) {
-      const body = readWorkflowBody(workflow);
-      if (body != null) result.body = body;
-    }
     return result;
   },
 };

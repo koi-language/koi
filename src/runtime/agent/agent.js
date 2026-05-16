@@ -231,7 +231,17 @@ export class Agent {
       for (const t of taskManager.list()) {
         if (t.status === 'pending' || t.status === 'in_progress') {
           try {
-            taskManager.update(t.id, { status: 'deleted' });
+            // Mark as `cancelled` (NOT `deleted`) so the plan survives
+            // the abort and can be resumed if the user changes their
+            // mind. Stash the prior status in `cancelledFrom` so a
+            // resume can restore the exact in_progress / pending shape
+            // the plan was in at the moment of Stop. `deleted` remains
+            // reserved for the user-declined path (`task_cancel_all`)
+            // where the plan is intentionally thrown away.
+            taskManager.update(t.id, {
+              status: 'cancelled',
+              cancelledFrom: t.status,
+            });
             cancelledTasks++;
           } catch { /* non-fatal */ }
         }
@@ -1087,6 +1097,20 @@ export class Agent {
       channel.log('agent', `${this.name}: Waiting for GUI client to connect...`);
       await globalThis.__guiClientReady;
       channel.log('agent', `${this.name}: GUI client connected`);
+
+      // SECOND handshake gate: wait for the GUI to either announce its
+      // resume target (`resumeSession` → display-log writer re-pointed)
+      // or confirm there's no resume coming (grace timeout, ~800 ms).
+      // Without this, the fast-start `prompt_user` below races the
+      // `resumeSession` flow and lands in the FRESH-session display log
+      // instead of the resumed one — the GUI's chat tab keeps spinning
+      // forever waiting for a prompt under the resumed session id that
+      // was orphaned in a session it doesn't open. See ws-protocol-server.js
+      // (`_resolveSessionGate`) for the resolver wiring.
+      if (globalThis.__guiSessionResolved) {
+        await globalThis.__guiSessionResolved;
+        channel.log('agent', `${this.name}: GUI session handshake settled`);
+      }
     }
 
     // Fire-and-forget: start project indexing in background (once per process).
@@ -1098,10 +1122,21 @@ export class Agent {
       const _home = (process.env.HOME || process.env.USERPROFILE || '').replace(/[\\/]+$/, '');
       const _normRoot = _root.replace(/[\\/]+$/, '');
       const _isHome = _home && _normRoot === _home;
-      const _disabled = process.env.KOI_DISABLE_AUTO_INDEX === '1';
-      if (_isHome || _disabled) {
+      // Background semantic indexing is OFF BY DEFAULT — opt-in via
+      // KOI_ENABLE_AUTO_INDEX=1. Indexing was kicking off on every
+      // session start and burning CPU / embeddings credits for projects
+      // that never use semantic_search. Search tools still fall back to
+      // grep when the index isn't built, so nothing breaks; users who
+      // want the index can set the env var (or we can wire a `/index`
+      // command later).
+      const _enabled = process.env.KOI_ENABLE_AUTO_INDEX === '1';
+      if (!_enabled || _isHome) {
         Agent._indexingStarted = true; // prevent retries
-        channel.log('background', `Background indexing skipped: ${_isHome ? 'project root is $HOME' : 'KOI_DISABLE_AUTO_INDEX=1'}`);
+        channel.log('background', `Background indexing skipped: ${
+          _isHome
+            ? 'project root is $HOME'
+            : 'disabled by default (set KOI_ENABLE_AUTO_INDEX=1 to enable)'
+        }`);
       } else {
         Agent._indexingStarted = true;
         channel.log('background', `Background indexing triggered by agent "${this.name}" on event "${eventName}"`);

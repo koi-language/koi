@@ -25,6 +25,7 @@ const STATUS_ICONS = {
   pending:     '☐',
   in_progress: '●',
   completed:   '✓',
+  cancelled:   '⏸',
   deleted:     '✗',
 };
 
@@ -201,9 +202,14 @@ class TaskManager {
     if (!subject) throw new Error('task_create: "subject" is required');
 
     // Auto-reset if the previous plan is fully done — prevents mixing old and new tasks.
-    // Only resets when there are no pending or in_progress tasks (plan is complete).
+    // Only resets when there are no pending or in_progress tasks. `cancelled` (Stop
+    // button) counts as "terminal" for this purpose: if the user paused a plan and
+    // then starts a brand-new one without typing a resume cue, the old cancelled
+    // set is implicitly abandoned and wiped here. Resuming a cancelled plan is
+    // expected to happen BEFORE any new `task_create` lands.
     const existing = Object.values(this._tasks).filter(t => t.status !== 'deleted');
-    if (existing.length > 0 && existing.every(t => t.status === 'completed')) {
+    if (existing.length > 0 &&
+        existing.every(t => t.status === 'completed' || t.status === 'cancelled')) {
       this._tasks = {};
       this._nextId = 1;
     }
@@ -295,6 +301,18 @@ class TaskManager {
     if (updates.description !== undefined) task.description = updates.description;
     if (updates.activeForm !== undefined) task.activeForm = updates.activeForm;
 
+    // `cancelledFrom` is set by `Agent.cancelAll` (Stop button) so a
+    // later resume can restore the exact pending / in_progress shape
+    // the plan was in at the moment of pause. Persisted on the task
+    // record via `_save()`. Cleared automatically when the task
+    // transitions away from `cancelled` so the field only ever
+    // reflects the MOST RECENT pause.
+    if (updates.cancelledFrom !== undefined) {
+      task.cancelledFrom = updates.cancelledFrom;
+    } else if (updates.status !== undefined && updates.status !== 'cancelled') {
+      delete task.cancelledFrom;
+    }
+
     if (Array.isArray(updates.addBlockedBy)) {
       for (const depId of updates.addBlockedBy) {
         const key = String(depId);
@@ -322,16 +340,23 @@ class TaskManager {
 
     this._save();
 
-    // When the last active task terminates (completed OR deleted) and
-    // nothing is left pending/in_progress, clear the plan and notify.
-    // Terminal set: completed + deleted (cancelled). The original guard
-    // only fired on `completed` — a fully-cancelled plan (status=deleted
-    // on every task) left skills activated forever because this sweep
-    // never ran.
-    const _isTerminal = updates.status === 'completed' || updates.status === 'deleted';
+    // When the last active task terminates (completed, cancelled, or deleted)
+    // and nothing is left pending/in_progress, clear the plan and notify.
+    // Terminal set: completed + cancelled (Stop button, resumable) + deleted
+    // (user-declined, not resumable). The original guard only fired on
+    // `completed` — a fully-cancelled plan left skills activated forever.
+    // `cancelled` is included so a Stop also releases skills cleanly; on
+    // resume the agent reactivates them via the normal in_progress flow.
+    const _isTerminal =
+      updates.status === 'completed' ||
+      updates.status === 'cancelled' ||
+      updates.status === 'deleted';
     if (_isTerminal && !this._allCompletedNotified) {
       const all = Object.values(this._tasks);
-      const hasActive = all.some(t => t.status !== 'completed' && t.status !== 'deleted');
+      const hasActive = all.some(t =>
+        t.status !== 'completed' &&
+        t.status !== 'cancelled' &&
+        t.status !== 'deleted');
       const hasAnyCompleted = all.some(t => t.status === 'completed');
       // Fire when the queue has fully drained (no pending/in_progress).
       // Require at least one completed task so an empty manager doesn't
@@ -407,8 +432,17 @@ class TaskManager {
           }).catch(() => { /* compactor module unavailable — skip */ });
         }).catch(() => {});
         setTimeout(() => {
-          channel.setTaskPanel([]);
-          channel.print(`\x1b[32m${t('allTasksCompleted')}\x1b[0m`);
+          // For a `completed`-driven drain, hide the panel and announce
+          // "All tasks completed". For a `cancelled`-driven drain (the
+          // user pressed Stop and the agent may resume on request) keep
+          // the panel visible so the user can SEE which tasks are
+          // paused; same for `deleted` (user-declined plan — the agent's
+          // own `task_cancel_all` flow prints its own "Plan cancelled."
+          // line so we don't double-announce here).
+          if (updates.status === 'completed') {
+            channel.setTaskPanel([]);
+            channel.print(`\x1b[32m${t('allTasksCompleted')}\x1b[0m`);
+          }
         }, 300);
       }
     }

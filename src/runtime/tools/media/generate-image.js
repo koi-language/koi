@@ -957,33 +957,43 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
 
   const props = wrappedAction.schema.properties;
 
-  // Sync the schema props with the catalog (used for JSON-schema validation
-  // and by any tool-introspection consumer).
-  if (caps.aspectRatios?.length) {
-    props.aspectRatio = { type: 'string', enum: caps.aspectRatios };
-  } else {
-    delete props.aspectRatio;
-  }
-  if (caps.resolutions?.length) {
-    props.resolution = { type: 'string', enum: caps.resolutions };
-  } else {
-    delete props.resolution;
-  }
+  // Canonical accepted values for the runtime's generic media API.
+  // Source of truth: same fallback enums used by `KoiGatewayProvider.
+  // capabilities` in `../../llm/providers/gateway.js`. The backend's
+  // `_collectCommon` deliberately STOPPED shipping per-model enums for
+  // these signals; the per-slug adapter is now the only authority. We
+  // surface the generic list to the agent so it can pick a value,
+  // and the adapter rejects with a clear error if the resolved model
+  // can't honour it. Tighten the enum only when the catalog DOES
+  // surface a narrower set (legacy / future-proof path).
+  const CANONICAL_ASPECT_RATIOS = [
+    '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9',
+  ];
+  const CANONICAL_RESOLUTIONS = [
+    'low', 'medium', 'high', 'ultra',
+    '512p', '720p', '1K', '1080p', '2K', '4K',
+  ];
+
+  props.aspectRatio = {
+    type: 'string',
+    enum: caps.aspectRatios?.length ? caps.aspectRatios : CANONICAL_ASPECT_RATIOS,
+  };
+  props.resolution = {
+    type: 'string',
+    enum: caps.resolutions?.length ? caps.resolutions : CANONICAL_RESOLUTIONS,
+  };
   if (caps.maxImages > 1) {
     props.n = { type: 'number', minimum: 1, maximum: caps.maxImages };
   } else {
     delete props.n;
   }
-  // Reference-image support comes from the fleet: any active model with
-  // maxRefImages != 0 counts. The legacy `anyCanEdit` gate is gone because
-  // "canEdit" was a false dichotomy — if a model accepts input images it
-  // can edit, end of story.
+  // referenceImages: keep the original schema entry (string OR
+  // {alias, path} oneOf) regardless of caps. The per-slug adapter
+  // rejects with a clear error when the resolved model doesn't accept
+  // refs — better than silently hiding the param and forcing the agent
+  // to write "use the attached image" in the prose (which the model
+  // can't see).
   const refsEnabled = caps.hasRefImageSupport;
-  if (refsEnabled) {
-    props.referenceImages = { type: 'array', items: { type: 'string' } };
-  } else {
-    delete props.referenceImages;
-  }
   if (caps.labels?.length) {
     props.label = { type: 'string', enum: caps.labels };
   } else {
@@ -996,20 +1006,20 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
   // that the renderer does not unfold.
   const fields = ['"prompt" (required) — text description of the desired image'];
 
-  if (caps.aspectRatios?.length) {
-    const list = caps.aspectRatios.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "aspectRatio" — one of: ${list}. Pick based on user intent (portrait → tall, landscape → wide). Omit to let the backend pick.`);
+  {
+    const list = props.aspectRatio.enum.map((v) => `"${v}"`).join(', ');
+    fields.push(`optional "aspectRatio" — one of: ${list}. Omit to let the backend pick.`);
   }
-  if (caps.resolutions?.length) {
-    const list = caps.resolutions.map((v) => `"${v}"`).join(', ');
+  {
+    const list = props.resolution.enum.map((v) => `"${v}"`).join(', ');
     fields.push(`optional "resolution" — one of: ${list}. Omit to let the backend pick.`);
   }
   if (caps.maxImages > 1) {
     fields.push(`optional "n" — integer 1..${caps.maxImages} (default 1)`);
   }
-  if (refsEnabled) {
+  {
     const maxRef = caps.maxRefImages ? ` Max ${caps.maxRefImages}.` : '';
-    fields.push(`optional "referenceImages" — array of attachment IDs (e.g. "att-1") or absolute file paths.${maxRef} Annotation attachments are auto-excluded.`);
+    fields.push(`optional "referenceImages" — array of reference assets. Each item is a string (absolute file path, attachment ID like "att-1", or \`@mention\` handle like "@tom") OR an object \`{ alias, path }\` so the prompt can refer to it by alias.${maxRef} The per-slug adapter validates whether the resolved model accepts refs.`);
   }
   if (caps.labels?.length) {
     // Slug list for the enum; descriptions come via labelDetails so the

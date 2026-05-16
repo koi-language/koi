@@ -1416,19 +1416,29 @@ export function buildExpandedResourceSection(resources, agent) {
   }
 
   // ── AVAILABLE WORKFLOWS ─────────────────────────────────────────────────
-  // Names only — mirrors the toolset-intents pattern. Workflows are
-  // pre-approved task plans; the agent calls describe_workflow(<name>)
-  // to read the description + body, then run_workflow(<name>) to
-  // instantiate. Only surfaced to agents with `delegate` permission
-  // (i.e. root coordinators) — delegates execute the tasks a workflow
-  // creates, they don't pick which workflow to run.
+  // List each workflow with its description so the agent can match the
+  // user's intent against a workflow BEFORE falling through to
+  // planner::do_plan. The agent gets ONLY the name + description here —
+  // never the WORKFLOW.md body. The body is the property of
+  // `run_workflow`: when it was previously exposed (via describe_workflow
+  // returning `body`), the agent read the body and started executing the
+  // workflow's steps directly in its own turn, silently skipping
+  // run_workflow → no tasks created, no workspace, no planner.result fired.
+  // Only surfaced to agents with `delegate` permission (root coordinators)
+  // — delegates execute the tasks a workflow creates, they don't pick
+  // which workflow to run.
   if (agent?.role?.can('delegate')) {
     try {
       const catalog = listWorkflowsCatalog();
       if (catalog.length > 0) {
-        const names = catalog.map(w => w.name).join(', ');
         doc += '## AVAILABLE WORKFLOWS\n\n';
-        doc += `Call **describe_workflow("<name>")** to read what a workflow does, then **run_workflow("<name>")** to invoke it: ${names}\n\n`;
+        doc += 'Pre-approved task plans curated for this project. **WORKFLOW-FIRST routing rule**: when one of these clearly matches the user\'s request, invoke `run_workflow("<name>")` INSTEAD of delegating to `planner::do_plan`. The planner is the fallback for requests no workflow covers. The name + description below is all you need to route — do NOT pre-fetch the workflow body before deciding (the body is internal to `run_workflow`; reading it would just lead you to inline its steps instead of running it).\n\n';
+        for (const wf of catalog) {
+          const scope = wf.scope ? ` _(${wf.scope})_` : '';
+          const desc = (wf.description || '').trim();
+          doc += `- **${wf.name}**${scope}${desc ? ` — ${desc}` : ''}\n`;
+        }
+        doc += '\n';
       }
     } catch { /* non-fatal */ }
   }

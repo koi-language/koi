@@ -239,6 +239,27 @@ class Channel {
     return result;
   }
 
+  /**
+   * Ask the user to attach one or more files. Sibling to [form] — the
+   * CLI / GUI layers override this with a richer inline picker (drop
+   * zone + Browse button). This fallback is a plain prompt that takes
+   * comma-separated paths so the action still works in non-interactive
+   * contexts and on a bare terminal.
+   * @param {{title?:string, question?:string, hint?:string, multiple?:boolean, extensions?:string[]}} opts
+   * @returns {Promise<string[]|null>} Absolute paths, or null if cancelled.
+   */
+  async files(opts) {
+    const question = opts?.question || 'Please attach the files you want to share.';
+    this.print(question);
+    if (opts?.hint) this.print(opts.hint);
+    const answer = await this.prompt('Path(s) (comma-separated, blank to cancel): ');
+    if (!answer || !String(answer).trim()) return null;
+    return String(answer)
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+
   // ── Delegation / Slot Management ────────────────────────────────────────
 
   /** @private Slot tracking via AsyncLocalStorage. */
