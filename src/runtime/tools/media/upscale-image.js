@@ -53,7 +53,7 @@ const upscaleImageAction = {
       },
       prompt: {
         type: 'string',
-        description: 'Optional text prompt to guide generative upscalers (Topaz Redefine, Clarity Upscaler, Recraft Creative). Ignored by non-generative upscalers. Max ~1024 chars.',
+        description: 'Optional text prompt to guide generative upscalers (Topaz Redefine, Clarity Upscaler, Recraft Creative). Ignored by non-generative upscalers. Max ~1024 chars. MANDATORY when set: write the prompt in English regardless of the user\'s language — these models are trained predominantly on English. The ONLY exception is text the image must literally render (a sign, a label), which stays verbatim in the user\'s language wrapped in quotes inside the otherwise-English prompt.',
       },
       creativity: {
         type: 'number',

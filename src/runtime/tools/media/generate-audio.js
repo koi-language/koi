@@ -54,7 +54,7 @@ const generateAudioAction = {
       pitch:        { type: 'number', description: 'Pitch offset in semitones (MiniMax: -12..12). Ignored by OpenAI.' },
       volume:       { type: 'number', description: 'Volume multiplier (MiniMax: 0..10, default 1.0). Ignored by OpenAI.' },
       // Sfx mode fields
-      prompt:       { type: 'string', description: 'Free-form description of the sound effect to synthesise (sfx mode).' },
+      prompt:       { type: 'string', description: 'Free-form description of the sound effect (sfx mode) or music track (music mode) to synthesise. MANDATORY: write the prompt in English regardless of the user\'s language — audio models are trained on English-heavy descriptions and degrade with non-English prompts. NOTE: this does NOT affect the `text` field of speech mode — actual spoken dialogue / voice-over copy stays in the user\'s language because it is reproduced verbatim by the TTS voice.' },
       durationSeconds: { type: 'number', description: 'Target clip length in seconds (sfx mode). Provider-clamped — ElevenLabs sound-effects/v2 accepts 0.5–22. Omit to let the provider auto-pick.' },
       promptInfluence: { type: 'number', description: 'How strictly to follow the prompt vs. take creative liberties (sfx mode, 0..1). ElevenLabs-specific; ignored elsewhere.' },
       loop:         { type: 'boolean', description: 'Render a seamlessly-looping clip (sfx mode). ElevenLabs sound-effects/v2 only — useful for ambient beds (rain, engine hum, drone) where you want a stitched loop. Ignored by other SFX adapters.' },

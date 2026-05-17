@@ -108,7 +108,7 @@ const outpaintImageAction = {
       },
       prompt: {
         type: 'string',
-        description: 'Optional guidance for what the new margins should contain (e.g. "continue the ocean and horizon", "add more forest canopy"). Prepended to an auto-built outpainting instruction. Max ~1024 chars.',
+        description: 'Optional guidance for what the new margins should contain (e.g. "continue the ocean and horizon", "add more forest canopy"). Prepended to an auto-built outpainting instruction. Max ~1024 chars. MANDATORY: write the prompt in English regardless of the user\'s language — outpaint models are trained on English captions. The ONLY exception is text that must literally appear in the extended canvas (a sign, a label), which stays in the user\'s language wrapped in quotes inside the otherwise-English prompt.',
       },
       outputFormat: {
         type: 'string',

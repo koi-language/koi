@@ -142,14 +142,57 @@ export function clearJobMetadata(jobId) {
  *  Returns null (and logs) on any failure so the caller can continue
  *  without the reference instead of aborting the whole generation.
  */
-export async function _uploadVideoRef(ref) {
+export async function _uploadVideoRef(ref, opts = {}) {
   if (!ref) return null;
   if (typeof ref !== 'string') return null;
   if (/^https?:\/\//i.test(ref)) return ref; // already a URL
-  const resolved = path.resolve(ref);
-  if (!fs.existsSync(resolved)) {
-    channel.log('video', `reference video not found: ${resolved}`);
+  const original = path.resolve(ref);
+  if (!fs.existsSync(original)) {
+    channel.log('video', `reference video not found: ${original}`);
     return null;
+  }
+  // Defensive temporal pad at the upload site. Some models reject inputs
+  // below a hard duration floor (Seedance 2.0 reference-to-video observed:
+  // 2.0 s minimum, fal returns `body.video_urls.0: Video duration is too
+  // short. Minimum is 2.0 seconds. Found 1.633333 seconds.`). The
+  // upstream `padIfNeeded` branch in execute() only fires for the
+  // `caps.videoToVideo` path; reference-to-video routes upload through
+  // here without going through that branch and used to hit the
+  // backend with the raw short clip. Guaranteeing the minimum at THIS
+  // layer protects every callsite (v2v, reference-to-video, v2v extend,
+  // future buckets) with one block of code.
+  //
+  // We probe dimensions first and pass them as `targetDims` so
+  // `padIfNeeded` does TEMPORAL pad only — no spatial scaling/padding
+  // (which would re-encode the canvas unnecessarily and could change
+  // resolution underneath the model's envelope picker). The temporal
+  // pad appends a black tail via ffmpeg's `tpad` filter; recovery
+  // already trims it back to the original duration so the user never
+  // sees the filler.
+  let resolved = original;
+  if (Number.isFinite(opts.minDurationSec) && opts.minDurationSec > 0) {
+    try {
+      const dims = await _probeRefDims(original);
+      const padOpts = { minDurationMs: opts.minDurationSec * 1000 };
+      if (dims && dims.width > 0 && dims.height > 0) {
+        padOpts.targetDims = { w: dims.width, h: dims.height };
+      }
+      const r = await padIfNeeded(original, 'video', padOpts);
+      if (r?.paddedPath && r.geometry?.needsTemporalPad) {
+        channel.log(
+          'video',
+          `pre-upload temporal pad: ${path.basename(original)} → ` +
+          `${path.basename(r.paddedPath)} ` +
+          `(source < ${opts.minDurationSec.toFixed(3)}s min, padded with black tail)`,
+        );
+        resolved = r.paddedPath;
+      }
+    } catch (err) {
+      channel.log(
+        'video',
+        `pre-upload temporal pad failed (uploading original — may be rejected): ${err?.message || err}`,
+      );
+    }
   }
   try {
     const buf = fs.readFileSync(resolved);
@@ -267,7 +310,7 @@ const generateVideoAction = {
   schema: {
     type: 'object',
     properties: {
-      prompt:          { type: 'string',  description: 'Text description of the desired video' },
+      prompt:          { type: 'string',  description: 'Text description of the desired video. MANDATORY: write the prompt in English regardless of the user\'s language — video models are trained on English-heavy datasets and lose motion fidelity / scene coherence with non-English prompts. The ONLY exception is dialogue, lyrics, voice-over lines, or on-screen text the model must reproduce verbatim — keep that in the user\'s language, wrapped in quotes inside the otherwise-English prompt.' },
       duration:        { type: 'number',  description: 'Duration in seconds (default: 5)' },
       aspectRatio:     { type: 'string',  description: 'Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4 (default: 16:9)' },
       resolution:      { type: 'string',  description: 'Resolution: 360p, 480p, 720p, 1080p, 2k, 4k (default: 720p)' },
@@ -287,7 +330,7 @@ const generateVideoAction = {
         items: {
           type: 'object',
           properties: {
-            prompt:          { type: 'string' },
+            prompt:          { type: 'string', description: 'Per-shot prompt override. MANDATORY: English (same rule as the top-level prompt — only dialogue / voice-over / on-screen text stays in the user\'s language).' },
             duration:        { type: 'number' },
             cameraMovement:  { type: 'string' },
             startFrame:      { type: 'string' },
@@ -2040,9 +2083,24 @@ async function _resolveReferenceVideos(pathArr, caps, resolved) {
     );
     return undefined;
   }
+  // Derive the model's minimum input-video duration from caps (same
+  // resolution order as the upstream pad branch in execute()). The
+  // value is forwarded to `_uploadVideoRef`, which now does a defensive
+  // temporal pad before sending the bytes to the gateway. This catches
+  // routes (reference-to-video, future buckets) that skip the
+  // upstream pad branch — without it, the model rejects the upload
+  // with `Video duration is too short. Minimum is X seconds.`.
+  let minDurSec = null;
+  if (caps && Number.isFinite(caps.minInputDurationSec) && caps.minInputDurationSec > 0) {
+    minDurSec = caps.minInputDurationSec;
+  } else if (caps && Array.isArray(caps.durations) && caps.durations.length > 0) {
+    minDurSec = caps.durations[0];
+  } else if (caps && caps.videoToVideo) {
+    minDurSec = 3; // matches the legacy "video-to-video catalog-row-empty" fallback
+  }
   const urls = [];
   for (const input of pathArr) {
-    const url = await _uploadVideoRef(input);
+    const url = await _uploadVideoRef(input, { minDurationSec: minDurSec });
     if (url) urls.push(url);
   }
   return urls.length > 0 ? urls : undefined;

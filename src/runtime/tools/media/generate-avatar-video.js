@@ -56,7 +56,7 @@ const generateAvatarVideoAction = {
     properties: {
       image:        { type: 'string', description: 'Absolute path to the source face photo (jpg / png / webp).' },
       audioFile:    { type: 'string', description: 'Absolute path to the driving audio file.' },
-      prompt:       { type: 'string', description: 'Optional scene / style hint (most avatar models ignore this).' },
+      prompt:       { type: 'string', description: 'Optional scene / style hint (most avatar models ignore this). MANDATORY when set: write it in English regardless of the user\'s language — avatar models that DO read this field are trained on English. The spoken content is driven by `audioFile`, not by this prompt; this field is for visual scene direction only.' },
       aspectRatio:  { type: 'string', description: 'Aspect ratio: "1:1", "16:9", "9:16" (provider-dependent).' },
       seed:         { type: 'number', description: 'Optional seed for reproducible output.' },
       saveTo:       { type: 'string', description: 'Directory to save the final video. Defaults to ~/.koi/videos/.' },
