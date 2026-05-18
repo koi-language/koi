@@ -1510,6 +1510,13 @@ CRITICAL RULES:
     // ── Resolve message attachments ─────────────────────────────────────────
     // Each message may have `attachments: [{type:'image', path:'/...'}]`.
     // Optimize images and inject as multimodal content via the provider's API format.
+    //
+    // The images we resolve here are ALSO recorded in `session._lastConsumedImages`
+    // so that when the coordinator emits a `delegate` action right after seeing
+    // them, the propagation path in agent.js (line ~3115 → 5430) can forward the
+    // bytes to the delegate. Without this, the delegate's LLM only sees the
+    // textual `[Attached images: …]` hint but never the actual pixels.
+    const _resolvedUserImages = [];
     {
       const _MAX_IMG_DIM = 1568;
       const _optimizeImage = async (imgPath) => {
@@ -1578,6 +1585,30 @@ CRITICAL RULES:
           };
         }
         _debugAttachPaths.push(...imageParts.map(p => p.path));
+        // Record for delegate propagation. Shape matches `_pendingMcpImages`
+        // entries so the delegate's reactive loop can re-inject them
+        // verbatim (see agent.js:1470 and llm-provider.js:1640+).
+        for (const p of imageParts) {
+          _resolvedUserImages.push({
+            data: p.b64,
+            mimeType: p.mime,
+            _debugPath: p.path,
+            role: 'user_attachment',
+          });
+        }
+      }
+    }
+
+    // Stash for delegate propagation. The coordinator may emit a delegate
+    // action this turn — agent.js reads `session._lastConsumedImages` at
+    // the dispatch point and forwards it onto the delegate's
+    // `_pendingImagesToPropagate`. Only set when we genuinely resolved
+    // images, so we don't overwrite an MCP-tool image set further down.
+    if (_resolvedUserImages.length > 0) {
+      const _canDelegateUserImg = agent?.hasPermission?.('delegate');
+      if (_canDelegateUserImg) {
+        const prev = Array.isArray(session._lastConsumedImages) ? session._lastConsumedImages : [];
+        session._lastConsumedImages = [...prev, ..._resolvedUserImages];
       }
     }
 

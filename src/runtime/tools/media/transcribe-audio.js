@@ -31,8 +31,11 @@ const transcribeAudioAction = {
     'Optional: "language" (ISO-639-1 hint — leave empty to let the model auto-detect, useful for sniffing the language of an unknown sample), ' +
     '"task" ("transcribe" → same-language output (default); "translate" → English output), ' +
     '"prompt" (Whisper-style decoder prompt to bias domain-specific terms), ' +
-    '"diarize" (boolean — return per-speaker segments), "numSpeakers" (hint for the diarizer). ' +
-    'Returns: { success, text, language?, segments?, provider, model }. `language` is the DETECTED ISO-639-1 code — even when no language hint was passed, the agent gets it back.',
+    '"diarize" (boolean — return per-speaker segments), "numSpeakers" (hint for the diarizer), ' +
+    '"saveTo" (absolute path to write the full JSON result — text + segments + language + provider/model — directly to disk). ' +
+    'STRONGLY RECOMMENDED for any transcript longer than a couple of sentences: pass `saveTo` so the result lands on disk verbatim. ' +
+    'Without it the agent has to copy the full text + segments into a subsequent `write_file`, and LLMs routinely abbreviate long blobs with placeholders like `"... [Full transcription content captured]"` when re-emitting them — which silently destroys the transcript and every downstream step that depends on the timestamps. ' +
+    'Returns: { success, text, language?, segments?, provider, model, savedTo? }. `language` is the DETECTED ISO-639-1 code — even when no language hint was passed, the agent gets it back. When `saveTo` was used, `savedTo` echoes the absolute path that received the JSON.',
   thinkingHint: 'Transcribing audio',
   permission: 'generate_audio',
 
@@ -46,6 +49,7 @@ const transcribeAudioAction = {
       prompt:      { type: 'string',  description: 'Optional decoder prompt to bias toward specific terms / proper nouns.' },
       diarize:     { type: 'boolean', description: 'Return per-speaker segments when the provider supports it.' },
       numSpeakers: { type: 'number',  description: 'Diarizer hint — speaker count if known.' },
+      saveTo:      { type: 'string',  description: 'Absolute file path where the full result JSON (text + segments + language + provider/model) is written verbatim. Use this whenever you need the transcript on disk for a subsequent step — bypasses the LLM, so the bytes that land in the file are EXACTLY what the model returned, not a re-emitted (and possibly abbreviated) copy.' },
     },
     // Either audioFile OR audioUrl must be present — enforced in execute().
   },
@@ -132,6 +136,42 @@ const transcribeAudioAction = {
       `Transcribed: ${result.text.length} chars${result.language ? ` lang=${result.language}` : ''} provider=${resolved.provider} model=${result.model || resolved.model}`,
     );
 
+    // Persist the full result JSON to disk when the caller requested it.
+    // Done BEFORE building the return payload so a partial write fails
+    // the whole action — the caller would otherwise believe `saveTo`
+    // succeeded and a downstream `read_file` would either miss the file
+    // or read a truncated blob. The on-disk shape mirrors the in-memory
+    // return EXACTLY (success/savedTo aside), so any code that already
+    // consumes the action result can also consume the saved file.
+    let savedTo = null;
+    if (typeof action.saveTo === 'string' && action.saveTo.trim().length > 0) {
+      try {
+        const resolvedSavePath = path.resolve(action.saveTo);
+        const dir = path.dirname(resolvedSavePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const payload = {
+          text: result.text,
+          language: result.language,
+          segments: result.segments,
+          provider: resolved.provider,
+          model: result.model || resolved.model,
+        };
+        fs.writeFileSync(resolvedSavePath, JSON.stringify(payload, null, 2));
+        savedTo = resolvedSavePath;
+        channel.log(
+          'audio',
+          `Saved transcript JSON to ${resolvedSavePath} (${result.text.length} chars text + ${(result.segments || []).length} segments)`,
+        );
+      } catch (err) {
+        return {
+          success: false,
+          provider: resolved.provider,
+          model: result.model || resolved.model,
+          error: `Transcribed OK but failed to write saveTo=${action.saveTo}: ${err.message || err}`,
+        };
+      }
+    }
+
     return {
       success: true,
       text: result.text,
@@ -139,6 +179,7 @@ const transcribeAudioAction = {
       segments: result.segments,
       provider: resolved.provider,
       model: result.model || resolved.model,
+      ...(savedTo ? { savedTo } : {}),
     };
   },
 };

@@ -537,6 +537,148 @@ const generateImageAction = {
     const effectiveAspect = action.aspectRatio || autoAspectRatio;
     const effectiveResolution = action.resolution || autoResolution;
 
+    // ── Payload-size guard: shrink fat reference images ──────────────
+    // The gateway POSTs `reference_images: [{data: <base64>, mime_type}]`
+    // and the surrounding HTTP layer caps payload at ~10 MB. 4K PNG
+    // refs run 2-4 MB each in binary, ~3-6 MB once base64-encoded —
+    // half a dozen of them and the request fails with HTTP 413
+    // "Payload Too Large" before any model sees it. The 413 comes
+    // back as an opaque `errorType: "generation_error"` and the agent
+    // has no way to know it was just bytes.
+    //
+    // Strategy is a ladder, each step kept as lossless as possible:
+    //
+    //   1. PNG re-encode with max zlib compression + palette
+    //      indexing (`.png({ compressionLevel: 9, palette: true })`).
+    //      Pure lossless — sharp picks an 8-bit palette only when the
+    //      image actually has ≤256 distinct colours (typical for
+    //      screenshots / diagrams / UI), so screencaps drop 5-10× with
+    //      ZERO pixel change. Real photos / renders fall back to
+    //      true-colour PNG and shrink only marginally — that's fine,
+    //      step 2 picks it up.
+    //   2. Downscale to longest edge 2048 px (still lossless re-encode
+    //      as PNG). Edit models resample internally to ≤2K anyway, so
+    //      losing nothing above 2K. Only the spatial resample loses
+    //      information, and the model would have lost it itself.
+    //   3. Downscale harder (1536 → 1024) if the budget still isn't met.
+    //   4. JPEG q92 as the absolute last resort — only when no
+    //      lossless re-encode + resize chain fits inside the budget.
+    //      This branch should be rare in practice (10+ MB of photos
+    //      from a real DSLR, etc.).
+    //
+    // PNG with alpha is preserved as PNG throughout (masks /
+    // outpaint canvases rely on the alpha channel; JPEG would
+    // silently flatten it).
+    if (referenceImages?.length) {
+      try {
+        const sharp = (await import('sharp')).default;
+        // Encoded size = base64 expansion (×4/3) + tiny JSON wrapper.
+        // Budget aligned with the backend's hard cap: Fastify's
+        // `bodyLimit` is 50 MB (backend/src/app.ts) so anything inside
+        // that ceiling reaches the route handler. Railway's edge proxy
+        // sits in front and its body cap is undocumented but empirically
+        // generous (no fail seen at 30+ MB in past tests). Putting the
+        // budget right at 50 MB means we only shrink when the request
+        // genuinely cannot fit, which preserves maximum fidelity for the
+        // common case (3-5 refs at native resolution). If a future bug
+        // surfaces an actual Railway cap lower than 50 MB, drop this
+        // back to ~30 MB — it's the only knob.
+        const BUDGET_BYTES = 50 * 1024 * 1024;
+        const _encodedSize = (n) => Math.ceil(n * 4 / 3);
+        const _totalEncoded = () => referenceImages.reduce(
+          (acc, r) => acc + _encodedSize(r.data?.length || 0), 0,
+        );
+
+        if (_totalEncoded() > BUDGET_BYTES) {
+          channel.log(
+            'image',
+            `Reference payload ${(_totalEncoded() / 1024 / 1024).toFixed(1)} MB > budget ${(BUDGET_BYTES / 1024 / 1024).toFixed(1)} MB — shrinking refs (lossless first, JPEG only as last resort)`,
+          );
+
+          // Shrink a single ref through the lossless ladder + JPEG
+          // fallback. Returns the new buffer and the chosen mime type.
+          const _shrinkRef = async (buf) => {
+            const meta = await sharp(buf).metadata();
+            if (!meta?.width || !meta?.height) {
+              return { data: buf, mimeType: 'image/png', note: 'no-metadata' };
+            }
+            const hasAlpha = meta.hasAlpha === true || meta.channels === 4;
+            // Step 1 — lossless PNG re-encode at full res.
+            let cur = await sharp(buf)
+              .png({ compressionLevel: 9, palette: true })
+              .toBuffer();
+            let curW = meta.width;
+            let curH = meta.height;
+            let note = 'png-recompress';
+            // Steps 2/3 — progressively downscale, still lossless PNG.
+            const sizes = [2048, 1536, 1024];
+            for (const target of sizes) {
+              const longEdge = Math.max(curW, curH);
+              if (longEdge <= target) break;
+              const aspect = curW / curH;
+              const newW = curW >= curH ? target : Math.round(target * aspect);
+              const newH = curH > curW ? target : Math.round(target / aspect);
+              cur = await sharp(buf)
+                .resize({
+                  width: curW >= curH ? target : null,
+                  height: curH > curW ? target : null,
+                  fit: 'inside',
+                  withoutEnlargement: true,
+                })
+                .png({ compressionLevel: 9, palette: true })
+                .toBuffer();
+              curW = newW;
+              curH = newH;
+              note = `png@${target}`;
+              if (_encodedSize(cur.length) < BUDGET_BYTES / referenceImages.length) break;
+            }
+            // Step 4 — JPEG fallback (only if no alpha, since JPEG
+            // can't carry transparency). Use the final dimensions we
+            // already arrived at; q92 is visually identical to PNG
+            // for natural photos and is the last lever we have.
+            const stillTooFat = _encodedSize(cur.length) > BUDGET_BYTES / referenceImages.length;
+            if (stillTooFat && !hasAlpha) {
+              cur = await sharp(buf)
+                .resize({
+                  width: curW >= curH ? Math.min(curW, 1024) : null,
+                  height: curH > curW ? Math.min(curH, 1024) : null,
+                  fit: 'inside',
+                  withoutEnlargement: true,
+                })
+                .jpeg({ quality: 92, mozjpeg: true })
+                .toBuffer();
+              note = 'jpeg-fallback';
+              return { data: cur, mimeType: 'image/jpeg', note, w: curW, h: curH };
+            }
+            return { data: cur, mimeType: 'image/png', note, w: curW, h: curH };
+          };
+
+          for (let i = 0; i < referenceImages.length; i++) {
+            const ref = referenceImages[i];
+            if (!ref?.data) continue;
+            try {
+              const beforeKB = (ref.data.length / 1024).toFixed(0);
+              const out = await _shrinkRef(ref.data);
+              const afterKB = (out.data.length / 1024).toFixed(0);
+              channel.log(
+                'image',
+                `  ref[${i}]: ${beforeKB} KB → ${afterKB} KB (${out.note}${out.w ? `, ${out.w}x${out.h}` : ''})`,
+              );
+              referenceImages[i] = { data: out.data, mimeType: out.mimeType };
+            } catch (resizeErr) {
+              channel.log('image', `  ref[${i}] shrink failed (sending original): ${resizeErr.message}`);
+            }
+          }
+          channel.log(
+            'image',
+            `Reference payload after shrink: ${(_totalEncoded() / 1024 / 1024).toFixed(1)} MB`,
+          );
+        }
+      } catch (sharpErr) {
+        channel.log('image', `Reference payload size guard skipped (sharp unavailable): ${sharpErr.message}`);
+      }
+    }
+
     // Log full generation request details. Ref items can now be strings or
     // {alias,path} objects — normalise for the summary without re-parsing.
     const refSummary = (action.referenceImages || []).map((it) => {

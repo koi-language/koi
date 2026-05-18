@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { actionRegistry } from '../agent/action-registry.js';
@@ -8,6 +9,46 @@ import { getBuiltinSlotMap } from '../prompt/builtin-slot-maps.js';
 import { channel } from '../io/channel.js';
 import * as memory from '../memory/index.js';
 import { listWorkflowsCatalog } from '../state/workflows-catalog.js';
+
+// Pinned ffmpeg version installed by `ffmpeg-installer.js`. Mirrored
+// here as a constant so we don't have to import the installer (and
+// trigger its side effects) just to know the version string for the
+// RUNTIME CONTEXT block.
+const _PINNED_FFMPEG_VERSION = '8.1.1';
+
+/// Resolve the ffmpeg binary path without forcing an install. Order:
+///   1. `KOI_FFMPEG_PATH` env var (set by the Flutter bundle).
+///   2. Pinned cache `~/.koi/bin/ffmpeg-<PINNED>/ffmpeg`.
+///   3. null — caller falls back to assuming `ffmpeg` is on PATH.
+/// Cached per process (the file system check is cheap, but we'd
+/// re-stat on every prompt build otherwise — hundreds of times a
+/// session for a chatty agent).
+let _ffmpegInfoCache;
+function _resolveFfmpegInfo() {
+  if (_ffmpegInfoCache) return _ffmpegInfoCache;
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  const envPath = process.env.KOI_FFMPEG_PATH;
+  let resolved = null;
+  let source = null;
+  if (envPath && fs.existsSync(envPath)) {
+    resolved = envPath;
+    source = 'env';
+  } else {
+    const cached = path.join(
+      os.homedir(),
+      '.koi',
+      'bin',
+      `ffmpeg-${_PINNED_FFMPEG_VERSION}`,
+      `ffmpeg${exe}`,
+    );
+    if (fs.existsSync(cached)) {
+      resolved = cached;
+      source = 'cache';
+    }
+  }
+  _ffmpegInfoCache = { path: resolved, version: _PINNED_FFMPEG_VERSION, source };
+  return _ffmpegInfoCache;
+}
 
 // =========================================================================
 // SYSTEM PROMPT BUILDER — standalone functions extracted from LLMProvider
@@ -1110,43 +1151,23 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
     }
   }
 
-  // ── Known media handles: cross-project `@mention` vocabulary ──
-  // Lists every distinct mention pinned via `tag_media` (or the GUI's
-  // right-click "Set @mention") so the agent knows up front what
-  // `@`-handles it can reuse — e.g. `referenceImages: ["@tom"]` —
-  // before deciding to invent a fresh one. Cheap (single full-table
-  // scan over the cajón). Lives in DYNAMIC because the catalog grows
-  // during a session; the cache rebuild is acceptable since the block
-  // only changes when the agent (or user) tags something new. Cap at
-  // 50 entries with a tail count so the prompt never explodes on a
-  // mature catalog.
-  let mentionVocabularyBlock = '';
-  try {
-    const { MediaLibrary } = await import('../state/media-library.js');
-    const lib = MediaLibrary.global();
-    if (lib) {
-      const all = await lib.listMentions();
-      if (Array.isArray(all) && all.length > 0) {
-        const limit = 50;
-        const shown = all.slice(0, limit);
-        const tail = all.length > limit ? `\n…and ${all.length - limit} more (use list_media or recall by partial mention to expand).` : '';
-        const lines = shown.map(m => {
-          const count = m.count > 1 ? ` ×${m.count}` : '';
-          const type = m.mediaType || 'unknown';
-          return `  • \`@${m.mention}\` — ${type}${count}`;
-        });
-        mentionVocabularyBlock = `\n# KNOWN MEDIA HANDLES\nMention handles already pinned in the cross-project library. Refer to any of these in \`referenceImages\` / \`referenceVideos\` / \`startFrame\` / \`endFrame\` etc. as \`"@name"\` — the runtime resolves to the most-recent file tagged with that handle. Tag new assets with \`tag_media\` to grow this vocabulary.\n\n${lines.join('\n')}${tail}\n`;
-      }
-    }
-  } catch (err) {
-    try {
-      const { channel: _ch } = await import('../io/channel.js');
-      _ch.log('prompt', `[mention-vocab] ERROR building block — block omitted: ${err?.stack || err?.message || err}`);
-    } catch {
-      // eslint-disable-next-line no-console
-      console.error('[prompt] [mention-vocab] ERROR building block — block omitted:', err);
-    }
-  }
+  // KNOWN MEDIA HANDLES block REMOVED on purpose.
+  //
+  // Previously this dumped every `@mention` pinned via tag_media into
+  // the prompt — up to 50 entries with type + description per turn,
+  // worth several hundred tokens. In practice the agent almost never
+  // looked at it: (a) when the user actually wants a specific handle,
+  // they type `@xxx` into their message and the handle arrives in the
+  // user content directly, so the inventory adds nothing; (b) when the
+  // agent wants to discover existing media before generating new
+  // assets, it can call `list_media` / `recall_image` on demand at the
+  // moment it needs them, which is far cheaper than carrying the whole
+  // catalog in every turn's static prefix; (c) the @ autocomplete in
+  // the chat input is the right surface for users browsing handles,
+  // not the agent's prompt. Removed the block; left this comment so a
+  // future maintainer doesn't re-add it without thinking through these
+  // points first.
+  const mentionVocabularyBlock = '';
 
   // Expanded tool schemas: full docs for every tool the agent has
   // already requested via `get_tool_info` this session. Lives in the
@@ -1157,6 +1178,17 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
   const expandedToolsBlock = actionRegistry.generateExpandedToolsBlock(agent);
 
   // ── Dynamic section: runtime context, project map, language, non-interactive ──
+  // ffmpeg path/version — the agent's media tools and ad-hoc shell
+  // calls (e.g. `ffmpeg -i in.mp4 -c copy ...`) all need to know where
+  // the controlled binary lives. The Koi pipeline pins ffmpeg 8.1.1
+  // via `ffmpeg-installer.js`; surface that path here so the agent
+  // doesn't shell out to `which ffmpeg` and accidentally pick up a
+  // system ffmpeg 4.x or 5.x with stale flags.
+  const _ffmpeg = _resolveFfmpegInfo();
+  const ffmpegField = _ffmpeg.path
+    ? `\n| ffmpeg | \`${_ffmpeg.path}\` (v${_ffmpeg.version}) |`
+    : `\n| ffmpeg | not yet installed — runs via Koi's installer on first media call (pinned v${_ffmpeg.version}). Prefer the high-level media actions over raw shell \`ffmpeg\` calls. |`;
+
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
   const dynamic = `${phaseSystemBlock}
@@ -1165,7 +1197,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 | Field | Value |
 |---|---|
 | Current date/time | \`${now}\`${timezone ? ` (${timezone})` : ''} |
-| Working directory | \`${cwd}\` |${platformField}${langField}
+| Working directory | \`${cwd}\` |${platformField}${langField}${ffmpegField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
@@ -1779,7 +1811,7 @@ async function _runContextCompiler(agent) {
       const title = _humanizeSlotId(s.id);
       return `### ${title}\n${s.included.trim()}`;
     });
-    parts.push(`## RECALLED CONTEXT (Recursive Memory Harness)\n\n${sections.join('\n\n')}`);
+    parts.push(`## RECALLED CONTEXT\n\n${sections.join('\n\n')}`);
   }
   const out = parts.join('\n\n');
   _compileCacheSet(cacheKey, out);

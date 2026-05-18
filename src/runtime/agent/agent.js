@@ -3270,7 +3270,22 @@ export class Agent {
             }
             Agent._cliHooks?.onBusy?.(true);
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
-            this._lastUserMessage = _isBgWakeup ? null : (result?.answer || null);
+            // Build the user message string the rest of the runtime will
+            // treat as "what the user just said". When attachments came
+            // with the prompt, append a `[Attached: …]` hint so the
+            // CURRENT FOCUS block (system-prompt-builder._buildTriggerTask
+            // reads `_lastUserMessage`) and downstream consumers know
+            // about them. The actual image bytes flow through the
+            // multimodal pipeline (see _resolvedUserImages in
+            // llm-provider.js) — this string is purely textual context.
+            let _lastUserText = _isBgWakeup ? null : (result?.answer || null);
+            if (_lastUserText && Array.isArray(result?.attachments) && result.attachments.length > 0) {
+              const _names = result.attachments
+                .filter(a => a && a.path)
+                .map(a => a.path.split('/').pop());
+              if (_names.length > 0) _lastUserText = `${_lastUserText}\n[Attached: ${_names.join(', ')}]`;
+            }
+            this._lastUserMessage = _lastUserText;
             channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
 
             // Fire user.message reaction
@@ -3885,15 +3900,24 @@ export class Agent {
 
         if (!promptResult?.answer) return {};
 
-        // Track user message so compose templates can use {{userMessage}} / @if (userMessage)
-        this._lastUserMessage = promptResult.answer;
-
         // Add user's new message to context and restart the reactive loop.
         // Re-evaluate the playbook via playbookResolver so compose blocks pick up
         // any runtime state changes (e.g. tasks created since the session started).
         const _promptAtts = Array.isArray(promptResult.attachments)
           ? promptResult.attachments.filter(a => a.path)
           : [];
+        // Track user message so compose templates can use {{userMessage}} /
+        // @if (userMessage). Append a textual `[Attached: …]` hint when the
+        // prompt carried attachments so the CURRENT FOCUS block surfaces them
+        // (the actual bytes flow through the multimodal pipeline).
+        {
+          let _msg = promptResult.answer;
+          if (_promptAtts.length > 0) {
+            const _names = _promptAtts.map(a => a.path.split('/').pop());
+            _msg = `${_msg}\n[Attached: ${_names.join(', ')}]`;
+          }
+          this._lastUserMessage = _msg;
+        }
         // Register attachments and annotate with IDs so delegates can resolve them
         let _attNote = '';
         if (_promptAtts.length > 0) {

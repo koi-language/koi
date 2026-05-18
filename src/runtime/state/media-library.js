@@ -931,6 +931,14 @@ export class MediaLibrary {
         filePath: row.file_path,
         createdAt: row.created_at,
         id: row.id,
+        // Surface the row's description so callers (notably the system
+        // prompt's `KNOWN MEDIA HANDLES` block) can show WHAT each handle
+        // actually points at, not just its type. The bare list of names
+        // is otherwise opaque ("`@tucan` — image" tells the agent nothing
+        // it can act on; "`@tucan` — image: cartoon toucan on a branch,
+        // bright tropical palette" lets the agent decide whether to
+        // reuse it without opening the file).
+        description: row.description || '',
       }))
       .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   }
