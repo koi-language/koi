@@ -238,11 +238,53 @@ export async function _uploadVideoRef(ref, opts = {}) {
  * for the 10-15MB outputs typical of Kling/Veo: undici aborts mid-body and
  * the call returned null silently with no signal to the agent.
  */
+/**
+ * Redirect any `saveTo` that points INSIDE a workflow workspace
+ * (`<root>/.koi/workflows/<run_id>/...`) to the canonical home for
+ * media of this kind (`~/.koi/<kind>/`). Workflow workspaces are
+ * ephemeral — they get cleaned up at run-end (or by manual garbage
+ * collection), and anything persisted there silently disappears.
+ * Generated artefacts MUST live in stable storage if downstream code
+ * (timelines, gallery, chat history) is going to reference them by
+ * absolute path; otherwise the user sees clips turn into black
+ * rectangles with "file missing" cartouches days later. See the
+ * "de repente un clip ha desaparecido" diagnosis for the exact
+ * incident this guards against. Kind is one of `videos` / `images` /
+ * `audio` (drives the destination directory under `~/.koi/`).
+ */
+function _canonicalKoiSaveDir(resolvedDir, kind) {
+  if (typeof resolvedDir !== 'string' || !resolvedDir) return resolvedDir;
+  const segs = resolvedDir.split(path.sep);
+  // Detect `<...>/.koi/workflows/<...>` anywhere in the path. The leading
+  // dot keeps us from triggering on a user folder literally named
+  // `workflows`.
+  let inWorkflowWorkspace = false;
+  for (let i = 0; i + 1 < segs.length; i++) {
+    if (segs[i] === '.koi' && segs[i + 1] === 'workflows') {
+      inWorkflowWorkspace = true;
+      break;
+    }
+  }
+  if (!inWorkflowWorkspace) return resolvedDir;
+  const canonical = path.join(os.homedir(), '.koi', kind);
+  channel.log(
+    'video',
+    `saveTo "${resolvedDir}" is inside a workflow workspace (ephemeral); ` +
+    `redirecting to canonical home "${canonical}" so the artefact survives ` +
+    `workspace cleanup. Workflows that need true intermediates should keep ` +
+    `them outside generator output paths.`,
+  );
+  return canonical;
+}
+
 export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}) {
   if (!url) return { path: null, error: 'No video URL returned by provider.' };
-  const saveDir = typeof saveTo === 'string' && saveTo.trim()
-    ? path.resolve(saveTo.trim())
-    : path.join(os.homedir(), '.koi', 'videos');
+  const saveDir = _canonicalKoiSaveDir(
+    typeof saveTo === 'string' && saveTo.trim()
+      ? path.resolve(saveTo.trim())
+      : path.join(os.homedir(), '.koi', 'videos'),
+    'videos',
+  );
 
   try {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });

@@ -1069,8 +1069,12 @@ CRITICAL RULES:
           // Build text references for attached files
           const _promptAtts = session._promptAttachments || [];
           const _imgPaths = _promptAtts.filter(a => a.type === 'image').map(a => a.path);
+          // Markdown bullet list — easier for the LLM to read AND to copy
+          // verbatim into delegate task descriptions than a single inline
+          // `["x", "y", …]` array. Each path on its own line means the LLM
+          // also can't accidentally split the list mid-quote.
           const _imgRef = _imgPaths.length > 0
-            ? `\n[Attached images: ${_imgPaths.map(p => `"${p}"`).join(', ')}]`
+            ? `\n\n**Attached images:**\n${_imgPaths.map(p => `- ${p}`).join('\n')}`
             : '';
           const _imgShort = _imgPaths.length > 0
             ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`

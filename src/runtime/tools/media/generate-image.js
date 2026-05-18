@@ -592,82 +592,144 @@ const generateImageAction = {
         if (_totalEncoded() > BUDGET_BYTES) {
           channel.log(
             'image',
-            `Reference payload ${(_totalEncoded() / 1024 / 1024).toFixed(1)} MB > budget ${(BUDGET_BYTES / 1024 / 1024).toFixed(1)} MB — shrinking refs (lossless first, JPEG only as last resort)`,
+            `Reference payload ${(_totalEncoded() / 1024 / 1024).toFixed(1)} MB > budget ${(BUDGET_BYTES / 1024 / 1024).toFixed(1)} MB — greedy shrink (largest refs first, stop as soon as total fits)`,
           );
 
-          // Shrink a single ref through the lossless ladder + JPEG
-          // fallback. Returns the new buffer and the chosen mime type.
-          const _shrinkRef = async (buf) => {
-            const meta = await sharp(buf).metadata();
-            if (!meta?.width || !meta?.height) {
-              return { data: buf, mimeType: 'image/png', note: 'no-metadata' };
+          // Greedy global shrinker. Previous version allocated
+          // `BUDGET / N` per image and pushed EVERY ref through the
+          // full ladder until each individual ref fit that per-image
+          // budget. With many refs (9 photos → 5.5 MB encoded each),
+          // that forced almost every reference down to 1024 px JPEG
+          // even though the GLOBAL total had plenty of headroom — the
+          // model then saw an aggressively downscaled storyboard and
+          // produced visibly worse results (the symptom the user
+          // reported).
+          //
+          // The right strategy: keep every ref at native res when the
+          // global budget permits; when it doesn't, shrink only the
+          // biggest ones, ONE step at a time, and stop the moment the
+          // global total fits. Small refs are never touched.
+          //
+          // The ladder is (per ref):
+          //   0 = original   (untouched)
+          //   1 = png-recompress  (lossless, only step that's cheap to
+          //       run on every ref preemptively — palette PNG often
+          //       drops screenshots / diagrams 5-10× with zero loss)
+          //   2 = 2048 px PNG lossless
+          //   3 = 1536 px PNG lossless
+          //   4 = 1024 px PNG lossless
+          //   5 = JPEG q92 @ 1024 px  (last resort, only when no
+          //       alpha — JPEG can't carry transparency)
+          //   6 = JPEG q85 @ 1024 px  (only fired when 5 still busts
+          //       the budget on a many-ref payload)
+          const refState = referenceImages.map((r, i) => ({
+            idx: i,
+            step: 0,
+            data: r.data,
+            mimeType: r.mimeType,
+            hasAlpha: null, // resolved lazily on first shrink
+          }));
+          const _refSize = (s) => s?.data?.length || 0;
+
+          const _applyStep = async (state) => {
+            const sharpInst = sharp(state.data);
+            const meta = await sharpInst.metadata();
+            if (state.hasAlpha == null) {
+              state.hasAlpha = meta?.hasAlpha === true || meta?.channels === 4;
             }
-            const hasAlpha = meta.hasAlpha === true || meta.channels === 4;
-            // Step 1 — lossless PNG re-encode at full res.
-            let cur = await sharp(buf)
-              .png({ compressionLevel: 9, palette: true })
-              .toBuffer();
-            let curW = meta.width;
-            let curH = meta.height;
-            let note = 'png-recompress';
-            // Steps 2/3 — progressively downscale, still lossless PNG.
-            const sizes = [2048, 1536, 1024];
-            for (const target of sizes) {
-              const longEdge = Math.max(curW, curH);
-              if (longEdge <= target) break;
-              const aspect = curW / curH;
-              const newW = curW >= curH ? target : Math.round(target * aspect);
-              const newH = curH > curW ? target : Math.round(target / aspect);
-              cur = await sharp(buf)
-                .resize({
-                  width: curW >= curH ? target : null,
-                  height: curH > curW ? target : null,
-                  fit: 'inside',
-                  withoutEnlargement: true,
-                })
+            const fromBuf = state.data;
+            if (state.step === 1) {
+              // Lossless recompress at native res.
+              const out = await sharp(fromBuf)
                 .png({ compressionLevel: 9, palette: true })
                 .toBuffer();
-              curW = newW;
-              curH = newH;
-              note = `png@${target}`;
-              if (_encodedSize(cur.length) < BUDGET_BYTES / referenceImages.length) break;
+              return { data: out, mimeType: 'image/png', note: 'png-recompress' };
             }
-            // Step 4 — JPEG fallback (only if no alpha, since JPEG
-            // can't carry transparency). Use the final dimensions we
-            // already arrived at; q92 is visually identical to PNG
-            // for natural photos and is the last lever we have.
-            const stillTooFat = _encodedSize(cur.length) > BUDGET_BYTES / referenceImages.length;
-            if (stillTooFat && !hasAlpha) {
-              cur = await sharp(buf)
-                .resize({
-                  width: curW >= curH ? Math.min(curW, 1024) : null,
-                  height: curH > curW ? Math.min(curH, 1024) : null,
-                  fit: 'inside',
-                  withoutEnlargement: true,
-                })
-                .jpeg({ quality: 92, mozjpeg: true })
+            const dimMap = { 2: 2048, 3: 1536, 4: 1024 };
+            if (state.step in dimMap) {
+              const target = dimMap[state.step];
+              const out = await sharp(fromBuf)
+                .resize({ width: target, height: target, fit: 'inside', withoutEnlargement: true })
+                .png({ compressionLevel: 9, palette: true })
                 .toBuffer();
-              note = 'jpeg-fallback';
-              return { data: cur, mimeType: 'image/jpeg', note, w: curW, h: curH };
+              return { data: out, mimeType: 'image/png', note: `png@${target}` };
             }
-            return { data: cur, mimeType: 'image/png', note, w: curW, h: curH };
+            if (state.step === 5 || state.step === 6) {
+              if (state.hasAlpha) {
+                // JPEG can't carry alpha — keep PNG at 1024 instead.
+                const out = await sharp(fromBuf)
+                  .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+                  .png({ compressionLevel: 9, palette: true })
+                  .toBuffer();
+                return { data: out, mimeType: 'image/png', note: 'png@1024(alpha)' };
+              }
+              const quality = state.step === 5 ? 92 : 85;
+              const out = await sharp(fromBuf)
+                .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality, mozjpeg: true })
+                .toBuffer();
+              return { data: out, mimeType: 'image/jpeg', note: `jpeg-q${quality}@1024` };
+            }
+            return null; // step exhausted
           };
 
-          for (let i = 0; i < referenceImages.length; i++) {
-            const ref = referenceImages[i];
-            if (!ref?.data) continue;
+          const _totalNow = () => refState.reduce(
+            (acc, s) => acc + _encodedSize(_refSize(s)), 0,
+          );
+
+          // Optional pass 0: cheap palette-recompress on every ref
+          // FIRST. Lossless and fast — often clears the deficit on
+          // its own when the refs are screenshots / UI mocks.
+          for (const s of refState) {
             try {
-              const beforeKB = (ref.data.length / 1024).toFixed(0);
-              const out = await _shrinkRef(ref.data);
-              const afterKB = (out.data.length / 1024).toFixed(0);
+              s.step = 1;
+              const out = await _applyStep(s);
+              if (out && out.data.length < s.data.length) {
+                s.data = out.data;
+                s.mimeType = out.mimeType;
+                s._note = out.note;
+              }
+            } catch { /* ignore — keep original */ }
+            if (_totalNow() <= BUDGET_BYTES) break;
+          }
+
+          // Greedy loop: while we're still over budget, find the
+          // largest ref that still has ladder steps available and
+          // bump it ONE step. Recheck total. Repeat.
+          let safety = refState.length * 6 + 4; // hard stop, can't loop forever
+          while (_totalNow() > BUDGET_BYTES && safety-- > 0) {
+            const candidate = refState
+              .filter((s) => s.step < 6)
+              .sort((a, b) => _refSize(b) - _refSize(a))[0];
+            if (!candidate) break; // every ref exhausted the ladder
+            candidate.step += 1;
+            try {
+              const out = await _applyStep(candidate);
+              if (out) {
+                candidate.data = out.data;
+                candidate.mimeType = out.mimeType;
+                candidate._note = out.note;
+              }
+            } catch (err) {
+              channel.log('image', `  ref[${candidate.idx}] shrink step ${candidate.step} failed (keeping previous): ${err.message}`);
+              // Mark exhausted so we don't retry this step in a loop.
+              candidate.step = 6;
+            }
+          }
+
+          // Write back + log per-ref outcome.
+          for (const s of refState) {
+            const before = referenceImages[s.idx]?.data?.length || 0;
+            const after = s.data.length;
+            if (s.step > 0) {
               channel.log(
                 'image',
-                `  ref[${i}]: ${beforeKB} KB → ${afterKB} KB (${out.note}${out.w ? `, ${out.w}x${out.h}` : ''})`,
+                `  ref[${s.idx}]: ${(before / 1024).toFixed(0)} KB → ${(after / 1024).toFixed(0)} KB (${s._note || 'unchanged'})`,
               );
-              referenceImages[i] = { data: out.data, mimeType: out.mimeType };
-            } catch (resizeErr) {
-              channel.log('image', `  ref[${i}] shrink failed (sending original): ${resizeErr.message}`);
+            } else {
+              channel.log('image', `  ref[${s.idx}]: ${(before / 1024).toFixed(0)} KB (native, kept as-is)`);
             }
+            referenceImages[s.idx] = { data: s.data, mimeType: s.mimeType };
           }
           channel.log(
             'image',

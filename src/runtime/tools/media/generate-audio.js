@@ -22,8 +22,38 @@ import { findVoiceByName } from '../../state/voice-registry.js';
 import { _uploadVideoRef } from './generate-video.js';
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
+
+/**
+ * Redirect a per-file `saveTo` that points INSIDE a workflow workspace
+ * (`<root>/.koi/workflows/<run_id>/...`) to the canonical home for
+ * audio (`~/.koi/audio/<basename>`). Workflow workspaces are
+ * ephemeral; anything persisted there silently disappears on cleanup,
+ * and timeline / chat references break days later. Mirrors the same
+ * guard in generate-video.js's `_canonicalKoiSaveDir`. Returns the
+ * input unchanged when not inside a workspace.
+ */
+function _canonicalAudioSavePath(resolvedFilePath) {
+  if (typeof resolvedFilePath !== 'string' || !resolvedFilePath) return resolvedFilePath;
+  const segs = resolvedFilePath.split(path.sep);
+  let inWorkflowWorkspace = false;
+  for (let i = 0; i + 1 < segs.length; i++) {
+    if (segs[i] === '.koi' && segs[i + 1] === 'workflows') {
+      inWorkflowWorkspace = true;
+      break;
+    }
+  }
+  if (!inWorkflowWorkspace) return resolvedFilePath;
+  const canonical = path.join(os.homedir(), '.koi', 'audio', path.basename(resolvedFilePath));
+  channel.log(
+    'audio',
+    `saveTo "${resolvedFilePath}" is inside a workflow workspace (ephemeral); ` +
+    `redirecting to "${canonical}" so the audio survives workspace cleanup.`,
+  );
+  return canonical;
+}
 
 const generateAudioAction = {
   type: 'generate_audio',
@@ -181,7 +211,7 @@ const generateAudioAction = {
       });
 
       // Save to disk
-      const savePath = path.resolve(action.saveTo);
+      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
       const dir = path.dirname(savePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(savePath, result.audio);
@@ -288,7 +318,7 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      const savePath = path.resolve(action.saveTo);
+      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
       const dir = path.dirname(savePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(savePath, result.audio);
@@ -361,7 +391,7 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      const savePath = path.resolve(action.saveTo);
+      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
       const dir = path.dirname(savePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(savePath, result.audio);

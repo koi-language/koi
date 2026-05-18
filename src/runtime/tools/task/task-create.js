@@ -46,7 +46,7 @@ export default {
     },
   ],
 
-  async execute(action) {
+  async execute(action, agent) {
     // NOTE: auto-skill-activation does NOT fire here on purpose. When
     // System enqueues a task it usually delegates it to a specialist,
     // so activating skills on System at creation time would pollute
@@ -61,9 +61,29 @@ export default {
     // instantiates a workflow's steps as tasks — NOT advertised in the
     // schema so the LLM doesn't try to pass it. Lets agent.js group
     // sibling tasks for PRIOR STEPS injection + shared workspace dir.
+
+    // Auto-propagate user-attached media paths into the task description.
+    // When the caller (e.g. Planner) was invoked with `args.userAttachments`
+    // — set by the delegate dispatch path in agent.js when the user attached
+    // media to the conversation — the executor of THIS new task must see
+    // those paths too. The Planner's LLM frequently rewrites the description
+    // in its own words and drops the paths, leaving the Worker unable to
+    // pass them to `generate_image` / `generate_video` as references. This
+    // runtime stamp guarantees the paths reach the executor regardless of
+    // what the LLM chose to copy into the spec.
+    let description = action.description || '';
+    try {
+      const _args = agent?._activeSession?.actionContext?.args;
+      const _parentAttachments = Array.isArray(_args?.userAttachments) ? _args.userAttachments : [];
+      if (_parentAttachments.length > 0 && !description.includes('## ATTACHED MEDIA')) {
+        const _block = `\n\n## ATTACHED MEDIA (provided by the user — pass to media tools as referenceImages / referenceVideos when relevant)\n${_parentAttachments.map((p) => `- ${p}`).join('\n')}`;
+        description = description + _block;
+      }
+    } catch { /* non-fatal — never block task creation on this stamp */ }
+
     const task = taskManager.create({
       subject: action.subject,
-      description: action.description,
+      description,
       activeForm: action.activeForm || null,
       workflowRunId: action.workflowRunId || undefined,
     });

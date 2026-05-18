@@ -1620,7 +1620,18 @@ export class Agent {
               if (entry?.type === 'user_input') {
                 const text = String(entry.text || '').trim();
                 if (!text) continue;
-                replay.push({ role: 'user', content: text });
+                // Re-stitch the attachments bullet list when the entry
+                // carries them — the root agent stored them as a
+                // sibling field so the delegate can reconstruct the
+                // exact "text + **Attached files:** …" body it would
+                // have seen if it had been the one running prompt_user.
+                let content = text;
+                const _atts = Array.isArray(entry.attachments) ? entry.attachments.filter(a => a && a.path) : [];
+                if (_atts.length > 0) {
+                  const _bullets = _atts.map(a => `- ${a.path}`).join('\n');
+                  content = `${text}\n\n**Attached files:**\n${_bullets}`;
+                }
+                replay.push({ role: 'user', content });
               } else if (entry?.type === 'action') {
                 const intent = entry.intent || '';
                 if (intent !== 'print' && intent !== 'assistant_message' && intent !== 'show_result') continue;
@@ -3272,18 +3283,20 @@ export class Agent {
             channel.planning(`🤖 \x1b[1m\x1b[38;2;173;218;228m${this.name}\x1b[0m \x1b[38;2;185;185;185m${thinkingHint || 'Processing your answer'}\x1b[0m`);
             // Build the user message string the rest of the runtime will
             // treat as "what the user just said". When attachments came
-            // with the prompt, append a `[Attached: …]` hint so the
-            // CURRENT FOCUS block (system-prompt-builder._buildTriggerTask
-            // reads `_lastUserMessage`) and downstream consumers know
-            // about them. The actual image bytes flow through the
-            // multimodal pipeline (see _resolvedUserImages in
-            // llm-provider.js) — this string is purely textual context.
+            // with the prompt, append a markdown bullet list of file
+            // paths so the CURRENT FOCUS block (system-prompt-builder.
+            // _buildTriggerTask reads `_lastUserMessage`) and downstream
+            // consumers know about them. Full paths — never basenames —
+            // so a delegate can copy the list verbatim into a
+            // referenceImages / referenceVideos call.
             let _lastUserText = _isBgWakeup ? null : (result?.answer || null);
             if (_lastUserText && Array.isArray(result?.attachments) && result.attachments.length > 0) {
-              const _names = result.attachments
+              const _paths = result.attachments
                 .filter(a => a && a.path)
-                .map(a => a.path.split('/').pop());
-              if (_names.length > 0) _lastUserText = `${_lastUserText}\n[Attached: ${_names.join(', ')}]`;
+                .map(a => a.path);
+              if (_paths.length > 0) {
+                _lastUserText = `${_lastUserText}\n\n**Attached files:**\n${_paths.map(p => `- ${p}`).join('\n')}`;
+              }
             }
             this._lastUserMessage = _lastUserText;
             channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
@@ -3358,7 +3371,28 @@ export class Agent {
           if (intent === 'prompt_user' && sessionTracker && result) {
             // appendDialogue FIRST — it creates the session dir (via mkdirSync),
             // which saveInputHistory and saveConversation depend on.
-            sessionTracker.appendDialogue({ ts: Date.now(), type: 'user_input', text: result.answer || '' });
+            //
+            // Persist BOTH the user's text AND the attached file paths. The
+            // dialogue.jsonl is the canonical session log that delegates
+            // replay into their own contextMemory (see ~line 1599 of this
+            // file). If we only stored `text`, the Planner / Worker would
+            // wake up with the user's words but ZERO attachment paths —
+            // exactly the failure mode where `generate_image` was getting
+            // called with no `referenceImages`. Storing `attachments` as a
+            // sibling field lets the replay reconstruct the full
+            // "text + **Attached files:** bullet list" verbatim, so the
+            // delegate sees the same message body the root agent saw.
+            const _dialogueAtts = Array.isArray(result.attachments)
+              ? result.attachments
+                  .filter(a => a && a.path)
+                  .map(a => ({ path: a.path, type: a.type || 'file' }))
+              : [];
+            sessionTracker.appendDialogue({
+              ts: Date.now(),
+              type: 'user_input',
+              text: result.answer || '',
+              ...(_dialogueAtts.length > 0 ? { attachments: _dialogueAtts } : {}),
+            });
             try {
               const getInputHistory = (await import('../io/channel.js')).channel.getHistory;
               sessionTracker.saveInputHistory(getInputHistory());
@@ -3765,16 +3799,12 @@ export class Agent {
         this._lastUserMessage = _quotaAnswer;
         let _attNote = '';
         if (_quotaAttachments.length > 0) {
-          try {
-            const { attachmentRegistry } = await import('../state/attachment-registry.js');
-            const _attParts = _quotaAttachments.map(a => {
-              const id = attachmentRegistry.register(a.path);
-              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
-            });
-            _attNote = `\n[Attached ${_attParts.join(', ')}]`;
-          } catch {
-            _attNote = `\n[Attached: ${_quotaAttachments.map(a => a.path.split('/').pop()).join(', ')}]`;
-          }
+          // Markdown bullet list so the LLM (and a human reading the
+          // log) can scan the paths line-by-line. Full path always
+          // included — the LLM needs it to pass to media tools as
+          // referenceImages / referenceVideos.
+          const _bullets = _quotaAttachments.map((a) => `- ${a.path}`).join('\n');
+          _attNote = `\n\n**Attached files:**\n${_bullets}`;
         }
         contextMemory.add('user', _quotaAnswer + _attNote, _quotaAnswer + _attNote, null,
           _quotaAttachments.length > 0 ? { attachments: _quotaAttachments } : {});
@@ -3907,31 +3937,26 @@ export class Agent {
           ? promptResult.attachments.filter(a => a.path)
           : [];
         // Track user message so compose templates can use {{userMessage}} /
-        // @if (userMessage). Append a textual `[Attached: …]` hint when the
-        // prompt carried attachments so the CURRENT FOCUS block surfaces them
-        // (the actual bytes flow through the multimodal pipeline).
+        // @if (userMessage). Append a markdown bullet list of attached
+        // file paths when the prompt carried attachments so the CURRENT
+        // FOCUS block surfaces them. Use FULL paths (not basenames) so
+        // a downstream agent can copy the list verbatim into a
+        // referenceImages / referenceVideos call without further
+        // resolution.
         {
           let _msg = promptResult.answer;
           if (_promptAtts.length > 0) {
-            const _names = _promptAtts.map(a => a.path.split('/').pop());
-            _msg = `${_msg}\n[Attached: ${_names.join(', ')}]`;
+            const _bullets = _promptAtts.map(a => `- ${a.path}`).join('\n');
+            _msg = `${_msg}\n\n**Attached files:**\n${_bullets}`;
           }
           this._lastUserMessage = _msg;
         }
-        // Register attachments and annotate with IDs so delegates can resolve them
-        let _attNote = '';
-        if (_promptAtts.length > 0) {
-          try {
-            const { attachmentRegistry } = await import('../state/attachment-registry.js');
-            const _attParts = _promptAtts.map(a => {
-              const id = attachmentRegistry.register(a.path);
-              return `${id}: ${a.path.split('/').pop()} (${a.type || 'file'})`;
-            });
-            _attNote = `\n[Attached ${_attParts.join(', ')}]`;
-          } catch {
-            _attNote = `\n[Attached: ${_promptAtts.map(a => a.path.split('/').pop()).join(', ')}]`;
-          }
-        }
+        // Same bullet-list format goes into the contextMemory user
+        // entry. Attachments are also kept on the entry's metadata so
+        // the multimodal pipeline can resolve the bytes for vision.
+        const _attNote = _promptAtts.length > 0
+          ? `\n\n**Attached files:**\n${_promptAtts.map(a => `- ${a.path}`).join('\n')}`
+          : '';
         contextMemory.add('user', promptResult.answer + _attNote, promptResult.answer + _attNote, null,
           _promptAtts.length > 0 ? { attachments: _promptAtts } : {});
         this.contextMemoryState = contextMemory.serialize();
@@ -5453,6 +5478,33 @@ Many commands are inherently slow and produce little or no output for extended p
             // Propagate user-attached images to delegate so it can see them too
             if (this._lastConsumedImages?.length > 0) {
               teamMember.agent._pendingImagesToPropagate = [...this._lastConsumedImages];
+              // Also push the *paths* of the user-attached files into the
+              // delegate's args so the executor can reference them by path
+              // in tool calls (e.g. generate_image's referenceImages). The
+              // multimodal bytes alone are not enough — the LLM writing the
+              // task spec often omits paths from the description, leaving
+              // the executor unable to cite them by path. We back-stop that
+              // here. Only entries flagged as `user_attachment` count;
+              // annotation overlays and MCP tool results are excluded.
+              const _attachedPaths = this._lastConsumedImages
+                .filter((p) => p && p.role === 'user_attachment' && typeof p._debugPath === 'string' && p._debugPath.length > 0)
+                .map((p) => p._debugPath);
+              if (_attachedPaths.length > 0) {
+                if (!currentData || typeof currentData !== 'object') currentData = {};
+                const _existing = Array.isArray(currentData.userAttachments) ? currentData.userAttachments : [];
+                const _merged = Array.from(new Set([..._existing, ..._attachedPaths]));
+                currentData.userAttachments = _merged;
+                // Mirror into the description so a plain-text args dump
+                // also shows them — the executor's LLM reads
+                // args.description verbatim into its prompt and we want
+                // the paths to be impossible to miss.
+                const _block = `\n\n## ATTACHED MEDIA (provided by the user — pass to media tools as referenceImages / referenceVideos when relevant)\n${_merged.map((p) => `- ${p}`).join('\n')}`;
+                if (typeof currentData.description === 'string' && !currentData.description.includes('## ATTACHED MEDIA')) {
+                  currentData.description = currentData.description + _block;
+                } else if (currentData.description == null) {
+                  currentData.description = _block.trimStart();
+                }
+              }
               this._lastConsumedImages = null; // only propagate once
             }
             result = await channel.withSlot(_delegateSlot, () => teamMember.agent.handle(teamMember.event, currentData, true, _parentAnswerFn));
@@ -5477,15 +5529,34 @@ Many commands are inherently slow and produce little or no output for extended p
           const actionTitle = action.title || intent;
           const _routerSlot = `${best.agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           const _routerParentSlotId = channel.getCurrentSlotId() ?? null;
-          const _routerData = action.data || action.input || {};
+          let _routerData = action.data || action.input || {};
           channel.registerSlotMeta(_routerSlot, {
             agentName: best.agent.name,
             subject: _routerData?.subject || null,
           });
           channel.clearSlotById(_routerParentSlotId);
-          // Propagate user-attached images to delegate
+          // Propagate user-attached images to delegate — both the bytes
+          // (for multimodal vision) and the paths (so the executor can
+          // cite them in tool calls like generate_image's
+          // referenceImages). See the teamMember branch above for the
+          // full rationale on why path-propagation is needed.
           if (this._lastConsumedImages?.length > 0) {
             best.agent._pendingImagesToPropagate = [...this._lastConsumedImages];
+            const _attachedPaths = this._lastConsumedImages
+              .filter((p) => p && p.role === 'user_attachment' && typeof p._debugPath === 'string' && p._debugPath.length > 0)
+              .map((p) => p._debugPath);
+            if (_attachedPaths.length > 0) {
+              if (typeof _routerData !== 'object' || _routerData == null) _routerData = {};
+              const _existing = Array.isArray(_routerData.userAttachments) ? _routerData.userAttachments : [];
+              const _merged = Array.from(new Set([..._existing, ..._attachedPaths]));
+              _routerData.userAttachments = _merged;
+              const _block = `\n\n## ATTACHED MEDIA (provided by the user — pass to media tools as referenceImages / referenceVideos when relevant)\n${_merged.map((p) => `- ${p}`).join('\n')}`;
+              if (typeof _routerData.description === 'string' && !_routerData.description.includes('## ATTACHED MEDIA')) {
+                _routerData.description = _routerData.description + _block;
+              } else if (_routerData.description == null) {
+                _routerData.description = _block.trimStart();
+              }
+            }
             this._lastConsumedImages = null;
           }
           let routerResult;
