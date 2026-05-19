@@ -1061,6 +1061,31 @@ export class Agent {
       if (txt) this._currentTaskText = String(txt).slice(0, 800);
     }
 
+    // ── @mention auto-resolution ─────────────────────────────────────
+    // Scan args for `@handle` tokens and resolve each one against the
+    // MediaLibrary. This way a workflow / skill / task description
+    // that says "Generate a video of @sara walking on the beach" can
+    // be acted on directly: the agent sees a `## RESOLVED @MENTIONS`
+    // block listing `@sara → /abs/path/to/sara.png` AND the image
+    // bytes ride along the multimodal pipeline on the next LLM call.
+    // Without this the agent has to manually `recall_memory` or grep
+    // the description for a path that isn't there — exactly the
+    // user-reported regression where Worker called recall_memory for
+    // "@sara imagen path archivo portrait" instead of just using it.
+    //
+    // The mutation is best-effort and fully optional: if the
+    // MediaLibrary is unavailable, the handle is unknown, or the row
+    // sits on a missing file, we leave args untouched and the agent
+    // falls back to its prior behaviour (which still works, just
+    // requires the recall_memory roundtrip).
+    if (args != null && typeof args === 'object') {
+      try {
+        await this._autoResolveMentionsInArgs(args);
+      } catch (e) {
+        channel.log('agent', `${this.name}: mention auto-resolve failed: ${e.message}`);
+      }
+    }
+
     // Bootstrap CLI layer (e.g. Ink) early — before any stdout writes.
     // When KOI_CLI_MODE is set, dynamically import the bootstrap module
     // which sets up providers on cliLogger, cliInput, cliSelect, and Agent.
@@ -4025,6 +4050,158 @@ export class Agent {
     // Fallback: return last action result if loop exhausted
     const lastEntry = session.actionHistory[session.actionHistory.length - 1];
     return lastEntry?.result || {};
+  }
+
+  /** Scan textual fields of `args` for `@handle` mentions, resolve
+   *  each against the MediaLibrary, and weave the result into args so
+   *  the agent never has to look up paths manually.
+   *
+   *  Side effects (all idempotent — re-running on already-resolved args
+   *  is a no-op via the `## RESOLVED @MENTIONS` marker check):
+   *   • Appends a `## RESOLVED @MENTIONS` block to `args.description`
+   *     (or creates one when there's no description yet) listing each
+   *     handle → absolute path on disk + media type.
+   *   • Stamps `args._resolvedMentions = { sara: { path, mediaType }, … }`
+   *     so callers / playbooks can read the mapping structurally.
+   *   • For IMAGE mentions, queues the image bytes onto
+   *     `this._pendingImagesToPropagate` so the agent's next LLM call
+   *     gets them as multimodal blocks. Videos / audios are NOT
+   *     inlined (too heavy); the agent reads them with `read_file`
+   *     when it actually needs the bytes.
+   *
+   *  No-ops when:
+   *   • args has no `@handle` tokens in any scanned text field.
+   *   • MediaLibrary is unavailable (lazy import fails).
+   *   • Every found handle resolves to nothing (we don't pollute the
+   *     description with an empty block).
+   *  @private */
+  async _autoResolveMentionsInArgs(args) {
+    if (!args || typeof args !== 'object') return;
+    // Collect every plain-string field we want to scan. Recursively
+    // walk the `task` sub-object too because that's the shape
+    // delegates often receive.
+    const fields = [];
+    const _collect = (obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      for (const key of ['description', 'subject', 'instruction', 'intent', 'title', 'userRequest', 'request', 'goal', 'prompt']) {
+        const v = obj[key];
+        if (typeof v === 'string' && v.includes('@')) fields.push(v);
+      }
+      if (obj.task && typeof obj.task === 'object') _collect(obj.task);
+    };
+    _collect(args);
+    if (fields.length === 0) return;
+
+    // Pull unique @handle tokens. Same regex used by the input bar /
+    // generate_* tools so the user's autocomplete and the agent's
+    // backstop see the same set.
+    const RE = /(^|\s)@([A-Za-z0-9_\-]+)/g;
+    const handles = [];
+    const seen = new Set();
+    for (const text of fields) {
+      for (const m of text.matchAll(RE)) {
+        const h = (m[2] || '').toLowerCase();
+        if (!h || seen.has(h)) continue;
+        seen.add(h);
+        handles.push(m[2]);
+      }
+    }
+    if (handles.length === 0) return;
+
+    // Already-resolved guard: if the description already carries the
+    // resolution block, the prior handle() pass did the work — skip
+    // re-injecting (would duplicate the block on retries / pivots).
+    if (typeof args.description === 'string' && args.description.includes('## RESOLVED @MENTIONS')) {
+      return;
+    }
+
+    // Lazy-load the MediaLibrary so this helper stays a no-op in
+    // contexts where the gallery isn't wired (unit tests, headless CI).
+    let lib;
+    try {
+      const mod = await import('../state/media-library.js');
+      lib = mod.MediaLibrary.global();
+    } catch { return; }
+    if (!lib) return;
+
+    const resolved = {};
+    const imageRecords = []; // for multimodal injection
+    for (const raw of handles) {
+      try {
+        const rows = await lib.findByMention(raw);
+        if (!rows || rows.length === 0) continue;
+        const top = rows[0]; // newest-first per findByMention's sort
+        const filePath = top?.filePath;
+        if (!filePath) continue;
+        if (!fs.existsSync(filePath)) continue;
+        const mediaType = top?.mediaType || 'file';
+        resolved[raw] = { path: filePath, mediaType };
+        if (mediaType === 'image') {
+          imageRecords.push({ path: filePath, mediaType });
+        }
+      } catch { /* per-handle failure is non-fatal */ }
+    }
+    if (Object.keys(resolved).length === 0) return;
+
+    // 1. Stamp the structured mapping so callers can read it.
+    args._resolvedMentions = { ...(args._resolvedMentions || {}), ...resolved };
+
+    // 2. Append a textual block to `description`. The bullet format
+    //    matches the `## ATTACHED MEDIA` block used elsewhere — same
+    //    visual language so the LLM doesn't have to learn two shapes.
+    const bullets = Object.entries(resolved)
+      .map(([h, info]) => `- @${h} → ${info.path} (${info.mediaType})`)
+      .join('\n');
+    const block = `\n\n## RESOLVED @MENTIONS (auto-attached by Koi — do NOT recall_memory for these, the paths are below)\n${bullets}`;
+    if (typeof args.description === 'string') {
+      args.description = args.description + block;
+    } else {
+      args.description = block.trimStart();
+    }
+
+    // 3. Multimodal queue for IMAGE handles. Mirrors the
+    //    `_pendingImagesToPropagate` shape the delegate-handoff path
+    //    populates (data: base64, mimeType, _debugPath, role).
+    if (imageRecords.length > 0) {
+      const sharp = (await import('sharp')).default;
+      const records = [];
+      for (const rec of imageRecords) {
+        try {
+          const buf = fs.readFileSync(rec.path);
+          // Optimise > 200 KB the same way llm-provider does so we
+          // don't push raw multi-MB PNGs into the next LLM context.
+          let optimized = buf;
+          let mime = 'image/png';
+          if (buf.length > 200_000) {
+            try {
+              optimized = await sharp(buf)
+                .resize(1568, 1568, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 80 })
+                .toBuffer();
+              mime = 'image/jpeg';
+            } catch { /* keep original */ }
+          }
+          records.push({
+            data: optimized.toString('base64'),
+            mimeType: mime,
+            _debugPath: rec.path,
+            role: 'mention_resolution',
+          });
+        } catch { /* unreadable file — skip */ }
+      }
+      if (records.length > 0) {
+        const prev = Array.isArray(this._pendingImagesToPropagate)
+          ? this._pendingImagesToPropagate : [];
+        this._pendingImagesToPropagate = [...prev, ...records];
+      }
+    }
+
+    channel.log(
+      'agent',
+      `${this.name}: auto-resolved ${Object.keys(resolved).length} @mention(s) → ${
+        Object.entries(resolved).map(([h, i]) => `@${h}(${i.mediaType})`).join(', ')
+      }`,
+    );
   }
 
   /**
