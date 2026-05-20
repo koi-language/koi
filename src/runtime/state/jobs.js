@@ -187,9 +187,26 @@ export function startJob({ type, params, runner }) {
         j.status = 'cancelled';
         j.error = j.error || 'Cancelled';
       } else {
-        j.status = 'succeeded';
-        j.result = result ?? null;
-        j.progress = 1;
+        // Tools by convention return `{ success: false, error: "..." }`
+        // when the underlying operation failed but the runner itself
+        // didn't throw (e.g. provider returned an error response,
+        // poll timed out, model returned a malformed payload). Treat
+        // that shape as a failure so the job's terminal status — and
+        // every UI consumer that reads `j.status` — reflect reality.
+        // Previously these landed as `succeeded`, which made the chat
+        // banner paint a green ✓ on jobs that hadn't actually
+        // produced any output.
+        const explicitFailure =
+            result && typeof result === 'object' && result.success === false;
+        if (explicitFailure) {
+          j.status = 'failed';
+          j.error = result.error || j.error || 'Job runner reported success=false';
+          j.result = result;
+        } else {
+          j.status = 'succeeded';
+          j.result = result ?? null;
+          j.progress = 1;
+        }
       }
       j.finishedAt = _now();
       j.updatedAt = j.finishedAt;
