@@ -95,9 +95,10 @@ const _inCategory = (m, cat) => {
 };
 
 /** Sort eligible candidates so the best pick lands at index 0. Ranks:
- *  1. Label match (when one was requested, matching wins; when none,
- *     unlabelled wins over labelled — labels mark specialised variants
- *     that shouldn't leak into generic requests by accident).
+ *  1. Label match. When a label was requested, matching wins. When none
+ *     was requested, the "default" label is treated as a curated
+ *     preference: models carrying `default` rank first, then unlabelled
+ *     (generic) models, then models with other (specialised) labels.
  *  2. isFallback (admin-curated rows tagged `isFallback: true` lose to
  *     primary rows when both qualify — used for "keep around but only
  *     pick if nothing else fits" entries).
@@ -109,9 +110,16 @@ const _rankSort = (eligible, req) => {
   const wantLabel = req.label || null;
   const preferQuality = req.preferQuality !== false;
   const rankOf = (m) => {
-    const labelRank = wantLabel
-      ? (_modelHasLabel(m, wantLabel) ? 0 : 1)
-      : (_modelHasAnyLabel(m) ? 1 : 0);
+    let labelRank;
+    if (wantLabel) {
+      labelRank = _modelHasLabel(m, wantLabel) ? 0 : 1;
+    } else if (_modelHasLabel(m, 'default')) {
+      labelRank = 0;
+    } else if (!_modelHasAnyLabel(m)) {
+      labelRank = 1;
+    } else {
+      labelRank = 2;
+    }
     const fallbackRank = m.isFallback ? 1 : 0;
     const rawPrice = m.pricePerUnit ?? Number.POSITIVE_INFINITY;
     const priceRank = preferQuality ? -rawPrice : rawPrice;
@@ -205,6 +213,28 @@ function _pickByBucket(kind, models, req, wantedBucket) {
   }
 
   if (eligible.length === 0) {
+    // Verbose diagnostic — surface to console.error so the user can see
+    // EXACTLY which slugs are in the cache and what their `categories`
+    // arrays look like. The catalog-by-category map alone hides slugs
+    // when the category aliases didn't match, so dump the raw shape
+    // too.
+    try {
+      const raw = pool.map((m) => ({
+        slug: m?.slug,
+        categories: m?.categories,
+        labels: Array.isArray(m?.labels)
+          ? m.labels.map((l) => (typeof l === 'string' ? l : l?.slug))
+          : [],
+        isActive: m?.isActive,
+        pricePerUnit: m?.pricePerUnit,
+      }));
+      // eslint-disable-next-line no-console
+      console.error(
+        `[media-router] No ${kind} model in bucket="${wantedBucket}". ` +
+        `Pool has ${pool.length} model(s):`,
+        JSON.stringify(raw, null, 2),
+      );
+    } catch { /* logging is best-effort */ }
     throw new MediaModelRoutingError(
       `No active ${kind} model in bucket="${wantedBucket}"${wantLabel ? ` with label="${wantLabel}"` : ''}`,
       {

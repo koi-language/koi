@@ -142,7 +142,11 @@ async function _resumeVideoJob(job) {
   // load order at startup (this file is imported from bin-entry which
   // runs before lots of state is initialised).
   const { GatewayVideoGen } = await import('../llm/providers/gateway.js');
-  const { _pollUntilTerminal, saveVideoFromUrl } = await import('../tools/media/generate-video.js');
+  const {
+    _pollUntilTerminal,
+    saveVideoFromUrl,
+    _reconcileExtendOutput,
+  } = await import('../tools/media/generate-video.js');
 
   // Heartbeat the lock so other watchers see we're alive. Cleared in
   // the finally block — even on throw — so the lock doesn't stick on
@@ -224,6 +228,34 @@ async function _resumeVideoJob(job) {
       return;
     }
 
+    // ── Extend reconcile ─────────────────────────────────────────
+    // If this was a kind='extend' generation, the provider may have
+    // returned only the new tail slice (Seedance reference-to-video
+    // and friends). Without this step, we'd assign the slice to the
+    // clip and silently lose the source — same bug the inline path
+    // guards against. Skipped for non-extend kinds.
+    let mediaPath = saved.path;
+    const _isExtend = job.params?.kind === 'extend';
+    const _extendSource = Array.isArray(job.params?.referenceVideoPaths) &&
+      job.params.referenceVideoPaths.length > 0
+      ? job.params.referenceVideoPaths[0]
+      : null;
+    if (_isExtend && _extendSource) {
+      const reconciled = await _reconcileExtendOutput({
+        outputPath: saved.path,
+        sourcePath: _extendSource,
+        requestedExtensionSec: job.params?.duration,
+        modelSlug: final.model || job.slug,
+      });
+      if (reconciled.error) {
+        markFailed(job.jobId, reconciled.error);
+        channel.log('jobs', `Resumed job ${job.jobId} → FAILED at extend reconcile: ${reconciled.error}`);
+        _notifyClipFailed(job, reconciled.error);
+        return;
+      }
+      mediaPath = reconciled.path;
+    }
+
     // Assign to the clip if the job carried clipContext (i.e. it was
     // originally fired from a timeline placeholder, not a free-form
     // agent generation). Wrapped in try/catch — even if the assign
@@ -234,7 +266,7 @@ async function _resumeVideoJob(job) {
         const res = await assignTool.execute({
           id: job.clipContext.timelineId,
           clipId: job.clipContext.clipId,
-          mediaPath: saved.path,
+          mediaPath,
         });
         if (!res?.success) {
           channel.log('jobs', `assign_to_clip(${job.clipContext.clipId}) failed: ${res?.error || 'unknown'}`);
@@ -247,7 +279,7 @@ async function _resumeVideoJob(job) {
     markCompleted(job.jobId);
     channel.log(
       'jobs',
-      `Resumed job ${job.jobId} → COMPLETED, saved to ${saved.path}` +
+      `Resumed job ${job.jobId} → COMPLETED, saved to ${mediaPath}` +
       (job.clipContext?.clipId ? ` and assigned to clip ${job.clipContext.clipId}` : ''),
     );
   } finally {

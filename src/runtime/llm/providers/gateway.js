@@ -2018,7 +2018,21 @@ export class GatewayVideoGen extends BaseVideoGen {
           throw e;
         }
       }),
-      { kind: 'avatar', label: opts.label },
+      // `hasImageUrl` / `hasAudioUrl` MUST be set here so the router's
+      // `_filterByRequires` doesn't drop avatar models whose `requires`
+      // contract declares `["imageUrl", "audioUrl"]` (e.g. OmniHuman
+      // v1.5). The buffers ARE already in hand at this point — the
+      // upload to /uploads happens right after — so the presence
+      // signal is unconditionally true. Without these flags the
+      // filter discarded every avatar-capable model and `_pickByBucket`
+      // then failed with `No active model in bucket="video_avatar"`
+      // even though the catalog contained a viable row.
+      {
+        kind: 'avatar',
+        label: opts.label,
+        hasImageUrl: true,
+        hasAudioUrl: true,
+      },
     );
 
     // Upload audio.

@@ -1124,6 +1124,12 @@ const generateVideoAction = {
       prompt,
       model: submitted?.model || resolved.model,
       provider: resolved.provider,
+      // Stored so a crash-recovery resume in pending-jobs-watcher can
+      // tell whether it needs to re-run the extend reconcile (concat
+      // source + slice) before assigning the result to the clip.
+      // Without this, the watcher would happily overwrite the source
+      // with the slice-only output.
+      kind: action.kind || null,
       duration: globalDuration,
       aspectRatio: globalAspect,
       resolution: globalResolution,
@@ -1385,77 +1391,23 @@ const generateVideoAction = {
         action.referenceVideos.length > 0 &&
         action.referenceVideos[0];
       if (savedTo && _isPureExtend) {
-        try {
-          const sourcePath = action.referenceVideos[0];
-          const srcDurSec = await _probeVideoDurationSec(sourcePath);
-          const outDurSec = await _probeVideoDurationSec(savedTo);
-          const reqExtSec = Number.isFinite(action.duration) && action.duration > 0
-            ? Number(action.duration)
-            : null;
-          if (
-            Number.isFinite(srcDurSec) &&
-            Number.isFinite(outDurSec) &&
-            reqExtSec !== null
-          ) {
-            const expectedFull = srcDurSec + reqExtSec;
-            const expectedSlice = reqExtSec;
-            const distFull = Math.abs(outDurSec - expectedFull);
-            const distSlice = Math.abs(outDurSec - expectedSlice);
-            const isSliceOnly = distSlice < distFull;
-            channel.log(
-              'video',
-              `extend reconcile: output=${outDurSec.toFixed(2)}s, ` +
-              `source=${srcDurSec.toFixed(2)}s, req-ext=${reqExtSec.toFixed(2)}s, ` +
-              `expected-full=${expectedFull.toFixed(2)}s, ` +
-              `expected-slice=${expectedSlice.toFixed(2)}s ` +
-              `→ ${isSliceOnly ? 'SLICE-ONLY (concat)' : 'FULL (as-is)'}`,
-            );
-            if (isSliceOnly) {
-              const concatDir = path.dirname(savedTo);
-              const concatPath = await _concatVideoSegments(
-                [sourcePath, savedTo],
-                concatDir,
-              );
-              if (concatPath) {
-                savedTo = concatPath;
-                channel.log(
-                  'video',
-                  `extend reconcile: concat OK → ${path.basename(concatPath)}`,
-                );
-              } else {
-                channel.log(
-                  'video',
-                  `extend reconcile: ffmpeg concat failed — returning slice-only ` +
-                  `output as-is (the GUI will show only the extension portion)`,
-                );
-              }
-            }
-          } else if (
-            Number.isFinite(srcDurSec) &&
-            Number.isFinite(outDurSec) &&
-            outDurSec < srcDurSec - 0.5
-          ) {
-            // Fallback when `action.duration` is missing: the old
-            // "output shorter than source" heuristic still catches the
-            // common case (slice-only adapter, request was small).
-            channel.log(
-              'video',
-              `extend reconcile (fallback, no req-ext): output ${outDurSec.toFixed(2)}s < ` +
-              `source ${srcDurSec.toFixed(2)}s → assuming slice-only; concatenating`,
-            );
-            const concatDir = path.dirname(savedTo);
-            const concatPath = await _concatVideoSegments(
-              [sourcePath, savedTo],
-              concatDir,
-            );
-            if (concatPath) savedTo = concatPath;
-          }
-        } catch (err) {
-          channel.log(
-            'video',
-            `extend reconcile failed (returning model output unchanged): ${err.message}`,
-          );
+        const _reconciled = await _reconcileExtendOutput({
+          outputPath: savedTo,
+          sourcePath: action.referenceVideos[0],
+          requestedExtensionSec: action.duration,
+          modelSlug: resolved.model,
+        });
+        if (_reconciled.error) {
+          return {
+            success: false,
+            provider: resolved.provider,
+            model: resolved.model,
+            id: final.id || submitted.id,
+            status: 'failed',
+            error: _reconciled.error,
+          };
         }
+        savedTo = _reconciled.path;
       }
 
       // ── Hybrid chain (Case 3): edit → extend → concat ────────────
@@ -1993,9 +1945,168 @@ async function _probeVideoDurationSec(filePath) {
 }
 
 /**
+ * Reconcile the output of a video-extend call so the saved file is
+ * ALWAYS the full source+extension video, no matter which adapter ran.
+ *
+ * Probes [outputPath] against [sourcePath]:
+ *   • If the output duration is closer to `source + requestedExtension`
+ *     → the adapter already returned the full concat. Returns { path: outputPath }.
+ *   • If the output duration is closer to just `requestedExtension` (Seedance
+ *     reference-to-video and friends), runs ffmpeg concat of [source, output]
+ *     and returns { path: <concat> }.
+ *   • If concat fails, returns { error: <message> } — the caller MUST treat
+ *     this as a generation failure and NOT assign the slice to the clip
+ *     (otherwise the source content is lost; this was the "ha asignado pero
+ *     no lo ha hecho" recurring bug).
+ *
+ * [requestedExtensionSec] may be null when the caller didn't request a
+ * specific duration — in that case the function falls back to the
+ * "output shorter than source" heuristic (still hard-fails on concat
+ * failure for the same reason).
+ *
+ * Always resolves; never throws. The modelSlug is only used to build
+ * actionable error messages for the agent.
+ */
+export async function _reconcileExtendOutput({
+  outputPath,
+  sourcePath,
+  requestedExtensionSec,
+  modelSlug,
+}) {
+  if (!outputPath || !sourcePath) return { path: outputPath };
+  try {
+    const srcDurSec = await _probeVideoDurationSec(sourcePath);
+    const outDurSec = await _probeVideoDurationSec(outputPath);
+    const reqExtSec = Number.isFinite(requestedExtensionSec) &&
+      requestedExtensionSec > 0
+      ? Number(requestedExtensionSec)
+      : null;
+    let isSliceOnly = false;
+    if (
+      Number.isFinite(srcDurSec) &&
+      Number.isFinite(outDurSec) &&
+      reqExtSec !== null
+    ) {
+      const expectedFull = srcDurSec + reqExtSec;
+      const expectedSlice = reqExtSec;
+      const distFull = Math.abs(outDurSec - expectedFull);
+      const distSlice = Math.abs(outDurSec - expectedSlice);
+      isSliceOnly = distSlice < distFull;
+      channel.log(
+        'video',
+        `extend reconcile: output=${outDurSec.toFixed(2)}s, ` +
+        `source=${srcDurSec.toFixed(2)}s, req-ext=${reqExtSec.toFixed(2)}s, ` +
+        `expected-full=${expectedFull.toFixed(2)}s, ` +
+        `expected-slice=${expectedSlice.toFixed(2)}s ` +
+        `→ ${isSliceOnly ? 'SLICE-ONLY (concat)' : 'FULL (as-is)'}`,
+      );
+    } else if (
+      Number.isFinite(srcDurSec) &&
+      Number.isFinite(outDurSec) &&
+      outDurSec < srcDurSec - 0.5
+    ) {
+      // Fallback heuristic when reqExt is missing: any output noticeably
+      // shorter than the source is treated as slice-only.
+      isSliceOnly = true;
+      channel.log(
+        'video',
+        `extend reconcile (fallback, no req-ext): output ${outDurSec.toFixed(2)}s < ` +
+        `source ${srcDurSec.toFixed(2)}s → assuming slice-only; concatenating`,
+      );
+    }
+    if (!isSliceOnly) return { path: outputPath };
+    const concatDir = path.dirname(outputPath);
+    const concatPath = await _concatVideoSegments(
+      [sourcePath, outputPath],
+      concatDir,
+    );
+    if (concatPath) {
+      channel.log(
+        'video',
+        `extend reconcile: concat OK → ${path.basename(concatPath)}`,
+      );
+      return { path: concatPath };
+    }
+    const _slug = modelSlug || 'unknown';
+    const _outDurStr = Number.isFinite(outDurSec)
+      ? ` (${outDurSec.toFixed(2)}s)`
+      : '';
+    return {
+      error:
+        `[model=${_slug}] Could not assemble extended video: provider ` +
+        `returned a slice-only output${_outDurStr} and the ffmpeg concat ` +
+        `of source + extension failed. The original clip was left ` +
+        `untouched. Try a different extend model ` +
+        `(e.g. excludeModels: ['${_slug}']) or retry with a shorter duration.`,
+    };
+  } catch (err) {
+    // Probe failures etc. — don't punish the caller for an unprobeable
+    // file; let the original output through unchanged (matches the
+    // previous best-effort behaviour for unknown durations).
+    channel.log(
+      'video',
+      `extend reconcile failed (returning model output unchanged): ${err.message}`,
+    );
+    return { path: outputPath };
+  }
+}
+
+/** Probe a video's width/height/fps via ffprobe. Returns null when any
+ *  field is missing — the caller falls back to a default spec. */
+async function _probeVideoSpec(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  let bins = null;
+  try { bins = await _ensureFfmpegForProbe(); } catch { return null; }
+  if (!bins?.ffprobe) return null;
+  return await new Promise((resolve) => {
+    const proc = _spawnForProbe(bins.ffprobe, [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,r_frame_rate',
+      '-of', 'csv=p=0',
+      filePath,
+    ]);
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr.on('data', () => {});
+    proc.on('close', () => {
+      // Output looks like "1920,1080,30000/1001" (one line, comma-separated).
+      const line = out.trim().split(/\r?\n/)[0] || '';
+      const parts = line.split(',');
+      if (parts.length < 3) return resolve(null);
+      const w = parseInt(parts[0], 10);
+      const h = parseInt(parts[1], 10);
+      const r = parts[2]; // "num/den"
+      const [rn, rd] = r.split('/').map((n) => parseFloat(n));
+      const fps = Number.isFinite(rn) && Number.isFinite(rd) && rd > 0
+        ? rn / rd
+        : NaN;
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+        return resolve(null);
+      }
+      resolve({
+        width: w,
+        height: h,
+        fps: Number.isFinite(fps) && fps > 0 ? fps : 30,
+      });
+    });
+    proc.on('error', () => resolve(null));
+  });
+}
+
+/**
  * ffmpeg concat via the concat filter (re-encodes; safe across codecs).
  * Drops audio — the AI clips we're chaining are visual-only by design
  * and the model regenerates any soundscape on its own pass anyway.
+ *
+ * The concat filter requires every input to share width, height, SAR
+ * and pixel format. Provider outputs routinely violate this (e.g. the
+ * source is 1924×1076 while the extension slice comes back at 1280×720,
+ * which makes libx264 abort with `-22 Invalid argument` and the whole
+ * extend flow silently fall back to a slice-only clip). We probe the
+ * FIRST input — the source — and pre-normalize every subsequent input
+ * with `scale + pad + setsar + fps + format` so the concat filter
+ * never sees mismatched specs.
  *
  * Returns the absolute path of the concatenated output, or null on
  * failure. Output lives next to the inputs (under [outDir]).
@@ -2013,14 +2124,39 @@ async function _concatVideoSegments(paths, outDir) {
     channel.log('video', 'concat: no ffmpeg binary available');
     return null;
   }
+  // Use the SOURCE video's spec as the target so the concatenated
+  // output preserves the user's expected resolution and frame rate.
+  // Fallback when probe fails: 1920×1080@30 (safe defaults that libx264
+  // accepts and that won't surprise users with degraded resolution).
+  const refSpec = await _probeVideoSpec(paths[0]);
+  const targetW = refSpec?.width ?? 1920;
+  const targetH = refSpec?.height ?? 1080;
+  const targetFps = refSpec?.fps ?? 30;
+  // libx264 requires even dimensions for yuv420p — round down to the
+  // nearest even number rather than failing later in the encode.
+  const evenW = targetW % 2 === 0 ? targetW : targetW - 1;
+  const evenH = targetH % 2 === 0 ? targetH : targetH - 1;
+  channel.log(
+    'video',
+    `concat normalize target: ${evenW}×${evenH}@${targetFps.toFixed(2)}fps` +
+    `${refSpec ? '' : ' (probe failed → defaults)'}`,
+  );
   const outFile = path.join(outDir, `concat-${Date.now()}.mp4`);
   const inputArgs = [];
   for (const p of paths) {
     inputArgs.push('-i', p);
   }
-  // Build the filter graph: `[0:v][1:v]...[N-1:v]concat=n=N:v=1:a=0[outv]`
-  const filterParts = paths.map((_, i) => `[${i}:v]`).join('');
-  const filter = `${filterParts}concat=n=${paths.length}:v=1:a=0[outv]`;
+  // Per-input normalize step: scale-fit, pad to fill, force square
+  // pixels, resample to target fps, force yuv420p. All inputs land in
+  // the same spec, so the concat filter has nothing to complain about.
+  const normalizeParts = paths.map((_, i) =>
+    `[${i}:v]scale=${evenW}:${evenH}:force_original_aspect_ratio=decrease,` +
+    `pad=${evenW}:${evenH}:(ow-iw)/2:(oh-ih)/2:color=black,` +
+    `setsar=1,fps=${targetFps},format=yuv420p[v${i}]`,
+  ).join(';');
+  const concatInputs = paths.map((_, i) => `[v${i}]`).join('');
+  const filter =
+    `${normalizeParts};${concatInputs}concat=n=${paths.length}:v=1:a=0[outv]`;
   const args = [
     '-hide_banner', '-loglevel', 'error',
     ...inputArgs,

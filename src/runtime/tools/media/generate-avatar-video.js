@@ -92,13 +92,28 @@ const generateAvatarVideoAction = {
     if (!imagePath) return { success: false, error: 'generate_avatar_video: "image" is required' };
     if (!audioPath) return { success: false, error: 'generate_avatar_video: "audioFile" is required' };
 
-    const resolvedImage = path.resolve(imagePath);
-    const resolvedAudio = path.resolve(audioPath);
+    // Resolve the image path via MediaLibrary lookup if the literal
+    // path doesn't exist. Workers routinely hallucinate paths like
+    // `~/.koi/media/<media-id>.png` from a `recall_image` result —
+    // the library row is the authoritative source. Falling back to
+    // the lookup turns those drive-by mistakes into successful calls.
+    let resolvedImage = path.resolve(imagePath);
     if (!fs.existsSync(resolvedImage)) {
-      return { success: false, error: `Image not found: ${imagePath}` };
+      const fallback = await _resolveImageViaLibrary(imagePath);
+      if (fallback) {
+        resolvedImage = fallback;
+      } else {
+        return { success: false, error: `Image not found: ${imagePath}` };
+      }
     }
+    let resolvedAudio = path.resolve(audioPath);
     if (!fs.existsSync(resolvedAudio)) {
-      return { success: false, error: `Audio file not found: ${audioPath}` };
+      const fallback = await _resolveImageViaLibrary(audioPath);
+      if (fallback) {
+        resolvedAudio = fallback;
+      } else {
+        return { success: false, error: `Audio file not found: ${audioPath}` };
+      }
     }
 
     const clients = agent?.llmProvider?.getClients?.() || {};
@@ -280,6 +295,45 @@ fetchMediaCapabilities('video').then((caps) => {
       'Unavailable: no active model carries the `video_avatar` category.';
   }
 }).catch(() => {});
+
+/**
+ * Best-effort lookup: when an image/audio path the agent passes doesn't
+ * exist on disk, try to recover it from the MediaLibrary by treating
+ * the path's basename (without extension) as a media id. Worker LLMs
+ * often invent `~/.koi/media/<media-id>.png`-style paths from a prior
+ * `recall_image` result instead of using the row's actual `filePath`;
+ * this fallback turns that miss into a hit.
+ *
+ * Returns the absolute on-disk path of the matched row, or null if no
+ * row matches / the row's file is missing / the library is unavailable.
+ */
+async function _resolveImageViaLibrary(input) {
+  if (typeof input !== 'string' || !input) return null;
+  // Strip directory and extension — what the agent passes as the
+  // basename is typically the media id verbatim.
+  const base = path.basename(input, path.extname(input));
+  if (!base) return null;
+  // Try basename + the full string (so callers that pass just the id
+  // also work without inventing a path first).
+  const candidates = base === input ? [base] : [base, input];
+  let lib;
+  try {
+    const mod = await import('../../state/media-library.js');
+    lib = mod.MediaLibrary.global();
+  } catch { return null; }
+  if (!lib) return null;
+  for (const id of candidates) {
+    try {
+      const row = await lib.get(id);
+      if (row && row.filePath && fs.existsSync(row.filePath)) {
+        channel.log('generate_avatar_video',
+            `Resolved image via library: "${input}" → ${row.filePath}`);
+        return row.filePath;
+      }
+    } catch { /* try next */ }
+  }
+  return null;
+}
 
 import asyncCapable from '../_async-capable.js';
 export default asyncCapable(generateAvatarVideoAction);
