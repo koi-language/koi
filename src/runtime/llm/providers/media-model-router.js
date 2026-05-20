@@ -94,15 +94,65 @@ const _inCategory = (m, cat) => {
   return false;
 };
 
+/** Canonical names of every input a per-slug `requires` array might
+ *  list, paired with the `req` flag that signals the caller is sending
+ *  that input. Used by `_shapeMatchScore` so the ranker can prefer
+ *  slugs whose declared input shape OVERLAPS with what the caller
+ *  actually has — a model with `requires: ['startFrame']` ranks ahead
+ *  of one with `requires: []` when the caller passed a startFrame,
+ *  even though both pass the cheap `_filterByRequires` gate.
+ *  Without this tier the seedance reference-to-video slug
+ *  (`requires: []`, accepts image_urls optionally) tied on every other
+ *  rank with the seedance image-to-video slug (`requires: ['startFrame']`)
+ *  and won by alphabetical accident, silently remapping the caller's
+ *  startFrame to a reference image with different semantics. */
+const _REQUIRES_KEY_FROM_REQ = {
+  startFrame:          (r) => !!r.hasStartFrame,
+  endFrame:            (r) => !!r.hasEndFrame,
+  referenceImages:     (r) => (r.refsCount || 0) > 0,
+  referenceVideos:     (r) => (r.videoRefsCount || 0) > 0,
+  imageUrl:            (r) => !!r.hasImageUrl,
+  audioUrl:            (r) => !!r.hasAudioUrl,
+  characterOrientation:(r) => !!r.characterOrientation,
+  maskImage:           (r) => !!r.hasMaskImage,
+  sourceImage:         (r) => !!r.hasSourceImage,
+  targetSize:          (r) => !!r.hasTargetSize,
+  sourceImageOffset:   (r) => !!r.hasSourceImageOffset,
+  cameraAngles:        (r) => !!(r.cameraAngles
+      && (typeof r.cameraAngles.horizontal === 'number'
+          || typeof r.cameraAngles.vertical === 'number'
+          || typeof r.cameraAngles.zoom === 'number')),
+  videoUrl:            (r) => !!r.hasVideoUrl,
+};
+
+/** Returns the count of `m.requires` entries the caller actually sent.
+ *  Higher = better shape match (model and caller agree on the inputs).
+ *  Empty `m.requires` → 0 (no declared shape), no penalty either way. */
+function _shapeMatchScore(m, req) {
+  const reqs = Array.isArray(m?.requires) ? m.requires : null;
+  if (!reqs || reqs.length === 0) return 0;
+  let matched = 0;
+  for (const key of reqs) {
+    const has = _REQUIRES_KEY_FROM_REQ[key];
+    if (typeof has === 'function' && has(req)) matched += 1;
+  }
+  return matched;
+}
+
 /** Sort eligible candidates so the best pick lands at index 0. Ranks:
- *  1. Label match. When a label was requested, matching wins. When none
+ *  1. Shape match. Models whose `requires` list overlaps with the
+ *     caller's actual inputs win — keeps an image-to-video slug
+ *     (`requires: ['startFrame']`) ahead of a reference-to-video slug
+ *     (`requires: []`) when the caller passed `startFrame`, even if
+ *     both pass `_filterByRequires` and tie on price.
+ *  2. Label match. When a label was requested, matching wins. When none
  *     was requested, the "default" label is treated as a curated
  *     preference: models carrying `default` rank first, then unlabelled
  *     (generic) models, then models with other (specialised) labels.
- *  2. isFallback (admin-curated rows tagged `isFallback: true` lose to
+ *  3. isFallback (admin-curated rows tagged `isFallback: true` lose to
  *     primary rows when both qualify — used for "keep around but only
  *     pick if nothing else fits" entries).
- *  3. Price — by default the most EXPENSIVE wins (price as a quality
+ *  4. Price — by default the most EXPENSIVE wins (price as a quality
  *     proxy). Caller can flip with `preferQuality: false` for budget
  *     mode where cheapest wins.
  *  Mutates the array in place. */
@@ -110,6 +160,8 @@ const _rankSort = (eligible, req) => {
   const wantLabel = req.label || null;
   const preferQuality = req.preferQuality !== false;
   const rankOf = (m) => {
+    // Negate so a higher match score sorts FIRST.
+    const shapeRank = -_shapeMatchScore(m, req);
     let labelRank;
     if (wantLabel) {
       labelRank = _modelHasLabel(m, wantLabel) ? 0 : 1;
@@ -123,7 +175,7 @@ const _rankSort = (eligible, req) => {
     const fallbackRank = m.isFallback ? 1 : 0;
     const rawPrice = m.pricePerUnit ?? Number.POSITIVE_INFINITY;
     const priceRank = preferQuality ? -rawPrice : rawPrice;
-    return [labelRank, fallbackRank, priceRank];
+    return [shapeRank, labelRank, fallbackRank, priceRank];
   };
   eligible.sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
@@ -159,6 +211,19 @@ const _catalogByCategory = (models) => {
 function _pickByBucket(kind, models, req, wantedBucket) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new MediaModelRoutingError(`No active ${kind} models available`, { requirements: req });
+  }
+
+  // `other` / `default` are admin placeholders in the catalog rather
+  // than meaningful semantic choices — `other` means "no specific
+  // category" and `default` means "this is the curated baseline".
+  // Treat them as no-label so the caller's pool isn't accidentally
+  // narrowed to whichever model happened to carry the placeholder tag
+  // (real-world bug: an agent passing `label: 'other'` filtered the
+  // video catalog down to kling alone because kling was the only model
+  // tagged with that placeholder, even though seedance image-to-video
+  // was the better pick by every other tier).
+  if (req.label === 'other' || req.label === 'default') {
+    req = { ...req, label: null };
   }
 
   // Whitelist (caller-pinned slugs) takes precedence so debug/error

@@ -2483,12 +2483,26 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
   }
   if (caps.labels?.length) {
     const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
-    const lines = caps.labels.map((slug) => {
-      const d = details.find((x) => x && x.slug === slug);
-      const desc = d && d.description ? ` — ${d.description}` : '';
-      return `    • "${slug}"${desc}`;
-    }).join('\n');
-    fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved source image/video, look at them — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
+    // `other` and `default` are admin placeholders, not semantic choices.
+    // Hiding them from the agent's option list stops the agent from
+    // picking them as a "neutral / no-preference" flag — the router
+    // already treats no-label as "rank by quality" and exposing these
+    // names only makes the agent narrow the pool to a single model that
+    // happens to carry the placeholder tag (real-world bug:
+    // `label: 'other'` filtered the catalog down to kling because kling
+    // was the only model carrying that tag, even though seedance i2v
+    // was cheaper, smaller-payload-friendly, and tagged `default`).
+    const meaningfulLabels = caps.labels.filter(
+      (slug) => slug !== 'other' && slug !== 'default',
+    );
+    if (meaningfulLabels.length > 0) {
+      const lines = meaningfulLabels.map((slug) => {
+        const d = details.find((x) => x && x.slug === slug);
+        const desc = d && d.description ? ` — ${d.description}` : '';
+        return `    • "${slug}"${desc}`;
+      }).join('\n');
+      fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved source image/video, look at them — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result. Omit this field for the default routing.\n${lines}`);
+    }
   }
   if (caps.anyExtend || caps.anyBgRemove) {
     const parts = ['optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:'];
