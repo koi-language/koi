@@ -18,10 +18,28 @@
 
 import fs from 'fs';
 import path from 'path';
+import sharp from 'sharp';
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { _stashJobMetadata, getJobMetadata, clearJobMetadata, saveVideoFromUrl, _pollUntilTerminal } from './generate-video.js';
 import { channel } from '../../io/channel.js';
+
+// Fal's hard cap for file_too_large is 10 MB / 10485760 bytes (see
+// `docs.fal.ai/model-apis/errors`). Originals that exceed this also
+// occasionally trigger `body.image_url: Failed to download the file`
+// on the worker side even when the upload itself succeeded, so we keep
+// a small safety margin below the documented ceiling.
+//
+// Re-encoding strategy: ALWAYS lossless PNG (`compressionLevel: 9`).
+// JPEG is forbidden — we never want to silently degrade pixel values
+// the model relies on for face / lipsync work. When the original
+// already fits, we ship the original bytes untouched (zero re-encode).
+// When it doesn't, we shrink the longest side by 15 % per iteration
+// and re-encode until it fits, capped at 8 iterations so a pathological
+// file can't loop forever.
+const _AVATAR_BYTE_CAP = 9 * 1024 * 1024;     // 9 MB safety margin vs fal's 10 MB
+const _AVATAR_SHRINK_FACTOR = 0.85;
+const _AVATAR_MAX_ITERATIONS = 8;
 
 const DEFAULT_POLL_INTERVAL_MS = 8000;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -132,11 +150,67 @@ const generateAvatarVideoAction = {
       };
     }
 
-    const imageBuf = fs.readFileSync(resolvedImage);
     const audioBuf = fs.readFileSync(resolvedAudio);
+    let imageBuf = fs.readFileSync(resolvedImage);
+    const imageFilename = path.basename(resolvedImage); // .png kept; never JPEG
+    const originalBytes = imageBuf.length;
+    // Iterative LOSSLESS shrink to keep the upload below fal's 10 MB
+    // file_too_large cap (we aim for 9 MB with a margin). If the
+    // original already fits, the buffer is shipped untouched — zero
+    // re-encode. Otherwise shrink the longest side by 15 % per pass
+    // and re-encode as max-compression PNG, looping up to 8 times.
+    if (imageBuf.length > _AVATAR_BYTE_CAP) {
+      try {
+        const meta0 = await sharp(imageBuf).metadata();
+        const w0 = meta0.width || 0;
+        const h0 = meta0.height || 0;
+        let curW = w0;
+        let curH = h0;
+        let attempt = 0;
+        while (imageBuf.length > _AVATAR_BYTE_CAP && attempt < _AVATAR_MAX_ITERATIONS) {
+          attempt += 1;
+          curW = Math.max(1, Math.round(curW * _AVATAR_SHRINK_FACTOR));
+          curH = Math.max(1, Math.round(curH * _AVATAR_SHRINK_FACTOR));
+          imageBuf = await sharp(fs.readFileSync(resolvedImage))
+              .rotate() // honour EXIF orientation
+              .resize({ width: curW, height: curH, fit: 'inside', withoutEnlargement: true })
+              .png({ compressionLevel: 9, palette: false })
+              .toBuffer();
+          channel.log(
+            'video',
+            `generate_avatar_video: shrink attempt ${attempt} → ${curW}×${curH} ` +
+            `(${(imageBuf.length / 1024).toFixed(0)}KB, lossless PNG)`,
+          );
+        }
+        if (imageBuf.length > _AVATAR_BYTE_CAP) {
+          channel.log(
+            'video',
+            `generate_avatar_video: WARNING — could not shrink below ${_AVATAR_BYTE_CAP} bytes ` +
+            `after ${attempt} iterations (final ${(imageBuf.length / 1024).toFixed(0)}KB). ` +
+            `Uploading anyway — fal may reject.`,
+          );
+        } else {
+          channel.log(
+            'video',
+            `generate_avatar_video: pre-shrunk ${path.basename(resolvedImage)} ` +
+            `(${(originalBytes / 1024).toFixed(0)}KB ${w0}×${h0}) → ` +
+            `${imageFilename} (${(imageBuf.length / 1024).toFixed(0)}KB ${curW}×${curH}, lossless PNG)`,
+          );
+        }
+      } catch (err) {
+        // Sharp couldn't parse / re-encode — restore the original
+        // bytes and let fal try its luck. Logging only so the user
+        // sees why an oversized image might still slip through.
+        imageBuf = fs.readFileSync(resolvedImage);
+        channel.log(
+          'video',
+          `generate_avatar_video: sharp pre-shrink skipped (${err?.message || err}) — uploading original`,
+        );
+      }
+    }
     channel.log(
       'video',
-      `generate_avatar_video: image=${path.basename(resolvedImage)} (${(imageBuf.length / 1024).toFixed(0)}KB), ` +
+      `generate_avatar_video: image=${imageFilename} (${(imageBuf.length / 1024).toFixed(0)}KB), ` +
       `audio=${path.basename(resolvedAudio)} (${(audioBuf.length / 1024).toFixed(0)}KB), ` +
       `aspect=${action.aspectRatio ?? '-'}`,
     );
@@ -148,7 +222,7 @@ const generateAvatarVideoAction = {
     let submitted;
     try {
       submitted = await instance.generateAvatar(imageBuf, audioBuf, {
-        imageFilename: path.basename(resolvedImage),
+        imageFilename: imageFilename,
         audioFilename: path.basename(resolvedAudio),
         prompt: action.prompt,
         aspectRatio: action.aspectRatio,
