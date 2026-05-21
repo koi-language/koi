@@ -283,14 +283,44 @@ class PluginManager {
    * @returns {{ success: boolean, installed: number, pluginId: string }}
    */
   async install({ pluginId, repo, source, marketplaceRepo, scope = 'global', projectRoot }) {
-    const { execSync } = await import('child_process');
-
     const cloneUrl = repo || marketplaceRepo;
     if (!cloneUrl) throw new Error('repo or marketplaceRepo required');
 
-    // Clone
+    // Clone using `isomorphic-git` (pure JS, bundled with the runtime).
+    // This removes the runtime dependency on the system's `git` binary,
+    // which used to bite Windows users without Git for Windows installed
+    // and macOS users on a fresh box without Xcode CLT — both raised
+    // "command not found" the moment they clicked Install on the
+    // marketplace. The on-disk layout is identical to a native shallow
+    // clone (working tree + `.git/`) so the per-plugin file walk below
+    // doesn't need to care which path produced the tree.
+    const igit = await import('isomorphic-git');
+    const igitHttp = await import('isomorphic-git/http/node');
     const tmpDir = path.join(os.tmpdir(), `koi-plugin-${Date.now()}`);
-    execSync(`git clone --depth 1 "${cloneUrl}" "${tmpDir}"`, { timeout: 120000, stdio: 'pipe' });
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const _cloneAc = new AbortController();
+    const _cloneTimer = setTimeout(() => _cloneAc.abort(), 120000);
+    try {
+      await igit.clone({
+        fs,
+        http: igitHttp.default || igitHttp,
+        dir: tmpDir,
+        url: cloneUrl,
+        depth: 1,
+        singleBranch: true,
+        noCheckout: false,
+        noTags: true,
+      });
+    } catch (err) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      clearTimeout(_cloneTimer);
+    }
+    if (_cloneAc.signal.aborted) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw new Error('Plugin clone timed out after 120s');
+    }
 
     try {
       // Resolve plugin directory

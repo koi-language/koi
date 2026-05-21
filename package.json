@@ -66,6 +66,7 @@
     "graphology": "^0.26.0",
     "graphology-communities-louvain": "^2.0.2",
     "graphology-metrics": "^2.4.0",
+    "isomorphic-git": "^1.38.1",
     "keyv": "^5.1.1",
     "linkedom": "^0.18.12",
     "lodash": "^4.17.23",
