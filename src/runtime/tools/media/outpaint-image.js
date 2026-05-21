@@ -185,8 +185,72 @@ const outpaintImageAction = {
       return { success: false, error: `Failed to read image metadata: ${err.message}` };
     }
 
-    const newWidth = origWidth + pads.left + pads.right;
-    const newHeight = origHeight + pads.top + pads.bottom;
+    let newWidth = origWidth + pads.left + pads.right;
+    let newHeight = origHeight + pads.top + pads.bottom;
+
+    // Auto-downscale guard. Most outpaint models cap inputs around 4 MP
+    // (fal-ai/flux-2-pro/outpaint: 4,194,304; flux-pro/v1/fill: 4 MP;
+    // bria/expand: 4 MP). When the requested canvas exceeds the cap we
+    // used to bail with "dimensions exceed maximum" and ask the user to
+    // retry. That's a bad UX — the user just wanted the image
+    // outpainted, not a lecture about megapixels. Instead we scale the
+    // ORIGINAL image AND the requested pads by the same factor so the
+    // resulting canvas lands under the cap, then continue the normal
+    // flow.
+    //
+    // The 0.95 multiplier reserves headroom for the "Aspect-cap pre-pad"
+    // step in generate-image.js (lines ~442-496), which aligns every
+    // reference image to multiples of `DIM_ALIGNMENT = 16` px in
+    // `_pad-and-recover.js`. Without that buffer, a canvas at exactly
+    // 4 MP gets bumped up to ~4.24 MP after stride-alignment and the
+    // model rejects it. With the buffer, even worst-case alignment
+    // (+15 px on each side) keeps the final canvas under 4 MP. The 5 %
+    // resolution loss is invisible to the eye and saves the entire
+    // retry round-trip.
+    //
+    // The proportions are preserved end-to-end; the original file is
+    // NOT mutated — we write a temp downscaled copy and re-point
+    // `resolvedPath` at it.
+    const MAX_OUTPAINT_PIXELS = Math.floor(4 * 1024 * 1024 * 0.95);
+    let workingPath = resolvedPath;
+    if (newWidth * newHeight > MAX_OUTPAINT_PIXELS) {
+      const scale = Math.sqrt(MAX_OUTPAINT_PIXELS / (newWidth * newHeight));
+      const scaledOrigW = Math.max(1, Math.floor(origWidth * scale));
+      const scaledOrigH = Math.max(1, Math.floor(origHeight * scale));
+      const scaledPads = {
+        left: Math.max(0, Math.floor(pads.left * scale)),
+        right: Math.max(0, Math.floor(pads.right * scale)),
+        top: Math.max(0, Math.floor(pads.top * scale)),
+        bottom: Math.max(0, Math.floor(pads.bottom * scale)),
+      };
+      try {
+        const sharp = (await import('sharp')).default;
+        const scaledPath = path.join(os.tmpdir(), `outpaint-src-${Date.now()}.png`);
+        await sharp(resolvedPath)
+          .resize(scaledOrigW, scaledOrigH, { fit: 'fill' })
+          .png({ compressionLevel: 9, palette: false })
+          .toFile(scaledPath);
+        workingPath = scaledPath;
+        channel.log(
+          'image',
+          `outpaint_image: auto-downscaled to fit ${MAX_OUTPAINT_PIXELS / (1024 * 1024)} MP cap ` +
+          `(orig ${origWidth}×${origHeight} → ${scaledOrigW}×${scaledOrigH}, scale=${scale.toFixed(3)}, ` +
+          `pads T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right} → ` +
+          `T${scaledPads.top}/B${scaledPads.bottom}/L${scaledPads.left}/R${scaledPads.right})`,
+        );
+        origWidth = scaledOrigW;
+        origHeight = scaledOrigH;
+        pads.left = scaledPads.left;
+        pads.right = scaledPads.right;
+        pads.top = scaledPads.top;
+        pads.bottom = scaledPads.bottom;
+        newWidth = origWidth + pads.left + pads.right;
+        newHeight = origHeight + pads.top + pads.bottom;
+      } catch (err) {
+        return { success: false, error: `Failed to downscale source for outpaint cap: ${err.message}` };
+      }
+    }
+
     const newAspect = _closestAspectRatio(newWidth, newHeight);
 
     // Build the transparent-padded canvas: a `newWidth × newHeight`
@@ -215,7 +279,7 @@ const outpaintImageAction = {
           background: { r: 0, g: 0, b: 0, alpha: 0 },
         },
       })
-        .composite([{ input: resolvedPath, left: pads.left, top: pads.top }])
+        .composite([{ input: workingPath, left: pads.left, top: pads.top }])
         .png()
         .toBuffer();
       fs.writeFileSync(paddedCanvasPath, canvasBuffer);
@@ -298,7 +362,7 @@ const outpaintImageAction = {
     // to prepend a "Reference images (by position)" legend to the prompt,
     // which fill models render as visible text inside the painted region.
     let originalBuffer;
-    try { originalBuffer = fs.readFileSync(resolvedPath); } catch { /* fall through; reframe models will fail loudly */ }
+    try { originalBuffer = fs.readFileSync(workingPath); } catch { /* fall through; reframe models will fail loudly */ }
     const genAction = {
       prompt: effectivePrompt,
       // `intent` routes the picker to the `image_extend` bucket (see
@@ -343,6 +407,10 @@ const outpaintImageAction = {
     // Clean up the temp canvas regardless of outcome — keeps /tmp tidy
     // and avoids leaking PII (the canvas contains the original image).
     try { fs.unlinkSync(paddedCanvasPath); } catch { /* best-effort */ }
+    // Same for the auto-downscaled source copy when we wrote one.
+    if (workingPath !== resolvedPath) {
+      try { fs.unlinkSync(workingPath); } catch { /* best-effort */ }
+    }
 
     if (!result || result.success === false) {
       return {
