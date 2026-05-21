@@ -286,40 +286,111 @@ class PluginManager {
     const cloneUrl = repo || marketplaceRepo;
     if (!cloneUrl) throw new Error('repo or marketplaceRepo required');
 
-    // Clone using `isomorphic-git` (pure JS, bundled with the runtime).
-    // This removes the runtime dependency on the system's `git` binary,
-    // which used to bite Windows users without Git for Windows installed
-    // and macOS users on a fresh box without Xcode CLT — both raised
-    // "command not found" the moment they clicked Install on the
-    // marketplace. The on-disk layout is identical to a native shallow
-    // clone (working tree + `.git/`) so the per-plugin file walk below
-    // doesn't need to care which path produced the tree.
-    const igit = await import('isomorphic-git');
-    const igitHttp = await import('isomorphic-git/http/node');
+    // Targeted SUBPATH fetch via GitHub Trees + raw URLs. We list the
+    // entire repo tree with one Trees API request (~200 KB JSON for a
+    // typical catalog), filter to entries under the plugin's `source`
+    // subpath, and download only those files in parallel via
+    // raw.githubusercontent.com. For a single plugin install on a big
+    // marketplace repo this is dramatically faster than cloning or
+    // tarballing the whole repo — `koi-language/plugins` is ~400 MB
+    // tarball but a single plugin is often <1 MB.
+    //
+    // On-disk layout: every blob is written at `tmpDir/<full-repo-
+    // relative-path>`, so the existing `pluginSrcDir = path.join(
+    // tmpDir, source)` resolution below keeps working unchanged.
+    const ghMatch = cloneUrl.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/|$)/);
+    if (!ghMatch) {
+      throw new Error(`Subpath install only supports GitHub repos: ${cloneUrl}`);
+    }
+    const ghOwner = ghMatch[1];
+    const ghRepo = ghMatch[2];
     const tmpDir = path.join(os.tmpdir(), `koi-plugin-${Date.now()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
-    const _cloneAc = new AbortController();
-    const _cloneTimer = setTimeout(() => _cloneAc.abort(), 120000);
-    try {
-      await igit.clone({
-        fs,
-        http: igitHttp.default || igitHttp,
-        dir: tmpDir,
-        url: cloneUrl,
-        depth: 1,
-        singleBranch: true,
-        noCheckout: false,
-        noTags: true,
+    const https = await import('https');
+    const FETCH_TIMEOUT_MS = 120000;
+
+    const httpGet = (url, asJson = false) => new Promise((resolve, reject) => {
+      const req = https.default.get(url, {
+        headers: {
+          'User-Agent': 'koi-cli',
+          'Accept': asJson ? 'application/vnd.github.v3+json' : '*/*',
+        },
+      }, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302) {
+          httpGet(res.headers.location, asJson).then(resolve, reject);
+          res.resume();
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
+          if (asJson) {
+            try { resolve(JSON.parse(buf.toString('utf8'))); }
+            catch (e) { reject(new Error(`JSON parse failed for ${url}: ${e.message}`)); }
+          } else {
+            resolve(buf);
+          }
+        });
+        res.on('error', reject);
       });
+      req.on('error', reject);
+      req.setTimeout(FETCH_TIMEOUT_MS, () => {
+        req.destroy(new Error(`fetch timed out after ${FETCH_TIMEOUT_MS}ms`));
+      });
+    });
+
+    let branch = 'main';
+    let tree;
+    try {
+      tree = await httpGet(`https://api.github.com/repos/${ghOwner}/${ghRepo}/git/trees/main?recursive=1`, true);
+    } catch (mainErr) {
+      branch = 'master';
+      try {
+        tree = await httpGet(`https://api.github.com/repos/${ghOwner}/${ghRepo}/git/trees/master?recursive=1`, true);
+      } catch (masterErr) {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        throw new Error(`Tree fetch failed (main: ${mainErr.message}; master: ${masterErr.message})`);
+      }
+    }
+    if (tree.truncated) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw new Error(`Repo tree truncated (>100k entries) — targeted subpath install not supported`);
+    }
+    const entries = Array.isArray(tree.tree) ? tree.tree : [];
+    const normSub = source ? source.replace(/^\.\//, '').replace(/\/$/, '') : '';
+    const wanted = normSub
+      ? entries.filter(e => e.path === normSub || e.path.startsWith(normSub + '/'))
+      : entries;
+    const blobs = wanted.filter(e => e.type === 'blob');
+    if (blobs.length === 0) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw new Error(`No files found under '${source || '/'}' in ${ghOwner}/${ghRepo}`);
+    }
+
+    const CONCURRENCY = 8;
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(CONCURRENCY, blobs.length) }, async () => {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= blobs.length) return;
+        const blob = blobs[idx];
+        const dest = path.join(tmpDir, blob.path);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        const rawUrl = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${branch}/${blob.path}`;
+        const buf = await httpGet(rawUrl, false);
+        fs.writeFileSync(dest, buf);
+      }
+    });
+    try {
+      await Promise.all(workers);
     } catch (err) {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      throw err;
-    } finally {
-      clearTimeout(_cloneTimer);
-    }
-    if (_cloneAc.signal.aborted) {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      throw new Error('Plugin clone timed out after 120s');
+      throw new Error(`Blob fetch failed: ${err.message}`);
     }
 
     try {
