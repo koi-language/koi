@@ -73,13 +73,14 @@ function _directionPhrase(pads) {
   return parts;
 }
 
+
 const outpaintImageAction = {
   type: 'outpaint_image',
   intent: 'outpaint_image',
   bannerKind: 'image',
   bannerLabel: 'Extendiendo imagen',
   bannerIconId: 'outpaint',
-  description: 'Extend (outpaint) an image\'s canvas by adding pixels to one or more sides, filling the new margins with content that seamlessly continues the scene. Internally delegates to generate_image using the same underlying image models. In: "image" (path or attachment id, required), at least one of "padTop" / "padBottom" / "padLeft" / "padRight" (pixels, 0–4096), optional "prompt" (guides what the new margins should contain — e.g. "continue the beach and sky"), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory). Returns: { success, provider, model, images: [{ savedTo }] }. Use this when the scene needs to be wider/taller than the source — for style transfer, img2img or composition, use generate_image directly.',
+  description: 'Extend (outpaint) an image\'s canvas by adding pixels to one or more sides, filling the new margins with content that seamlessly continues the scene. Internally delegates to generate_image using the same underlying image models. In: "image" (path or attachment id, required), at least one of "padTop" / "padBottom" / "padLeft" / "padRight" (pixels, 0–4096), optional "prompt" (see PROMPT TEMPLATE below), optional "outputFormat" (png|jpeg|webp), optional "saveTo" (directory). Returns: { success, provider, model, images: [{ savedTo }] }. Use this when the scene needs to be wider/taller than the source — for style transfer, img2img or composition, use generate_image directly.\n\nPROMPT TEMPLATE — the optional `prompt` field MUST be ENGLISH (translate the user\'s request if it\'s in any other language) and describe ONLY the content for the NEW margins, never restate the geometry (the tool appends the px directions automatically). Use this shape:\n  "<short scene continuation description>. <optional explicit additions the user requested>."\nExamples:\n  • User says nothing → leave `prompt` empty; the tool uses a safe background-continuation default.\n  • User says "extiende el cielo y mete más nubes" → prompt: "Continue the sky with additional natural-looking clouds in the same lighting."\n  • User says "mete más personas a los lados" → prompt: "Add 2–3 additional pedestrians walking on the cobblestone in the new margins, dressed consistently with the existing figure."\n  • User says "que se vea más calle a la derecha" → prompt: "Continue the cobblestone street, shopfronts and trees to the right at the same perspective."\nDO NOT include phrases like "no new people / no new objects" — those are the tool\'s default guards and they conflict with users who DO want new content. The tool already appends a universal "no text, no captions, no labels" tail, so don\'t restate it. Keep the prompt to ONE coherent sentence.',
   thinkingHint: 'Outpainting image',
   permission: 'generate_image',
 
@@ -318,20 +319,24 @@ const outpaintImageAction = {
     //     into the masked region. We have screenshots of the prompt's own
     //     words coming back as post-it notes inside the painted margins.
     //
-    // The compromise: a short scene-description prompt with NO meta
-    // instructions about canvas dimensions, ban-lists, or rule lists.
-    // The mask + the existing pixels at the seam already tell every model
-    // where and what to paint. We only describe the desired CONTENT and
-    // (briefly) ban text/new-subjects, in declarative form. This is safe
-    // for both families.
-    const basePrompt =
-      `Continue the existing scene into the surrounding background area, ${directionsList}. ` +
-      `Match the same art style, color palette, texture, and lighting as the existing pixels at the boundary. ` +
-      `Background continuation only — no new people, no new objects, no text, no captions, no labels.`;
-
+    // The CALLING AGENT is responsible for emitting an English prompt
+    // that already incorporates user intent + scene description. The
+    // tool's `description` field documents the required template for
+    // that prompt (see action spec above). All we do here is:
+    //   - When the agent passed a prompt, use it as-is and append a
+    //     short geometry hint + the universal "no text/captions/labels"
+    //     guard (text in painted margins is the #1 outpaint failure
+    //     mode across every model we've shipped).
+    //   - When the agent passed NO prompt, fall back to a safe-default
+    //     prompt: pure background continuation with the full guard
+    //     list (no new people / objects / text / captions). This is
+    //     the right default for "extend the canvas, don't add stuff".
+    const guardsTail = `No text, no captions, no labels.`;
     const effectivePrompt = userPrompt
-      ? `${userPrompt}. ${basePrompt}`
-      : basePrompt;
+      ? `${userPrompt} Extend the canvas ${directionsList}, matching the existing art style, palette, lighting, and texture at the boundary. ${guardsTail}`
+      : `Continue the existing scene into the surrounding background area, ${directionsList}. ` +
+        `Match the same art style, color palette, texture, and lighting as the existing pixels at the boundary. ` +
+        `Background continuation only — no new people, no new objects, ${guardsTail.toLowerCase()}`;
 
     channel.log(
       'image',
