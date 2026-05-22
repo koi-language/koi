@@ -34,7 +34,14 @@ export class PlaybookSession {
     // Error tracking
     this.lastError = null;
     this.consecutiveErrors = 0;
-    this.maxConsecutiveErrors = 10;
+    // Lowered from 10 to 4 — at 10 a flailing LLM (e.g. burning two
+    // minutes per call on truncated `prompt_user` retries) could
+    // chew through 5+ minutes of wall time before the pivot logic
+    // kicked in, and the user perceived the chat as "frozen at the
+    // end of a plan". 4 gives the model enough rope to recover from
+    // a transient provider hiccup while still bailing out fast when
+    // the loop is genuinely stuck.
+    this.maxConsecutiveErrors = 4;
 
     // Error log: tracks past failures so the LLM doesn't retry actions
     // that already failed without fixing the underlying cause first.

@@ -1189,6 +1189,19 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
     ? `\n| ffmpeg | \`${_ffmpeg.path}\` (v${_ffmpeg.version}) |`
     : `\n| ffmpeg | not yet installed — runs via Koi's installer on first media call (pinned v${_ffmpeg.version}). Prefer the high-level media actions over raw shell \`ffmpeg\` calls. |`;
 
+  // Session working dir — the per-session scratch area at
+  // `<projectRoot>/.koi/sessions/<sessionId>`. Surfacing it in the
+  // runtime context (and pinning it with the `*` note below) is what
+  // pushes the agent to drop intermediate artefacts (downloaded inputs,
+  // generated assets, scratch JSON, tool outputs) inside the session
+  // folder instead of polluting the project root with random files
+  // that survive after the session ends.
+  const _projectRoot = process.env.KOI_PROJECT_ROOT || cwd;
+  const _sessionId = process.env.KOI_SESSION_ID || agent?.sessionId || null;
+  const sessionWorkingDirField = _sessionId
+    ? `\n| Session working dir | \`${path.join(_projectRoot, '.koi', 'sessions', _sessionId)}\` |`
+    : '';
+
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
   const dynamic = `${phaseSystemBlock}
@@ -1197,9 +1210,10 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 | Field | Value |
 |---|---|
 | Current date/time | \`${now}\`${timezone ? ` (${timezone})` : ''} |
-| Working directory | \`${cwd}\` |${platformField}${langField}${ffmpegField}
+| Working directory | \`${cwd}\` |${platformField}${sessionWorkingDirField}${langField}${ffmpegField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
+${_sessionId ? `* **Session working dir**: write every intermediate / process file you produce during this session (downloads, scratch JSON, tool outputs, generated assets you don't intend to ship as final deliverables, transient logs) inside the "Session working dir" above. Keep the project root clean — only files the user explicitly asked to create/edit in the project belong there.\n` : ''}
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
 ${openDocumentsBlock}${mentionVocabularyBlock}${nonInteractiveBlock}${expandedToolsBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;

@@ -72,7 +72,7 @@ export default {
                 extensions: {
                   type: 'array',
                   items: { type: 'string' },
-                  description: 'Optional whitelist of extensions WITHOUT the leading dot (e.g. ["png","jpg","svg"]). When set, the native browse dialog filters by these and the drop zone rejects files outside the list.'
+                  description: 'Optional whitelist of extensions WITHOUT the leading dot. When set, the native browse dialog filters by these and the drop zone rejects files outside the list. For IMAGE inputs always include iPhone formats — use ["jpg","jpeg","png","webp","heic","heif"] (the GUI auto-normalises HEIC/HEIF to PNG before upload, so models that don\'t speak HEIC still get a clean PNG). Skipping heic/heif means iPhone screenshots are silently rejected at drop time.'
                 }
               }
             }
@@ -131,7 +131,7 @@ export default {
           label: 'References',
           question: 'Drop a few reference photos of the restaurant.',
           hint: 'Dining room, plates, ambient. PNG/JPG.',
-          files: { multiple: true, extensions: ['png', 'jpg', 'jpeg'] }
+          files: { multiple: true, extensions: ['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif'] }
         },
         {
           label: 'Voiceover',

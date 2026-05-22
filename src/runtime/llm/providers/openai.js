@@ -290,6 +290,27 @@ export class OpenAIChatLLM extends BaseLLM {
     // Throwing here lets the agent retry the LLM call instead of failing at parse.
     if (text.startsWith('{') || text.startsWith('[')) {
       try { JSON.parse(text); } catch {
+        // Recovery path: the model sometimes emits TWO consecutive
+        // top-level actions (`{json1}\n\n{json2-partial}`) instead of
+        // a single object or batch. Strict `JSON.parse` chokes on the
+        // trailing partial and we'd throw "truncated JSON", which
+        // sends the agent into a retry loop with bigger / pricier
+        // models — observed when the user said "I'm satisfied,
+        // finish photoshoot" and the agent kept retrying forever.
+        // Try to slice the FIRST balanced JSON object from the text
+        // and use it on its own. If THAT parses cleanly, the second
+        // action is just LLM noise we can safely drop.
+        const firstObject = _extractFirstBalancedJson(text);
+        if (firstObject) {
+          try {
+            JSON.parse(firstObject);
+            channel.log(
+              'llm',
+              `[recover] Trimmed trailing non-JSON garbage: kept ${firstObject.length} of ${text.length} chars`,
+            );
+            return { text: firstObject, usage };
+          } catch { /* fall through to the original error */ }
+        }
         const reason = _finishReason === 'length'
           ? `output hit max_tokens limit (${this.maxTokens})`
           : _finishReason ? `finish_reason=${_finishReason}` : 'stream ended prematurely';
@@ -764,4 +785,42 @@ export class OpenAIAudioGen extends BaseAudioGen {
       throw err;
     }
   }
+}
+
+/**
+ * Scan a string for the first balanced top-level `{...}` or `[...]`
+ * object and return JUST that slice. Respects JSON string escaping so
+ * braces inside `"..."` don't close the outer object early.
+ *
+ * Used as a recovery hook in `streamReactive` when the model emits
+ * multiple concatenated JSON values (e.g. `{a}\n\n{b-partial}` —
+ * observed when a flailing model loops on `prompt_user`). Returns
+ * null when no balanced object is found.
+ */
+function _extractFirstBalancedJson(text) {
+  if (!text || typeof text !== 'string') return null;
+  const open = text[0];
+  if (open !== '{' && open !== '[') return null;
+  const close = open === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (c === '\\') escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === open) depth++;
+    else if (c === close) {
+      depth--;
+      if (depth === 0) {
+        return text.substring(0, i + 1);
+      }
+    }
+  }
+  return null;
 }
