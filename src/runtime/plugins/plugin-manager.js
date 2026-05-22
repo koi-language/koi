@@ -166,11 +166,22 @@ class PluginManager {
       if (agents.length > 0) caps.agents = agents;
     }
 
-    // Workflows — same layout as skills: one subdirectory per workflow,
-    // each containing a `WORKFLOW.md` (frontmatter declares the
-    // workflow's `name` + `description`, body holds the prose script).
-    // Single workflow at the plugin root (just a `WORKFLOW.md`) is
-    // ALSO accepted so a one-trick plugin can skip the wrapping dir.
+    // Workflows — three accepted layouts so plugin authors aren't
+    // forced into one convention:
+    //   1. `<plugin>/workflows/<name>/WORKFLOW.md` — one sub-directory
+    //      per workflow. Recommended for multi-workflow plugins
+    //      (matches `<plugin>/skills/<name>/SKILL.md`).
+    //   2. `<plugin>/workflows/WORKFLOW.md`        — single workflow
+    //      under a `workflows/` folder, used as a bag for the
+    //      workflow's accompanying assets (style guides, sample
+    //      images, …). The workflow gets `path.basename(plugin)` as
+    //      its name. THIS is the layout the video-ad-generation
+    //      plugin shipped first — without this branch the install
+    //      would silently copy zero workflows and the agent had no
+    //      pre-approved plan to match user intent against.
+    //   3. `<plugin>/WORKFLOW.md`                   — workflow file
+    //      directly at the plugin root (no wrapping `workflows/`),
+    //      for one-trick plugins that don't ship side assets.
     const workflowsDir = path.join(dir, 'workflows');
     if (fs.existsSync(workflowsDir)) {
       const workflows = [];
@@ -180,7 +191,17 @@ class PluginManager {
           workflows.push({ name, path: path.join(wd, 'WORKFLOW.md'), dir: wd });
         }
       }
-      if (workflows.length > 0) caps.workflows = workflows;
+      if (workflows.length > 0) {
+        caps.workflows = workflows;
+      } else if (fs.existsSync(path.join(workflowsDir, 'WORKFLOW.md'))) {
+        // Layout #2 — single WORKFLOW.md sitting directly inside
+        // workflows/ with the plugin's other assets.
+        caps.workflows = [{
+          name: path.basename(dir),
+          path: path.join(workflowsDir, 'WORKFLOW.md'),
+          dir: workflowsDir,
+        }];
+      }
     }
     if (!caps.workflows && fs.existsSync(path.join(dir, 'WORKFLOW.md'))) {
       caps.workflows = [{ name: path.basename(dir), path: path.join(dir, 'WORKFLOW.md'), dir }];
