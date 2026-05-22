@@ -587,6 +587,33 @@ export class GatewayImageGen extends BaseImageGen {
     };
   }
 
+  /**
+   * Return the model OBJECT (slug, categories, constraints, …) that
+   * `generate(...)` WOULD pick for the given request shape, WITHOUT
+   * actually dispatching. Tools call this BEFORE building their
+   * payload so they can read `constraints.output.maxArea`/`maxDimension`
+   * (and the input caps) and proactively resize / recompress — instead
+   * of round-tripping a guaranteed 4xx like the outpaint canvas does
+   * when it exceeds the picked model's caps.
+   *
+   * @param {object} req — same shape passed to pickImageModel (intent,
+   *                       refsCount, hasMaskImage, hasSourceImage, …)
+   * @returns {Promise<object|null>} the picked model object, or null
+   *                                  when the catalog is empty / the
+   *                                  pick fails (caller falls back to
+   *                                  bucket defaults).
+   */
+  async peekModel(req = {}) {
+    try {
+      const caps = await fetchMediaCapabilities('image');
+      if (!caps || !Array.isArray(caps.models) || caps.models.length === 0) return null;
+      const { peekImageModel } = await import('./media-model-router.js');
+      return peekImageModel(caps.models, req) || null;
+    } catch {
+      return null;
+    }
+  }
+
   async generate(prompt, opts = {}) {
     // Auto-retry on content-policy / safety-filter rejections.
     //
@@ -1541,6 +1568,20 @@ export class GatewayVideoGen extends BaseVideoGen {
   }
 
   get providerName() { return 'koi-gateway'; }
+
+  /** Same contract as GatewayImageGen.peekModel — return the model
+   *  object the router WOULD pick for this request, without
+   *  dispatching, so tools can size inputs against its constraints. */
+  async peekModel(req = {}) {
+    try {
+      const caps = await fetchMediaCapabilities('video');
+      if (!caps || !Array.isArray(caps.models) || caps.models.length === 0) return null;
+      const { peekVideoModel } = await import('./media-model-router.js');
+      return peekVideoModel(caps.models, req) || null;
+    } catch {
+      return null;
+    }
+  }
 
   get capabilities() {
     const mc = _getMediaCaps(this.model);

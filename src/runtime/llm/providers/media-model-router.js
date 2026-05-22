@@ -324,7 +324,13 @@ function _pickByBucket(kind, models, req, wantedBucket) {
     }).join(' > ');
     channel.log('media-router', `${kind}/${wantedBucket}${wantLabel ? `:${wantLabel}` : ''} → ${winner}  (ranked: ${competitors}${eligible.length > 5 ? ` +${eligible.length - 5} more` : ''})`);
   } catch { /* logging is best-effort */ }
-  return eligible[0].slug;
+  // Return the full model OBJECT, not just the slug. Callers that
+  // only need the slug do `picked.slug`; tools that need
+  // `constraints` / `categories` / etc. before dispatching read
+  // those off the object directly (the whole point of this refactor —
+  // outpaint-image needs the picked model's output.maxArea/Dimension
+  // BEFORE building the canvas to avoid the guaranteed 4xx).
+  return eligible[0];
 }
 
 // ── Image ───────────────────────────────────────────────────────────────────
@@ -406,6 +412,53 @@ export function pickImageModel(models, req = {}) {
   };
   const filtered = _filterByRequires(models, presence);
   const pool = filtered.length > 0 ? filtered : models;
+  // Preserve the public-API contract: pickImageModel returns the slug
+  // STRING. Tools that need the full model object (with `constraints`)
+  // use `peekImageModel` below, which performs the same ranking but
+  // returns the model object directly.
+  return _pickByBucket('image', pool, req, wantedBucket).slug;
+}
+
+/**
+ * Identical to pickImageModel but returns the full model OBJECT
+ * (slug, displayName, categories, constraints, …) instead of just
+ * the slug string. Tools call this BEFORE dispatching so they can
+ * read the picked model's `constraints` and resize / recompress the
+ * payload accordingly. The cameraAngles short-circuit, the
+ * `_filterByRequires` step, and the bucket-rank logic are exactly
+ * the same — only the return shape differs.
+ */
+export function peekImageModel(models, req = {}) {
+  if (req?.cameraAngles
+      && (typeof req.cameraAngles.horizontal === 'number'
+          || typeof req.cameraAngles.vertical === 'number'
+          || typeof req.cameraAngles.zoom === 'number')) {
+    const QWEN_ANGLES_SLUG = 'fal-ai/qwen-image-edit-2511-multiple-angles';
+    const hit = (models || []).find((m) => m?.slug === QWEN_ANGLES_SLUG);
+    if (hit) return hit;
+  }
+  const intent = typeof req.intent === 'string' ? req.intent.trim() : '';
+  const refsCount = req.refsCount || 0;
+  const wantedBucket =
+    (intent === 'bg-remove' || intent === 'background-removal' || intent === 'rembg') ? 'image_background_removal' :
+    (intent === 'upscale' || intent === 'upscaling') ? 'image_upscaling' :
+    (intent === 'outpaint' || intent === 'extend') ? 'image_extend' :
+    (intent === 'edit' || intent === 'inpaint') ? 'image_editing' :
+    refsCount > 0 ? 'image_editing' :
+    'image_generation';
+  const presence = {
+    referenceImages: refsCount > 0,
+    maskImage: !!req.hasMaskImage,
+    sourceImage: !!req.hasSourceImage,
+    targetSize: !!req.hasTargetSize,
+    sourceImageOffset: !!req.hasSourceImageOffset,
+    cameraAngles: !!(req.cameraAngles
+      && (typeof req.cameraAngles.horizontal === 'number'
+          || typeof req.cameraAngles.vertical === 'number'
+          || typeof req.cameraAngles.zoom === 'number')),
+  };
+  const filtered = _filterByRequires(models, presence);
+  const pool = filtered.length > 0 ? filtered : models;
   return _pickByBucket('image', pool, req, wantedBucket);
 }
 
@@ -466,7 +519,7 @@ export function pickVideoModel(models, req = {}) {
     'video_generation';
 
   if (!Array.isArray(models) || models.length === 0) {
-    return _pickByBucket('video', models, req, wantedBucket);
+    return _pickByBucket('video', models, req, wantedBucket).slug;
   }
 
   // Build the presence snapshot mirroring the keys of VideoRequires.
@@ -485,6 +538,34 @@ export function pickVideoModel(models, req = {}) {
   // fall back to the unfiltered list. The per-slug adapter will reject
   // and the agent can react — better than throwing `no_model_matches`
   // with a misleading reason.
+  const pool = filtered.length > 0 ? filtered : models;
+  return _pickByBucket('video', pool, req, wantedBucket).slug;
+}
+
+/** Same as pickVideoModel but returns the full model OBJECT — see
+ *  peekImageModel for rationale. */
+export function peekVideoModel(models, req = {}) {
+  const kind = req.kind || '';
+  const videoRefsCount = req.videoRefsCount || 0;
+  const wantedBucket =
+    kind === 'avatar' ? 'video_avatar' :
+    kind === 'extend' ? 'video_extend' :
+    (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
+    videoRefsCount > 0 ? 'video_editing' :
+    'video_generation';
+  if (!Array.isArray(models) || models.length === 0) {
+    return _pickByBucket('video', models, req, wantedBucket);
+  }
+  const presence = {
+    startFrame: !!req.hasStartFrame,
+    endFrame: !!req.hasEndFrame,
+    referenceImages: (req.refsCount || 0) > 0,
+    referenceVideos: (req.videoRefsCount || 0) > 0,
+    imageUrl: !!req.hasImageUrl,
+    audioUrl: !!req.hasAudioUrl,
+    characterOrientation: !!req.characterOrientation,
+  };
+  const filtered = _filterByRequires(models, presence);
   const pool = filtered.length > 0 ? filtered : models;
   return _pickByBucket('video', pool, req, wantedBucket);
 }
@@ -516,6 +597,23 @@ export function pickAudioModel(models, req = {}) {
   const presence = {
     videoUrl: !!req.hasVideoUrl,
   };
+  const filtered = _filterByRequires(models, presence);
+  const pool = filtered.length > 0 ? filtered : models;
+  return _pickByBucket('audio', pool, req, wantedBucket).slug;
+}
+
+/** Same as pickAudioModel but returns the full model OBJECT — see
+ *  peekImageModel for rationale. */
+export function peekAudioModel(models, req = {}) {
+  const kind = req.kind || 'tts';
+  const wantedBucket =
+    kind === 'tts' ? 'audio_tts' :
+    kind === 'transcribe' ? 'audio_transcription' :
+    kind === 'voice-clone' ? 'audio_voice_clone' :
+    kind === 'music' ? 'audio_music' :
+    kind === 'sfx' ? 'audio_sfx' :
+    'audio_tts';
+  const presence = { videoUrl: !!req.hasVideoUrl };
   const filtered = _filterByRequires(models, presence);
   const pool = filtered.length > 0 ? filtered : models;
   return _pickByBucket('audio', pool, req, wantedBucket);

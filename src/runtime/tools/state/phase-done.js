@@ -3,7 +3,12 @@
  *
  * The agent does not decide which phase comes next. Invoking `phase_done`
  * fires a `phase.done` event that the agent's `reactions { }` block maps to
- * the next phase. If no matching reaction exists, the phase does not change.
+ * the next phase. If no matching reaction exists, the call returns
+ * `success: false` with an actionable hint: previously it was a silent
+ * no-op (success: true) which the LLM would interpret as "all good, keep
+ * going", and the agent then looped — System's `routing` phase has no
+ * `routing.done` transition (it terminates with `prompt_user`), so any
+ * phase_done from there was the start of a spin until max_tokens.
  *
  * Use this when the agent has no user-visible result to report (e.g. the
  * Developer finishes `exploring` and wants to move on to `implementing`).
@@ -44,9 +49,25 @@ export default {
 
     const newPhase = agent.state?.statusPhase;
     if (newPhase === currentPhase) {
+      // No reaction wired for this phase → phase_done is a no-op here.
+      // Previously we returned `success: true` with a soft message, but
+      // the agent loop reads that as "the action did its job, keep going"
+      // and appends a "Continue." prompt; the LLM then has no clear next
+      // step and tends to spam phase_done (or fall back to repeated
+      // prompt_user emissions, blowing past max_tokens). Reporting
+      // failure with an actionable hint pushes the model toward the
+      // correct alternative (prompt_user to suspend, or a real next
+      // action) and breaks the loop at the source.
       return {
-        success: true,
-        message: `Phase "${currentPhase}" acknowledged as done, but no reaction matched — still in the same phase.`,
+        success: false,
+        error:
+          `phase_done is a no-op in phase "${currentPhase}": the agent's ` +
+          `reactions block does not declare a transition for ` +
+          `phase("${currentPhase}").done, so this call would not advance ` +
+          `state. Choose a concrete next action instead — typically ` +
+          `\`prompt_user\` to suspend and wait for the user, or another ` +
+          `action that progresses the current task. Do not retry ` +
+          `\`phase_done\` from this phase.`,
       };
     }
     return {

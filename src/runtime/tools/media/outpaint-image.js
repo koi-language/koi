@@ -186,100 +186,19 @@ const outpaintImageAction = {
       return { success: false, error: `Failed to read image metadata: ${err.message}` };
     }
 
-    // Capture immutable source dims + pad request so the retry loop
-    // below can recompute against a tighter cap WITHOUT compounding
-    // floor-rounding errors from a previous attempt.
-    const srcWidth = origWidth;
-    const srcHeight = origHeight;
-    const srcPads = { ...pads };
-
     let newWidth = origWidth + pads.left + pads.right;
     let newHeight = origHeight + pads.top + pads.bottom;
 
-    // Auto-downscale guard. Outpaint models typically impose TWO
-    // independent limits that we have to satisfy simultaneously:
-    //
-    //   1. Total area cap: ~4 MP (fal-ai/flux-2-pro/outpaint: 4,194,304;
-    //      flux-pro/v1/fill: 4 MP; bria/expand: 4 MP).
-    //   2. Per-dimension cap: ≤ 2560 px on the long side (flux-2-pro
-    //      family rejects 2672×1504 even though the area is only 4 MP).
-    //
-    // These are MODEL-SPECIFIC: the router (image_extend bucket) can
-    // pick different slugs (flux-2-pro/outpaint, flux-pro/v1/fill,
-    // bria/expand, ideogram/v3/reframe, gpt-image-2/edit, …) each
-    // with its own limits. The constants below encode the WORST
-    // common case across the catalog as a fast first-pass guard,
-    // covering ~95% of cases without any round-trip. For the
-    // remaining cases the reactive retry below the generate_image
-    // call parses the actual cap from the model's error message and
-    // re-runs with tighter limits — so newly-added models with
-    // different caps are handled too, without a backend change.
-    //
-    // The 0.95 multiplier on the area cap and the -16 px slack on the
-    // dimension cap reserve headroom for the "Aspect-cap pre-pad" step
-    // in generate-image.js (lines ~442-496), which aligns every
-    // reference image to multiples of `DIM_ALIGNMENT = 16` px (see
-    // `_pad-and-recover.js`). Without these buffers, a canvas at
-    // exactly the limit gets bumped over after stride-alignment and
-    // the model rejects it.
-    //
-    // The proportions are preserved end-to-end; the original file is
-    // NOT mutated — we write a temp downscaled copy and re-point
-    // `resolvedPath` at it.
-    let MAX_OUTPAINT_PIXELS = Math.floor(4 * 1024 * 1024 * 0.95);
-    let MAX_OUTPAINT_DIMENSION = 2560 - 16;
+    // No pre-resize for output canvas dimensions: `targetSize` is an
+    // adapter-internal numeric mapping, NOT a file we upload. The
+    // adapter is responsible for handling whatever output-canvas
+    // limits the model has — the tool just sends what the request
+    // semantics call for. File-level caps on the source bytes
+    // (sourceImage.maxBytes, etc.) are handled per-input separately
+    // by future per-file helpers; the outpaint tool doesn't ship a
+    // raw source file (it composes a padded canvas), so the
+    // sourceImage cap doesn't bite here either.
     let workingPath = resolvedPath;
-    // Compute the scale factor needed to satisfy each cap independently,
-    // then pick the SMALLER (= more restrictive) one. This is the only
-    // way to honour both caps without over-shooting either. A previous
-    // version only checked area, which is why a 2672×1504 canvas (4 MP
-    // total but 2672 > 2560 long-side) still made it through and was
-    // rejected by the model.
-    const areaScale = (newWidth * newHeight > MAX_OUTPAINT_PIXELS)
-      ? Math.sqrt(MAX_OUTPAINT_PIXELS / (newWidth * newHeight))
-      : 1;
-    const dimScale = (Math.max(newWidth, newHeight) > MAX_OUTPAINT_DIMENSION)
-      ? MAX_OUTPAINT_DIMENSION / Math.max(newWidth, newHeight)
-      : 1;
-    if (areaScale < 1 || dimScale < 1) {
-      const scale = Math.min(areaScale, dimScale);
-      const scaledOrigW = Math.max(1, Math.floor(origWidth * scale));
-      const scaledOrigH = Math.max(1, Math.floor(origHeight * scale));
-      const scaledPads = {
-        left: Math.max(0, Math.floor(pads.left * scale)),
-        right: Math.max(0, Math.floor(pads.right * scale)),
-        top: Math.max(0, Math.floor(pads.top * scale)),
-        bottom: Math.max(0, Math.floor(pads.bottom * scale)),
-      };
-      try {
-        const sharp = (await import('sharp')).default;
-        const scaledPath = path.join(os.tmpdir(), `outpaint-src-${Date.now()}.png`);
-        await sharp(resolvedPath)
-          .resize(scaledOrigW, scaledOrigH, { fit: 'fill' })
-          .png({ compressionLevel: 9, palette: false })
-          .toFile(scaledPath);
-        workingPath = scaledPath;
-        const limitingCap = areaScale <= dimScale ? 'area' : 'dimension';
-        channel.log(
-          'image',
-          `outpaint_image: auto-downscaled to fit caps (area ${(MAX_OUTPAINT_PIXELS / (1024 * 1024)).toFixed(2)} MP, ` +
-          `dim ${MAX_OUTPAINT_DIMENSION}px, limited by: ${limitingCap}) ` +
-          `(orig ${origWidth}×${origHeight} → ${scaledOrigW}×${scaledOrigH}, scale=${scale.toFixed(3)}, ` +
-          `pads T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right} → ` +
-          `T${scaledPads.top}/B${scaledPads.bottom}/L${scaledPads.left}/R${scaledPads.right})`,
-        );
-        origWidth = scaledOrigW;
-        origHeight = scaledOrigH;
-        pads.left = scaledPads.left;
-        pads.right = scaledPads.right;
-        pads.top = scaledPads.top;
-        pads.bottom = scaledPads.bottom;
-        newWidth = origWidth + pads.left + pads.right;
-        newHeight = origHeight + pads.top + pads.bottom;
-      } catch (err) {
-        return { success: false, error: `Failed to downscale source for outpaint cap: ${err.message}` };
-      }
-    }
 
     const newAspect = _closestAspectRatio(newWidth, newHeight);
 

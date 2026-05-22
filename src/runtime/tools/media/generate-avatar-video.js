@@ -37,9 +37,9 @@ import { channel } from '../../io/channel.js';
 // When it doesn't, we shrink the longest side by 15 % per iteration
 // and re-encode until it fits, capped at 8 iterations so a pathological
 // file can't loop forever.
-const _AVATAR_BYTE_CAP = 9 * 1024 * 1024;     // 9 MB safety margin vs fal's 10 MB
-const _AVATAR_SHRINK_FACTOR = 0.85;
-const _AVATAR_MAX_ITERATIONS = 8;
+// Image adaptation now lives in `_constraints.adaptImageInput` —
+// generic algorithm used across every media tool. This file no
+// longer carries shrink-loop parameters.
 
 const DEFAULT_POLL_INTERVAL_MS = 8000;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -153,61 +153,58 @@ const generateAvatarVideoAction = {
     const audioBuf = fs.readFileSync(resolvedAudio);
     let imageBuf = fs.readFileSync(resolvedImage);
     const imageFilename = path.basename(resolvedImage); // .png kept; never JPEG
-    const originalBytes = imageBuf.length;
-    // Iterative LOSSLESS shrink to keep the upload below fal's 10 MB
-    // file_too_large cap (we aim for 9 MB with a margin). If the
-    // original already fits, the buffer is shipped untouched — zero
-    // re-encode. Otherwise shrink the longest side by 15 % per pass
-    // and re-encode as max-compression PNG, looping up to 8 times.
-    if (imageBuf.length > _AVATAR_BYTE_CAP) {
-      try {
-        const meta0 = await sharp(imageBuf).metadata();
-        const w0 = meta0.width || 0;
-        const h0 = meta0.height || 0;
-        let curW = w0;
-        let curH = h0;
-        let attempt = 0;
-        while (imageBuf.length > _AVATAR_BYTE_CAP && attempt < _AVATAR_MAX_ITERATIONS) {
-          attempt += 1;
-          curW = Math.max(1, Math.round(curW * _AVATAR_SHRINK_FACTOR));
-          curH = Math.max(1, Math.round(curH * _AVATAR_SHRINK_FACTOR));
-          imageBuf = await sharp(fs.readFileSync(resolvedImage))
-              .rotate() // honour EXIF orientation
-              .resize({ width: curW, height: curH, fit: 'inside', withoutEnlargement: true })
-              .png({ compressionLevel: 9, palette: false })
-              .toBuffer();
-          channel.log(
-            'video',
-            `generate_avatar_video: shrink attempt ${attempt} → ${curW}×${curH} ` +
-            `(${(imageBuf.length / 1024).toFixed(0)}KB, lossless PNG)`,
-          );
-        }
-        if (imageBuf.length > _AVATAR_BYTE_CAP) {
-          channel.log(
-            'video',
-            `generate_avatar_video: WARNING — could not shrink below ${_AVATAR_BYTE_CAP} bytes ` +
-            `after ${attempt} iterations (final ${(imageBuf.length / 1024).toFixed(0)}KB). ` +
-            `Uploading anyway — fal may reject.`,
-          );
-        } else {
-          channel.log(
-            'video',
-            `generate_avatar_video: pre-shrunk ${path.basename(resolvedImage)} ` +
-            `(${(originalBytes / 1024).toFixed(0)}KB ${w0}×${h0}) → ` +
-            `${imageFilename} (${(imageBuf.length / 1024).toFixed(0)}KB ${curW}×${curH}, lossless PNG)`,
-          );
-        }
-      } catch (err) {
-        // Sharp couldn't parse / re-encode — restore the original
-        // bytes and let fal try its luck. Logging only so the user
-        // sees why an oversized image might still slip through.
-        imageBuf = fs.readFileSync(resolvedImage);
-        channel.log(
-          'video',
-          `generate_avatar_video: sharp pre-shrink skipped (${err?.message || err}) — uploading original`,
-        );
+
+    // Ask the router which avatar slug it would dispatch to so we
+    // adapt inputs against THAT model's restrictions (not some
+    // hardcoded conservative cap). When peek isn't available we
+    // ship inputs untouched.
+    let pickedAvatarModel = null;
+    try {
+      if (typeof agent?.videoGen?.peekModel === 'function') {
+        pickedAvatarModel = await agent.videoGen.peekModel({
+          kind: 'avatar',
+          hasImageUrl: true,
+          hasAudioUrl: true,
+        });
       }
+    } catch { /* no peek → no restriction → ship original */ }
+
+    // Generic constraint-aware adaptation. The helper applies
+    // dim caps first (maxWidth / maxHeight / maxArea on `imageUrl`),
+    // then iterative lossless PNG shrink for any remaining
+    // maxBytes overshoot. No-op when the adapter declared nothing.
+    try {
+      const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
+      const adapted = await adaptImageInput(imageBuf, pickedAvatarModel, 'imageUrl');
+      if (adapted.changed) {
+        imageBuf = adapted.buffer;
+        channel.log('video', `generate_avatar_video: ${adapted.reason}`);
+      }
+    } catch (err) {
+      // Sharp parse / re-encode failed — fall back to the original
+      // bytes and let the model try its luck. Logging only so the
+      // user can see why an oversized image might still slip through.
+      channel.log(
+        'video',
+        `generate_avatar_video: adapt-image step skipped (${err?.message || err}) — uploading original`,
+      );
     }
+
+    // Audio: catalog may cap bytes (e.g. omnihuman). Duration checks
+    // would need an ffprobe-style helper we don't have in-runtime
+    // yet — skip those and let the model reject if the clip is too
+    // long. Once a duration probe is wired in, swap the meta arg.
+    try {
+      const { checkAudioInput } = await import('../../llm/providers/_constraints.js');
+      const check = checkAudioInput(audioBuf, {}, pickedAvatarModel, 'audioUrl');
+      if (!check.ok) {
+        return {
+          success: false,
+          error: check.error,
+          hint: 'The picked model has a hard cap on this audio input declared in its adapter.',
+        };
+      }
+    } catch { /* no helper → skip check */ }
     channel.log(
       'video',
       `generate_avatar_video: image=${imageFilename} (${(imageBuf.length / 1024).toFixed(0)}KB), ` +
