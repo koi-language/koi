@@ -1,8 +1,9 @@
 /**
  * Generic, constraint-aware input adapters used by every media tool
- * that uploads a file to the gateway. Tools pass the picked model
- * (via `agent.imageGen.peekModel()` / `agent.videoGen.peekModel()`)
- * plus the canonical input role the file plays; the helper reads
+ * that uploads a file to the gateway. Tools resolve the picked
+ * model by calling `fetchMediaCapabilities(kind)` + the matching
+ * `peekImageModel` / `peekVideoModel` / `peekAudioModel` from the
+ * media-model-router; the helper then reads
  * `model.constraints.inputs.<role>` and adapts the bytes accordingly.
  *
  * When the role has NO restriction in the catalog, every helper is a
@@ -39,14 +40,19 @@ export function clampOutputDims(dims, model) {
   if (!out) return { scale: 1, needsResize: false, limitingCap: null };
   const w = Math.max(1, Math.floor(dims.width));
   const h = Math.max(1, Math.floor(dims.height));
-  // Safety floor: callers typically scale several values (source W/H
-  // + four pads) and Math.floor each one. Floor rounding can push
-  // the sum back just over the cap by a few pixels. Apply a small
-  // 0.5 % nudge so even the worst-case cumulative round-down lands
-  // safely inside the envelope.
-  const SAFETY = 0.995;
+  // Safety margin. There's a downstream step in generate-image.js
+  // ("Aspect-cap pad", _pad-and-recover.js) that aligns every ref
+  // image's dims to multiples of `DIM_ALIGNMENT = 16` px so the
+  // upstream model's own validation floor doesn't break the ratio.
+  // That alignment can add UP TO +16 px on EACH dim — for dims
+  // around 2,000 px the area can grow by ~16×(W+H) ≈ 65,000 px,
+  // which is ~1.6 % of a 4 MP cap. So we target 95 % of the
+  // declared area cap to guarantee post-alignment area stays
+  // inside the envelope. For the dim cap we knock off the full
+  // 16 px stride.
+  const SAFETY = 0.95;
   const areaCap = typeof out.maxArea === 'number' ? out.maxArea * SAFETY : null;
-  const dimCap = typeof out.maxDimension === 'number' ? out.maxDimension - 1 : null;
+  const dimCap = typeof out.maxDimension === 'number' ? out.maxDimension - 16 : null;
   const areaScale = (areaCap != null && w * h > areaCap)
     ? Math.sqrt(areaCap / (w * h))
     : 1;

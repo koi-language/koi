@@ -193,21 +193,28 @@ const outpaintImageAction = {
     // would dispatch to and read `constraints.output.maxArea /
     // maxDimension` off it. When present, resize the source AND the
     // requested pads by the same factor so the composed canvas
-    // lands inside the cap. Adapter-side has a defence-in-depth
-    // fallback that does the same downscale at build() time, but
-    // doing it here too avoids round-tripping a needlessly large
-    // upload through the gateway.
+    // lands inside the cap.
+    //
+    // We DON'T have an `agent.imageGen` handle here — outpaint
+    // delegates to generate_image which resolves the provider
+    // internally. So we walk the same path the gateway picker
+    // would: fetch the media catalog, run `peekImageModel` with
+    // the request shape we're about to send, and read constraints
+    // off the picked model.
     let pickedModel = null;
     try {
-      if (typeof agent?.imageGen?.peekModel === 'function') {
-        pickedModel = await agent.imageGen.peekModel({
+      const { fetchMediaCapabilities } = await import('../../llm/providers/gateway.js');
+      const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
+      const caps = await fetchMediaCapabilities('image');
+      if (caps && Array.isArray(caps.models) && caps.models.length > 0) {
+        pickedModel = peekImageModel(caps.models, {
           intent: 'outpaint',
           refsCount: 1,
           hasMaskImage: true,
           hasSourceImage: true,
           hasTargetSize: true,
           hasSourceImageOffset: true,
-        });
+        }) || null;
       }
     } catch { /* no peek → no restrictions to honour */ }
     const { clampOutputDims } = await import('../../llm/providers/_constraints.js');

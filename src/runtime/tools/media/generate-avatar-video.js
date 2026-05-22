@@ -156,16 +156,20 @@ const generateAvatarVideoAction = {
 
     // Ask the router which avatar slug it would dispatch to so we
     // adapt inputs against THAT model's restrictions (not some
-    // hardcoded conservative cap). When peek isn't available we
-    // ship inputs untouched.
+    // hardcoded conservative cap). Goes through the same fetch +
+    // pick path the gateway dispatcher uses, but without firing
+    // the call.
     let pickedAvatarModel = null;
     try {
-      if (typeof agent?.videoGen?.peekModel === 'function') {
-        pickedAvatarModel = await agent.videoGen.peekModel({
+      const { fetchMediaCapabilities } = await import('../../llm/providers/gateway.js');
+      const { peekVideoModel } = await import('../../llm/providers/media-model-router.js');
+      const caps = await fetchMediaCapabilities('video');
+      if (caps && Array.isArray(caps.models) && caps.models.length > 0) {
+        pickedAvatarModel = peekVideoModel(caps.models, {
           kind: 'avatar',
           hasImageUrl: true,
           hasAudioUrl: true,
-        });
+        }) || null;
       }
     } catch { /* no peek → no restriction → ship original */ }
 
