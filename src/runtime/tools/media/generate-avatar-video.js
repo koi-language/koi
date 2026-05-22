@@ -173,12 +173,20 @@ const generateAvatarVideoAction = {
     // dim caps first (maxWidth / maxHeight / maxArea on `imageUrl`),
     // then iterative lossless PNG shrink for any remaining
     // maxBytes overshoot. No-op when the adapter declared nothing.
+    // adaptImageInput emits its own `[detect]` / `[shrink]` /
+    // `[apply ]` lines via channel.log('constraints', ...) so the
+    // operator can trace every restriction action without the tool
+    // duplicating those messages.
+    channel.log(
+      'constraints',
+      `[tool  ] generate_avatar_video: source ${(imageBuf.length / 1024).toFixed(0)}KB — ` +
+      `checking ${pickedAvatarModel?.slug ?? '?'}.imageUrl caps…`,
+    );
     try {
       const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
       const adapted = await adaptImageInput(imageBuf, pickedAvatarModel, 'imageUrl');
       if (adapted.changed) {
         imageBuf = adapted.buffer;
-        channel.log('video', `generate_avatar_video: ${adapted.reason}`);
       }
     } catch (err) {
       // Sharp parse / re-encode failed — fall back to the original

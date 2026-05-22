@@ -189,16 +189,79 @@ const outpaintImageAction = {
     let newWidth = origWidth + pads.left + pads.right;
     let newHeight = origHeight + pads.top + pads.bottom;
 
-    // No pre-resize for output canvas dimensions: `targetSize` is an
-    // adapter-internal numeric mapping, NOT a file we upload. The
-    // adapter is responsible for handling whatever output-canvas
-    // limits the model has — the tool just sends what the request
-    // semantics call for. File-level caps on the source bytes
-    // (sourceImage.maxBytes, etc.) are handled per-input separately
-    // by future per-file helpers; the outpaint tool doesn't ship a
-    // raw source file (it composes a padded canvas), so the
-    // sourceImage cap doesn't bite here either.
+    // Output-canvas cap enforcement. Ask the router which slug it
+    // would dispatch to and read `constraints.output.maxArea /
+    // maxDimension` off it. When present, resize the source AND the
+    // requested pads by the same factor so the composed canvas
+    // lands inside the cap. Adapter-side has a defence-in-depth
+    // fallback that does the same downscale at build() time, but
+    // doing it here too avoids round-tripping a needlessly large
+    // upload through the gateway.
+    let pickedModel = null;
+    try {
+      if (typeof agent?.imageGen?.peekModel === 'function') {
+        pickedModel = await agent.imageGen.peekModel({
+          intent: 'outpaint',
+          refsCount: 1,
+          hasMaskImage: true,
+          hasSourceImage: true,
+          hasTargetSize: true,
+          hasSourceImageOffset: true,
+        });
+      }
+    } catch { /* no peek → no restrictions to honour */ }
+    const { clampOutputDims } = await import('../../llm/providers/_constraints.js');
+    // The helper logs `[detect] <slug>.output exceeds <cap>` when it
+    // fires. The tool below adds the post-resize log line so the
+    // operator sees both "what was detected" and "what the tool did".
+    channel.log(
+      'constraints',
+      `[tool  ] outpaint_image: composed ${newWidth}×${newHeight} (orig ${origWidth}×${origHeight} + ` +
+      `pads T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right}) — ` +
+      `checking ${pickedModel?.slug ?? '?'}.output caps…`,
+    );
+    const clamp = clampOutputDims({ width: newWidth, height: newHeight }, pickedModel);
+
     let workingPath = resolvedPath;
+    if (clamp.needsResize) {
+      const scale = clamp.scale;
+      const scaledOrigW = Math.max(1, Math.floor(origWidth * scale));
+      const scaledOrigH = Math.max(1, Math.floor(origHeight * scale));
+      const scaledPads = {
+        left: Math.max(0, Math.floor(pads.left * scale)),
+        right: Math.max(0, Math.floor(pads.right * scale)),
+        top: Math.max(0, Math.floor(pads.top * scale)),
+        bottom: Math.max(0, Math.floor(pads.bottom * scale)),
+      };
+      try {
+        const sharp = (await import('sharp')).default;
+        const scaledPath = path.join(os.tmpdir(), `outpaint-src-${Date.now()}.png`);
+        await sharp(resolvedPath)
+          .resize(scaledOrigW, scaledOrigH, { fit: 'fill' })
+          .png({ compressionLevel: 9, palette: false })
+          .toFile(scaledPath);
+        workingPath = scaledPath;
+        channel.log(
+          'constraints',
+          `[apply ] outpaint_image resized source + pads to fit ${pickedModel?.slug ?? '?'}.output: ` +
+          `source ${origWidth}×${origHeight} → ${scaledOrigW}×${scaledOrigH}, ` +
+          `pads T${pads.top}/B${pads.bottom}/L${pads.left}/R${pads.right} → ` +
+          `T${scaledPads.top}/B${scaledPads.bottom}/L${scaledPads.left}/R${scaledPads.right}, ` +
+          `composed ${scaledOrigW + scaledPads.left + scaledPads.right}×` +
+          `${scaledOrigH + scaledPads.top + scaledPads.bottom}, scale=${scale.toFixed(3)}`,
+        );
+        origWidth = scaledOrigW;
+        origHeight = scaledOrigH;
+        pads.left = scaledPads.left;
+        pads.right = scaledPads.right;
+        pads.top = scaledPads.top;
+        pads.bottom = scaledPads.bottom;
+        newWidth = origWidth + pads.left + pads.right;
+        newHeight = origHeight + pads.top + pads.bottom;
+      } catch (err) {
+        return { success: false, error: `Failed to pre-resize source for outpaint cap: ${err.message}` };
+      }
+    }
 
     const newAspect = _closestAspectRatio(newWidth, newHeight);
 

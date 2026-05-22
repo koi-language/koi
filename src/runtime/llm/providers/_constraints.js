@@ -20,6 +20,57 @@
  */
 
 /**
+ * Resolve the scale factor needed to bring `(width, height)` under
+ * the picked model's OUTPUT caps (`output.maxArea`,
+ * `output.maxDimension`). Tools that compose an output canvas from
+ * user inputs (outpaint stitching source + pads, …) call this to
+ * size their composition BEFORE dispatching — the model never sees
+ * an oversized request.
+ *
+ * Returns scale = 1 (no resize) when no output cap exists OR the
+ * dims are already inside the envelope.
+ *
+ * @param {{ width: number, height: number }} dims
+ * @param {{ slug?: string, constraints?: object } | null | undefined} model
+ * @returns {{ scale: number, needsResize: boolean, limitingCap: 'maxArea'|'maxDimension'|null }}
+ */
+export function clampOutputDims(dims, model) {
+  const out = model?.constraints?.output;
+  if (!out) return { scale: 1, needsResize: false, limitingCap: null };
+  const w = Math.max(1, Math.floor(dims.width));
+  const h = Math.max(1, Math.floor(dims.height));
+  // Safety floor: callers typically scale several values (source W/H
+  // + four pads) and Math.floor each one. Floor rounding can push
+  // the sum back just over the cap by a few pixels. Apply a small
+  // 0.5 % nudge so even the worst-case cumulative round-down lands
+  // safely inside the envelope.
+  const SAFETY = 0.995;
+  const areaCap = typeof out.maxArea === 'number' ? out.maxArea * SAFETY : null;
+  const dimCap = typeof out.maxDimension === 'number' ? out.maxDimension - 1 : null;
+  const areaScale = (areaCap != null && w * h > areaCap)
+    ? Math.sqrt(areaCap / (w * h))
+    : 1;
+  const dimScale = (dimCap != null && Math.max(w, h) > dimCap)
+    ? dimCap / Math.max(w, h)
+    : 1;
+  const scale = Math.min(areaScale, dimScale);
+  if (scale >= 1) return { scale: 1, needsResize: false, limitingCap: null };
+  const limitingCap = areaScale <= dimScale ? 'maxArea' : 'maxDimension';
+  // Fire-and-forget log via dynamic import so this stays a pure
+  // synchronous function for callers. The tool log adds tool-side
+  // context on its end; this line says exactly what cap fired.
+  import('../../io/channel.js').then(({ channel }) => {
+    const slug = typeof model?.slug === 'string' ? model.slug : '?';
+    channel.log(
+      'constraints',
+      `[detect] ${slug}.output exceeds ${limitingCap}=${out[limitingCap]} ` +
+      `(composed ${w}×${h} = ${w * h}px) → resize ×${scale.toFixed(3)}`,
+    );
+  }).catch(() => { /* logging best-effort */ });
+  return { scale, needsResize: true, limitingCap };
+}
+
+/**
  * Adapt a single uploaded image so it fits the picked model's
  * restrictions on the given canonical role. Reads
  * `inputs.<role>.maxWidth/Height/Area/Bytes` and applies in order:
@@ -53,7 +104,9 @@
 export async function adaptImageInput(source, model, role) {
   const fs = await import('fs');
   const sharp = (await import('sharp')).default;
+  const { channel } = await import('../../io/channel.js');
   const slot = model?.constraints?.inputs?.[role];
+  const slug = typeof model?.slug === 'string' ? model.slug : '?';
 
   // Load source. Buffer in → use as-is; path in → read once.
   let buffer = Buffer.isBuffer(source) ? source : fs.readFileSync(source);
@@ -91,6 +144,15 @@ export async function adaptImageInput(source, model, role) {
   if (dimScale < 1) {
     const newW = Math.max(1, Math.floor(width * dimScale));
     const newH = Math.max(1, Math.floor(height * dimScale));
+    const which =
+      dimScale === areaScale   ? `maxArea=${slot.maxArea}`     :
+      dimScale === widthScale  ? `maxWidth=${slot.maxWidth}`   :
+      `maxHeight=${slot.maxHeight}`;
+    channel.log(
+      'constraints',
+      `[detect] ${slug}.${role} exceeds ${which} ` +
+      `(input ${width}×${height} = ${width * height}px) → resize ×${dimScale.toFixed(3)} → ${newW}×${newH}`,
+    );
     buffer = await sharp(buffer)
       .rotate() // honour EXIF orientation before downscaling
       .resize(newW, newH, { fit: 'fill' })
@@ -107,6 +169,11 @@ export async function adaptImageInput(source, model, role) {
 
   // ── 2) Byte cap (iterative LOSSLESS shrink) ─────────────────────
   if (typeof slot.maxBytes === 'number' && buffer.length > slot.maxBytes) {
+    channel.log(
+      'constraints',
+      `[detect] ${slug}.${role} exceeds maxBytes=${slot.maxBytes} ` +
+      `(input ${buffer.length}B at ${width}×${height}) → iterative lossless PNG shrink`,
+    );
     // If we haven't transcoded yet (still original mime), force a PNG
     // re-encode now so the first iteration measures against the same
     // codec the loop will use.
@@ -133,13 +200,24 @@ export async function adaptImageInput(source, model, role) {
         .resize(curW, curH, { fit: 'fill' })
         .png({ compressionLevel: 9, palette: false })
         .toBuffer();
+      channel.log(
+        'constraints',
+        `[shrink] ${slug}.${role} attempt ${attempt}: ${curW}×${curH} = ${buffer.length}B ` +
+        `(target ≤ ${slot.maxBytes}B)`,
+      );
     }
     width = curW;
     height = curH;
     limitedBy = 'maxBytes';
   }
 
-  const slug = typeof model?.slug === 'string' ? model.slug : '?';
+  if (changed) {
+    channel.log(
+      'constraints',
+      `[apply ] ${slug}.${role} adapted: ${originalBytes}B / ${meta0.width}×${meta0.height} → ` +
+      `${buffer.length}B / ${width}×${height} (limitedBy=${limitedBy})`,
+    );
+  }
   return {
     buffer,
     mimeType,
@@ -173,7 +251,12 @@ export function checkAudioInput(buffer, meta, model, role) {
   const slot = model?.constraints?.inputs?.[role];
   if (!slot) return { ok: true, error: null, limitedBy: null };
   const slug = typeof model?.slug === 'string' ? model.slug : '?';
+  const log = (msg) => {
+    import('../../io/channel.js').then(({ channel }) => channel.log('constraints', msg))
+      .catch(() => {});
+  };
   if (typeof slot.maxBytes === 'number' && buffer.length > slot.maxBytes) {
+    log(`[detect] ${slug}.${role} exceeds maxBytes=${slot.maxBytes} (got ${buffer.length}B) — surfacing error to tool`);
     return {
       ok: false,
       error: `Audio exceeds maxBytes (${buffer.length} > ${slot.maxBytes}) for ${slug}.${role}`,
@@ -183,6 +266,7 @@ export function checkAudioInput(buffer, meta, model, role) {
   if (typeof slot.maxDurationSec === 'number'
       && typeof meta?.durationSec === 'number'
       && meta.durationSec > slot.maxDurationSec) {
+    log(`[detect] ${slug}.${role} exceeds maxDurationSec=${slot.maxDurationSec}s (got ${meta.durationSec.toFixed(1)}s) — surfacing error to tool`);
     return {
       ok: false,
       error: `Audio exceeds maxDurationSec (${meta.durationSec.toFixed(1)}s > ${slot.maxDurationSec}s) for ${slug}.${role}`,

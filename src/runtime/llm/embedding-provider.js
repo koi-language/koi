@@ -26,6 +26,53 @@ export class EmbeddingProvider {
 
     // Serialization lock for batch requests
     this._embeddingBatchLock = null;
+
+    // ── Coalescing cache ────────────────────────────────────────────
+    // The prompt builder declares N slots that all embed the SAME
+    // `{{trigger.payload.task}}` text (see builtin-slot-maps.js — the
+    // System agent has 4 such slots: relevant_notes, active_blockers,
+    // recent_decisions, previous_sessions). Without dedup we paid for
+    // 4 sequential gateway round-trips on every LLM turn, ~4 s of
+    // wasted wall time + 4× the cost. The cache solves it on two
+    // levels:
+    //   • `_embeddingInflight` (Map<text, Promise>) — concurrent
+    //     callers asking for the SAME text join the in-flight request
+    //     instead of starting a new one. Cleared when the request
+    //     resolves.
+    //   • `_embeddingCache` (Map<text, {vector, expiresAt}>) — the
+    //     resolved vector lingers for `_embeddingCacheTtlMs` so a
+    //     follow-up call for the same text within that window skips
+    //     the network entirely. Short TTL on purpose: prompt builds
+    //     within a single agent turn dedupe perfectly, but stale
+    //     vectors from old turns never sneak in.
+    this._embeddingInflight = new Map();
+    this._embeddingCache = new Map();
+    this._embeddingCacheTtlMs = 30_000;
+    this._embeddingCacheMaxEntries = 64;
+  }
+
+  _embeddingCacheGet(text) {
+    const hit = this._embeddingCache.get(text);
+    if (!hit) return null;
+    if (hit.expiresAt <= Date.now()) {
+      this._embeddingCache.delete(text);
+      return null;
+    }
+    return hit.vector;
+  }
+
+  _embeddingCachePut(text, vector) {
+    // LRU-ish: when full, drop the oldest insertion (Maps preserve
+    // insertion order in JS). Cheap, no priority queue needed for a
+    // 64-entry cache.
+    if (this._embeddingCache.size >= this._embeddingCacheMaxEntries) {
+      const oldest = this._embeddingCache.keys().next().value;
+      if (oldest !== undefined) this._embeddingCache.delete(oldest);
+    }
+    this._embeddingCache.set(text, {
+      vector,
+      expiresAt: Date.now() + this._embeddingCacheTtlMs,
+    });
   }
 
   /**
@@ -51,6 +98,33 @@ export class EmbeddingProvider {
       throw new Error('getEmbedding requires non-empty text input');
     }
 
+    // Resolved-vector cache — within the TTL window we never hit the
+    // network. Prompt builds that re-embed the same task text across
+    // multiple slots become a single lookup.
+    const cached = this._embeddingCacheGet(text);
+    if (cached) return cached;
+
+    // In-flight cache — concurrent calls for the SAME text share one
+    // request. This is the case the prompt compiler hits: 4 slots
+    // resolve in parallel and all embed the same `{{trigger.payload.task}}`.
+    const inflight = this._embeddingInflight.get(text);
+    if (inflight) return inflight;
+
+    const promise = this._getEmbeddingUncached(text)
+      .then((vec) => {
+        this._embeddingCachePut(text, vec);
+        return vec;
+      })
+      .finally(() => {
+        this._embeddingInflight.delete(text);
+      });
+    this._embeddingInflight.set(text, promise);
+    return promise;
+  }
+
+  /** Original embedding logic — bypasses the dedup cache. Called only
+   *  from `getEmbedding` after the cache misses. */
+  async _getEmbeddingUncached(text) {
     const MAX_RETRIES = 2;
     const TIMEOUT_MS = 15000;
     const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
