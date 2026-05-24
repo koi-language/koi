@@ -63,6 +63,48 @@ function _classifyOpenAIError(err) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Message-shape guards
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Anchor a messages array to user-last.
+ *
+ * Some OpenAI-compatible upstreams (Anthropic direct, Gemini direct,
+ * OpenAI itself) treat a trailing assistant message as a "prefill" the
+ * model should continue from. Others — most notably Bedrock-hosted
+ * Claude served via OpenRouter — refuse it outright with:
+ *
+ *   400 "This model does not support assistant message prefill. The
+ *        conversation must end with a user message."
+ *
+ * The Koi engine never INTENTIONALLY prefills. Trailing assistant
+ * entries leak in through cross-agent replay (`agent.js:1670`), the
+ * context-memory buffer rebuilds, and a couple of recovery paths
+ * that snapshot the last LLM emit without queuing the action result
+ * yet. Rather than chase every producer, anchor the conversation at
+ * the consumer: append a tiny synthetic user continuation when the
+ * last non-system message is an assistant turn.
+ *
+ * Returns the original array (referentially!) when no change is
+ * needed — important because the wrapping `_cleanParams` shouldn't
+ * pay for an unnecessary copy on the hot path.
+ */
+function _ensureLastMessageIsUser(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  // Find the last entry that isn't `system` — system is a preamble,
+  // not a turn, and most APIs ignore its position.
+  let lastTurnIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== 'system') { lastTurnIdx = i; break; }
+  }
+  if (lastTurnIdx < 0) return messages; // only system → fine
+  if (messages[lastTurnIdx].role === 'user') return messages;
+  // Trailing assistant → append a continuation. Keep the text generic
+  // and noise-free so it doesn't bias the next reply.
+  return [...messages, { role: 'user', content: 'Continue.' }];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // OpenAI Chat Completions LLM
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -78,6 +120,19 @@ export class OpenAIChatLLM extends BaseLLM {
     let outChars = 0;
     let _thinkChars = 0;
     let _finishReason = null;
+
+    // Normalise trailing assistant: many upstreams (Anthropic direct,
+    // Gemini direct) treat a trailing assistant as a "prefill" and
+    // continue from that text, but Bedrock-hosted Claude via OpenRouter
+    // rejects it with `400 "This model does not support assistant
+    // message prefill. The conversation must end with a user message."`.
+    // The engine doesn't intentionally use prefill anywhere; trailing
+    // assistant entries leak in through the per-agent buffer / replay
+    // paths. Anchor every outgoing conversation to user-last with a
+    // tiny synthetic continuation prompt so the same call works on
+    // every backend. No-op when messages already end with user (or
+    // when the only entry is `system`).
+    messages = _ensureLastMessageIsUser(messages);
 
     try {
       // Send reasoning_effort ONLY when we actually want reasoning. Even
@@ -326,6 +381,10 @@ export class OpenAIChatLLM extends BaseLLM {
     const responseFormat = opts.responseFormat ? { type: opts.responseFormat } : undefined;
     const timeoutMs = opts.timeoutMs || 0;
 
+    // Same Bedrock-prefill guard as streamReactive — see the comment on
+    // `_ensureLastMessageIsUser` for why.
+    messages = _ensureLastMessageIsUser(messages);
+
     const controller = timeoutMs ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
@@ -424,6 +483,10 @@ export class OpenAIResponsesLLM extends BaseLLM {
 
   async streamReactive(messages, opts = {}) {
     const { abortSignal, onChunk, onHeartbeat } = opts;
+
+    // Anchor to user-last. See the long comment on the sibling chat-
+    // completions `streamReactive` for the Bedrock prefill background.
+    messages = _ensureLastMessageIsUser(messages);
 
     // Responses API: system → instructions, user/assistant → input
     const systemPrompt = this._flattenSystemToString(messages.find(m => m.role === 'system')?.content || '');
@@ -554,6 +617,9 @@ export class OpenAIResponsesLLM extends BaseLLM {
     const maxTokens = opts.maxTokens ?? this.maxTokens;
     const responseFormat = opts.responseFormat;
     const timeoutMs = opts.timeoutMs || 0;
+
+    // Bedrock-prefill guard — see `_ensureLastMessageIsUser`.
+    messages = _ensureLastMessageIsUser(messages);
 
     const controller = timeoutMs ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;

@@ -387,6 +387,16 @@ const outpaintImageAction = {
     let originalBuffer;
     try { originalBuffer = fs.readFileSync(workingPath); } catch { /* fall through; reframe models will fail loudly */ }
     const genAction = {
+      // Mark this as an internal tool-to-tool delegation so
+      // generate_image bypasses its `requireToolInfoFirst` guard.
+      // The guard exists to force the AGENT to read schema before
+      // calling blind; from the agent's perspective the request IS
+      // `outpaint_image`, and `outpaint_image` knows the
+      // `generate_image` schema. Without this flag, the first
+      // outpaint call short-circuits into a "here's my docs" return
+      // and never actually generates — surfaces as
+      // {success:true, tool:'generate_image', documentation:'...'}.
+      _internalDelegate: true,
       prompt: effectivePrompt,
       // `intent` routes the picker to the `image_extend` bucket (see
       // media-model-router.js:pickImageModel). The `operation` keys

@@ -29,6 +29,7 @@ import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
+import { slugifyDescription, buildDescribedFilename } from './util/slugify-description.js';
 import {
   padIfNeeded,
   recoverFromPadded,
@@ -277,7 +278,7 @@ function _canonicalKoiSaveDir(resolvedDir, kind) {
   return canonical;
 }
 
-export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}) {
+export async function saveVideoFromUrl(url, { saveTo, provider, model, id, prompt } = {}) {
   if (!url) return { path: null, error: 'No video URL returned by provider.' };
   const saveDir = _canonicalKoiSaveDir(
     typeof saveTo === 'string' && saveTo.trim()
@@ -313,8 +314,18 @@ export async function saveVideoFromUrl(url, { saveTo, provider, model, id } = {}
         : /webm/i.test(contentType) ? 'webm'
         : /quicktime/i.test(contentType) ? 'mov'
         : 'mp4';
-      const tag = (id || 'video').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
-      const filename = `video_${Date.now()}_${tag}.${ext}`;
+      // Derive a descriptive name from the prompt when the caller
+      // supplied one. Falls back to the legacy `video_<id>` shape when
+      // there's no prompt (e.g. when this util is called from a path
+      // that just stitches segments — no descriptive text to slug).
+      const slug = slugifyDescription(prompt);
+      let filename;
+      if (slug) {
+        filename = buildDescribedFilename({ slug, fallback: 'video', index: 0, ext });
+      } else {
+        const tag = (id || 'video').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16);
+        filename = `video_${Date.now()}_${tag}.${ext}`;
+      }
       filePath = path.join(saveDir, filename);
 
       await pipeline(Readable.fromWeb(resp.body), fs.createWriteStream(filePath));
@@ -1321,6 +1332,10 @@ const generateVideoAction = {
         provider: resolved.provider,
         model: resolved.model,
         id: final.id,
+        // Pass the user's prompt so the saved file name describes the
+        // content (`mouse-with-cheese-mh4n5p_0.mp4`) instead of being
+        // an opaque timestamp.
+        prompt: action.prompt,
       });
       savedTo = saveResult.path;
       saveError = saveResult.error;
@@ -1504,6 +1519,9 @@ const generateVideoAction = {
             provider: resolved.provider,
             model: resolved.model,
             id: `shot${shot.index}-${shot.id || ''}`,
+            // Multishot pieces inherit the parent prompt's slug so
+            // they sit alphabetically next to it in the drawer.
+            prompt: action.prompt,
           });
           shotSavedTo = sr.path;
           shotSaveError = sr.error;

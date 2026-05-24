@@ -5,7 +5,15 @@ import { channel } from '../io/channel.js';
  * Keeps first 20 chars … last 10 chars so the output stays readable.
  */
 function _truncB64Debug(str) {
-  return str.replace(/[A-Za-z0-9+/]{60,}={0,2}/g, m => `${m.slice(0, 20)}\u2026${m.slice(-10)}`);
+  // `/` is intentionally excluded from the character class \u2014 including
+  // it matched long absolute paths (e.g. `/var/folders/xv/<32-char-tmp>/T/\u2026`)
+  // and replaced their middle with `\u2026`, making debug output look as if
+  // the runtime had corrupted the file path. The LLM and downstream
+  // tools always received the full path \u2014 the corruption was purely
+  // cosmetic, but very confusing when chasing real bugs. Real base64
+  // image payloads still get caught because the runs between any `/`
+  // chars they contain are well over 60.
+  return str.replace(/[A-Za-z0-9+]{60,}={0,2}/g, m => `${m.slice(0, 20)}\u2026${m.slice(-10)}`);
 }
 
 /**

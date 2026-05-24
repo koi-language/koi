@@ -408,14 +408,28 @@ async function _drainPermQueue() {
     const _cancelToken = new Promise(r => { _cancelDialog = r; });
     _activeSelectCancel = () => _cancelDialog(null);
 
-    // Pass command + warning as meta so the UI can render the Claude-style layout
+    // Pass command + warning + description as meta so the UI can render a
+    // friendly layout. `description` is the LLM's plain-language explanation
+    // (e.g. "Search the project for files mentioning user authentication")
+    // — the GUI uses it as the headline. `command` stays available for the
+    // collapsed "Show technical details" toggle.
     const _shellHeader = `${agentName || 'Agent'} ${t('wantsToExecute') || 'wants to execute shell command'}`;
+    const _permCategory = permissionCategory(baseCmd); // 'READ' | 'WRITE' | <baseCmd>
     const value = await Promise.race([
       channel.select('', [
         { title: t('permYes'), value: 'yes' },
         { title: alwaysLabel, value: 'always' },
         { title: t('permNo'), value: 'no' }
-      ], 0, { meta: { type: 'bash', command, warning, header: _shellHeader } }),
+      ], 0, { meta: {
+        type: 'bash',
+        command,
+        warning,
+        header: _shellHeader,
+        description,
+        baseCmd,
+        permissionCategory: _permCategory,
+        agentName: agentName || null,
+      } }),
       _cancelToken,
     ]);
 
@@ -561,6 +575,45 @@ When a command requires sudo, just use sudo normally in the command. The system 
     const ALWAYS_ALLOWED = new Set(['pwd', 'whoami', 'date', 'which', 'uname', 'hostname']);
     const isSilent = ALWAYS_ALLOWED.has(baseCmd);
 
+    // Implicit allow for anything happening INSIDE a `.koi` directory —
+    // both the global one (~/.koi) and the project-local one
+    // (<cwd>/.koi). Braxil is the app that owns those trees (skills,
+    // plugins, agents, sessions, generated media, knowledge base, …),
+    // so prompting the user for permission every time we touch our
+    // own state would just be noise.
+    //
+    // Detection rules (the command "touches .koi" if ANY of these hold):
+    //
+    //   1. effectiveDir / cwd is inside a `.koi` tree.
+    //   2. The command STRING references `.koi` as a DIRECTORY component
+    //      anywhere — i.e. `.koi` preceded by `/`, start-of-arg, space,
+    //      quote, or `=`, and followed by `/`, end-of-arg, quote, space,
+    //      or end-of-string. This catches:
+    //        • Absolute paths   `/Users/.../.koi/sessions/...`
+    //        • Plain     `~/.koi/audio`
+    //        • Relative  `.koi/skills/...`  / `cd .koi`
+    //        • Quoted    `'/Users/.../.koi/audio/...'`
+    //        • Malformed `Braxil/~/.koi/...` (literal `~` inside a quoted
+    //          path because bash didn't expand it — still INTENDED as a
+    //          .koi reference, so we honour the intent and let the
+    //          underlying filesystem reject it if the path is bogus)
+    //      Crucially we do NOT match `something.koi` as a file extension
+    //      (Koi language source files like `system.koi`) because the char
+    //      preceding `.koi` would be a word char, not a directory
+    //      separator — those should follow the normal permission flow
+    //      for whatever directory they live in.
+    const _homeKoi = path.join(os.homedir(), '.koi');
+    const _isKoiPath = (p) => {
+      if (typeof p !== 'string' || p.length === 0) return false;
+      if (p.startsWith(_homeKoi)) return true;
+      if (p.includes('/.koi/') || p.endsWith('/.koi')) return true;
+      return false;
+    };
+    const _commandTouchesKoi =
+      _isKoiPath(effectiveDir) ||
+      _isKoiPath(cwd) ||
+      /(?:^|[/\s'"=])\.koi(?:\/|['"]|\s|$)/.test(command);
+
     // Check permission — READ/WRITE share the same FilePermissions instance as
     // read_file / write_file / edit_file, so a grant in one covers the other.
     const checkPermitted = () => {
@@ -569,7 +622,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       return _globalIndividualPerms.isAllowed(baseCmd, effectiveDir);
     };
 
-    let permitted = isSilent || process.env.KOI_YES === '1' || checkPermitted();
+    let permitted = isSilent || _commandTouchesKoi || process.env.KOI_YES === '1' || checkPermitted();
     let reportDone;
     let descriptionShown = false;
 
@@ -621,7 +674,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       let _bgActionId = null;
       if (!isSilent) {
         channel.resetActionGroup();
-        _bgActionId = channel.beginAction('shell', cmdPreview) || channel._currentActionId || null;
+        _bgActionId = channel.beginAction('shell', cmdPreview, description) || channel._currentActionId || null;
         descriptionShown = true;
       }
 
@@ -693,7 +746,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
     // channel._currentActionId singleton).
     let _shellActionId = null;
     if (!isSilent) {
-      _shellActionId = channel.beginAction('shell', cmdPreview) || channel._currentActionId || null;
+      _shellActionId = channel.beginAction('shell', cmdPreview, description) || channel._currentActionId || null;
       descriptionShown = true;
       // Inside a scope (parallel shells), skip the progress spinner — it would clutter the grouped display
       if (!_inScope) {

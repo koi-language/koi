@@ -1,0 +1,97 @@
+/**
+ * Turn a free-form description (image prompt, video prompt, audio
+ * text, …) into a short kebab-case slug suitable for a filename.
+ *
+ * Why this exists:
+ *   The auto-generated filenames used to be `image_${Date.now()}_${i}.png` —
+ *   informative for the engine, useless for humans. The user has to
+ *   scan their `~/.koi/images` directory and play "which timestamp
+ *   was the mouse with cheese?". Deriving the name from the prompt
+ *   makes the file self-describing — `mouse-with-cheese-mh4n5p_0.png`
+ *   tells you what's inside without opening it.
+ *
+ * Properties:
+ *   * Unicode-safe — `"un ratón con queso"` → `"raton-con-queso"`
+ *     (accents stripped via NFD normalization).
+ *   * Stopword-pruned — drops English + Spanish articles / prepositions
+ *     so a long descriptive prompt still produces a tight slug:
+ *     `"a happy mouse holding a piece of cheese"` →
+ *     `"happy-mouse-holding-piece-cheese"` (5 words).
+ *   * Bounded — caps the slug at 60 chars so even verbose prompts
+ *     don't produce 200-char filenames that break on FAT32-formatted
+ *     external drives or fail bundle-validation on macOS.
+ *   * Safe — strips every character that isn't `[a-z0-9-]`, so
+ *     emoji / quotes / pipes / slashes from the prompt can't escape
+ *     into the filename and cause path-injection or "file not
+ *     found" surprises downstream.
+ *   * Deterministic — same input always produces same output. The
+ *     uniquifier (timestamp + index) lives at the caller, not here.
+ *
+ * Returns the slug, or an empty string when nothing usable came
+ * out — callers should fall back to a generic prefix (e.g. `image`).
+ */
+export function slugifyDescription(text, maxWords = 5) {
+  if (!text || typeof text !== 'string') return '';
+
+  // 1. Unicode normalize (NFD) and strip combining marks → accents go away.
+  const normalized = text.normalize('NFD').replace(/[̀-ͯ]/g, '');
+
+  // 2. Lowercase, replace non-alphanumeric with space, split into words.
+  const words = normalized
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/[\s-]+/)
+    .filter((w) => w.length > 0);
+
+  if (words.length === 0) return '';
+
+  // 3. Drop high-frequency English + Spanish stopwords. The set is
+  //    intentionally small — better to keep too many words than
+  //    strip a meaningful one. Words shorter than 2 chars also go
+  //    (mostly noise: "a", "i", "y", "o" already covered).
+  const stopwords = new Set([
+    // English
+    'a', 'an', 'the', 'and', 'or', 'but', 'of', 'to', 'for', 'in', 'on',
+    'at', 'with', 'by', 'as', 'is', 'are', 'was', 'were', 'be', 'been',
+    'this', 'that', 'these', 'those', 'it', 'its', 'from', 'into',
+    // Spanish
+    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del',
+    'al', 'con', 'por', 'para', 'y', 'o', 'que', 'es', 'son', 'esta',
+    'este', 'estas', 'estos', 'sin', 'sobre', 'entre', 'su', 'sus',
+  ]);
+  const meaningful = words.filter((w) => w.length >= 2 && !stopwords.has(w));
+
+  // 4. Fallback: if stopword pruning emptied the list (e.g. prompt
+  //    was "el del con para"), use the original words so we don't
+  //    return an empty slug.
+  const picked = (meaningful.length > 0 ? meaningful : words).slice(0, maxWords);
+
+  // 5. Hard cap to 60 chars — leaves headroom for the uniquifier
+  //    suffix the caller will tack on (`-mh4n5p_0.png` ≈ 14 chars).
+  return picked.join('-').slice(0, 60).replace(/-+$/, '');
+}
+
+/**
+ * Build a unique filename in the form `<slug>-<ts36>_<index>.<ext>`.
+ *
+ * `slug` may be empty — the caller passes a fallback prefix in that
+ * case (e.g. `"image"` or `"video"`) so we never produce a name that
+ * starts with a dash.
+ *
+ * `index` (default 0) disambiguates multiple files generated in the
+ * same call (e.g. a batch of 4 variations).
+ *
+ * The timestamp is base36-encoded (`Date.now().toString(36)`) — shorter
+ * than the raw ms count, still strictly monotonic per process, and
+ * unique across processes too because `Date.now()` is wall clock.
+ */
+export function buildDescribedFilename({
+  slug,
+  fallback,
+  index = 0,
+  ext,
+}) {
+  const base = (slug && slug.length > 0) ? slug : fallback;
+  const ts = Date.now().toString(36);
+  return `${base}-${ts}_${index}.${ext}`;
+}

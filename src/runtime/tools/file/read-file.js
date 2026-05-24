@@ -561,10 +561,9 @@ export default {
   intent: 'read_file',
   description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
   instructions: `read_file rules:
-- Always use offset + limit for text files
-- Prefer 50-150 lines per read
-- Never read more than 200 lines at once
-- For large files, never omit offset/limit
+- For text files, prefer 50-150 lines per read with offset + limit
+- 200-line soft cap per read, UNLESS the task genuinely needs the whole file (e.g. a small config / prompt / script you must read end-to-end, a search where you don't know where the answer lives, generating a full review/edit). In that case omit limit (or set it high) and read the whole file in one go — paginating just to satisfy the cap wastes turns
+- For large files (>500 lines), still paginate: read targeted ranges with offset + limit, don't dump the whole thing
 - For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
 - For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them as vision input — same UX as reading an image. Treat that as "you've now seen the video"; do not fall back to other tools to inspect it.
 - \`@mention\` handles work directly: \`{"intent":"read_file","path":"@hero_script"}\` resolves the handle via the cross-project MediaLibrary to the most recent tagged asset. Do NOT enumerate the library by hand to look up the path first — the resolver does it for you. Same for \`@tom\` (image), \`@narrator\` (audio), etc.`,

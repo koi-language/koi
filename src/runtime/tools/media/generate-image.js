@@ -21,6 +21,7 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { absolutizeMediaRefs } from './_absolutize-media-ref.js';
+import { slugifyDescription, buildDescribedFilename } from './util/slugify-description.js';
 import {
   computeAspectCapGeometry,
   padImageBuffer,
@@ -199,9 +200,19 @@ const generateImageAction = {
     // excludeProviders/excludeModels, the live per-model catalog,
     // and the aspect/resolution enums BEFORE wasting a round-trip
     // on a default that might mismatch the intent.
-    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
-    const _guard = await requireToolInfoFirst('generate_image', agent);
-    if (_guard) return _guard;
+    // The guard intercepts BLIND agent calls — the agent must have
+    // expanded the docs at least once before. When `outpaint_image`
+    // (or any other internal tool) delegates here, the agent already
+    // sees only the outer tool's docs and never asked for
+    // `generate_image`. The internal caller signals that by setting
+    // `_internalDelegate: true` on the action; we then bypass the
+    // guard because the delegating tool is responsible for matching
+    // the schema, not the agent.
+    if (action._internalDelegate !== true) {
+      const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+      const _guard = await requireToolInfoFirst('generate_image', agent);
+      if (_guard) return _guard;
+    }
 
     // Strip agent-supplied `model` — auto-picker decides. See the
     // matching block in generate-video.js for the full rationale;
@@ -220,6 +231,13 @@ const generateImageAction = {
 
     const prompt = action.prompt;
     if (!prompt) throw new Error('generate_image: "prompt" is required');
+
+    // Derive a human-readable slug from the prompt so the auto-named
+    // output file describes its content ("mouse-with-cheese-mh4n5p_0.png")
+    // instead of being an opaque timestamp ("image_1779209209076_0.png").
+    // Computed once here and reused for every file the call emits so a
+    // batch of N images shares a consistent prefix.
+    const slug = slugifyDescription(prompt);
 
     // If the active doc in the working-area store carries a
     // [DocumentBundle], surface a one-line log — matches the
@@ -942,7 +960,7 @@ const generateImageAction = {
             if (resp.ok) {
               const contentType = resp.headers.get('content-type') || '';
               const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'png';
-              const filename = `image_${Date.now()}_${i}.${ext}`;
+              const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
               const filePath = path.join(saveDir, filename);
               const buffer = Buffer.from(await resp.arrayBuffer());
               fs.writeFileSync(filePath, buffer);
@@ -955,7 +973,7 @@ const generateImageAction = {
         }
         if (img.b64) {
           const ext = action.outputFormat || 'png';
-          const filename = `image_${Date.now()}_${i}.${ext}`;
+          const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
           const filePath = path.join(saveDir, filename);
           fs.writeFileSync(filePath, Buffer.from(img.b64, 'base64'));
           img.savedTo = filePath;
