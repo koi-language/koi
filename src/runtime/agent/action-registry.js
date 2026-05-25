@@ -670,6 +670,7 @@ function _wrapWithBanner(action) {
     }
     let ok = false;
     let cancelled = false;
+    let deferredJobId = null;
     try {
       const result = await _orig.call(this, act, agent);
       // `_guardedAutoExpand: true` means the tool's `requireToolInfoFirst`
@@ -682,10 +683,54 @@ function _wrapWithBanner(action) {
       // We flag it as cancelled so the GUI can REMOVE the banner
       // entirely instead of showing a misleading completion.
       cancelled = !!(result && result._guardedAutoExpand === true);
-      ok = !cancelled && !!(result && result.success !== false);
+
+      // Async kickoff: when an async-capable tool is invoked with
+      // `wait: false` it returns immediately with `{ success: true,
+      // jobId }` while the real work runs in the background. The
+      // result envelope carries NO terminal artifact (no savedTo, no
+      // url, no path). Without this branch the wrapper would close the
+      // banner here with ok=true, painting a "Video generated ✓" badge
+      // on a clip that hasn't been rendered yet — the user reported
+      // this verbatim: 8 video cards marked done while the underlying
+      // seedance jobs were still in `pending`/`processing`. Detect
+      // this shape and defer banner closure to the job's terminal
+      // transition instead.
+      const isAsyncKickoff = !cancelled
+        && result
+        && result.success !== false
+        && typeof result.jobId === 'string'
+        && !result.savedTo
+        && !result.url
+        && !result.path;
+      if (isAsyncKickoff) {
+        deferredJobId = result.jobId;
+      } else {
+        ok = !cancelled && !!(result && result.success !== false);
+      }
       return result;
     } finally {
-      channel.mediaToolEnd({ id, ok, cancelled });
+      if (deferredJobId) {
+        try {
+          const { attachBannerToJob } = await import('../state/jobs.js');
+          attachBannerToJob(deferredJobId, ({ status }) => {
+            try {
+              channel.mediaToolEnd({
+                id,
+                ok: status === 'succeeded',
+                cancelled: status === 'cancelled',
+              });
+            } catch { /* observability is best-effort */ }
+          });
+        } catch (err) {
+          // Fallback so a missing jobs registry doesn't strand the
+          // banner open forever. Mark as failed — a stuck spinner is
+          // worse than a clear "failed" badge.
+          try { channel.mediaToolEnd({ id, ok: false, cancelled: false }); } catch { /* */ }
+          try { channel.log?.('banner', `attachBannerToJob failed for ${deferredJobId}: ${err.message}`); } catch { /* */ }
+        }
+      } else {
+        channel.mediaToolEnd({ id, ok, cancelled });
+      }
     }
   };
   action.__bannerWrapped = true;

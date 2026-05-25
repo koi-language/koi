@@ -359,3 +359,37 @@ export function deleteJob(id) {
   fs.unlinkSync(_filePath(id));
   return true;
 }
+
+/**
+ * Subscribe a callback to the next terminal transition of a job. Used by
+ * the media-banner middleware so banners opened during an async kickoff
+ * (`generate_video { wait: false }`, etc.) stay live until the underlying
+ * job actually finishes — instead of being closed with `ok: true` the
+ * moment the kickoff call returns its `{ jobId }` envelope.
+ *
+ * The callback receives `{ status }` where status is one of
+ * 'succeeded' | 'failed' | 'cancelled'. If the job is already terminal
+ * when this is called (race window between kickoff and attach) the
+ * callback fires on the next microtask so callers always see the same
+ * "async then resolve" timing.
+ *
+ * Returns a disposer that detaches early — useful for tests; in
+ * production the handler self-detaches on the first terminal event.
+ */
+export function attachBannerToJob(id, onTerminal) {
+  if (typeof onTerminal !== 'function') return () => {};
+  const current = _readRaw(id);
+  if (current && TERMINAL.has(current.status)) {
+    queueMicrotask(() => {
+      try { onTerminal({ status: current.status }); } catch { /* observability */ }
+    });
+    return () => {};
+  }
+  const handler = (j) => {
+    if (!j || !TERMINAL.has(j.status)) return;
+    _bus.off(id, handler);
+    try { onTerminal({ status: j.status }); } catch { /* observability */ }
+  };
+  _bus.on(id, handler);
+  return () => _bus.off(id, handler);
+}
