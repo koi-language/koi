@@ -410,17 +410,29 @@ export default {
       };
     }
 
+    // Internal edits skip the diff card AND the permission dialog so
+    // agent-only state changes (workflow checkpoints under `.koi/wfr-*/`,
+    // scratch JSON) don't pollute the chat. Explicit `action.internal`
+    // wins; otherwise default to true under `.koi/`.
+    const isInternal = action.internal === true
+      || (action.internal !== false && _isInternalPath(resolvedPath));
+
     // Emit structured diff preview (GUI renders natively, terminal formats to ANSI)
-    channel.clearProgress();
     const _diffPayload = buildDiffPayloadFromHunks(hunks, resolvedPath, 'Update');
     _diffPayload.beforeContent = content; // for GUI revert
     _diffPayload.afterContent = newContent; // for GUI re-apply after denial
     _diffPayload.diffId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await channel.showDiff(_diffPayload);
+    if (!isInternal) {
+      channel.clearProgress();
+      await channel.showDiff(_diffPayload);
+    } else {
+      channel.log('edit_file', `internal edit → ${resolvedPath}`);
+    }
 
-    // Check permissions (shared across all file actions)
+    // Check permissions (shared across all file actions). Internal edits
+    // bypass the dialog — see write_file.js for the rationale.
     const permissions = getFilePermissions(agent);
-    let permitted = permissions.isAllowed(resolvedPath, 'write');
+    let permitted = isInternal || permissions.isAllowed(resolvedPath, 'write');
 
     if (!permitted) {
       const agentName = agent?.name || 'Agent';
