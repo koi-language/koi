@@ -271,10 +271,23 @@ function _resolveSettings(timeline, params, clips) {
   if (!_ACODEC_ARGS[audioCodec]) {
     throw new Error(`Unsupported audioCodec: ${audioCodec}. Allowed: ${Object.keys(_ACODEC_ARGS).join(', ')}`);
   }
-  const fps = Number.isFinite(params.fps) && params.fps > 0 ? params.fps : 30;
-  // Width/height: param > settings hint > 1920×1080.
-  const width = Number.isFinite(params.width) && params.width > 0 ? Math.round(params.width) : 1920;
-  const height = Number.isFinite(params.height) && params.height > 0 ? Math.round(params.height) : 1080;
+  // Fps + dimensions: prefer (a) explicit render params, (b) the
+  // timeline's stamped settings (populated by `add_clip_to_timeline`
+  // from the first dropped video clip), (c) the legacy hard defaults.
+  // The two-stage fallback keeps the source / output frame rate +
+  // aspect ratio aligned by default — a 24 fps × 9:16 seedance clip
+  // played inside a 30 fps × 16:9 default renders with black flicker
+  // at every clip seam and black bars top + bottom.
+  const tlSettings = timeline?.settings || {};
+  const fps = Number.isFinite(params.fps) && params.fps > 0
+    ? params.fps
+    : (Number.isFinite(tlSettings.fps) && tlSettings.fps > 0 ? tlSettings.fps : 30);
+  const width = Number.isFinite(params.width) && params.width > 0
+    ? Math.round(params.width)
+    : (Number.isFinite(tlSettings.width) && tlSettings.width > 0 ? Math.round(tlSettings.width) : 1920);
+  const height = Number.isFinite(params.height) && params.height > 0
+    ? Math.round(params.height)
+    : (Number.isFinite(tlSettings.height) && tlSettings.height > 0 ? Math.round(tlSettings.height) : 1080);
   // CRF default depends on the codec.
   let crf = params.crf;
   if (crf == null && videoCodec !== 'gif' && videoCodec !== 'prores') {

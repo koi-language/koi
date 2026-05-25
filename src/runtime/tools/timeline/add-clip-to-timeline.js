@@ -10,7 +10,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { addClip } from '../../state/timelines.js';
+import { addClip, getTimeline, setTimelineSettings } from '../../state/timelines.js';
 import { resolveTimelineId } from './_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
 
@@ -57,6 +57,72 @@ async function _probeHasAudio(filePath) {
     return String(stdout).trim().length > 0;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Best-effort: probe a video file's frame rate + pixel dimensions.
+ * The renderer falls back to these when the timeline has no explicit
+ * fps / width / height set — which is the right behaviour for
+ * agent-built timelines: if every dropped clip is 24 fps × 1080×1920
+ * (a 9:16 reel from seedance), the render should be 24 fps × 1080×1920
+ * too. Hard-coding the renderer to 30 fps × 1920×1080 default produces
+ * the black-flicker / black-band artefacts the user reported when a 24
+ * fps source plays inside a 30 fps timeline at a different aspect ratio.
+ *
+ * Returns: { fps, width, height } with whichever fields parsed cleanly,
+ * or {} when ffprobe is unavailable / the file isn't a video. Never
+ * throws — the caller defaults to "no metadata, leave it alone".
+ */
+async function _probeVideoMeta(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return {};
+  if (filePath.startsWith('placeholder-') ||
+      filePath.startsWith('title:') ||
+      filePath.startsWith('timeline:')) return {};
+  const ext = path.extname(filePath).toLowerCase();
+  // Skip non-video sources — images / audio files have no "fps for the
+  // render to inherit" and we'd just waste an ffprobe call.
+  const videoExts = ['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.gif'];
+  if (!videoExts.includes(ext)) return {};
+  if (!fs.existsSync(filePath)) return {};
+
+  let bin = 'ffprobe';
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    if (r?.ffprobe) bin = r.ffprobe;
+  } catch { /* fall back to PATH */ }
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      bin,
+      [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=avg_frame_rate,width,height',
+        '-of', 'json',
+        filePath,
+      ],
+      { timeout: 3000 },
+    );
+    const data = JSON.parse(stdout);
+    const stream = data?.streams?.[0];
+    if (!stream) return {};
+    const out = {};
+    // avg_frame_rate is a rational "num/den" string like "24/1" or "30000/1001".
+    if (typeof stream.avg_frame_rate === 'string') {
+      const [num, den] = stream.avg_frame_rate.split('/').map(Number);
+      if (Number.isFinite(num) && Number.isFinite(den) && den > 0 && num > 0) {
+        out.fps = Math.round((num / den) * 1000) / 1000; // keep 3 decimals for 23.976 / 29.97
+      }
+    }
+    if (Number.isFinite(stream.width) && stream.width > 0) out.width = stream.width;
+    if (Number.isFinite(stream.height) && stream.height > 0) out.height = stream.height;
+    return out;
+  } catch {
+    return {};
   }
 }
 
@@ -251,6 +317,54 @@ export default {
     }
     try {
       const { clip: created, timeline } = addClip(id, clip);
+
+      // Inherit fps + width + height from the FIRST video clip dropped
+      // onto an empty timeline (only when the timeline doesn't already
+      // have those settings stamped). Goal: keep the render frame rate
+      // / aspect ratio aligned with the source clips, so a 24 fps × 9:16
+      // seedance reel plays back at 24 fps × 9:16 instead of being
+      // forced into the renderer's 30 fps × 16:9 default (which produces
+      // the black-flicker / black-band artefacts the user reported).
+      try {
+        const isVideoTrack = typeof created?.track === 'string' && created.track[0] === 'V';
+        const settings = timeline?.settings || {};
+        const fpsAlreadySet = Number.isFinite(settings.fps) && settings.fps > 0;
+        const dimsAlreadySet =
+          Number.isFinite(settings.width) && settings.width > 0 &&
+          Number.isFinite(settings.height) && settings.height > 0;
+        if (isVideoTrack && (!fpsAlreadySet || !dimsAlreadySet)) {
+          // Count video clips currently on the timeline. We only inherit
+          // when this is the FIRST — later clips on a populated timeline
+          // shouldn't silently switch the project's framerate.
+          const videoClipsBefore = (timeline?.clips || [])
+            .filter((c) => typeof c?.track === 'string' && c.track[0] === 'V' && c.id !== created.id)
+            .length;
+          if (videoClipsBefore === 0 && typeof created?.path === 'string') {
+            const meta = await _probeVideoMeta(created.path);
+            const patch = {};
+            if (!fpsAlreadySet && Number.isFinite(meta.fps)) patch.fps = meta.fps;
+            if (!dimsAlreadySet) {
+              if (Number.isFinite(meta.width)) patch.width = meta.width;
+              if (Number.isFinite(meta.height)) patch.height = meta.height;
+            }
+            if (Object.keys(patch).length > 0) {
+              const tl2 = setTimelineSettings(id, patch);
+              channel.log(
+                'timeline',
+                `add_clip_to_timeline: inherited ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(', ')} from first video clip (${path.basename(created.path)})`,
+              );
+              return { success: true, clipId: created.id, clip: created, timeline: tl2 };
+            }
+          }
+        }
+      } catch (probeErr) {
+        // Non-fatal: we still added the clip, just couldn't read its
+        // metadata. The renderer falls back to its 30 fps × 1920×1080
+        // defaults — black flickers may reappear but the timeline is
+        // otherwise functional.
+        channel.log('timeline', `add_clip_to_timeline: meta inheritance skipped (${probeErr.message})`);
+      }
+
       return { success: true, clipId: created.id, clip: created, timeline };
     } catch (e) {
       return { success: false, error: e.message };

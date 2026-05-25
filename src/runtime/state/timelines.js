@@ -458,6 +458,16 @@ function _normaliseSettings(s = {}) {
   const out = { videoTracks, audioTracks, pixelsPerSecond, previewSplit, playheadMs };
   if (markInMs != null) out.markInMs = markInMs;
   if (markOutMs != null) out.markOutMs = markOutMs;
+  // Render settings inherited from the first video clip dropped onto
+  // the timeline by `add_clip_to_timeline`. The renderer reads these
+  // before falling back to the hard 30 fps / 1920×1080 defaults — so
+  // when the source clips are 24 fps × 1080×1920 (vertical reel) the
+  // rendered output matches and there are no black flickers / black
+  // bands at clip seams. All three fields are optional; missing
+  // values keep the legacy defaults at render time.
+  if (Number.isFinite(s.fps) && s.fps > 0) out.fps = Math.round(s.fps * 1000) / 1000;
+  if (Number.isFinite(s.width) && s.width > 0) out.width = Math.round(s.width);
+  if (Number.isFinite(s.height) && s.height > 0) out.height = Math.round(s.height);
   return out;
 }
 
@@ -591,6 +601,26 @@ export function getTimeline(id) {
  * for "set everything at once" — easiest path when generating a new
  * edit from scratch via an LLM template.
  */
+/**
+ * Merge a partial settings object into the timeline's settings without
+ * touching clips or other top-level state. Use for narrow updates like
+ * "stamp fps/width/height from the first dropped video clip" — going
+ * through the full updateTimeline shape would force the caller to
+ * resend every clip and risk overwriting concurrent edits.
+ *
+ * Returns the persisted timeline. Throws if the id isn't found.
+ */
+export function setTimelineSettings(id, patch = {}) {
+  const tl = _read(id);
+  if (!tl) throw new Error(`Timeline ${id} not found`);
+  const merged = _normalise({
+    ...tl,
+    settings: { ...(tl.settings || {}), ...patch },
+  });
+  _write(merged);
+  return merged;
+}
+
 export function updateTimeline(id, state) {
   if (!_read(id)) throw new Error(`Timeline ${id} not found`);
   // Cycle guard for bulk-replace: walk every nested reference in the
