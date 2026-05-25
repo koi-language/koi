@@ -1202,6 +1202,18 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
     ? `\n| Session working dir | \`${path.join(_projectRoot, '.koi', 'sessions', _sessionId)}\` |`
     : '';
 
+  // When the agent is executing a step of a workflow run, expose the run's
+  // workspace dir so it can save/read step<N>_output.json there without
+  // having to glob-search across all `.koi/workflows/wfr-*` runs (the user
+  // reported Step N+1 picking up the wrong run's snapshot). Set on the
+  // agent by the delegate-args handler in agent.js when args carry
+  // `workflowWorkspace`.
+  const _workflowWorkspace = agent?._currentWorkflowWorkspace || null;
+  const _workflowRunId = agent?._currentWorkflowRunId || null;
+  const workflowWorkspaceField = _workflowWorkspace
+    ? `\n| Workflow workspace | \`${_workflowWorkspace}\`${_workflowRunId ? ` (runId \`${_workflowRunId}\`)` : ''} |`
+    : '';
+
   // Changes every turn (timestamp, task counts, phase). Placed AFTER the agent's
   // playbook so the static prefix (generic rules + agent playbook) is maximally cacheable.
   const dynamic = `${phaseSystemBlock}
@@ -1210,10 +1222,10 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
 | Field | Value |
 |---|---|
 | Current date/time | \`${now}\`${timezone ? ` (${timezone})` : ''} |
-| Working directory | \`${cwd}\` |${platformField}${sessionWorkingDirField}${langField}${ffmpegField}
+| Working directory | \`${cwd}\` |${platformField}${sessionWorkingDirField}${workflowWorkspaceField}${langField}${ffmpegField}
 
 All file paths (read_file, edit_file, write_file, shell) are relative to working directory unless absolute.
-${_sessionId ? `* **Session working dir**: write every intermediate / process file you produce during this session (downloads, scratch JSON, tool outputs, generated assets you don't intend to ship as final deliverables, transient logs) inside the "Session working dir" above. Keep the project root clean — only files the user explicitly asked to create/edit in the project belong there.\n` : ''}
+${_sessionId ? `* **Session working dir**: write every intermediate / process file you produce during this session (downloads, scratch JSON, tool outputs, generated assets you don't intend to ship as final deliverables, transient logs) inside the "Session working dir" above. Keep the project root clean — only files the user explicitly asked to create/edit in the project belong there.\n` : ''}${_workflowWorkspace ? `* **Workflow workspace**: shared scratch space across the steps of THIS workflow run. Save your step's persistent outputs here (e.g. \`step<N>_output.json\` with paths/IDs the next step needs) and read prior steps' outputs from here. Do NOT glob-search the parent \`.koi/workflows/\` directory — other concurrent / older runs live there.\n` : ''}
 **LANGUAGE:** The "User language" field above is set automatically by the runtime whenever a new user message arrives — trust it. All user-facing output (print, prompt_user, questions) must be in that language. Code and technical identifiers stay in English. You do not need (and cannot) change the language yourself — it tracks the user's latest message natively.
 ${openDocumentsBlock}${mentionVocabularyBlock}${nonInteractiveBlock}${expandedToolsBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
@@ -1825,7 +1837,7 @@ async function _runContextCompiler(agent) {
       const title = _humanizeSlotId(s.id);
       return `### ${title}\n${s.included.trim()}`;
     });
-    parts.push(`## RECALLED CONTEXT\n\n${sections.join('\n\n')}`);
+    parts.push(`## RECALLED CONTEXT — REFERENCE ONLY (facts about PRIOR work; NOT input for the current turn)\n\nThese are facts from past sessions / past projects that the Context Compiler surfaced because they may be relevant. **Do NOT silently treat them as if the user just stated them.** When the current user message is brief or generic and these recalled facts would "fill the gap" (a prior character name, a prior topic, a prior style), STOP and propose reuse via \`prompt_user\` — never adopt them into a new workflow's \`context\` without explicit user confirmation in THIS session.\n\n${sections.join('\n\n')}`);
   }
   const out = parts.join('\n\n');
   _compileCacheSet(cacheKey, out);

@@ -171,15 +171,18 @@ export function compileTimeline(timeline, params = {}) {
   }
   const finalVideoLabel = currentLabel;
 
-  // Audio — collect every clip whose source has an audio stream. We
-  // can't trivially detect that without ffprobe; assume video clips
-  // carry audio (overridden by the tool if it ran a probe) and that
-  // every A-track clip is audio. ffmpeg will fail loudly if a `-map`
-  // hits a non-existent stream; instead we use `?` to make audio maps
-  // optional via `[N:a?]` plus an `aresample=async=1` to absorb gaps.
+  // Audio — collect every clip whose source has an audio stream.
+  // Source of truth for "does this clip have audio?" is `clip.hasAudio`,
+  // stamped at add_clip_to_timeline time via an ffprobe call. When the
+  // field is missing (older clips, or probe failed), we fall back to a
+  // file-extension heuristic. The `[i:a?]` form is "optional" — ffmpeg
+  // drops the chain silently if input i has no audio stream rather than
+  // failing the whole render. The skip below is the deterministic path;
+  // `?` is the belt-and-braces.
   const audioLabels = [];
   for (const clip of clips) {
     if (!_clipAudibleInRange(clip, range)) continue;
+    if (!_clipHasAudioSource(clip)) continue;
     const i = clipInputIndex.get(clip.id);
     const lbl = `[a${_safe(clip.id)}]`;
     const trimmedDelay = Math.max(0, clip.startMs - range.startMs);
@@ -188,7 +191,7 @@ export function compileTimeline(timeline, params = {}) {
     const fadeOut = _fadeOutForClip(clip, range, /*audio*/ true);
     const fadePart = [fadeIn, fadeOut].filter(Boolean).join(',');
     chains.push(
-      `[${i}:a]aresample=async=1${fadePart ? `,${fadePart}` : ''}` +
+      `[${i}:a?]aresample=async=1${fadePart ? `,${fadePart}` : ''}` +
       `,adelay=${trimmedDelay}|${trimmedDelay}` +
       `,apad=whole_dur=${baseDurSec}${lbl}`,
     );
@@ -310,6 +313,27 @@ function _clipVisibleInRange(clip, range) {
 
 function _clipAudibleInRange(clip, range) {
   return _clipVisibleInRange(clip, range);
+}
+
+/** Decide whether a clip contributes to the audio mix. The authoritative
+ *  signal is `clip.hasAudio` (stamped by add_clip_to_timeline via
+ *  ffprobe). When missing, fall back to a coarse extension heuristic:
+ *  static images and synthetic sentinels never have audio; everything
+ *  else (mp4 / mov / mp3 / wav / ...) is assumed to carry audio. This
+ *  fallback preserves the legacy behaviour for clips added before the
+ *  probe existed. Explicit `hasAudio: false` always wins. */
+function _clipHasAudioSource(clip) {
+  if (clip && clip.hasAudio === true) return true;
+  if (clip && clip.hasAudio === false) return false;
+  // Heuristic when the field is undefined (legacy clips, probe miss).
+  const p = clip && typeof clip.path === 'string' ? clip.path : '';
+  if (!p) return false;
+  if (p.startsWith('placeholder-') || p.startsWith('title:') || p.startsWith('timeline:')) return false;
+  const lower = p.toLowerCase();
+  if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg')
+      || lower.endsWith('.webp') || lower.endsWith('.gif') || lower.endsWith('.bmp')
+      || lower.endsWith('.tiff')) return false;
+  return true;
 }
 
 function _enableExpr(clip, range) {

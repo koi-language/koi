@@ -413,6 +413,12 @@ function _validateClip(c, settings) {
     // Per-clip volume automation curve (audio clips). Same rule:
     // engine doesn't read it, must not drop it.
     'volumePoints',
+    // Cached "does the source file have an audio stream?" stamped by
+    // add_clip_to_timeline via ffprobe. The renderer skips the audio
+    // chain for clips with hasAudio:false (silent video, image,
+    // synthetic sentinel) so the filter graph doesn't reference a
+    // non-existent `[i:a]` stream and break the whole mix.
+    'hasAudio',
   ];
   for (const key of _passthrough) {
     if (c[key] !== undefined && c[key] !== null) {

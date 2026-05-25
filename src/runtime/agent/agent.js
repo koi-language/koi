@@ -1059,6 +1059,18 @@ export class Agent {
           || '';
       }
       if (txt) this._currentTaskText = String(txt).slice(0, 800);
+
+      // Pick up the workflow-run workspace dir when the delegate carries one.
+      // run-workflow.js → agent.js delegate-site sets `args.workflowWorkspace`
+      // and `args.workflowRunId` on the delegate payload; stashing them here
+      // lets system-prompt-builder surface the path in RUNTIME CONTEXT so the
+      // executing agent doesn't have to parse it out of the task description.
+      if (typeof args === 'object' && args && args.workflowWorkspace) {
+        this._currentWorkflowWorkspace = String(args.workflowWorkspace);
+        if (args.workflowRunId) {
+          this._currentWorkflowRunId = String(args.workflowRunId);
+        }
+      }
     }
 
     // ── @mention auto-resolution ─────────────────────────────────────
@@ -4689,22 +4701,24 @@ export class Agent {
               }
               _sections.push(
                 'Use these outputs to skip work already done. If a prior step saved an ' +
-                'artifact under WORKFLOW_WORKSPACE, read it from disk instead of re-fetching.',
+                'artifact under the workflow workspace (see RUNTIME CONTEXT row), read it ' +
+                'from disk instead of re-fetching.',
               );
             }
-            _sections.push(
-              `## WORKFLOW_WORKSPACE\n${_workspace}\n\n` +
-              `Persist heavy outputs (downloaded pages, generated files, large blobs) ` +
-              `to this directory. Reference them by absolute path in your return summary ` +
-              `so subsequent steps can read them directly.`,
-            );
+            // Workflow workspace path is surfaced via RUNTIME CONTEXT
+            // (see system-prompt-builder's "Workflow workspace" row) — no
+            // need to repeat it inline in the task description. _prelude
+            // may be empty when there are no prior siblings; in that case
+            // we leave the original description untouched below.
             const _prelude = _sections.join('\n\n');
             if (!resolvedAction.data) resolvedAction.data = {};
             const _origDesc = resolvedAction.data.description
               ?? resolvedAction.data.task
               ?? resolvedAction.data.instruction
               ?? '';
-            resolvedAction.data.description = `${_prelude}\n\n---\n\n${_origDesc}`;
+            resolvedAction.data.description = _prelude
+              ? `${_prelude}\n\n---\n\n${_origDesc}`
+              : _origDesc;
             resolvedAction.data.workflowRunId = _runId;
             resolvedAction.data.workflowWorkspace = _workspace;
           }

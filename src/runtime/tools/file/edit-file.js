@@ -281,7 +281,7 @@ export default {
   intent: 'edit_file',
   description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). The "path" field accepts an absolute or relative path OR a `@mention` handle (e.g. "@hero_script") that resolves via the cross-project MediaLibrary to the most recent file tagged with that handle — the same handle the user / agent set via tag_media. Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Optional "internal" field: when true, the edit is silent (no diff card / no permission dialog) — use for files only the agent reads (workflow state JSON, scratch under `.koi/`). Returns: { success, path }',
   instructions: 'This is the ONLY correct way to modify existing files. NEVER use shell commands (sed, awk, echo >, python scripts, etc.) to edit files — always use edit_file instead. Use "internal": true for files only the agent itself reads (workflow state, scratch under .koi/) so they do not appear as diff cards in the chat. User-facing files (scripts, drafts, code the user reviews) must remain visible.',
-  thinkingHint: (action) => `Editing ${action.path || 'file'}`,
+  thinkingHint: (action) => `Editing ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'write',
   hidden: false,
 
@@ -445,7 +445,15 @@ export default {
         { title: _acceptLabel, value: 'always' },
         { title: 'No, but give feedback', value: 'feedback' },
         { title: t('permNo'), value: 'no' }
-      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToEdit')}`.replace(':', ''), command: `Edit(${filePath})` } }));
+      ], 0, { meta: {
+        type: 'bash',
+        header: `${agentName} ${t('wantsToEdit')}`.replace(':', ''),
+        command: `Edit(${filePath})`,
+        // WRITE category → dialog title reads "Allow Braxil to write
+        // files…" instead of the generic "run a command on your
+        // computer?".
+        permissionCategory: 'WRITE',
+      } }));
 
       if (value === 'always') {
         if (_isInProject) {

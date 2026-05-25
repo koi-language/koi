@@ -15,6 +15,52 @@ import { resolveTimelineId } from './_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
 
 /**
+ * Best-effort: does the source file have an audio stream?
+ * The renderer needs this to know which clips contribute an audio chain
+ * to the final mix — without it, a single image / silent video on the
+ * timeline can break the filtergraph (it tries to reference an `[i:a]`
+ * stream that doesn't exist) and the whole output goes silent. Probed
+ * here, once, at add-time so the renderer never has to guess.
+ *
+ * Returns:
+ *   - true  → audio stream confirmed present
+ *   - false → file exists, ffprobe ran, no audio stream
+ *   - null  → unknown (no ffprobe, file unreadable, sentinel path);
+ *             the renderer treats null as "assume audio" for video paths
+ *             and "no audio" for image paths via the extension heuristic.
+ */
+async function _probeHasAudio(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return null;
+  if (filePath.startsWith('placeholder-') ||
+      filePath.startsWith('title:') ||
+      filePath.startsWith('timeline:')) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  // Static images obviously carry no audio — skip the probe.
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'].includes(ext)) return false;
+  if (!fs.existsSync(filePath)) return null;
+
+  let bin = 'ffprobe';
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    if (r?.ffprobe) bin = r.ffprobe;
+  } catch { /* fall back to PATH */ }
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      bin,
+      ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
+      { timeout: 3000 },
+    );
+    return String(stdout).trim().length > 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Workflow workspaces (`<root>/.koi/workflows/<run_id>/...`) are
  * ephemeral — they get cleaned up at run-end or by manual garbage
  * collection. Once a timeline records a clip whose `path` lives there,
@@ -185,6 +231,23 @@ export default {
     // turns the clip into a black rectangle in the editor.
     if (clip && typeof clip === 'object' && typeof clip.path === 'string') {
       clip.path = _stabilizeWorkspaceClipPath(clip.path);
+    }
+    // Probe the source for an audio stream and stamp `hasAudio` on the
+    // clip so the renderer knows whether to include it in the audio
+    // mix. Only override when the caller didn't already set it
+    // explicitly — agents that have already probed (or know the source
+    // is muted on purpose) can pass `hasAudio: false` to opt out, OR
+    // pass `hasAudio: true` to force the chain. Probe failures (no
+    // ffprobe, weird codec) leave the field unset and the renderer's
+    // extension heuristic kicks in.
+    if (clip && typeof clip === 'object' && typeof clip.path === 'string'
+        && clip.hasAudio === undefined) {
+      try {
+        const probed = await _probeHasAudio(clip.path);
+        if (probed !== null) clip.hasAudio = probed;
+      } catch (err) {
+        channel.log('timeline', `add_clip_to_timeline: audio probe failed for "${clip.path}" (${err.message}); renderer will fall back to extension heuristic`);
+      }
     }
     try {
       const { clip: created, timeline } = addClip(id, clip);

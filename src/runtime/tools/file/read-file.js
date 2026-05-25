@@ -147,15 +147,37 @@ async function _loadPdfjsFromCache() {
   const markerFile = path.join(cacheDir, '.extracted');
 
   if (!fs.existsSync(markerFile)) {
-    // Find pdfjs-dist in the snapshot via require.resolve
+    // Find pdfjs-dist in the snapshot via require.resolve. ESM has no
+    // CommonJS `__filename`; we anchor `createRequire` at this file
+    // first (handles the pkg-binary case where bundled deps live
+    // alongside the runtime) and fall back to the CLI's entry script +
+    // cwd so the resolver also walks `koi-cli/node_modules/` when the
+    // runtime is consumed from a sibling package (the workspace
+    // layout: `koi-cli` declares pdfjs-dist, `koi` doesn't, and
+    // anchoring only at `koi/...` never finds it).
     const { createRequire } = await import('module');
-    const _req = createRequire(__filename || process.argv[1]);
-    let snapshotDir;
-    try {
-      const resolved = _req.resolve('pdfjs-dist/legacy/build/pdf.mjs');
-      snapshotDir = path.dirname(resolved);
-    } catch {
-      throw new Error('pdfjs-dist not found in snapshot — PDF reading unavailable');
+    const anchors = [import.meta.url];
+    if (process.argv[1]) anchors.push(process.argv[1]);
+    anchors.push(path.join(process.cwd(), 'package.json'));
+    let snapshotDir = null;
+    let lastErr = null;
+    for (const anchor of anchors) {
+      try {
+        const req = createRequire(anchor);
+        const resolved = req.resolve('pdfjs-dist/legacy/build/pdf.mjs');
+        snapshotDir = path.dirname(resolved);
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!snapshotDir) {
+      throw new Error(
+        `pdfjs-dist not found from any module-resolution anchor ` +
+        `(tried ${anchors.length}: ${anchors.map((a) => String(a)).join(', ')}). ` +
+        `Install pdfjs-dist as a dep of the package whose binary launches the runtime. ` +
+        `Last resolve error: ${lastErr?.message || 'unknown'}`,
+      );
     }
 
     // Extract all files from the legacy/build directory
@@ -559,7 +581,7 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs). If path is a directory, lists its contents.',
+  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. For SCANNED PDFs (pages with no text layer), Tesseract OCR runs automatically with a shared worker across all pages; pass `language` to specify the language(s) (default "eng+spa"). The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs), optional "language" (OCR language for scanned PDFs — string or array, e.g. "spa" or ["spa","eng"]). If path is a directory, lists its contents.',
   instructions: `read_file rules:
 - For text files, prefer 50-150 lines per read with offset + limit
 - 200-line soft cap per read, UNLESS the task genuinely needs the whole file (e.g. a small config / prompt / script you must read end-to-end, a search where you don't know where the answer lives, generating a full review/edit). In that case omit limit (or set it high) and read the whole file in one go — paginating just to satisfy the cap wastes turns
@@ -577,7 +599,8 @@ export default {
       path: { type: 'string', description: 'File path to read. Accepts: an absolute or relative path; an attachment ID (e.g. "att-1") for an attached file; OR a `@mention` handle (e.g. "@hero_script", "@tom") resolved via the cross-project MediaLibrary to the most recent asset tagged with that handle. Use the `@`-form when you have already named an asset (via tag_media or right-click) — it is the stable identity across sessions and projects.' },
       offset: { type: 'number', description: 'Start reading from this line number (1-based, optional)' },
       limit: { type: 'number', description: 'Maximum number of lines to read (optional)' },
-      pages: { type: 'string', description: 'Page range for PDF files (e.g. "1-5", "3", "10-20"). Only for .pdf files. Max 20 pages per request.' }
+      pages: { type: 'string', description: 'Optional page range for PDF files (e.g. "1-5", "3", "10-20"). Only for .pdf files. No hard page cap — use `limit` to bound output by line count instead, or omit both to read the whole PDF. For SCANNED PDFs that need OCR, prefer scoping via `pages` or `limit` because OCR takes ~3s per page (a 100-page scan = ~5 min).' },
+      language: { description: 'OCR language(s) for SCANNED PDFs (pages with no text layer). Tesseract ISO-639-3 codes. Accepts a single string ("spa") or an array (["spa","eng"]) — multiple languages are loaded together (faster than picking one wrong). Default ["eng","spa"]. Examples: "spa" for Spanish-only, "eng+deu" or ["eng","deu"] for English+German, "fra" for French. Ignored on PDFs that already have a text layer.' }
     },
     required: ['path']
   },
@@ -586,6 +609,7 @@ export default {
     { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js' },
     { actionType: 'direct', intent: 'read_file', path: 'src/cli/koi.js', offset: 10, limit: 50 },
     { actionType: 'direct', intent: 'read_file', path: 'docs/manual.pdf', pages: '1-5' },
+    { actionType: 'direct', intent: 'read_file', path: 'docs/escritura-judicial.pdf', language: 'spa' },
     { actionType: 'direct', intent: 'read_file', path: 'assets/screenshot.png' }
   ],
 
@@ -670,7 +694,18 @@ export default {
         { title: t('permYes'), value: 'yes' },
         { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
         { title: t('permNo'), value: 'no' }
-      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToRead')}`.replace(':', ''), command: `Read(${filePath})` } });
+      ], 0, { meta: {
+        type: 'bash',
+        header: `${agentName} ${t('wantsToRead')}`.replace(':', ''),
+        command: `Read(${filePath})`,
+        // Tell the GUI this is a READ-category permission so the
+        // dialog title reads "Allow Braxil to read files…" instead
+        // of the generic "Allow Braxil to run a command on your
+        // computer?" (which makes a file read look like an
+        // arbitrary shell exec — confusing when the displayed
+        // "command" is a bare directory path).
+        permissionCategory: 'READ',
+      } });
 
       if (value === 'always') {
         permissions.allowProject(resolvedPath);
@@ -998,12 +1033,15 @@ export default {
         pdfjsLib.VerbosityLevel && pdfjsLib.setVerbosityLevel?.(0);
         const dataBuffer = fs.readFileSync(resolvedPath);
         const uint8Array = new Uint8Array(dataBuffer);
-        const MAX_PDF_PAGES = 20;
 
         const doc = await pdfjsLib.getDocument({ data: uint8Array, verbosity: 0 }).promise;
         const totalPages = doc.numPages;
 
-        // Parse page range if provided
+        // Parse page range if provided. No hard page cap — the model
+        // decides scope via `pages` (explicit range) and/or `limit`
+        // (max output lines, with early-exit inside the page loop so
+        // scanned PDFs don't keep OCR'ing after the limit is reached).
+        // Omitting both reads the whole PDF.
         let pagesToRead = [];
         if (action.pages) {
           const ranges = String(action.pages).split(',').map(r => r.trim());
@@ -1021,14 +1059,138 @@ export default {
               if (!isNaN(p) && p >= 1 && p <= totalPages) pageSet.add(p);
             }
           }
-          if (pageSet.size > MAX_PDF_PAGES) {
-            return { success: false, error: `Too many pages requested (max ${MAX_PDF_PAGES}). Use a smaller range.` };
-          }
           pagesToRead = [...pageSet].sort((a, b) => a - b);
         } else {
-          // No pages specified — read all (up to MAX_PDF_PAGES)
-          const maxPage = Math.min(totalPages, MAX_PDF_PAGES);
-          for (let i = 1; i <= maxPage; i++) pagesToRead.push(i);
+          for (let i = 1; i <= totalPages; i++) pagesToRead.push(i);
+        }
+
+        // Normalise the `language` param for OCR. Accepts:
+        //   - missing (default ["eng","spa"] — covers the common cases here),
+        //   - string "spa", "spa+eng", or comma-separated "spa,eng",
+        //   - array ["spa","eng"].
+        // Multi-language packs load once, recognise together — picking the
+        // wrong single language returns garbage, multi-loading is fast.
+        const _userLang = action.language;
+        let _ocrLangs;
+        if (Array.isArray(_userLang)) {
+          _ocrLangs = _userLang.map(s => String(s).trim()).filter(Boolean);
+        } else if (typeof _userLang === 'string' && _userLang.trim()) {
+          _ocrLangs = _userLang.split(/[+,\s]+/).map(s => s.trim()).filter(Boolean);
+        } else {
+          _ocrLangs = ['eng', 'spa'];
+        }
+        if (_ocrLangs.length === 0) _ocrLangs = ['eng'];
+        const _tesseractLangStr = _ocrLangs.join('+');
+
+        // Pre-scan: detect a "fully scanned" PDF before walking every page,
+        // so we can (a) warn the user about the expected OCR runtime and
+        // (b) spin a SINGLE Tesseract worker reused across all pages —
+        // creating one worker per page on an 88-page scan wastes ~3 min in
+        // init alone (the user-reported bug). Sample up to 3 pages from the
+        // requested range; if NONE has a text layer, treat the PDF as a
+        // scan and prepare the worker. Pages with a real text layer fall
+        // through the same loop unaffected — they just skip OCR.
+        const _OCR_TEXT_THRESHOLD = 30; // chars per page below which we treat the page as "needs OCR"
+        const _sampleIdxs = pagesToRead.length <= 3
+          ? pagesToRead
+          : [pagesToRead[0], pagesToRead[Math.floor(pagesToRead.length / 2)], pagesToRead[pagesToRead.length - 1]];
+        let _samplePagesWithText = 0;
+        for (const _pn of _sampleIdxs) {
+          try {
+            const _pg = await doc.getPage(_pn);
+            const _tc = await _pg.getTextContent();
+            const _txt = _tc.items.map(i => i.str || '').join('').trim();
+            if (_txt.length >= _OCR_TEXT_THRESHOLD) _samplePagesWithText += 1;
+          } catch { /* skip — non-fatal */ }
+        }
+        const _isScannedPdf = _samplePagesWithText === 0 && pagesToRead.length > 0;
+
+        // ── Result cache for OCR'd pages ──────────────────────────
+        // Hash the PDF bytes + the requested OCR language(s) and use
+        // the pair as the cache key. Re-reading the same PDF (same
+        // content + same lang) in any later session — or even just a
+        // few minutes later in the same session — pulls per-page OCR
+        // text from disk instead of re-running Tesseract for ~3 sec
+        // per page. The cache supports PARTIAL hits: a previous run
+        // that OCR'd pages 1-20 with `pages: "1-20"` populates only
+        // those entries; a later "whole PDF" read OCR's just the
+        // missing tail and merges the new pages back into the cache.
+        const _fileHash = crypto.createHash('sha256').update(dataBuffer).digest('hex');
+        const _safeLang = _tesseractLangStr.replace(/[+,\s]/g, '-');
+        const _ocrResultsCacheDir = path.join(os.homedir(), '.koi', 'ocr-cache');
+        const _ocrResultsCacheFile = path.join(_ocrResultsCacheDir, `${_fileHash}__${_safeLang}.json`);
+        let _ocrResultsCache = { version: 1, hash: _fileHash, language: _tesseractLangStr, pages: {} };
+        try {
+          if (fs.existsSync(_ocrResultsCacheFile)) {
+            const _raw = fs.readFileSync(_ocrResultsCacheFile, 'utf8');
+            const _parsed = JSON.parse(_raw);
+            if (_parsed && typeof _parsed === 'object' && _parsed.pages && typeof _parsed.pages === 'object') {
+              _ocrResultsCache = _parsed;
+              channel.log('read_file', `OCR cache hit for "${path.basename(filePath)}" (${Object.keys(_parsed.pages).length} page(s) cached) at ${_ocrResultsCacheFile}`);
+            }
+          }
+        } catch (err) {
+          channel.log('read_file', `OCR cache read failed (${err.message}); proceeding without cache`);
+        }
+        let _ocrResultsCacheChanged = false;
+
+        // How many of the requested pages still need real OCR work?
+        // (Used to size the banner / decide whether to spin a worker.)
+        const _uncachedPagesToOcr = _isScannedPdf
+          ? pagesToRead.filter((p) => typeof _ocrResultsCache.pages[String(p)] !== 'string')
+          : [];
+
+        let _ocrWorker = null;
+        let _ocrCachePath = null;
+        let _ocrBannerId = null;
+        if (_isScannedPdf && _uncachedPagesToOcr.length === 0) {
+          // Every requested page is in cache. Skip worker init AND the
+          // progress banner entirely — the loop below will just pull
+          // text from `_ocrResultsCache` page by page (instantaneous).
+          channel.log('read_file', `All ${pagesToRead.length} requested page(s) of "${path.basename(filePath)}" are in OCR cache — skipping Tesseract entirely.`);
+        } else if (_isScannedPdf) {
+          _ocrCachePath = path.join(os.homedir(), '.koi', 'tesseract-data');
+          try { fs.mkdirSync(_ocrCachePath, { recursive: true }); } catch { /* */ }
+          const _cachedHits = pagesToRead.length - _uncachedPagesToOcr.length;
+          const _estSec = Math.ceil(_uncachedPagesToOcr.length * 3);
+          channel.log(
+            'read_file',
+            `PDF "${path.basename(filePath)}" appears to be a scan. ` +
+            `OCR'ing ${_uncachedPagesToOcr.length}/${pagesToRead.length} requested page(s) with lang=${_tesseractLangStr}` +
+            (_cachedHits > 0 ? ` (${_cachedHits} already in cache)` : '') +
+            ` — estimated ~${_estSec}s.` +
+            (totalPages > pagesToRead.length
+              ? ` Pass \`pages: "1-${pagesToRead.length}"\` to scope.`
+              : ''),
+          );
+          // User-visible progress banner — without this an 80-page OCR
+          // looks like a frozen tool for 4–5 minutes. Reuses the same
+          // media-banner channel the image / video / audio generators
+          // use, so the GUI renders the familiar progress card with
+          // elapsed time + estimated duration. We emit it ourselves
+          // (not via `bannerKind`) because we only want the banner for
+          // the SCANNED-PDF path, not for every read_file call.
+          _ocrBannerId = `read_file-pdf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          try {
+            channel.mediaToolStart({
+              id: _ocrBannerId,
+              intent: 'read_file',
+              kind: 'document',
+              label: `Scanning PDF — ${_uncachedPagesToOcr.length} page${_uncachedPagesToOcr.length === 1 ? '' : 's'} (${_tesseractLangStr})`,
+              iconId: 'read_file',
+              expectedDurationMs: _uncachedPagesToOcr.length * 3000,
+            });
+          } catch { /* observability — banner is nice-to-have */ }
+          try {
+            _ocrWorker = await Tesseract.createWorker(_tesseractLangStr, undefined, {
+              cachePath: _ocrCachePath,
+              logger: () => { /* suppress per-page Tesseract progress spam */ },
+            });
+            try { await _ocrWorker.setParameters({ user_defined_dpi: '300' }); } catch { /* not all versions */ }
+          } catch (err) {
+            channel.log('read_file', `Tesseract worker init failed (${err.message}) — falling back to per-page Tesseract.recognize`);
+            _ocrWorker = null;
+          }
         }
 
         // Extract text and images from selected pages.
@@ -1039,10 +1201,13 @@ export default {
         const session = agent?._activeSession;
         const _pdfImgDir = path.join(os.tmpdir(), 'koi-pdf-images');
 
+        let _ocrPagesDone = 0;
+        let _earlyExitAtPage = null;
         for (const pageNum of pagesToRead) {
           const page = await doc.getPage(pageNum);
           const textContent = await page.getTextContent();
           const items = textContent.items.filter(i => i.str !== undefined);
+          const _itemsRawText = items.map(i => i.str || '').join('').trim();
 
           // Extract images from every page. Save to temp files so the model
           // can inspect them via read_file. Small sets (≤3 total) are auto-attached
@@ -1061,17 +1226,72 @@ export default {
               }
             }
 
-            // Pages with no text: try OCR as fallback
-            if (!items.length && images.length > 0) {
-              const cachePath = path.join(os.homedir(), '.koi', 'tesseract-data');
-              if (!fs.existsSync(cachePath)) fs.mkdirSync(cachePath, { recursive: true });
-              for (const image of images) {
-                const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } }).png().withMetadata({ density: 300 }).toBuffer();
+            // OCR fallback fires when the page's text layer is empty OR
+            // suspiciously sparse (< 30 useful chars — typically just a
+            // footer like "Page 1" or a watermark, never the real content).
+            // The old gate required `items.length === 0` exactly, which
+            // missed scanned PDFs that carry a one-line page number and
+            // nothing else — Tesseract never ran, the agent saw "Page 1"
+            // as the entire page, and assumed there was no body text.
+            const _needsOcr = _itemsRawText.length < _OCR_TEXT_THRESHOLD;
+            if (_needsOcr && images.length > 0) {
+              // TODO: when extractPdfPageImages returns nothing on a
+              // scanned page (rare: PDFs that wrap the scan in nested
+              // form XObjects), render the page via pdfjs canvas to a
+              // PNG and OCR that. Skipping for now — covers >95% of real
+              // scans without adding canvas-backend deps.
+
+              // Cache hit: this page was already OCR'd in a previous
+              // read (same file content + same lang). Pull the text
+              // from disk — instant, no Tesseract call.
+              const _cachedText = _ocrResultsCache.pages[String(pageNum)];
+              if (typeof _cachedText === 'string') {
+                if (_cachedText.length > 0) {
+                  pageTexts.push(`--- Page ${pageNum} (OCR cached, ${_tesseractLangStr}) ---\n${_cachedText}`);
+                }
+              } else {
+                for (const image of images) {
+                  const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
+                    .png().withMetadata({ density: 300 }).toBuffer();
+                  try {
+                    const { data } = _ocrWorker
+                      ? await _ocrWorker.recognize(pngBuffer)
+                      : await Tesseract.recognize(
+                          pngBuffer,
+                          _tesseractLangStr,
+                          { cachePath: _ocrCachePath || path.join(os.homedir(), '.koi', 'tesseract-data'), user_defined_dpi: '300' },
+                        );
+                    const ocrText = data?.text ? data.text.trim() : '';
+                    if (ocrText) pageTexts.push(`--- Page ${pageNum} (OCR, ${_tesseractLangStr}) ---\n${ocrText}`);
+                    // Always cache the result — even an empty string
+                    // is a useful signal ("OCR ran but found nothing"
+                    // → don't try again on this page). When a page
+                    // has multiple image XObjects we'd write each in
+                    // turn; the last write wins, which is fine since
+                    // the loop's text was already pushed to pageTexts.
+                    _ocrResultsCache.pages[String(pageNum)] = ocrText;
+                    _ocrResultsCacheChanged = true;
+                  } catch (ocrErr) {
+                    channel.log('read_file', `OCR failed on page ${pageNum}: ${ocrErr.message}`);
+                  }
+                }
+              }
+              _ocrPagesDone += 1;
+              if (_isScannedPdf && (_ocrPagesDone % 10 === 0 || _ocrPagesDone === pagesToRead.length)) {
+                channel.log('read_file', `OCR progress: ${_ocrPagesDone}/${pagesToRead.length} pages`);
+              }
+              // Push DETERMINATE progress to the banner. We know
+              // exactly how many pages are done — feed the bar the
+              // real fraction instead of letting the GUI animate
+              // against the expectedDurationMs estimate.
+              if (_ocrBannerId) {
                 try {
-                  const { data } = await Tesseract.recognize(pngBuffer, 'eng', { cachePath, user_defined_dpi: '300' });
-                  const ocrText = data?.text ? data.text.trim() : '';
-                  if (ocrText) pageTexts.push(`--- Page ${pageNum} (OCR) ---\n${ocrText}`);
-                } catch { /* OCR failed */ }
+                  channel.mediaToolStatus({
+                    id: _ocrBannerId,
+                    progress: _ocrPagesDone / pagesToRead.length,
+                    progressLabel: `${_ocrPagesDone} / ${pagesToRead.length} pages`,
+                  });
+                } catch { /* observability */ }
               }
             }
           } catch (imgErr) {
@@ -1104,6 +1324,60 @@ export default {
           if (pageText) {
             pageTexts.push(`--- Page ${pageNum} ---\n${pageText}`);
           }
+
+          // Early-exit when the caller passed an explicit `limit`: as
+          // soon as the accumulated output reaches `offset + limit`
+          // lines, stop walking pages. Skips OCR (expensive) and text
+          // extraction on the tail of the PDF. When `limit` is omitted
+          // the loop reads every page.
+          if (typeof action.limit === 'number' && action.limit > 0) {
+            const _accLines = pageTexts.reduce((acc, t) => acc + (t ? t.split('\n').length : 0), 0);
+            const _cap = (action.offset && action.offset > 1 ? action.offset - 1 : 0) + action.limit;
+            if (_accLines >= _cap) {
+              if (pageNum < pagesToRead[pagesToRead.length - 1]) {
+                _earlyExitAtPage = pageNum;
+                if (_isScannedPdf) {
+                  channel.log(
+                    'read_file',
+                    `Reached limit (${action.limit} lines) at page ${pageNum} — stopping early; ${pagesToRead.length - pagesToRead.indexOf(pageNum) - 1} page(s) skipped. ` +
+                    `Pass a higher \`limit\` or \`pages: "${pageNum + 1}-${pagesToRead[pagesToRead.length - 1]}"\` to continue.`,
+                  );
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // Release the shared OCR worker (if we initialised one). Tesseract
+        // workers hold WASM heap + native handles — leaving them dangling
+        // grows memory across reads. Non-fatal if terminate() throws.
+        if (_ocrWorker) {
+          try { await _ocrWorker.terminate(); } catch { /* */ }
+        }
+        // Persist the OCR results cache so the next read of this PDF
+        // (any session, any time) skips Tesseract entirely. Atomic
+        // write to avoid leaving a half-written JSON if the process
+        // dies mid-flush. Only persist when something actually
+        // changed — pure cache-hit reads don't rewrite the file.
+        if (_ocrResultsCacheChanged) {
+          try {
+            fs.mkdirSync(_ocrResultsCacheDir, { recursive: true });
+            const _tmpFile = `${_ocrResultsCacheFile}.tmp-${process.pid}-${Date.now().toString(36)}`;
+            fs.writeFileSync(_tmpFile, JSON.stringify(_ocrResultsCache));
+            fs.renameSync(_tmpFile, _ocrResultsCacheFile);
+            channel.log('read_file', `OCR cache saved to ${_ocrResultsCacheFile} (${Object.keys(_ocrResultsCache.pages).length} page(s)).`);
+          } catch (err) {
+            channel.log('read_file', `OCR cache save failed (${err.message}); next read will re-OCR`);
+          }
+        }
+        // Close the user-visible progress banner. We made it this far
+        // without throwing, so report success. (If an error bubbled out
+        // of the OCR loop the banner would dangle — acceptable; the
+        // ReferenceError / read failure surfaces as a tool result and
+        // the GUI clears its in-flight registry on the next turn.)
+        if (_ocrBannerId) {
+          try { channel.mediaToolEnd({ id: _ocrBannerId, ok: true }); } catch { /* */ }
         }
 
         // Handle PDF images: ≤3 → auto-attach for vision; >3 → list paths so model picks
@@ -1148,12 +1422,16 @@ export default {
           return { success: true, path: filePath, type: 'pdf', totalPages, content: `(No extractable text, but ${_pdfImages.length} image(s) attached for vision.)` };
         }
 
-        // Apply line numbering and truncation like regular files
+        // Apply line numbering and truncation. PDFs differ from text
+        // files: when `limit` is omitted we return the WHOLE PDF (no
+        // default cap), because the user opted into the cost by reading
+        // a PDF and the page loop above already early-exited if the
+        // caller did set a limit. The MAX_LINES default still applies
+        // to regular text reads — see the earlier text branch.
         const allLines = text.split('\n');
-        const MAX_LINES = 2000;
         const MAX_LINE_LENGTH = 2000;
         const offset = Math.max(1, action.offset || 1);
-        const limit = action.limit || MAX_LINES;
+        const limit = action.limit || allLines.length;
         const startIdx = offset - 1;
         const endIdx = Math.min(startIdx + limit, allLines.length);
         const selectedLines = allLines.slice(startIdx, endIdx);
@@ -1179,7 +1457,10 @@ export default {
           from: offset,
           to: endIdx,
           ...(wasTruncated && { truncated: true, hint: `PDF text has ${allLines.length} lines. Use offset/limit to read more.` }),
-          ...(!action.pages && totalPages > MAX_PDF_PAGES && { hint: `PDF has ${totalPages} pages but only first ${MAX_PDF_PAGES} were read. Use "pages" field (e.g. "1-5") to read specific pages.` })
+          ...(_earlyExitAtPage !== null && {
+            partial: true,
+            hint: `Stopped at page ${_earlyExitAtPage} of ${pagesToRead[pagesToRead.length - 1]} because the line limit (${action.limit}) was reached. Pass a higher \`limit\` or \`pages: "${_earlyExitAtPage + 1}-${pagesToRead[pagesToRead.length - 1]}"\` to read the rest.`,
+          }),
         };
       } catch (err) {
         return { success: false, error: `Failed to read PDF: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}` };

@@ -35,7 +35,7 @@ export default {
   intent: 'write_file',
   description: 'Create a NEW file. Fields: "path" (file path — also accepts a `@mention` handle that resolves via MediaLibrary to overwrite a previously-tagged file; e.g. `path: "@hero_script"` overwrites whatever file is currently tagged @hero_script), "content" (full file content), "internal" (optional bool — true to write SILENTLY without the diff card / permission dialog; pass true for files only YOU read, like workflow state JSON or run-scoped scratch). Returns: { success, path }. ONLY for creating files that do not exist yet. To modify existing files (or to write to a `@mention` that already resolves to an existing file), use edit_file instead — write_file refuses to overwrite when the resolved path exists.',
   instructions: 'write_file is ONLY for creating NEW files. If the file already exists, you MUST use edit_file instead — even for large changes. Break big rewrites into multiple edit_file calls. NEVER use shell commands (cat >, echo >, tee, python scripts) to write files. Use "internal": true for files only the agent itself will read (workflow state, scratch JSON, run-scoped config) — they will not appear in the chat as a "Create file" card and need no permission. User-facing artifacts (final deliverables, scripts, content the user opens or reviews) must remain visible (omit "internal" or pass false).',
-  thinkingHint: 'Writing file',
+  thinkingHint: (action) => `Writing ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'write',
   hidden: false,
 
@@ -135,7 +135,15 @@ export default {
         { title: _acceptLabel, value: 'always' },
         { title: 'No, but give feedback', value: 'feedback' },
         { title: t('permNo'), value: 'no' }
-      ], 0, { meta: { type: 'bash', header: _header, command: `${exists ? 'Edit' : 'Write'}(${filePath})` } }));
+      ], 0, { meta: {
+        type: 'bash',
+        header: _header,
+        command: `${exists ? 'Edit' : 'Write'}(${filePath})`,
+        // WRITE category → dialog title reads "Allow Braxil to write
+        // files…" instead of the generic "run a command on your
+        // computer?".
+        permissionCategory: 'WRITE',
+      } }));
 
       if (value === 'always') {
         if (_isInProject) {

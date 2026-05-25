@@ -49,7 +49,10 @@ function listWorkflowFiles(directory) {
 /** Render the WORKFLOW WORKSPACE block prepended to every task. Mirrors
  *  what the skill activation returns (`directory` + `resources`) so an
  *  agent that opens a workflow task can resolve relative file mentions
- *  in the workflow body to absolute paths. */
+ *  in the workflow body to absolute paths. The per-run workspace dir
+ *  is NOT injected here — it's surfaced as a row in RUNTIME CONTEXT
+ *  (see system-prompt-builder), which is the canonical place for
+ *  env-var-style paths and keeps task descriptions short. */
 function workspaceBlock(workflow, files) {
   if (!workflow?.directory) return '';
   const lines = [
@@ -151,6 +154,10 @@ Rules:
   RESOLVED. Inline the value into the task description (e.g. "Type is already chosen:
   explainer — DO NOT re-ask"). The executing agent should never present a form row
   for a field whose value is already in ROUTING CONTEXT.
+- Steps run in separate workers with no shared memory. For artifacts that the
+  next step needs, instruct the producing step to save \`step<N>_output.json\`
+  in the workflow workspace (the executing agent sees the path in its RUNTIME
+  CONTEXT), and instruct the consuming step to read it as its first action.
 
 USER REQUEST:
 ${(userMessage || '(no explicit user message)').substring(0, 1500)}
@@ -263,6 +270,21 @@ export default {
     // block (belt-and-braces — even if the LLM forgets to substitute,
     // the executing agent has the absolute paths in front of it).
     const workflowFiles = listWorkflowFiles(workflow.directory);
+
+    // Each workflow invocation gets a unique runId. Tasks created here
+    // are tagged with it so agent.js can (a) find sibling completed
+    // tasks for PRIOR STEPS injection and (b) point each step at a
+    // shared on-disk workspace where heavy artifacts (HTML dumps,
+    // downloads, intermediate files, step<N>_output.json snapshots)
+    // persist between steps. The run workspace path is also injected
+    // into the WORKFLOW WORKSPACE block prepended to each task so the
+    // executing agent doesn't have to glob-search the project to find
+    // it — that was failing because multiple older runs live alongside
+    // and the worker was reading the wrong run's snapshot.
+    const runId = `wfr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+    const workspaceDir = path.join(projectRoot, '.koi', 'workflows', runId);
+
     const workspace = workspaceBlock(workflow, workflowFiles);
 
     const context = action.context && typeof action.context === 'object' && !Array.isArray(action.context)
@@ -281,14 +303,6 @@ export default {
       };
     }
 
-    // Each workflow invocation gets a unique runId. Tasks created here
-    // are tagged with it so agent.js can (a) find sibling completed
-    // tasks for PRIOR STEPS injection and (b) point each step at a
-    // shared on-disk workspace where heavy artifacts (HTML dumps,
-    // downloads, intermediate files) persist between steps.
-    const runId = `wfr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
-    const workspaceDir = path.join(projectRoot, '.koi', 'workflows', runId);
     try {
       fs.mkdirSync(workspaceDir, { recursive: true });
     } catch (err) {
