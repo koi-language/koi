@@ -422,8 +422,24 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
     candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, false, minContextK, noThinkingProfile, requiresVideo, requiresAudio, requiresFile);
   }
 
-  // If all providers are on cooldown, ignore cooldowns and pick the best available
-  // so we never block LLM calls entirely.
+  // No model passes the (possibly escalated) profile thresholds. Before
+  // ignoring cooldowns — which would happily re-pick a model we just
+  // blacklisted — try ANY model that's still healthy regardless of
+  // code/reasoning score. Reason: when consecutive errors push the
+  // profile to code:100, reasoning:100 and the single qualifying model
+  // is on cooldown, the original fallback bypassed the cooldown and
+  // re-picked it, creating an infinite "blacklist → bypass → re-pick"
+  // loop (see logs around the no-content/gemini-3.5-flash case).
+  // Honour the cooldown first; only break it when literally nothing
+  // else is available.
+  if (candidates.length === 0) {
+    candidates = _buildAllCandidates(availableProviders, taskType, requiresImage, minContextK, requiresVideo, requiresAudio, requiresFile)
+      .filter(c => !_isProviderOnCooldown(c.provider) && !_isModelOnCooldown(c.provider, c.model));
+  }
+
+  // Last resort — every candidate is on cooldown. Bypass cooldowns so
+  // we never block LLM calls entirely. This is the original fallback,
+  // now correctly gated behind "tried relaxed profile first".
   if (candidates.length === 0) {
     candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK, profile, requiresVideo, requiresAudio, requiresFile);
   }

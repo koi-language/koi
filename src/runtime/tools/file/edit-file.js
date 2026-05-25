@@ -267,11 +267,20 @@ function linesMatch(fileLines, oldLines, idx, normalize = false) {
   return true;
 }
 
+// Same convention as write_file: paths under `.koi/` are agent scratch
+// and default to silent (no diff card, no permission dialog). The agent
+// can still pass `internal: false` to force-show a specific edit.
+function _isInternalPath(resolvedPath) {
+  const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+  const koiDir = path.resolve(projectRoot, '.koi');
+  return resolvedPath === koiDir || resolvedPath.startsWith(koiDir + path.sep);
+}
+
 export default {
   type: 'edit_file',
   intent: 'edit_file',
-  description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). The "path" field accepts an absolute or relative path OR a `@mention` handle (e.g. "@hero_script") that resolves via the cross-project MediaLibrary to the most recent file tagged with that handle — the same handle the user / agent set via tag_media. Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Returns: { success, path }',
-  instructions: 'This is the ONLY correct way to modify existing files. NEVER use shell commands (sed, awk, echo >, python scripts, etc.) to edit files — always use edit_file instead.',
+  description: 'Edit a file using a unified diff. Provide "path" and "diff" (unified diff format with @@ hunks). The "path" field accepts an absolute or relative path OR a `@mention` handle (e.g. "@hero_script") that resolves via the cross-project MediaLibrary to the most recent file tagged with that handle — the same handle the user / agent set via tag_media. Shows colored preview and asks permission. The diff format is the standard unified diff: lines starting with - are removed, + are added, space are context. Example diff: "@@ -10,3 +10,4 @@\\n context line\\n-old line\\n+new line\\n+added line\\n context". Optional "internal" field: when true, the edit is silent (no diff card / no permission dialog) — use for files only the agent reads (workflow state JSON, scratch under `.koi/`). Returns: { success, path }',
+  instructions: 'This is the ONLY correct way to modify existing files. NEVER use shell commands (sed, awk, echo >, python scripts, etc.) to edit files — always use edit_file instead. Use "internal": true for files only the agent itself reads (workflow state, scratch under .koi/) so they do not appear as diff cards in the chat. User-facing files (scripts, drafts, code the user reviews) must remain visible.',
   thinkingHint: (action) => `Editing ${action.path || 'file'}`,
   permission: 'write',
   hidden: false,
@@ -280,7 +289,8 @@ export default {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path to edit. Accepts an absolute or relative path, or a `@mention` handle (e.g. "@hero_script") resolved via the cross-project MediaLibrary to the most recent file tagged with that handle.' },
-      diff: { type: 'string', description: 'Unified diff with @@ hunks. Lines: " " context, "-" remove, "+" add.' }
+      diff: { type: 'string', description: 'Unified diff with @@ hunks. Lines: " " context, "-" remove, "+" add.' },
+      internal: { type: 'boolean', description: 'Optional. When true, the edit is silent: no diff card and no permission dialog. Use for agent-only files (workflow state, scratch JSON). Paths under `.koi/` default to true automatically — pass false to force-show.' }
     },
     required: ['path', 'diff']
   },

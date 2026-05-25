@@ -1323,14 +1323,24 @@ CRITICAL RULES:
       // Escalate model on repeated LLM errors (truncated JSON, parse failures, etc.)
       // The classifier may keep returning the same category, so we force-bump scores
       // to break out of the "weak model → truncated → reclassify → same model" loop.
-      // BUT skip escalation when the recent errors are network/gateway failures —
-      // those have nothing to do with model capability and pushing to a bigger
-      // model just wastes credits on a request that will also fail.
+      // BUT skip escalation when:
+      //   - All recent errors are network/gateway failures — pushing to a
+      //     bigger model just wastes credits on a request that will also fail.
+      //   - All recent errors are "no content" exhaustion — the model
+      //     accepted the request and emitted nothing. Bumping scores drives
+      //     the selector to the highest-tier model (often the same one),
+      //     which is exactly what the per-model cooldown is trying to
+      //     prevent. Let agent.js's cooldown handling + reclassify do its
+      //     job without inflating the profile.
+      const _isNoContent = (err) => /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(err?.message || '');
       if (_isLoop && _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === '_llm_error')) {
         const { isNetworkError } = await import('./is-network-error.js');
         const _allNetErrs = _recentActions.every(e => isNetworkError(e.error));
+        const _allNoContent = _recentActions.every(e => _isNoContent(e.error));
         if (_allNetErrs) {
           channel.log('llm', `[classify] LLM error escalation skipped — all recent errors are network/transient (no model bump)`);
+        } else if (_allNoContent) {
+          channel.log('llm', `[classify] LLM error escalation skipped — all recent errors are "no content" exhaustion (cooldown + reclassify will route us off the failing model)`);
         } else {
           const _bump = Math.min(30, _recentActions.length * 10); // 30 for 3 errors, capped
           profile = {

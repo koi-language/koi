@@ -1,4 +1,5 @@
 import { channel } from '../../io/channel.js';
+
 /**
  * Prompt Form Action - Multi-step form wizard for collecting multiple fields.
  *
@@ -11,10 +12,17 @@ import { channel } from '../../io/channel.js';
  * Returns: { answers: { [fieldLabel]: string } }
  */
 
+const FILE_FIELD_KEYWORDS = /(\battach(?:es|ed|ment|ments|ing)?\b|\bupload(?:s|ed|ing)?\b|\bdrop\s+(?:a|any|the|some|your)?\s*(?:file|image|photo|picture|logo|screenshot|reference|ref|moodboard)|\bphotos?\b|\bimages?\b|\bpictures?\b|\bimágenes?\b|\bimagen(?:es)?\b|\bfotos?\b|\blogos?\b|\bscreenshots?\b|\bmood[\s-]?board\b|(?:reference|visual|file)\s+(?:image|photo|picture|ref)s?\b|\bficheros?\b|\barchivos?\b|\badjunt[ae]r?\b)/i;
+
+function looksLikeFileField(field) {
+  const text = `${field.label || ''} | ${field.question || ''} | ${field.hint || ''}`;
+  return FILE_FIELD_KEYWORDS.test(text);
+}
+
 export default {
   type: 'prompt_form',
   intent: 'prompt_form',
-  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/options fields, array of absolute paths for `files` fields).',
+  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. **Rule: if the field is asking the user to attach files or references of any kind, ALWAYS set `files`. Never a plain text field for attachments.** (If you forget, the runtime tries to detect the intent and auto-coerce — do not rely on that.) Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/options fields, array of absolute paths for `files` fields).',
   thinkingHint: 'Waiting for your input',
   permission: null,
 
@@ -147,6 +155,19 @@ export default {
 
     if (!Array.isArray(fields) || fields.length === 0) {
       return { error: 'prompt_form requires a non-empty "fields" array.' };
+    }
+
+    const coerced = [];
+    for (const field of fields) {
+      const hasFiles = field.files && typeof field.files === 'object';
+      const hasOptions = Array.isArray(field.options) && field.options.length > 0;
+      if (!hasFiles && !hasOptions && looksLikeFileField(field)) {
+        field.files = { multiple: true };
+        coerced.push(field.label || field.question || '<unnamed>');
+      }
+    }
+    if (coerced.length > 0) {
+      console.warn(`[prompt_form] Auto-coerced text field(s) to file-picker because the label/question/hint matched file-attachment keywords: ${coerced.join(', ')}. Set "files" explicitly next time.`);
     }
 
     channel.clearProgress();

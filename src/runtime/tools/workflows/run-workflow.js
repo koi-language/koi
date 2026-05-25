@@ -68,7 +68,7 @@ function workspaceBlock(workflow, files) {
   return lines.join('\n');
 }
 
-async function runTranslator(agent, workflow, body, userMessage, files) {
+async function runTranslator(agent, workflow, body, userMessage, files, context) {
   const { resolve: resolveModel } = await import('../../llm/providers/factory.js');
 
   // Delegate model selection to the factory — same pattern as call-llm.js
@@ -117,6 +117,16 @@ async function runTranslator(agent, workflow, body, userMessage, files) {
     ? '(none beyond WORKFLOW.md)'
     : files.map(f => `  - ${f.path}${f.kind === 'dir' ? '/' : ''}`).join('\n');
 
+  const contextEntries = context && typeof context === 'object'
+    ? Object.entries(context).filter(([, v]) => v !== null && v !== undefined && v !== '')
+    : [];
+  const contextBlock = contextEntries.length === 0
+    ? ''
+    : `ROUTING CONTEXT (fields the upstream router already resolved from the user's prior conversation — these are GIVEN; DO NOT instruct any task to re-ask them. Bake them into each task description so the executing agent treats them as known facts):
+${contextEntries.map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join('\n')}
+
+`;
+
   const prompt = `You are a workflow translator. A pre-approved workflow describes the ordered steps to complete a type of task. Your job is to INSTANTIATE those steps as concrete tasks for the user's current request.
 
 Rules:
@@ -137,11 +147,15 @@ Rules:
   the WORKFLOW DIRECTORY listing below into the task description. Never leave a bare
   filename — the executing agent runs in the user's project, NOT in the workflow's
   own directory, and will not find the file by name.
+- If a ROUTING CONTEXT block is present below, treat each listed field as ALREADY
+  RESOLVED. Inline the value into the task description (e.g. "Type is already chosen:
+  explainer — DO NOT re-ask"). The executing agent should never present a form row
+  for a field whose value is already in ROUTING CONTEXT.
 
 USER REQUEST:
 ${(userMessage || '(no explicit user message)').substring(0, 1500)}
 
-WORKFLOW: ${workflow.name}
+${contextBlock}WORKFLOW: ${workflow.name}
 WORKFLOW DESCRIPTION: ${workflow.description}
 WORKFLOW DIRECTORY: ${workflow.directory || '(unknown)'}
 WORKFLOW FILES (resolve sibling-file mentions to these absolute paths):
@@ -188,7 +202,7 @@ If the workflow does not actually match the user's request, return:
 export default {
   type: 'run_workflow',
   intent: 'run_workflow',
-  description: 'Run a workflow by name. Translates its WORKFLOW.md script into concrete tasks (via a cheap LLM), creates them, and fires planner.result to transition the System into running_plan. Call describe_workflow(name) FIRST to confirm the workflow matches your intent. Fields: "name" (required). → Returns: { activated, name, taskCount, fallback?, reason? }',
+  description: 'Run a workflow by name. Translates its WORKFLOW.md script into concrete tasks (via a cheap LLM), creates them, and fires planner.result to transition the System into running_plan. Call describe_workflow(name) FIRST to confirm the workflow matches your intent. Fields: "name" (required), "context" (optional — a flat object of fields the upstream router already resolved from the conversation, e.g. { type: "explainer", topic: "MFA training for SOC 2", productMode: "none" }; the translator pre-fills each step\'s description with these so executing agents never re-ask). → Returns: { activated, name, taskCount, fallback?, reason? }',
   thinkingHint: (action) => `Running workflow: ${action.name || '...'}`,
   permission: 'write_tasks',
   // Visible — see describe_workflow for the rationale. Without surfacing
@@ -203,12 +217,18 @@ export default {
         type: 'string',
         description: 'The workflow name to run (e.g. "generate-article")',
       },
+      context: {
+        type: 'object',
+        description: 'Optional flat object of fields the upstream router already resolved from the user\'s prior conversation. Pre-fills these into every task description so executing agents do not re-ask. Use the same field names the workflow itself uses (e.g. type, topic, duration, productMode, style). Values are usually strings; the keys are free-form.',
+        additionalProperties: true,
+      },
     },
     required: ['name'],
   },
 
   examples: [
     { actionType: 'direct', intent: 'run_workflow', name: 'generate-article' },
+    { actionType: 'direct', intent: 'run_workflow', name: 'create-video', context: { type: 'explainer', topic: 'MFA training for SOC 2 compliance' } },
   ],
 
   async execute(action, agent) {
@@ -245,7 +265,11 @@ export default {
     const workflowFiles = listWorkflowFiles(workflow.directory);
     const workspace = workspaceBlock(workflow, workflowFiles);
 
-    const translated = await runTranslator(agent, workflow, body, userMessage, workflowFiles);
+    const context = action.context && typeof action.context === 'object' && !Array.isArray(action.context)
+      ? action.context
+      : null;
+
+    const translated = await runTranslator(agent, workflow, body, userMessage, workflowFiles, context);
 
     if (translated.fallback || !translated.tasks || translated.tasks.length === 0) {
       channel.log('workflow', `Workflow "${name}" fell back to routing: ${translated.reason || 'no tasks'}`);

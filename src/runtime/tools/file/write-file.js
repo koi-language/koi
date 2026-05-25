@@ -18,11 +18,23 @@ import { sessionTracker } from '../../state/session-tracker.js';
 import { channel } from '../../io/channel.js';
 import { buildDiffPayloadFromContent, buildDiffPayloadFromNewFile } from '../../util/diff-render.js';
 
+// True when the resolved path lives under the project's `.koi/` directory —
+// the agent's own scratch space (workflow runs, cached state, session logs,
+// timeline JSON, etc.). User never reads these directly; surfacing them as
+// "Create <file>.json" cards in the chat just adds noise. We treat anything
+// under `.koi/` as internal by default; the agent can still flip
+// `internal: false` to force-show a specific write.
+function _isInternalPath(resolvedPath) {
+  const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+  const koiDir = path.resolve(projectRoot, '.koi');
+  return resolvedPath === koiDir || resolvedPath.startsWith(koiDir + path.sep);
+}
+
 export default {
   type: 'write_file',
   intent: 'write_file',
-  description: 'Create a NEW file. Fields: "path" (file path — also accepts a `@mention` handle that resolves via MediaLibrary to overwrite a previously-tagged file; e.g. `path: "@hero_script"` overwrites whatever file is currently tagged @hero_script), "content" (full file content). Returns: { success, path }. ONLY for creating files that do not exist yet. To modify existing files (or to write to a `@mention` that already resolves to an existing file), use edit_file instead — write_file refuses to overwrite when the resolved path exists.',
-  instructions: 'write_file is ONLY for creating NEW files. If the file already exists, you MUST use edit_file instead — even for large changes. Break big rewrites into multiple edit_file calls. NEVER use shell commands (cat >, echo >, tee, python scripts) to write files.',
+  description: 'Create a NEW file. Fields: "path" (file path — also accepts a `@mention` handle that resolves via MediaLibrary to overwrite a previously-tagged file; e.g. `path: "@hero_script"` overwrites whatever file is currently tagged @hero_script), "content" (full file content), "internal" (optional bool — true to write SILENTLY without the diff card / permission dialog; pass true for files only YOU read, like workflow state JSON or run-scoped scratch). Returns: { success, path }. ONLY for creating files that do not exist yet. To modify existing files (or to write to a `@mention` that already resolves to an existing file), use edit_file instead — write_file refuses to overwrite when the resolved path exists.',
+  instructions: 'write_file is ONLY for creating NEW files. If the file already exists, you MUST use edit_file instead — even for large changes. Break big rewrites into multiple edit_file calls. NEVER use shell commands (cat >, echo >, tee, python scripts) to write files. Use "internal": true for files only the agent itself will read (workflow state, scratch JSON, run-scoped config) — they will not appear in the chat as a "Create file" card and need no permission. User-facing artifacts (final deliverables, scripts, content the user opens or reviews) must remain visible (omit "internal" or pass false).',
   thinkingHint: 'Writing file',
   permission: 'write',
   hidden: false,
@@ -31,7 +43,8 @@ export default {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path to write. Accepts an absolute or relative path, or a `@mention` handle that resolves via MediaLibrary to a previously-tagged file (overwriting it). For brand-new files, pass a fresh path; for updating tagged ones, prefer edit_file.' },
-      content: { type: 'string', description: 'Full file content to write' }
+      content: { type: 'string', description: 'Full file content to write' },
+      internal: { type: 'boolean', description: 'Optional. When true, the write is silent: no "Create file" card in the chat, no permission dialog. Use for files only the agent itself will read (workflow state, scratch JSON). Paths under `.koi/` default to true automatically — pass false there to force-show a specific write to the user.' }
     },
     required: ['path', 'content']
   },
@@ -67,6 +80,17 @@ export default {
     const exists = fs.existsSync(resolvedPath);
     const oldContent = exists ? fs.readFileSync(resolvedPath, 'utf8') : '';
 
+    // "Internal" writes bypass the diff card AND the permission dialog so
+    // agent-only files (workflow state under `.koi/wfr-*/`, scratch JSON,
+    // etc.) don't pollute the chat or stall on a permission prompt.
+    // Resolution order:
+    //   1. Explicit `action.internal` value wins (true or false).
+    //   2. Otherwise, default to true when the resolved path is under
+    //      the project's `.koi/` directory — that's the agent's own
+    //      workspace and never user-facing.
+    const isInternal = action.internal === true
+      || (action.internal !== false && _isInternalPath(resolvedPath));
+
     // Build structured diff payload (GUI renders natively, terminal → ANSI)
     const diffPayload = exists
       ? buildDiffPayloadFromContent(oldContent, newContent, resolvedPath, 'Update')
@@ -74,7 +98,7 @@ export default {
 
     // No real changes (only trailing whitespace differences)
     if (exists && !diffPayload) {
-      channel.print(`\x1b[2m${t('noChanges')}\x1b[0m`);
+      if (!isInternal) channel.print(`\x1b[2m${t('noChanges')}\x1b[0m`);
       return { success: true, path: filePath, noChanges: true };
     }
 
@@ -83,12 +107,21 @@ export default {
       diffPayload.afterContent = newContent; // for GUI re-apply after denial
       diffPayload.diffId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
-    channel.clearProgress();
-    await channel.showDiff(diffPayload);
+    if (!isInternal) {
+      channel.clearProgress();
+      await channel.showDiff(diffPayload);
+    } else {
+      // Still log to the file channel so debugging / audit trails see
+      // the write even when the chat doesn't.
+      channel.log('write_file', `internal write → ${resolvedPath} (${newContent.length} bytes)`);
+    }
 
-    // Check permissions (shared across all file actions)
+    // Check permissions (shared across all file actions).
+    // Internal writes skip the permission flow — they're agent self-state,
+    // not user-visible mutations, and stopping on a permission dialog would
+    // block silent workflow checkpointing.
     const permissions = getFilePermissions(agent);
-    let permitted = permissions.isAllowed(resolvedPath, 'write');
+    let permitted = isInternal || permissions.isAllowed(resolvedPath, 'write');
 
     if (!permitted) {
       const agentName = agent?.name || 'Agent';
