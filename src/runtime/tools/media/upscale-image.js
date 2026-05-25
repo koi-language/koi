@@ -24,6 +24,7 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import asyncCapable from '../_async-capable.js';
+import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -216,10 +217,14 @@ const upscaleImageAction = {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = ({ webp: 'webp', jpeg: 'jpg', jpg: 'jpg' }[action.outputFormat] || 'png');
+    // Human-readable name derived from the source so the upscaled
+    // version sits next to the original in the gallery instead of
+    // floating in a sea of opaque timestamps.
+    const slug = slugFromSourcePath(action.image, 'upscaled');
     const saved = [];
     for (let i = 0; i < result.images.length; i++) {
       const img = result.images[i];
-      const filename = `upscale_${Date.now()}_${i}.${outExt}`;
+      const filename = buildDescribedFilename({ slug, fallback: 'upscaled', index: i, ext: outExt });
       const filePath = path.join(saveDir, filename);
 
       if (img.b64) {

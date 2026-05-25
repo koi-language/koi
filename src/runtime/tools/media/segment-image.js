@@ -13,6 +13,7 @@ import path from 'path';
 import os from 'os';
 import { channel } from '../../io/channel.js';
 import asyncCapable from '../_async-capable.js';
+import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
 
 // SAM 3 — text-prompted for precompute, point+text for fallback clicks.
 const SAM3_MODEL = 'fal-ai/sam-3/image';
@@ -259,10 +260,15 @@ const segmentImageAction = {
           }
         }));
 
+        // Mask filenames embed the source image stem + the concept so
+        // a `~/.koi/images/.masks/` listing reads as
+        // `mouse-with-cheese-mask-helmet-<ts>_0.png` instead of an
+        // opaque `mask_<ts>_<i>.png` you can't grep.
         for (const r of results) {
+          const slug = slugFromSourcePath(params.path, `mask-${r.concept || 'object'}`);
           for (let i = 0; i < (r.maskUrls?.length || 0); i++) {
             const maskUrl = r.maskUrls[i];
-            const fileName = `mask_${Date.now()}_${localMasks.length}.png`;
+            const fileName = buildDescribedFilename({ slug, fallback: 'mask', index: localMasks.length, ext: 'png' });
             const localPath = path.join(masksDir, fileName);
             try {
               const maskRes = await fetch(maskUrl);
@@ -334,7 +340,8 @@ const segmentImageAction = {
         const result = await res.json();
         const maskUrl = result.image?.url || result.masks?.[0]?.url;
         if (maskUrl) {
-          const fileName = `mask_${Date.now()}_0.png`;
+          const slug = slugFromSourcePath(params.path, 'mask-point');
+          const fileName = buildDescribedFilename({ slug, fallback: 'mask', index: 0, ext: 'png' });
           const localPath = path.join(masksDir, fileName);
           const maskRes = await fetch(maskUrl);
           if (maskRes.ok) {

@@ -17,6 +17,7 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import asyncCapable from '../_async-capable.js';
+import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -153,10 +154,14 @@ const backgroundRemovalAction = {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = action.outputFormat === 'webp' ? 'webp' : 'png';
+    // Human-readable filename derived from the source image so a
+    // batch of bg-removed files stays grouped next to its origin in
+    // the gallery / Finder ordering (e.g. `mouse-with-cheese-bgremoved-<ts>_0.png`).
+    const slug = slugFromSourcePath(action.image, 'bgremoved');
     const saved = [];
     for (let i = 0; i < result.images.length; i++) {
       const img = result.images[i];
-      const filename = `bgremove_${Date.now()}_${i}.${outExt}`;
+      const filename = buildDescribedFilename({ slug, fallback: 'bgremoved', index: i, ext: outExt });
       const filePath = path.join(saveDir, filename);
 
       if (img.b64) {

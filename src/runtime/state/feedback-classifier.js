@@ -105,8 +105,17 @@ export function classifyFeedback(action, result, error) {
     return { immediate, shortTerm, permanent: null, ...getTTL(intent) };
   }
 
-  // Handle error-like results (success: false)
-  if (result && result.success === false && result.error) {
+  // Handle error-like results. Two shapes are treated as failures:
+  //   (a) `{ success: false, error: ... }` — canonical structured failure
+  //   (b) `{ error: ... }` with no `success` field — defensive fallback.
+  //       Some handlers (historically prompt_user's pre-validate guard)
+  //       returned a bare `{ error }`. Without this OR-arm the classifier
+  //       fell through to the success switch below, which for `prompt_user`
+  //       reads `result.answer` only — so the LLM got an EMPTY string as
+  //       feedback, never saw the error, and re-emitted the same bad call
+  //       in a tight loop. Catch any `result.error` here regardless of
+  //       whether `success` was set explicitly.
+  if (result && result.error && (result.success === false || result.success === undefined)) {
     // Include stdout if present — many CLI tools (flutter analyze, tsc, etc.) write
     // their useful output to stdout even when exiting with a non-zero code.
     const exitCodeStr = result.exitCode != null ? ` (exit code ${result.exitCode})` : '';

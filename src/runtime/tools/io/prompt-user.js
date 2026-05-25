@@ -102,31 +102,15 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     // Always use the default prompt — the LLM must not change the visual prompt
     const promptText = '❯ ';
 
-    // Reject LLM-emitted malformed calls fast: an LLM batch that emits
-    // `prompt_user` with NONE of {question, options, inline prompt}
-    // falls through silently to INLINE mode, which only updates the
-    // input-box placeholder and shows the user no visible question.
-    // The user sees nothing to answer, the delegate hangs forever on
-    // `channel.prompt`, and the parent blocks on that delegate — hit
-    // in app-kitchen session 0d34ia where the Worker described "voy
-    // a componer las opciones" in a `print` but then called
-    // prompt_user empty. Erroring here teaches the LLM to retry with
-    // the missing field instead of silently deadlocking the task graph.
-    //
-    // Internal runtime call sites (abort recovery, feedback merge,
-    // post-return idle wait — see agent.js:1387, 1576, 2929, 3057) use
-    // genuine INLINE mode intentionally — no specific question, just
-    // "park here until the user types again". They pass `_runtime:
-    // true` to bypass the guard; without this the guard would crash
-    // the engine on every Stop press (return {} → process.exit(0)).
-    if (!action._runtime && !action.data?._runtime
-      && !question
-      && (!options || !Array.isArray(options) || options.length === 0)
-      && !explicitInlinePrompt) {
-      return {
-        error: "prompt_user requires at least one of: 'question' (text bubble), 'options' (select menu), or 'prompt' (explicit inline shell-style prompt). You called it with none of them — the user would see no visible question and the call would hang silently. Retry with a clear 'question' (and 'options' if the answer is a choice between known values).",
-      };
-    }
+    // Bare `prompt_user` (no question / options / inline prompt) is a
+    // LEGITIMATE pattern: "hand control back to the user, the chat bar
+    // is theirs again." The System agent's rules tell it to emit this
+    // shape after declines ("nada / no quiero nada"), after a `print`
+    // reply to a casual turn, after a `show_result`, and any time
+    // there is no follow-up question to ask. Internal runtime call
+    // sites (abort recovery, feedback merge, post-return idle wait —
+    // agent.js:1387, 1576, 2929, 3057) emit the same shape with
+    // `_runtime: true`. No validation: allow it.
 
     // --exit mode: allow consuming the initial prompt from the queue,
     // but block any subsequent prompt_user calls (no user to answer).
