@@ -23,9 +23,17 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { channel } from '../io/channel.js';
+import { detectAdminPluginsRoot } from './admin-root.js';
 
 const GLOBAL_CACHE = path.join(os.homedir(), '.koi', 'plugins', 'cache');
 const GLOBAL_CONFIG = path.join(os.homedir(), '.koi', 'plugins', 'plugins.json');
+
+// Scope rank — higher number wins. Admin sits above project so a
+// developer hacking on `koi-language/plugins` next to their koi-cli
+// checkout sees their in-progress version everywhere, no install step
+// required. Project still overrides global for end-users without an
+// admin checkout.
+const SCOPE_RANK = { global: 1, project: 2, admin: 3 };
 
 class PluginManager {
   constructor() {
@@ -54,10 +62,45 @@ class PluginManager {
       this._scanDir(projectPlugins, 'project');
     }
 
-    // 3. Load enabled state from config
+    // 3. Admin plugins — highest priority. The koi-language/plugins
+    //    repo (when present next to koi-cli) is the source of truth
+    //    for in-development plugins. Each subdir is a plugin and has
+    //    no `plugin.json` — we synthesize one from the directory name
+    //    in `_scanAdminDir`.
+    const adminRoot = detectAdminPluginsRoot();
+    if (adminRoot) {
+      this._scanAdminDir(adminRoot);
+    }
+
+    // 4. Load enabled state from config
     this._loadConfig();
 
     channel.log('plugins', `Loaded ${this._plugins.size} plugin(s), ${this._activePlugins.size} active`);
+  }
+
+  /// Variant of `_scanDir` for admin plugins. The marketplace repo
+  /// stores plugins as plain directories (no .koi-plugin/plugin.json),
+  /// so we register each subdir with a synthesized meta whose id is
+  /// the directory name. Capability detection (skills/, workflows/,
+  /// agents/, mcp/, …) still works because `_detectCapabilities` walks
+  /// the dir directly.
+  _scanAdminDir(baseDir) {
+    if (!fs.existsSync(baseDir)) return;
+    for (const entry of fs.readdirSync(baseDir)) {
+      if (entry.startsWith('.')) continue;
+      const pluginDir = path.join(baseDir, entry);
+      let stat;
+      try { stat = fs.statSync(pluginDir); } catch { continue; }
+      if (!stat.isDirectory()) continue;
+      // Honor a real plugin.json if one is committed in the repo
+      // (future-proofing — none of today's admin plugins have one).
+      const meta = this._readPluginJson(pluginDir) || {
+        id: entry,
+        name: entry,
+        version: '0.0.0-admin',
+      };
+      this._registerPlugin(meta, pluginDir, 'admin');
+    }
   }
 
   _scanDir(baseDir, scope) {
@@ -130,9 +173,14 @@ class PluginManager {
       meta,
     };
 
-    // Project scope overrides global
+    // Rank-aware override: higher SCOPE_RANK wins. Without this, a
+    // global plugin would silently shadow an admin checkout because
+    // global is scanned first and the old `scope === 'project'` check
+    // didn't know about admin at all.
     const existing = this._plugins.get(id);
-    if (!existing || scope === 'project') {
+    const incomingRank = SCOPE_RANK[scope] ?? 0;
+    const existingRank = existing ? (SCOPE_RANK[existing.scope] ?? 0) : -1;
+    if (incomingRank >= existingRank) {
       this._plugins.set(id, entry);
     }
   }

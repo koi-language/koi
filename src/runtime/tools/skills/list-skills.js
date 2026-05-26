@@ -5,13 +5,20 @@
  * and returns a catalog of available skills with name, description, and location.
  *
  * Discovery paths:
- *   - Global: ~/.koi/skills/
- *   - Project-level: <projectRoot>/.koi/skills/  (overrides global)
+ *   - Global:      ~/.koi/skills/
+ *   - Project:     <projectRoot>/.koi/skills/         (overrides global)
+ *   - Admin:       <pluginsRepo>/plugins/<plugin>/skills/  (overrides project)
+ *
+ * Admin scope only applies when running with a checkout of the
+ * `koi-language/plugins` marketplace repo next to the koi-cli source
+ * (or when `KOI_PLUGINS_REPO_PATH` is set). For end-user installs the
+ * admin tier is silently empty.
  */
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { listAdminPluginDirs } from '../../plugins/admin-root.js';
 
 /**
  * Parse YAML frontmatter from a SKILL.md file.
@@ -127,6 +134,19 @@ export default {
     const projectSkills = scanSkillsDirectory(projectDir);
     for (const skill of projectSkills) {
       allSkills.set(skill.name, { ...skill, scope: 'project' });
+    }
+
+    // 3. Admin-level skills: each admin plugin contributes the skills
+    //    inside its own `<plugin>/skills/` subdir. Writes go LAST so
+    //    admin entries override project + global by virtue of Map
+    //    insertion order. No-op on end-user installs where the admin
+    //    tier doesn't exist.
+    for (const p of listAdminPluginDirs()) {
+      const skillsRoot = path.join(p.dir, 'skills');
+      const adminSkills = scanSkillsDirectory(skillsRoot);
+      for (const skill of adminSkills) {
+        allSkills.set(skill.name, { ...skill, scope: 'admin', plugin: p.id });
+      }
     }
 
     if (allSkills.size === 0) {

@@ -9,12 +9,18 @@
  *
  * Discovery paths:
  *   - Global:        ~/.koi/workflows/
- *   - Project-level: <projectRoot>/.koi/workflows/  (overrides global)
+ *   - Project-level: <projectRoot>/.koi/workflows/         (overrides global)
+ *   - Admin:         <pluginsRepo>/plugins/<plugin>/workflows/  (overrides project)
+ *
+ * Admin tier is only active when the koi-language/plugins repo is
+ * present next to the koi-cli source (or `KOI_PLUGINS_REPO_PATH` is
+ * set). End-user installs have no admin tier.
  */
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { listAdminPluginDirs } from '../plugins/admin-root.js';
 
 function parseFrontmatter(content) {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
@@ -74,8 +80,8 @@ function scanDir(dirPath, scope) {
   return out;
 }
 
-/** Return the merged workflow catalog. Project-level entries override
- *  global entries with the same `name`. Each entry has at least
+/** Return the merged workflow catalog. Admin entries override project,
+ *  project entries override global. Each entry has at least
  *  `{ name, description, location, directory, scope }`. */
 export function listWorkflowsCatalog() {
   const merged = new Map();
@@ -84,6 +90,14 @@ export function listWorkflowsCatalog() {
   const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
   const projectDir = path.join(projectRoot, '.koi', 'workflows');
   for (const wf of scanDir(projectDir, 'project')) merged.set(wf.name, wf);
+  // Admin tier — each plugin's own `workflows/` subdir. Last write
+  // wins, so admin overrides project + global.
+  for (const p of listAdminPluginDirs()) {
+    const adminWfDir = path.join(p.dir, 'workflows');
+    for (const wf of scanDir(adminWfDir, 'admin')) {
+      merged.set(wf.name, { ...wf, plugin: p.id });
+    }
+  }
   return Array.from(merged.values());
 }
 
