@@ -684,6 +684,25 @@ export class GatewayImageGen extends BaseImageGen {
       if (opts.outputFormat) payload.output_format = opts.outputFormat;
       // resolution/quality are passed through to the Fal model as-is.
       if (opts.resolution) payload.resolution = opts.resolution;
+      // Quality knob — separate from resolution (pixel count). Used by
+      // openai/gpt-image-2(-edit); fal slugs that don't expose an
+      // equivalent ignore it. Forwarded only when the caller set it
+      // explicitly so unset → adapter falls back to deriving quality
+      // from resolution (legacy behaviour).
+      if (typeof opts.quality === 'string') {
+        const q = opts.quality.toLowerCase();
+        if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') {
+          payload.quality = q;
+        }
+      }
+      // Seed propagation — fal image adapters (flux, seedream, etc)
+      // expose a `seed` parameter that locks the noise tensor; reusing
+      // the same seed across sibling calls keeps character / style
+      // consistency stable. Forward when explicitly set; otherwise
+      // omit so the provider rolls a fresh seed.
+      if (typeof opts.seed === 'number' && Number.isFinite(opts.seed)) {
+        payload.seed = Math.floor(opts.seed);
+      }
 
       if (opts.referenceImages?.length) {
         payload.reference_images = opts.referenceImages.map(ref => ({

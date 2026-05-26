@@ -134,6 +134,7 @@ const generateImageAction = {
       prompt:          { type: 'string', description: 'Text description of the desired image. MANDATORY: write the prompt in English regardless of the user\'s language — image models are trained predominantly on English captions and degrade noticeably with non-English prompts. The ONLY exception is text the image itself must literally render (a sign, a label, dialogue in a speech bubble, on-screen UI copy): keep that verbatim in the user\'s language, wrapped in quotes inside the otherwise-English prompt. When you use named reference images, you can refer to them by alias in the prompt (e.g. "Paint the `illustration` onto the `boat`\'s hull, matching `placement_guide`") — far more precise than "FIRST/SECOND/THIRD reference".' },
       aspectRatio:     { type: 'string', description: 'Aspect ratio — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
       resolution:      { type: 'string', description: 'Resolution — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
+      quality:         { type: 'string', enum: ['low', 'medium', 'high', 'auto'], description: 'OPTIONAL. Sampling effort, decoupled from pixel count. Lower quality = faster + cheaper, less polished. Used today by `openai/gpt-image-2`(-edit); fal slugs that have no equivalent knob ignore it. Use "low" for thumbnails / storyboards / quick iteration, "medium" for general work, "high" for finals. "auto" lets the adapter pick. Omit entirely to fall back to the adapter\'s legacy behaviour (which derives quality from `resolution`).' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
       referenceImages: {
         type: 'array',
@@ -790,6 +791,25 @@ const generateImageAction = {
     if (effectiveResolution) genOpts.resolution = effectiveResolution;
     if (action.n && action.n > 1) genOpts.n = action.n;
     if (action.label) genOpts.label = action.label;
+    // Forward `quality` to the gateway — sampling-effort knob,
+    // decoupled from `resolution` (pixel count). Currently consumed
+    // by openai/gpt-image-2(-edit); other slugs ignore it. Used by
+    // the storyboard visor to render small thumbnails at LOW
+    // sampling effort without dragging pixel count down too.
+    if (typeof action.quality === 'string') {
+      const q = action.quality.toLowerCase();
+      if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') {
+        genOpts.quality = q;
+      }
+    }
+    // Forward `seed` to the gateway so character consistency across
+    // sibling generations (storyboard shots that share a hero, video
+    // frame variants, etc) is achievable. Fal models that accept a
+    // seed will reuse the same noise tensor when the same seed is
+    // passed; models that ignore it fall through silently.
+    if (typeof action.seed === 'number' && Number.isFinite(action.seed)) {
+      genOpts.seed = Math.floor(action.seed);
+    }
     // `intent` is the picker's primary signal (see
     // pickImageModel). outpaint_image passes 'outpaint' here so the
     // router routes to the `image_extend` bucket instead of the
