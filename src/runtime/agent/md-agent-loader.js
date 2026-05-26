@@ -19,6 +19,7 @@
 import fs from 'fs';
 import path from 'path';
 import { channel } from '../io/channel.js';
+import { listAdminPluginDirs } from '../plugins/admin-root.js';
 
 let _userAgentsTeam = null;
 let _initialized = false;
@@ -32,7 +33,9 @@ export async function initUserAgents() {
   _initialized = true;
   const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
   const dir = path.join(projectRoot, '.koi', 'agents');
-  if (!fs.existsSync(dir)) return;
+  const adminPlugins = listAdminPluginDirs();
+  const hasAdmin = adminPlugins.length > 0;
+  if (!fs.existsSync(dir) && !hasAdmin) return;
 
   // Lazy imports to avoid circular dependency chains
   const [{ Agent }, { Role }, { Team }] = await Promise.all([
@@ -41,8 +44,20 @@ export async function initUserAgents() {
     import('../team.js'),
   ]);
 
+  // Scan order: project first, then admin. `_scanRecursive` adds to
+  // `members` and OVERWRITES existing keys — so admin agents end up
+  // shadowing same-named project agents. Same priority story as
+  // skills and workflows.
   const members = {};
-  _scanRecursive(dir, members, Agent, Role);
+  if (fs.existsSync(dir)) {
+    _scanRecursive(dir, members, Agent, Role);
+  }
+  for (const p of adminPlugins) {
+    const adminAgentsDir = path.join(p.dir, 'agents');
+    if (fs.existsSync(adminAgentsDir)) {
+      _scanRecursive(adminAgentsDir, members, Agent, Role);
+    }
+  }
 
   if (Object.keys(members).length === 0) return;
 
@@ -58,7 +73,7 @@ export async function initUserAgents() {
     channel.log('agent', `[md-agent-loader] Router registration failed: ${err.message}`);
   }
 
-  channel.log('agent', `[md-agent-loader] Loaded ${Object.keys(members).length} user agent(s) from ${dir}`);
+  channel.log('agent', `[md-agent-loader] Loaded ${Object.keys(members).length} user agent(s) (project=${dir}${hasAdmin ? `, admin=${adminPlugins.length} plugin(s)` : ''})`);
 }
 
 /**
