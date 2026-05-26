@@ -211,7 +211,15 @@ export default {
         { title: t('permYes'),  value: 'yes' },
         { title: `${t('permAlwaysAllow')} (${_dirBase}/)`, value: 'always' },
         { title: t('permNo'),   value: 'no' }
-      ], 0, { meta: { type: 'bash', header: `${agentName} ${t('wantsToSearch')}`.replace(':', ''), command: `Search(${searchDir})` } });
+      ], 0, { meta: {
+        type: 'bash',
+        header: `${agentName} ${t('wantsToSearch')}`.replace(':', ''),
+        command: `Search(${searchDir})`,
+        // READ category → dialog title reads "Allow Braxil to read
+        // files…" instead of the generic "run a command on your
+        // computer?".
+        permissionCategory: 'READ',
+      } });
 
       if (value === 'always') {
         permissions.allow(searchDir, 'read');

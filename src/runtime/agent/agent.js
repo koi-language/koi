@@ -4552,7 +4552,17 @@ export class Agent {
         { title: _t('permYes', 'Yes'),  value: 'yes' },
         { title: `${_t('permAlwaysAllow', 'Always allow')} (${_dirBase}/)`, value: 'always' },
         { title: _t('permNo', 'No'),   value: 'no' }
-      ], 0, { meta: { type: 'bash', header: _header, command: dir } });
+      ], 0, { meta: {
+        type: 'bash',
+        header: _header,
+        command: dir,
+        // Tag the category so the GUI renders the correct headline
+        // ("Allow Braxil to read/write files in your project?") with
+        // the proper icon. Without this, the card falls back to the
+        // generic "Allow Braxil to run a command on your computer?"
+        // and shows the bare directory path as if it were a shell exec.
+        permissionCategory: level === 'write' ? 'WRITE' : 'READ',
+      } });
 
       if (value === 'yes' || value === 'always') {
         permissions.allow(dir, level);

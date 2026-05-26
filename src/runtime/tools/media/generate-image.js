@@ -214,19 +214,26 @@ const generateImageAction = {
       if (_guard) return _guard;
     }
 
-    // Strip agent-supplied `model` — auto-picker decides. See the
-    // matching block in generate-video.js for the full rationale;
-    // tl;dr the agent pinning a slug routinely lands on something
-    // whose shape doesn't match the request (e.g. gpt-image-2 for
-    // an explicit prompt → content-policy reject). Use
-    // excludeModels / includeModels / label to bias instead.
+    // Model selection policy:
+    //   • Explicit caller-supplied `model` (e.g. "fal/flux/schnell") ALWAYS
+    //     wins — programmatic clients (Flutter GUI, internal delegators,
+    //     scripted runs) have specific reasons to pin a slug (fastest model
+    //     for storyboard iteration, cheapest for batch, a model whose output
+    //     style matches the surrounding artefact). The previous behaviour
+    //     here stripped the field defensively, which made the explicit-pin
+    //     semantics quietly unreliable. If the slug isn't in the active
+    //     catalog the gateway returns a hard error and the caller learns;
+    //     that's healthier than silently swapping the model.
+    //   • `model: 'auto'` (or omitted) → auto-picker drives the selection
+    //     based on aspectRatio / resolution / refsCount / label.
+    //   • Agents that hallucinate slugs will now see real errors. The
+    //     correct guidance for the LLM is still: bias with
+    //     excludeModels / includeModels / label rather than pinning.
     if (action.model && action.model !== 'auto') {
       channel.log(
         'image',
-        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
-        `Use excludeModels / includeModels / label to bias instead.`,
+        `Honoring caller-supplied model="${action.model}" (explicit pin wins over auto-picker).`,
       );
-      action.model = undefined;
     }
 
     const prompt = action.prompt;
@@ -264,20 +271,19 @@ const generateImageAction = {
     // Get clients from the agent's LLM provider
     const clients = agent?.llmProvider?.getClients?.() || {};
 
-    // Resolve image provider. The picker is the sole decider: it chooses the
-    // concrete model from the active catalog based on the agent's parameters
-    // (aspectRatio, resolution, refsCount, label). `action.model`, even if an
-    // agent sneaks it into the JSON, is intentionally NOT forwarded — an
-    // agent-invented slug can be inactive, unavailable to the user, or
-    // mispriced, and the catalog is the only authoritative source.
-    // `excludeProviders` IS forwarded because it is set by the Coordinator on
-    // retry (not by the agent) after a BlockedResult — it tells the picker
-    // which provider family just failed so a different one is picked next.
+    // Resolve image provider. When the caller pinned a model the resolver
+    // forwards that slug straight to the gateway (see `_resolveImage` in
+    // `factory.js`); otherwise the picker chooses from the active catalog
+    // based on aspectRatio / resolution / refsCount / label. `excludeProviders`
+    // is set by the Coordinator on retry (not by the agent) after a
+    // BlockedResult — it tells the picker which provider family just failed
+    // so a different one is picked next.
     let resolved;
     try {
       resolved = resolveModel({
         type: 'image',
         clients,
+        model: action.model,
         excludeProviders: Array.isArray(action.excludeProviders) ? action.excludeProviders : undefined,
       });
     } catch (err) {
