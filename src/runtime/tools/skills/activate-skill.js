@@ -15,7 +15,6 @@ export default {
   description: 'Activate a skill by name. Reads its SKILL.md instructions and adds it to active skills. Fields: "name" (required). → Returns: { activated, name, content, directory, resources }',
   thinkingHint: (action) => `Activating skill: ${action.name || '...'}`,
   permission: null,
-  hidden: true,
 
   schema: {
     type: 'object',

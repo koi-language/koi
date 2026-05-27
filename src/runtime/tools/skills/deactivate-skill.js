@@ -9,7 +9,6 @@ export default {
   description: 'Deactivate an active skill by name. Fields: "name" (required). → Returns: { deactivated, name, activeSkills }',
   thinkingHint: (action) => `Deactivating skill: ${action.name || '...'}`,
   permission: null,
-  hidden: true,
 
   schema: {
     type: 'object',

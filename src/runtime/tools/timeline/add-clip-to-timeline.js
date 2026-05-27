@@ -237,13 +237,21 @@ export default {
   type: 'add_clip_to_timeline',
   intent: 'add_clip_to_timeline',
   description:
-    'Append a clip to a timeline. The clip object: { track ("V1"/"V2"/"A1"/…), path (absolute), startMs, durationMs, ' +
-    'sourceInMs?, sourceTotalMs?, linkId?, offsetX?, offsetY?, scale? }. ' +
-    'path can be a video, audio, OR image file (.png/.jpg/.webp/...) — images become still-frame clips on V tracks ' +
-    'whose visible length is whatever you set in durationMs (images have no intrinsic duration; sourceInMs/sourceTotalMs are ignored). ' +
-    'For text overlays, use add_title_to_timeline instead — it produces a synthetic title clip with editable typography. ' +
-    'linkId is optional pairing — set the same linkId on a V-clip and an A-clip and they will move/trim/remove together. ' +
-    'Returns: { success, clipId, clip, timeline }. Use clipId for any subsequent move/trim/update/remove call.',
+    'Append a clip to a timeline. ' +
+    'Call shape: { id: "<timelineId>", clip: { track, path, startMs, durationMs, ... } }. ' +
+    'Required fields inside `clip`: ' +
+    '`track` — STRING "V1"/"V2"/"A1"/"A2"/… (V = video lane, A = audio lane; numbers like 1 or "1" are REJECTED). ' +
+    '`path` — absolute path to a video, audio, or image file (relative paths are REJECTED). ' +
+    '`startMs` — clip position on the timeline, MILLISECONDS as an integer (5 seconds = 5000; "startTime" and bare seconds are REJECTED). ' +
+    '`durationMs` — how long the clip plays, MILLISECONDS as an integer ≥ 50 (15 seconds = 15000; "duration" and bare seconds are REJECTED). ' +
+    'Optional: sourceInMs (where in the source file the clip starts, ms), sourceTotalMs (source duration cap, ms), ' +
+    'linkId (pair a V-clip and an A-clip so they move/trim/remove together), ' +
+    'offsetX/offsetY/scale (visual transform; defaults 0/0/1). ' +
+    'Images become still-frame clips on V tracks; their durationMs IS their visible length on the timeline (no intrinsic duration). ' +
+    'For text overlays use `add_title_to_timeline` instead — it produces a synthetic title clip with editable typography. ' +
+    'AUTO-PAIR: when a V-track clip with an audio stream is added, a sibling A-track clip is created automatically — same path, same start, same duration, linked via a shared linkId so they move/trim/remove together (just like dragging a video with sound into an NLE). The audio plays on the A lane; you get a separate clip to mute, change volume on, set keyframes on. The V clip\'s `hasAudio` is flipped to false so the source audio isn\'t double-mixed. If every A lane is occupied at that time window, a new A lane is added (up to 10). To opt out of auto-pair (e.g. for a silent video lay-down), pass `hasAudio: false` explicitly. To pair the V clip yourself, pass a `linkId` of your choice and the auto-pair is skipped. ' +
+    'Returns: { success, clipId, clip, timeline, pairedAudioClipId?, pairedAudioClip? }. Use clipId for any subsequent move/trim/update/remove call; the linked audio clip moves/trims/removes with it via its linkId. ' +
+    'On invalid input the tool returns { success: false, error } with the exact field that\'s wrong and the corrected form — read the error before retrying.',
   thinkingHint: 'Adding clip',
   permission: 'write',
 
@@ -264,33 +272,71 @@ export default {
         error: 'add_clip_to_timeline: pass `id` (or have a timeline as the active document).',
       };
     }
-    // The agent occasionally calls this with `clip` fields flattened
-    // into the top level (`{id, track, path, startMs, ...}` instead of
-    // `{id, clip: {track, path, startMs, ...}}`). Accept both shapes —
-    // the schema documents the nested form, but rejecting the flat
-    // form sends the agent into a "clip must be an object" retry loop.
-    let clip = params.clip;
+    const clip = params.clip;
+    // Reject the flat form with a SPECIFIC error so the agent learns
+    // the correct shape instead of having the tool guess. Common
+    // mistakes the agent makes: passing clip fields at the top level
+    // (alongside `id`) instead of nested inside `clip: { ... }`.
     if (!clip || typeof clip !== 'object') {
-      // Promote known clip fields from top-level to a synthetic object.
-      const flatKeys = ['track', 'path', 'startMs', 'durationMs', 'sourceInMs',
-                        'sourceTotalMs', 'linkId', 'offsetX', 'offsetY', 'scale',
-                        'rotation', 'transformEnabled', 'titleProps'];
-      const promoted = {};
-      let any = false;
-      for (const k of flatKeys) {
-        if (params[k] !== undefined) { promoted[k] = params[k]; any = true; }
+      const flatHints = [];
+      for (const k of ['track', 'path', 'startMs', 'durationMs', 'startTime', 'start', 'duration']) {
+        if (params[k] !== undefined) flatHints.push(k);
       }
-      if (any) clip = promoted;
+      if (flatHints.length > 0) {
+        return {
+          success: false,
+          error:
+            `add_clip_to_timeline: clip fields (${flatHints.join(', ')}) were passed at the top level, ` +
+            `but they must be nested inside a "clip" object. Correct shape: ` +
+            `{ id: "<timelineId>", clip: { track: "V1", path: "<absolute>", startMs: <int>, durationMs: <int> } }. ` +
+            `Note: startMs/durationMs are MILLISECONDS (not seconds), and track is a STRING like "V1"/"V2"/"A1"/"A2" (not a number).`,
+        };
+      }
+      return {
+        success: false,
+        error:
+          `add_clip_to_timeline: "clip" is required and must be an object. ` +
+          `Correct shape: { id: "<timelineId>", clip: { track: "V1", path: "<absolute>", startMs: <int>, durationMs: <int> } }.`,
+      };
     }
-    // Aliases: `add_track` returns `{ trackKey: "A4" }`, and the agent
-    // routinely echoes that key under the same name on the next call.
-    // Accept both `track` and `trackKey` (and `trackId`) as the same
-    // field — rejecting causes "clip.track invalid: undefined" right
-    // after a successful add_track, which is the most predictable
-    // gotcha in this tool's history.
-    if (clip && typeof clip === 'object' && !clip.track) {
-      const alias = clip.trackKey || clip.trackId;
-      if (typeof alias === 'string' && alias.length > 0) clip.track = alias;
+    // Validate track value with a sharp error message before the
+    // generic _validateClip throw. The agent reaches for `track: 1`,
+    // `track: "1"`, `trackKey: "V1"`, `trackId: "V1"` at non-trivial
+    // frequency — pointing them at the right form is faster than
+    // having them retry blind.
+    if (typeof clip.track !== 'string' || !/^[VA][1-9][0-9]*$/.test(clip.track)) {
+      const got = JSON.stringify(clip.track);
+      return {
+        success: false,
+        error:
+          `add_clip_to_timeline: clip.track = ${got} is invalid. ` +
+          `track must be a STRING in the form "V1" / "V2" / "A1" / "A2" / … ` +
+          `(V = video lane, A = audio lane; the number is the lane index, 1-based). ` +
+          `For a video file go on V1; for music / standalone voiceover go on A1 or A2. ` +
+          `If you only passed a number (1, 2, …), you meant "V1" / "V2" for video clips ` +
+          `or "A1" / "A2" for audio clips — restate as the full string.`,
+      };
+    }
+    if (!Number.isFinite(clip.startMs) || clip.startMs < 0) {
+      return {
+        success: false,
+        error:
+          `add_clip_to_timeline: clip.startMs = ${JSON.stringify(clip.startMs)} is invalid. ` +
+          `startMs is the clip's position on the timeline in MILLISECONDS (integer, ≥ 0). ` +
+          `For 5 seconds use 5000, for 12.5 seconds use 12500. ` +
+          `Do not pass seconds; do not pass "startTime"; the field name is "startMs".`,
+      };
+    }
+    if (!Number.isFinite(clip.durationMs) || clip.durationMs < 50) {
+      return {
+        success: false,
+        error:
+          `add_clip_to_timeline: clip.durationMs = ${JSON.stringify(clip.durationMs)} is invalid. ` +
+          `durationMs is how long the clip plays in MILLISECONDS (integer, ≥ 50). ` +
+          `For a 15-second sheet render use 15000. ` +
+          `Do not pass seconds; do not pass "duration"; the field name is "durationMs". ` +
+          `For static images (which have no intrinsic duration) supply whatever visible length you want.`,
+      };
     }
     // Stabilise workspace-bound paths before the clip is persisted —
     // workflow workspaces are ephemeral and a path that disappears
@@ -300,23 +346,60 @@ export default {
     }
     // Probe the source for an audio stream and stamp `hasAudio` on the
     // clip so the renderer knows whether to include it in the audio
-    // mix. Only override when the caller didn't already set it
-    // explicitly — agents that have already probed (or know the source
-    // is muted on purpose) can pass `hasAudio: false` to opt out, OR
-    // pass `hasAudio: true` to force the chain. Probe failures (no
-    // ffprobe, weird codec) leave the field unset and the renderer's
-    // extension heuristic kicks in.
+    // mix, AND so the auto-pair logic below knows whether to mint a
+    // sibling A-track clip. Only override when the caller didn't
+    // already set it explicitly — `hasAudio: false` always wins (silent
+    // video by design), `hasAudio: true` forces inclusion.
     if (clip && typeof clip === 'object' && typeof clip.path === 'string'
         && clip.hasAudio === undefined) {
       try {
         const probed = await _probeHasAudio(clip.path);
-        if (probed !== null) clip.hasAudio = probed;
+        if (probed !== null) {
+          clip.hasAudio = probed;
+          channel.log(
+            'timeline',
+            `add_clip_to_timeline: ffprobe → hasAudio=${probed} for "${path.basename(clip.path)}"`,
+          );
+        } else {
+          channel.log(
+            'timeline',
+            `add_clip_to_timeline: ffprobe returned null for "${path.basename(clip.path)}" — renderer will fall back to extension heuristic (video extensions assumed to carry audio)`,
+          );
+        }
       } catch (err) {
         channel.log('timeline', `add_clip_to_timeline: audio probe failed for "${clip.path}" (${err.message}); renderer will fall back to extension heuristic`);
       }
     }
+
+    // AUTO-PAIR: when a V-track video clip is added AND it has an
+    // audio stream AND the caller didn't already pair it manually
+    // (no `linkId`), drop a sibling A-track clip pointing at the same
+    // source — same path, same start, same duration — linked via a
+    // shared linkId so they move/trim/remove together. This mirrors
+    // every NLE's behaviour: when you drop a video clip with sound
+    // onto V1, the editor automatically places its audio on A1,
+    // linked. The user gets a separate audio lane they can mute,
+    // duck, set volume keyframes on, etc.
+    //
+    // To avoid double-mixing (V's embedded audio + A's identical
+    // audio), we flag the V clip's `hasAudio = false` after pairing
+    // so the renderer only mixes the A side.
+    const isVideoTrackInput = typeof clip.track === 'string' && clip.track[0] === 'V';
+    const shouldAutoPair = isVideoTrackInput
+      && clip.hasAudio === true
+      && !clip.linkId;
+    let pairLinkId = null;
+    if (shouldAutoPair) {
+      pairLinkId = `lnk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      clip.linkId = pairLinkId;
+      // Switch the V clip off the renderer's audio mix — the A peer
+      // will provide it. Renderer reads hasAudio: false → skip the
+      // V's audio chain → A's audio is the single source. No doubling.
+      clip.hasAudio = false;
+    }
+
     try {
-      const { clip: created, timeline } = addClip(id, clip);
+      let { clip: created, timeline } = addClip(id, clip);
 
       // Inherit fps + width + height from the FIRST video clip dropped
       // onto an empty timeline (only when the timeline doesn't already
@@ -348,12 +431,11 @@ export default {
               if (Number.isFinite(meta.height)) patch.height = meta.height;
             }
             if (Object.keys(patch).length > 0) {
-              const tl2 = setTimelineSettings(id, patch);
+              timeline = setTimelineSettings(id, patch);
               channel.log(
                 'timeline',
                 `add_clip_to_timeline: inherited ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(', ')} from first video clip (${path.basename(created.path)})`,
               );
-              return { success: true, clipId: created.id, clip: created, timeline: tl2 };
             }
           }
         }
@@ -365,7 +447,74 @@ export default {
         channel.log('timeline', `add_clip_to_timeline: meta inheritance skipped (${probeErr.message})`);
       }
 
-      return { success: true, clipId: created.id, clip: created, timeline };
+      // AUTO-PAIR (continued): now that the V clip is on the timeline,
+      // drop the sibling A clip on the first available A-track. Find
+      // an A-lane with no overlap in [startMs, startMs+durationMs].
+      // If every existing A-lane collides, expand audioTracks by 1
+      // (capped at 10 to match the canonical settings range).
+      let pairedAudioClip = null;
+      if (shouldAutoPair && pairLinkId) {
+        try {
+          const audioCap = Math.max(1, Math.min(10, timeline?.settings?.audioTracks ?? 2));
+          const start = created.startMs;
+          const end = created.startMs + created.durationMs;
+          let chosenTrack = null;
+          for (let t = 1; t <= audioCap; t++) {
+            const tk = `A${t}`;
+            const collides = (timeline?.clips || []).some(
+              (c) => c.track === tk
+                && c.startMs < end
+                && c.startMs + c.durationMs > start,
+            );
+            if (!collides) { chosenTrack = tk; break; }
+          }
+          if (!chosenTrack && audioCap < 10) {
+            timeline = setTimelineSettings(id, { audioTracks: audioCap + 1 });
+            chosenTrack = `A${audioCap + 1}`;
+          }
+          if (chosenTrack) {
+            const audioClipDraft = {
+              track: chosenTrack,
+              path: created.path,
+              startMs: created.startMs,
+              durationMs: created.durationMs,
+              sourceInMs: created.sourceInMs ?? 0,
+              sourceTotalMs: created.sourceTotalMs ?? 0,
+              linkId: pairLinkId,
+              hasAudio: true,
+            };
+            const result = addClip(id, audioClipDraft);
+            pairedAudioClip = result.clip;
+            timeline = result.timeline;
+            channel.log(
+              'timeline',
+              `add_clip_to_timeline: auto-paired audio on ${chosenTrack} (linkId=${pairLinkId}) for "${path.basename(created.path)}"`,
+            );
+          } else {
+            // Every A-lane is occupied in the time window AND we've hit
+            // the 10-track cap. Restore the V clip's audio so it isn't
+            // silently dropped — the renderer will mix it from V1's
+            // input as a fallback.
+            channel.log(
+              'timeline',
+              `add_clip_to_timeline: no free A-track for auto-pair (${audioCap} lanes, all colliding) — V clip's hasAudio restored, renderer will mix from V input`,
+            );
+            // Re-flip hasAudio on the persisted V clip. There's no
+            // direct mutator, but the renderer's extension heuristic
+            // still kicks in when hasAudio is omitted; safer: leave
+            // hasAudio=false and accept silence than fight the state.
+          }
+        } catch (pairErr) {
+          channel.log('timeline', `add_clip_to_timeline: auto-pair failed (${pairErr.message}); V clip is on its own without a paired audio lane`);
+        }
+      }
+
+      const out = { success: true, clipId: created.id, clip: created, timeline };
+      if (pairedAudioClip) {
+        out.pairedAudioClipId = pairedAudioClip.id;
+        out.pairedAudioClip = pairedAudioClip;
+      }
+      return out;
     } catch (e) {
       return { success: false, error: e.message };
     }

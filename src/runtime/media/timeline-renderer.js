@@ -29,6 +29,7 @@
  */
 
 import path from 'node:path';
+import { channel } from '../io/channel.js';
 
 const _XFADE_MAP = {
   crossfade: 'fade',
@@ -180,9 +181,24 @@ export function compileTimeline(timeline, params = {}) {
   // failing the whole render. The skip below is the deterministic path;
   // `?` is the belt-and-braces.
   const audioLabels = [];
+  // Diagnostic accumulator — emit one log line per clip's audio decision
+  // so the recurring "el sonido del clip no se ha añadido" bug is
+  // debuggable from the channel log instead of guesswork.
+  const audioDecisions = [];
   for (const clip of clips) {
-    if (!_clipAudibleInRange(clip, range)) continue;
-    if (!_clipHasAudioSource(clip)) continue;
+    const audible = _clipAudibleInRange(clip, range);
+    const hasSrc = _clipHasAudioSource(clip);
+    if (!audible || !hasSrc) {
+      audioDecisions.push(
+        `${clip.track}:${path.basename(String(clip.path || '<no path>'))}` +
+        ` — SKIPPED (audibleInRange=${audible}, hasAudioSource=${hasSrc}, hasAudio=${clip.hasAudio})`,
+      );
+      continue;
+    }
+    audioDecisions.push(
+      `${clip.track}:${path.basename(String(clip.path || '<no path>'))}` +
+      ` — INCLUDED (hasAudio=${clip.hasAudio})`,
+    );
     const i = clipInputIndex.get(clip.id);
     const lbl = `[a${_safe(clip.id)}]`;
     const trimmedDelay = Math.max(0, clip.startMs - range.startMs);
@@ -196,6 +212,15 @@ export function compileTimeline(timeline, params = {}) {
       `,apad=whole_dur=${baseDurSec}${lbl}`,
     );
     audioLabels.push(lbl);
+  }
+  // Emit the per-clip audio decision summary. One line, indented, easy
+  // to spot in the channel log when audio comes out wrong.
+  if (audioDecisions.length > 0) {
+    channel.log(
+      'timeline',
+      `render: audio mix decisions (${audioLabels.length}/${audioDecisions.length} included):\n  - ` +
+      audioDecisions.join('\n  - '),
+    );
   }
   let finalAudioLabel = null;
   if (settings.audioCodec !== 'none') {

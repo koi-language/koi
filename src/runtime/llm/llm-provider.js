@@ -818,12 +818,15 @@ export class LLMProvider {
         }
       }
       const _catalogBlock = _skillCatalog.length > 0
-        ? '\n\n# Available Skills\n\n'
-          + 'These skills exist on disk. Each one is identified by name+description. '
-          + 'The FULL body of a skill is NOT in context until you call '
-          + '`activate_skill({ name })` — that loads its instructions into the '
+        ? '\n\n## AVAILABLE SKILLS\n\n'
+          + 'These skills exist on disk. Each one is identified by name + description. '
+          + 'The FULL body of a skill is NOT in context until you load it with the '
+          + '`activate_skill` intent; that loads its instructions into the '
           + '`# Active Skill Instructions` block below. Skills already loaded are '
           + 'marked with ✓.\n\n'
+          + 'Tools to manage skills:\n'
+          + ' - **activate_skill** — load a skill\'s body into context. In: { "name" }\n'
+          + ' - **deactivate_skill** — remove a loaded skill\'s body from context. In: { "name" }\n\n'
           + 'WHEN TO ACTIVATE A SKILL (read the descriptions carefully):\n'
           + '1. PRIMARY — at the start of a task, scan the descriptions below and '
           + 'activate every skill whose description matches what the user is '
@@ -840,8 +843,8 @@ export class LLMProvider {
           + 'Skills carry project-specific conventions, gotchas, and recipes that you '
           + 'will not derive from general knowledge. If a description matches, activate.\n\n'
           + _skillCatalog
-              .map(s => `- ${_activeNames.has(s.name) ? '✓ ' : ''}${s.name}: ${s.description}`)
-              .join('\n')
+              .map(s => `### ${_activeNames.has(s.name) ? '✓ ' : ''}${s.name}\n${s.description}`)
+              .join('\n\n')
         : '';
 
       const _activeBlock = _activeNames.size > 0

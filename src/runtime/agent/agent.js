@@ -2524,6 +2524,33 @@ export class Agent {
         }
       }
 
+      // ── SAFETY: drop user-prompts from multi-action batches ────────────
+      // `prompt_user` / `prompt_form` / `prompt_files` are wait points —
+      // they block until the user replies. Batching them with other
+      // actions almost always assumes those other actions will succeed
+      // (and that the user wants to be asked something AFTER they ran).
+      // If one of the siblings fails, the prompt fires on broken state
+      // and the user sees "what next?" right after a silent error.
+      // Rule: when a prompt appears in a batch of length > 1, drop the
+      // prompt — execute the rest, and record a synthetic result so the
+      // agent learns to re-emit the prompt ALONE next iteration. Single-
+      // action batches (just `prompt_user`) are unaffected.
+      const _PROMPT_INTENTS = new Set(['prompt_user', 'prompt_form', 'prompt_files']);
+      const _skippedPrompts = [];
+      if (actionBatch.length > 1) {
+        for (let i = actionBatch.length - 1; i >= 0; i--) {
+          const intent = actionBatch[i]?.intent || actionBatch[i]?.type || '';
+          if (_PROMPT_INTENTS.has(intent)) {
+            _skippedPrompts.push(actionBatch[i]);
+            actionBatch.splice(i, 1);
+          }
+        }
+        if (_skippedPrompts.length > 0 && process.env.KOI_DEBUG_LLM) {
+          const _names = _skippedPrompts.map((a) => a.intent || a.type).join(', ');
+          console.error(`[Agent:${this.name}] ✂️  Dropped ${_skippedPrompts.length} prompt action(s) from a multi-action batch (${_names}) — prompts must be emitted alone.`);
+        }
+      }
+
       if (process.env.KOI_DEBUG_LLM && actionBatch.length > 1) {
         console.error(`[Agent:${this.name}] 📦 Batched ${actionBatch.length} actions`);
       }
@@ -3620,15 +3647,23 @@ export class Agent {
           // Update thinking hint based on what just happened
           if (result && result.success === false) {
             thinkingHint = _h('retrying', 'Retrying');
-            // Stop batch on failure for stateful actions — screen/page state
-            // diverged, so subsequent actions would operate on wrong state.
+            // Stop batch on ANY action returning success:false. The
+            // tail of a batch almost always assumes earlier actions
+            // succeeded — running `prompt_user` after a failed
+            // `add_clip_to_timeline` (the canonical bug this guard
+            // exists for), or `show_result` after a failed
+            // `write_file`, or `return` after a failed `edit_file`,
+            // are all bad UX: the user gets prompted / sees a result
+            // built on broken state. Surfacing the error in the next
+            // LLM iteration lets the agent correct course before any
+            // dependent action runs. Truly independent batches (N
+            // unrelated `task_create`s) lose one round-trip of
+            // efficiency in exchange — acceptable trade.
             const intent = action?.intent || '';
-            if (intent.startsWith('mobile_') || intent.startsWith('browser_')) {
-              if (process.env.KOI_DEBUG_LLM) {
-                console.error(`[Agent:${this.name}] ⛔ Action "${intent}" failed — stopping batch.`);
-              }
-              break;
+            if (process.env.KOI_DEBUG_LLM) {
+              console.error(`[Agent:${this.name}] ⛔ Action "${intent}" returned success:false — stopping batch.`);
             }
+            break;
           } else {
             thinkingHint = this._describeNextStep(action, result) || 'Thinking';
           }
@@ -3658,6 +3693,36 @@ export class Agent {
           thinkingHint = _h('rethinking', 'Rethinking');
           break;
         }
+      }
+
+      // Surface dropped prompts (see the SAFETY block at the top of the
+      // iteration). Inject one synthetic tool-result per skipped prompt
+      // so the next LLM iteration sees it and re-emits the prompt as
+      // its OWN batch instead of bundling it with stateful actions.
+      for (const _dp of _skippedPrompts) {
+        const _intent = _dp.intent || _dp.type || 'prompt_*';
+        const _q = typeof _dp.question === 'string'
+          ? _dp.question
+          : (typeof _dp.message === 'string' ? _dp.message : '');
+        const _ctx = _q ? ` (question was: "${_q.length > 120 ? _q.substring(0, 120) + '…' : _q}")` : '';
+        const _msg =
+          `⚠ ${_intent} was DROPPED because it appeared in a batch with other actions${_ctx}. ` +
+          `User-prompts are wait points — batching them with stateful actions like ` +
+          `add_clip_to_timeline / write_file / edit_file means the prompt would fire on ` +
+          `top of whatever state those actions left, including failures. ` +
+          `Re-emit the prompt ALONE in its own batch now that you can see the results of ` +
+          `the other actions you just ran.`;
+        try {
+          session.recordAction(_dp, { success: false, error: _msg, dropped: true });
+        } catch { /* non-fatal */ }
+        try {
+          contextMemory.add(
+            'user',
+            `❌ ${_intent} DROPPED: ${_msg}`,
+            `❌ ${_intent} dropped (batched with other actions)`,
+            null,
+          );
+        } catch { /* non-fatal */ }
       }
 
       // ── MOBILE LOOP GUARD ──────────────────────────────────────────────

@@ -258,6 +258,14 @@ class ActionRegistry {
       // toolset (or behind `get_tool_info`) meant the agent treated the
       // names as suggestion-only and defaulted to planner::do_plan.
       'describe_workflow', 'run_workflow',
+      // Skill management surfaces here too: the AVAILABLE SKILLS section
+      // of the prompt lists every skill by name + description and tells
+      // the agent to call `activate_skill` / `deactivate_skill`, but
+      // those intents would otherwise be hidden behind the `skills`
+      // toolset and require a `get_tool_info` round-trip first. Result:
+      // agents either fabricated the call shape ("get_tool_info('<skill-name>')")
+      // or narrated activation in prose without ever firing the tool.
+      'activate_skill', 'deactivate_skill',
     ]);
 
     // Media tools get a dedicated "always-visible with one-liner"

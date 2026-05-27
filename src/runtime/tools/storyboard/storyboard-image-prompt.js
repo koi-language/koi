@@ -91,20 +91,20 @@ GOLD-STANDARD EXAMPLES — match these exactly
 
 Text-only mode:
 
-A) "Rough storyboard sketch of a medium close-up of an old man's face gazing off-frame, lost in memory, gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+A) "Rough storyboard sketch of a medium close-up of an old man's face gazing off-frame, lost in memory, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-B) "Rough storyboard sketch of a wide establishing shot of a lone car driving down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+B) "Rough storyboard sketch of a wide establishing shot of a lone car driving down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
 Reference-image mode:
 
 C) (referencedCharacters: [{label: 'EL_ANCIANO', description: 'an old man'}])
-   "Rough storyboard sketch of a medium close-up at eye level, camera trucks left on the man of the reference image with deep wrinkles closing his eyes and holding a pocket watch to his chest with a peaceful smile, gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+   "Rough storyboard sketch of a medium close-up at eye level, camera trucks left on the man of the reference image with deep wrinkles closing his eyes and holding a pocket watch to his chest with a peaceful smile, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
 D) (referencedCharacters: [{label: 'HERO_A', description: 'a woman'}, {label: 'DOG_A', description: 'a dog'}])
-   "Rough storyboard sketch of a wide shot of the woman and the dog of the reference image walking down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+   "Rough storyboard sketch of a wide shot of the woman and the dog of the reference image walking down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
 E) (referencedCharacters: [{label: 'HERO_A', description: 'a tall woman'}, {label: 'HERO_B', description: 'a shorter woman'}, {label: 'DOG_A', description: 'a dog'}])
-   "Rough storyboard sketch of a medium shot of the two women and the dog of the reference image standing on a doorstep, gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+   "Rough storyboard sketch of a medium shot of the two women and the dog of the reference image standing on a doorstep, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
 ═══════════════════════════════════════════════════════════════
 BUILDING THE PHRASE
@@ -123,7 +123,7 @@ BUILDING THE PHRASE
    - If \`movement\` is non-trivial (not "Static"), weave it naturally INTO the action clause — e.g. "...as the camera dollies in", "...as the camera pans across the room". Do NOT add a separate "arrow indicating ..." segment.
    - If \`dialogue\` is non-empty, hint at the speaker's expression instead of quoting the line — "a tear on his cheek as he speaks softly" tells the model the emotional state without trying to render unreadable text.
 
-3. **\`<STYLE_CUES>\`** — append the \`stylePreamble\` field VERBATIM after the action clause, separated by a comma. The preamble is already in the form "gesture drawing, loose pencil linework, grayscale tonal blocking, toned tan paper" — do not paraphrase, do not reorder, do not omit any tag.
+3. **\`<STYLE_CUES>\`** — append the \`stylePreamble\` field VERBATIM after the action clause, separated by a comma. The preamble is already in the form "gesture drawing, loose pencil linework, grayscale tonal blocking" — do not paraphrase, do not reorder, do not omit any tag.
 
 ═══════════════════════════════════════════════════════════════
 TRANSLATE EVERYTHING TO ENGLISH
