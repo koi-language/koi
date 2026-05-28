@@ -17,8 +17,12 @@
  *
  * Queries: WHERE clauses come straight from the consumer as raw SQL fragments
  * (e.g. `file_id = "abc"` / `content_hash = '0xff' AND favorite = '1'`). They
- * are passed through untouched. Vector search loads all rows into memory and
- * runs JS cosine — fine for project-scoped corpora (≤50k vectors).
+ * are passed through untouched. Vector search scores rows INSIDE SQLite via
+ * the `cosine_distance` UDF and `ORDER BY … LIMIT k`, so only the top-k rows
+ * are ever materialised in JS — memory is O(k), not O(rowCount). It's still a
+ * linear scan (no ANN index), so latency is O(n); fine for project-scoped
+ * corpora (tens of thousands of vectors). For larger sets, move to an
+ * extension with quantization/partitioning (e.g. sqlite-vec).
  *
  * NOT implemented (consumers don't use them):
  *   - hybrid search, secondary indexes, schema migration, alterTable
@@ -65,6 +69,15 @@ class SqliteVectorDB {
     // in this way (consumers compose with their own sanitised values).
     try { this._db.pragma('legacy_double_quoted_strings = 1'); } catch { /* older sqlite */ }
     try { this._db.pragma('writable_schema_compat = 1'); } catch { /* ignore */ }
+    // Register the `cosine_distance(storedBlob, queryBlob)` SQL function so
+    // vector search can run `ORDER BY cosine_distance(vector, ?) LIMIT k`
+    // entirely inside SQLite. SQLite streams rows off disk, calls this per
+    // row, and keeps only a bounded top-k sorter — so we never pull the
+    // whole table into the JS heap (the old path did `SELECT *` + JS cosine
+    // over every row). Returns a DISTANCE (lower = closer): `1 - cosine`,
+    // matching the `_distance` contract LanceDB exposed. `deterministic`
+    // lets SQLite skip re-evaluating identical argument pairs.
+    this._db.function('cosine_distance', { deterministic: true }, _cosineDistanceBlobs);
     this._tables = new Map();
   }
 
@@ -216,6 +229,36 @@ class SqliteTable {
     return new SqliteSearchBuilder(this, vector);
   }
 
+  /**
+   * Escape hatch for queries the chainable builder can't express
+   * (window functions for dedup, GROUP BY, COUNT, …). Runs `sql`
+   * against this table's underlying SQLite connection with bound
+   * `params` and decodes each result row through the table schema.
+   * The caller owns the SQL; `${_qid(this._name)}` gives the safely
+   * quoted table identifier to interpolate. Use bound params for any
+   * user-derived value — never splice strings.
+   *
+   *   const rows = await table.rawAll(
+   *     `SELECT * FROM ${table.tableId} WHERE media_type = ? LIMIT ?`,
+   *     ['image', 50]);
+   */
+  async rawAll(sql, params = []) {
+    const rows = this._db.prepare(sql).all(...params);
+    return rows.map((r) => this._decodeRow(r));
+  }
+
+  /** Like rawAll but returns the raw scalar rows undecoded — for
+   *  COUNT(*) and other aggregate queries that don't map to the
+   *  table schema. */
+  async rawScalar(sql, params = []) {
+    return this._db.prepare(sql).get(...params);
+  }
+
+  /** Safely-quoted table identifier, for callers building raw SQL. */
+  get tableId() {
+    return _qid(this._name);
+  }
+
   _encodeRow(row) {
     return this._schema.columns.map((c) => _encodeValue(row[c.name], c.kind));
   }
@@ -236,15 +279,36 @@ class SqliteQueryBuilder {
     this._table = table;
     this._where = null;
     this._limit = null;
+    this._offset = null;
+    this._orderBy = null; // { col, dir }
   }
 
   where(clause) { this._where = clause; return this; }
   limit(n) { this._limit = n; return this; }
+  offset(n) { this._offset = n; return this; }
+
+  /** ORDER BY <col> ASC|DESC. `col` is a bare column name (quoted as an
+   *  identifier), `dir` defaults to ASC. SQLite-native, so callers can
+   *  push sorting server-side instead of sorting the whole table in JS. */
+  orderBy(col, dir = 'asc') {
+    if (typeof col === 'string' && col.length > 0) {
+      this._orderBy = { col, dir: String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC' };
+    }
+    return this;
+  }
 
   async toArray() {
     let sql = `SELECT * FROM ${_qid(this._table._name)}`;
     if (this._where) sql += ` WHERE ${_normaliseWhere(this._where)}`;
+    if (this._orderBy) sql += ` ORDER BY ${_qid(this._orderBy.col)} ${this._orderBy.dir}`;
     if (this._limit != null) sql += ` LIMIT ${Math.max(0, Math.floor(this._limit))}`;
+    // OFFSET is only valid alongside LIMIT in SQLite. When a caller sets
+    // an offset without a limit, emit the SQLite idiom `LIMIT -1 OFFSET n`
+    // (−1 = unbounded) so the offset still applies.
+    if (this._offset != null && this._offset > 0) {
+      if (this._limit == null) sql += ' LIMIT -1';
+      sql += ` OFFSET ${Math.max(0, Math.floor(this._offset))}`;
+    }
     const rows = this._table._db.prepare(sql).all();
     return rows.map((r) => this._table._decodeRow(r));
   }
@@ -264,24 +328,46 @@ class SqliteSearchBuilder {
   limit(n) { this._limit = n; return this; }
 
   async toArray() {
-    let sql = `SELECT * FROM ${_qid(this._table._name)}`;
-    if (this._where) sql += ` WHERE ${_normaliseWhere(this._where)}`;
-    const rows = this._table._db.prepare(sql).all();
-    const decoded = rows.map((r) => this._table._decodeRow(r));
+    const k = Math.max(0, Math.floor(this._limit));
     const queryVec = _toFloat32(this._vector);
     const vectorCol = this._table._schema.columns.find((c) => c.kind === 'vector')?.name;
-    const scored = [];
-    for (const row of decoded) {
-      const v = vectorCol ? row[vectorCol] : null;
-      const score = (v && v.length === queryVec.length) ? _cosine(queryVec, v) : 0;
-      scored.push({ row, score });
+
+    // No vector column on this table — nothing to score against. Return the
+    // first k rows (filtered) with a neutral distance so callers still get a
+    // shaped result instead of throwing.
+    if (!vectorCol || queryVec.length === 0) {
+      let sql = `SELECT * FROM ${_qid(this._table._name)}`;
+      if (this._where) sql += ` WHERE ${_normaliseWhere(this._where)}`;
+      sql += ` LIMIT ${k}`;
+      const rows = this._table._db.prepare(sql).all();
+      return rows.map((r) => ({ ...this._table._decodeRow(r), _distance: 1 }));
     }
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, Math.max(0, Math.floor(this._limit)));
-    // LanceDB returns a `_distance` field on search results (lower = closer).
-    // Match that contract: distance = 1 - cosine_similarity (since vectors are
-    // typically L2-normalised, this approximates Euclidean rank).
-    return top.map((s) => ({ ...s.row, _distance: 1 - s.score }));
+
+    // Push the cosine scoring + top-k INTO SQLite. The query vector is bound
+    // as a BLOB parameter (zero-copy view over its Float32Array buffer); the
+    // `cosine_distance` UDF (registered on the connection) scores each row as
+    // SQLite streams it off disk, and `ORDER BY … LIMIT k` keeps only a
+    // bounded top-k. Result: memory stays O(k), not O(rowCount).
+    const queryBlob = Buffer.from(
+      queryVec.buffer,
+      queryVec.byteOffset,
+      queryVec.byteLength,
+    );
+    let sql =
+      `SELECT *, cosine_distance(${_qid(vectorCol)}, ?) AS _distance ` +
+      `FROM ${_qid(this._table._name)}`;
+    if (this._where) sql += ` WHERE ${_normaliseWhere(this._where)}`;
+    sql += ` ORDER BY _distance ASC LIMIT ${k}`;
+
+    const rows = this._table._db.prepare(sql).all(queryBlob);
+    // `_decodeRow` only emits schema columns, so the computed `_distance`
+    // column is dropped there — re-attach it from the raw row to preserve
+    // the LanceDB `_distance` contract (lower = closer).
+    return rows.map((r) => {
+      const out = this._table._decodeRow(r);
+      out._distance = typeof r._distance === 'number' ? r._distance : 1;
+      return out;
+    });
   }
 }
 
@@ -371,14 +457,41 @@ function _toFloat32(v) {
   return new Float32Array(0);
 }
 
-function _cosine(a, b) {
+/**
+ * View a SQLite BLOB (Node Buffer) as a Float32Array WITHOUT copying when
+ * possible. Embeddings are stored as `Float32Array.buffer` bytes (see
+ * `_encodeValue`), so each 4 bytes is one float. A typed-array view requires
+ * the byteOffset to be 4-aligned; better-sqlite3 blobs usually are, but
+ * pooled/sliced buffers might not be — in that rare case we copy into a fresh
+ * aligned buffer so we never throw a RangeError mid-query.
+ */
+function _blobToF32(buf) {
+  if (!buf || buf.byteLength < 4) return null;
+  if ((buf.byteOffset & 3) === 0) {
+    return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength >>> 2);
+  }
+  const copy = new Uint8Array(buf.byteLength);
+  copy.set(buf);
+  return new Float32Array(copy.buffer, 0, buf.byteLength >>> 2);
+}
+
+/**
+ * Cosine DISTANCE (1 − cosine similarity) between two embedding BLOBs, used
+ * as a SQLite UDF. Lower = closer. Returns a large sentinel for missing /
+ * zero / dimension-mismatched vectors so they reliably sort to the bottom of
+ * an `ORDER BY … LIMIT k` and never crowd out a real match.
+ */
+function _cosineDistanceBlobs(aBlob, bBlob) {
+  const a = _blobToF32(aBlob);
+  const b = _blobToF32(bBlob);
+  if (!a || !b || a.length === 0 || a.length !== b.length) return 1e9;
   let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < a.length; i++) {
     const va = a[i], vb = b[i];
     dot += va * vb; magA += va * va; magB += vb * vb;
   }
-  if (magA === 0 || magB === 0) return 0;
-  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+  if (magA === 0 || magB === 0) return 1e9;
+  return 1 - dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
 function _qid(name) {

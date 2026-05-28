@@ -158,6 +158,13 @@ Rules:
   next step needs, instruct the producing step to save \`step<N>_output.json\`
   in the workflow workspace (the executing agent sees the path in its RUNTIME
   CONTEXT), and instruct the consuming step to read it as its first action.
+- If a workflow step says the user must approve / review / confirm / sign off
+  before it is considered done (e.g. "get user approval before publishing",
+  "wait for the user to confirm the final cut"), set \`"requiresApproval": true\`
+  on that task AND write an \`"approvalNote"\` saying exactly what the user must
+  validate and how to ask them. The executor will be blocked from finishing
+  until it asks the user and records the approval. Only flag genuine sign-off /
+  point-of-no-return steps — not routine intermediate work.
 
 USER REQUEST:
 ${(userMessage || '(no explicit user message)').substring(0, 1500)}
@@ -174,7 +181,7 @@ ${body}
 Return ONLY a JSON object with this shape, no prose, no markdown fences:
 {
   "tasks": [
-    { "subject": "<short imperative title>", "description": "<detailed, self-contained instructions>", "activeForm": "<present-continuous label, optional>" }
+    { "subject": "<short imperative title>", "description": "<detailed, self-contained instructions>", "activeForm": "<present-continuous label, optional>", "requiresApproval": false, "approvalNote": "<only when requiresApproval is true>" }
   ],
   "fallback": false
 }
@@ -327,6 +334,8 @@ export default {
           description,
           activeForm: t.activeForm ? String(t.activeForm) : undefined,
           workflowRunId: runId,
+          requiresApproval: t.requiresApproval === true,
+          approvalNote: t.approvalNote ? String(t.approvalNote) : '',
         });
         if (result?.id) createdIds.push(result.id);
       } catch (err) {

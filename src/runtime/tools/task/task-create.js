@@ -26,6 +26,14 @@ export default {
         type: 'string',
         description: 'Present-continuous label shown while in_progress (e.g. "Setting up database")',
       },
+      requiresApproval: {
+        type: 'boolean',
+        description: 'Set true when the user MUST explicitly approve this task before it can be completed. The agent that executes it will be BLOCKED from finishing (return) until the user gives their go-ahead. Use for irreversible / costly / published / destructive actions, or any deliverable the user must sign off on. When true, you MUST also provide approvalNote.',
+      },
+      approvalNote: {
+        type: 'string',
+        description: 'Required when requiresApproval is true. Free text telling the executor WHAT the user has to validate and HOW to ask them — the executor has no other context for the approval question. E.g. "Before publishing, show the user the final caption + image and ask them to confirm it can go live on Instagram."',
+      },
     },
     required: ['subject', 'description'],
   },
@@ -86,8 +94,15 @@ export default {
       description,
       activeForm: action.activeForm || null,
       workflowRunId: action.workflowRunId || undefined,
+      requiresApproval: action.requiresApproval === true,
+      approvalNote: action.approvalNote || '',
     });
 
-    return { id: task.id, subject: task.subject, status: task.status };
+    return {
+      id: task.id,
+      subject: task.subject,
+      status: task.status,
+      requiresApproval: task.requiresApproval,
+    };
   },
 };

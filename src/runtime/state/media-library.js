@@ -563,6 +563,99 @@ export class MediaLibrary {
   }
 
   /**
+   * Server-side paginated list. Unlike `list()` (which pulls a capped
+   * window into memory, then filters/dedups/sorts/slices in JS — so the
+   * "page" is computed over an arbitrary truncated subset and old or
+   * category-tagged items below the cap silently vanish), this pushes
+   * EVERYTHING into one SQL query: visibility filter, media-type filter,
+   * category filter, dedup-by-content_hash (newest wins), newest-first
+   * sort, and LIMIT/OFFSET. The page is therefore correct no matter how
+   * deep the offset or how far down the matching items live.
+   *
+   * @param {object}   [opts]
+   * @param {string[]} [opts.mediaTypes]   restrict to these media_type values
+   * @param {string}   [opts.category]     only items tagged with this category
+   * @param {number}   [opts.limit=200]    page size
+   * @param {number}   [opts.offset=0]     rows to skip (pagination cursor)
+   * @param {boolean}  [opts.includeHidden=false]
+   * @returns {Promise<{ items: object[], total: number, hasMore: boolean }>}
+   */
+  async listPage({ mediaTypes, category, limit = 200, offset = 0, includeHidden = false } = {}) {
+    const table = await this._ensureTable();
+    const tid = table.tableId;
+
+    // Build the shared WHERE conditions + bound params. Everything that
+    // can be expressed in SQL goes here so the dedup window + LIMIT see
+    // the fully-filtered set.
+    const conds = [];
+    const params = [];
+
+    if (Array.isArray(mediaTypes) && mediaTypes.length > 0) {
+      const valid = mediaTypes.filter((t) => typeof t === 'string' && t);
+      if (valid.length > 0) {
+        conds.push(`media_type IN (${valid.map(() => '?').join(', ')})`);
+        params.push(...valid);
+      }
+    }
+
+    // Visibility: `meta.visible !== false`. json_extract returns 0 for a
+    // JSON false, 1 for true, NULL when absent. `IS NOT 0` is the
+    // null-safe "anything except an explicit false" — matches the JS
+    // `meta.visible !== false` semantics including the no-metadata case.
+    if (!includeHidden) {
+      conds.push(`json_extract(metadata_json, '$.visible') IS NOT 0`);
+    }
+
+    // Category membership: categories live as a JSON array under
+    // metadata_json.$.categories. json_each unrolls it; case-insensitive
+    // compare matches `_normaliseCategories` (which lowercases).
+    if (category && typeof category === 'string') {
+      conds.push(
+        `EXISTS (SELECT 1 FROM json_each(metadata_json, '$.categories') WHERE lower(json_each.value) = lower(?))`,
+      );
+      params.push(category);
+    }
+
+    const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+
+    // Dedup key: content_hash when present, else the row id (so empty-hash
+    // rows each stand alone). ROW_NUMBER picks the newest per key.
+    const hashKey = `(CASE WHEN content_hash IS NULL OR content_hash = '' THEN id ELSE content_hash END)`;
+
+    const lim = Math.max(0, Math.floor(limit));
+    const off = Math.max(0, Math.floor(offset));
+
+    const pageSql =
+      `SELECT * FROM (
+         SELECT *, ROW_NUMBER() OVER (
+           PARTITION BY ${hashKey} ORDER BY created_at DESC
+         ) AS _rn
+         FROM ${tid}
+         ${whereSql}
+       ) WHERE _rn = 1
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`;
+
+    const rows = await table.rawAll(pageSql, [...params, lim, off]);
+
+    // Total deduped count for the same filter, so the GUI knows whether a
+    // next page exists. COUNT over the deduped groups.
+    const countSql =
+      `SELECT COUNT(*) AS cnt FROM (
+         SELECT ${hashKey} AS hk FROM ${tid} ${whereSql} GROUP BY hk
+       )`;
+    let total = 0;
+    try {
+      const r = await table.rawScalar(countSql, params);
+      total = (r && typeof r.cnt === 'number') ? r.cnt : 0;
+    } catch { /* count is best-effort; hasMore falls back to page-full heuristic */ }
+
+    const items = rows.map((r) => this._deserialize(r));
+    const hasMore = total > 0 ? off + items.length < total : items.length === lim;
+    return { items, total, hasMore };
+  }
+
+  /**
    * Remove duplicate entries from LanceDB (keeps newest per content_hash).
    * Called on startup or manually.
    */

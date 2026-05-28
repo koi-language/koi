@@ -39,6 +39,18 @@ export default {
         type: 'string',
         description: 'Updated present-continuous label shown while in_progress',
       },
+      approved: {
+        type: 'boolean',
+        description: 'Record the user\'s explicit approval of a task flagged requiresApproval. Set true ONLY after the user has actually given their go-ahead (via prompt_user). Once approved, the task\'s return is no longer blocked. NEVER set this without an explicit user confirmation.',
+      },
+      requiresApproval: {
+        type: 'boolean',
+        description: 'Mark/unmark that this task needs explicit user approval before it can be completed. Usually set at creation time via task_create; update it here only to add an approval gate you missed.',
+      },
+      approvalNote: {
+        type: 'string',
+        description: 'Update the free-text note describing what the user must validate and how to ask them (paired with requiresApproval).',
+      },
       addBlockedBy: {
         type: 'array',
         items: { type: 'string' },

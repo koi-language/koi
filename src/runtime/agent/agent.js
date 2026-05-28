@@ -2916,6 +2916,58 @@ export class Agent {
             returnData = cleanData;
           }
 
+          // ── USER-APPROVAL GATE ────────────────────────────────────────────
+          // A task flagged `requiresApproval` CANNOT be completed until the
+          // user has explicitly approved it. We block the return here and
+          // push the agent back into the loop with an instruction to ask the
+          // user (via prompt_user) and, once they approve, record it with
+          // `task_update approved:true` before returning again. The gate keys
+          // off the in_progress task OWNED by this agent — i.e. the one it
+          // actually picked up — so System's own coordinator returns are never
+          // affected (it never owns the executor task). A `{ success:false }`
+          // return is a legitimate failure report and is allowed through so
+          // the executor can surface a blocker without being trapped here.
+          // Capped at 5 attempts so a stubborn LLM can't deadlock the session.
+          {
+            const _failedReturn = returnData && returnData.success === false;
+            if (!_failedReturn) {
+              try {
+                const { taskManager: _tmApproval } = await import('../state/task-manager.js');
+                const _ownTask = _tmApproval.list().find(
+                  t => t.owner === this.name && t.status === 'in_progress'
+                );
+                if (_ownTask && _ownTask.requiresApproval === true && _ownTask.approved !== true) {
+                  if (!session._approvalRejectCount) session._approvalRejectCount = 0;
+                  session._approvalRejectCount++;
+                  if (session._approvalRejectCount <= 5) {
+                    const _note = (_ownTask.approvalNote || '').trim()
+                      || '(no note was provided — re-read the task description to determine exactly what the user must approve)';
+                    channel.log('agent', `${this.name}: return BLOCKED — task #${_ownTask.id} requires user approval (attempt ${session._approvalRejectCount}/5)`);
+                    session.recordAction(action, {
+                      success: false,
+                      error: 'return blocked — this task requires explicit user approval',
+                    });
+                    contextMemory.add(
+                      'user',
+                      `❌ RETURN BLOCKED — task #${_ownTask.id} ("${_ownTask.subject}") requires explicit USER APPROVAL before it can be completed, and you have NOT recorded the user's approval yet.\n\n` +
+                      `WHAT THE USER MUST APPROVE (from the task):\n${_note}\n\n` +
+                      `Do this NOW, do not return yet:\n` +
+                      `1. Call prompt_user to show the user what needs approving (in THEIR language) and ask them to approve or request changes.\n` +
+                      `2. If the user APPROVES → call task_update { taskId: "${_ownTask.id}", approved: true } and THEN call return.\n` +
+                      `3. If the user REJECTS or wants changes → address their feedback first; do NOT mark approved.\n` +
+                      `NEVER set approved:true without an explicit go-ahead from the user.`,
+                      `return blocked — task #${_ownTask.id} needs user approval`,
+                      null,
+                    );
+                    thinkingHint = _h('requestingApproval', 'Requesting approval');
+                    continue;
+                  }
+                  channel.log('agent', `${this.name}: approval gate exhausted after ${session._approvalRejectCount} attempts on task #${_ownTask.id} — letting return through.`);
+                }
+              } catch { /* non-fatal — never trap a return on a gate failure */ }
+            }
+          }
+
           // In CLI mode, "return" means "task done, wait for next user input".
           // For delegate agents this does NOT apply — they must return the result
           // to the agent that called them, not wait for user input.

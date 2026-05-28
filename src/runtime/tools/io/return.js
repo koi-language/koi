@@ -3,6 +3,7 @@
  */
 
 import fs from 'fs';
+import { taskManager } from '../../state/task-manager.js';
 
 /**
  * Walk `data` and collect every string value whose KEY looks like a file path
@@ -59,6 +60,36 @@ export default {
   // Executor function
   async execute(action, agent) {
     const data = action.data || action.result || {};
+
+    // User-approval gate (belt-and-braces). The reactive agent loop in
+    // agent.js already blocks unapproved returns before this executor runs;
+    // this catches any non-reactive path that calls `return` directly. A task
+    // flagged requiresApproval cannot be completed until the user has approved
+    // it (recorded via `task_update approved:true`). A { success:false } return
+    // is a legitimate failure report and is allowed through.
+    if (data?.success !== false && agent?.name) {
+      try {
+        const ownTask = taskManager.list().find(
+          (t) => t.owner === agent.name && t.status === 'in_progress'
+        );
+        if (ownTask && ownTask.requiresApproval === true && ownTask.approved !== true) {
+          const note = (ownTask.approvalNote || '').trim()
+            || '(no note provided — re-read the task description to determine what the user must approve)';
+          const err = new Error(
+            `return blocked — task #${ownTask.id} ("${ownTask.subject}") requires explicit USER APPROVAL before it can be completed, ` +
+            `and the user's approval has not been recorded.\n\nWhat the user must approve:\n${note}\n\n` +
+            `Ask the user via prompt_user, and once they approve call task_update { taskId: "${ownTask.id}", approved: true } before returning. ` +
+            `Never set approved:true without an explicit go-ahead from the user.`
+          );
+          err.code = 'task_requires_user_approval';
+          err.details = { taskId: ownTask.id };
+          throw err;
+        }
+      } catch (e) {
+        if (e?.code === 'task_requires_user_approval') throw e;
+        // Any other failure looking up the task is non-fatal — don't trap a return on it.
+      }
+    }
 
     // Guard: every advertised filesystem path in the return payload must actually
     // exist on disk. This catches agents that hallucinate a result (typical failure

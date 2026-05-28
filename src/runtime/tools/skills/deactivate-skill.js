@@ -52,7 +52,12 @@ export default {
     // Update agent state via agent.callAction (avoids circular import)
     await agent.callAction('update_state', { updates: { skills: newSkills, _skillContents: currentContents } });
 
-    channel.print(`\x1b[33m✗\x1b[0m \x1b[2mSkill deactivated: \x1b[1m${skillName}\x1b[0m`);
+    // Log only — do NOT `print` to the chat. Skill (de)activation is
+    // internal bookkeeping the user didn't ask to see; activation
+    // already uses `channel.log` for the same reason. The structured
+    // `skillDeactivated` event still fires so the GUI can update its
+    // skills state without a chat line.
+    channel.log('skill', `Skill deactivated: ${skillName}`);
     channel.skillDeactivated?.({ agent: agent.name, skill: skillName });
 
     return {

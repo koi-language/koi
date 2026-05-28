@@ -197,7 +197,7 @@ class TaskManager {
    * Prints: "  ☐ [id] subject"
    * Returns the created task object.
    */
-  create({ subject, description, activeForm, workflowRunId } = {}) {
+  create({ subject, description, activeForm, workflowRunId, requiresApproval, approvalNote } = {}) {
     this._loadIfNeeded();
     if (!subject) throw new Error('task_create: "subject" is required');
 
@@ -224,8 +224,23 @@ class TaskManager {
     );
     if (duplicate) {
       // Update description if the new one is longer (more detailed)
+      let _changed = false;
       if (description && description.length > (duplicate.description || '').length) {
         duplicate.description = description;
+        _changed = true;
+      }
+      // Promote the approval flag onto an existing task — a later, more
+      // informed creation pass may have realised the step needs user sign-off.
+      // Never silently DOWNGRADE (clear) an existing approval requirement.
+      if (requiresApproval === true && duplicate.requiresApproval !== true) {
+        duplicate.requiresApproval = true;
+        _changed = true;
+      }
+      if (approvalNote && approvalNote !== duplicate.approvalNote) {
+        duplicate.approvalNote = approvalNote;
+        _changed = true;
+      }
+      if (_changed) {
         duplicate.updatedAt = new Date().toISOString();
         this._save();
       }
@@ -243,6 +258,22 @@ class TaskManager {
       status: 'pending',
       owner: null,
       blockedBy: [],
+      // requiresApproval: when true, the agent that executes this task CANNOT
+      // complete it (return) until the user has explicitly approved it. The
+      // return is blocked and the executor is forced to ask the user first.
+      // Set by the creator (System / Planner / a workflow step) for any task
+      // whose outcome the user must sign off on (irreversible actions, money
+      // spend, publishing, destructive changes, creative deliverables needing
+      // a go-ahead, …). See the user-approval gate in agent.js.
+      requiresApproval: requiresApproval === true,
+      // approvalNote: free-text written by the creator telling the executor
+      // WHAT the user has to validate and HOW to ask them. This is the
+      // executor's only briefing for the approval question — it has no other
+      // context. Empty when requiresApproval is false.
+      approvalNote: approvalNote || '',
+      // approved: flipped to true (via task_update) only after the user has
+      // explicitly given their go-ahead. Gates the return.
+      approved: false,
       // result: delegate's return value (truncated by setResult). Lets the
       // System inject PRIOR STEPS into sibling tasks of the same workflow.
       result: null,
@@ -300,6 +331,12 @@ class TaskManager {
     if (updates.subject !== undefined) task.subject = updates.subject;
     if (updates.description !== undefined) task.description = updates.description;
     if (updates.activeForm !== undefined) task.activeForm = updates.activeForm;
+    if (updates.requiresApproval !== undefined) task.requiresApproval = updates.requiresApproval === true;
+    if (updates.approvalNote !== undefined) task.approvalNote = updates.approvalNote || '';
+    // `approved` is how the executor records that the user gave the go-ahead.
+    // Coerce to a real boolean so a stray "true"/"yes" string can't slip past
+    // the return gate's strict `=== true` check.
+    if (updates.approved !== undefined) task.approved = updates.approved === true;
 
     // `cancelledFrom` is set by `Agent.cancelAll` (Stop button) so a
     // later resume can restore the exact pending / in_progress shape

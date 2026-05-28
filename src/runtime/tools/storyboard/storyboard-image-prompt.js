@@ -65,46 +65,40 @@ After the style cues, append this exact sentence (preceded by ". "):
 Why: gpt-image-2 LOVES rendering storyboard-panel chrome (page furniture, scene numbers stamped in the corner, handwritten labels, dashed borders, arrows overlaid on the image) when it sees "storyboard sketch" in the prompt. Without this anchor, the drawing ends up at ~50% of the canvas surrounded by garbage. The anchor disables all of that so the model fills the canvas with JUST the drawing.
 
 ═══════════════════════════════════════════════════════════════
-TWO MODES — pick based on \`referencedCharacters\`
+TEXT-ONLY — there are NO reference images
 ═══════════════════════════════════════════════════════════════
 
-MODE 1 — Text-only (no reference image, \`referencedCharacters\` empty or missing):
-  Subject is described inline as a noun phrase. The image model
-  renders from scratch.
+This compositor ALWAYS renders from text alone. There are NO attached reference photos. NEVER write "the man of the reference image", "the woman of the reference image", "the X of the reference image", "the referenced picture", or anything implying an attached image exists — those phrases produce broken prompts because there is nothing to reference.
 
-MODE 2 — With reference image (\`referencedCharacters\` non-empty):
-  The visor will pass the characters' reference photos as actual
-  attached images to the renderer. In this mode, refer to
-  characters with phrases like "the man of the reference image",
-  "the woman of the reference image", "the dog of the reference
-  image", "the two men of the reference image", "the characters of
-  the reference image". Use the \`description\` field of each
-  referenced character ONLY to pick the right noun (man / woman /
-  dog / boy / monster / etc.) — do NOT restate the character's
-  clothing, hair, age, etc. The reference photo carries those
-  traits; restating them dilutes the prompt and confuses the
-  model.
+Describe every character / object INLINE, by looking them up in the \`characters\` roster and writing what they look like — BUT scoped to what is actually VISIBLE at this shot's framing (see the framing table below). You are not pasting the full roster description; you are describing the part of the character the camera actually captures in THIS frame:
+- Extreme close-up of eyes → describe just the eyes / brow (their colour, intensity), not the outfit.
+- Close-up of the face → describe the face + hair + expression, not the shoes.
+- Medium / long / wide shot → describe progressively more: build, hair, then clothing, then the full figure in its setting.
+For recurring characters, reuse the SAME inline wording for the traits that ARE visible across shots so they stay consistent.
 
 ═══════════════════════════════════════════════════════════════
 GOLD-STANDARD EXAMPLES — match these exactly
 ═══════════════════════════════════════════════════════════════
 
-Text-only mode:
+Notice in EVERY example: the prompt (1) describes WHAT FILLS THE FRAME at the framing — never the cinematography term; (2) describes the subject INLINE, scoped to what's visible; (3) NEVER mentions a "reference image".
 
-A) "Rough storyboard sketch of a medium close-up of an old man's face gazing off-frame, lost in memory, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+A) (shot: "Extreme close-up, eye level"; characters roster: "EL_ANCIANO: an old man with deep wrinkles and tired grey eyes"; action: "the old man gazes off, lost in memory")
+   "Rough storyboard sketch of an old man's eyes filling the entire frame, only the deeply wrinkled brow and tired grey eyes visible, gazing off to one side lost in memory, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-B) "Rough storyboard sketch of a wide establishing shot of a lone car driving down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+B) (shot: "Extreme wide shot, eye level"; action: "a lone car drives down a desert highway at sunset")
+   "Rough storyboard sketch of a tiny lone car on a long empty desert highway stretching to the horizon at sunset, the vast landscape dominating the frame, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-Reference-image mode:
+C) (shot: "Point of view, eye level"; action: "the driver looks out at the road ahead")
+   "Rough storyboard sketch of the view through a car windshield at night, an empty road lit by the headlights stretching ahead, the dashboard edge at the bottom of the frame, no driver visible because we see through their eyes, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-C) (referencedCharacters: [{label: 'EL_ANCIANO', description: 'an old man'}])
-   "Rough storyboard sketch of a medium close-up at eye level, camera trucks left on the man of the reference image with deep wrinkles closing his eyes and holding a pocket watch to his chest with a peaceful smile, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+D) (shot: "Close-up, eye level"; characters roster: "DRIVER: a young man with short dark hair, sharp jaw, wearing a black leather bomber jacket"; action: "the driver looks back over his shoulder at the camera with a faint mysterious smile")
+   "Rough storyboard sketch of a young man's face filling the frame, short dark hair and a sharp jaw, his head turned to look back over his shoulder toward the viewer with a faint mysterious smile, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-D) (referencedCharacters: [{label: 'HERO_A', description: 'a woman'}, {label: 'DOG_A', description: 'a dog'}])
-   "Rough storyboard sketch of a wide shot of the woman and the dog of the reference image walking down a desert highway at sunset, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+E) (shot: "Wide shot, eye level"; characters roster: "HERO_A: a woman in a long champagne satin dress; DOG_A: a scruffy medium dog"; action: "the woman and her dog walk down a desert highway at sunset")
+   "Rough storyboard sketch of a woman in a long champagne satin dress and a scruffy medium dog as small figures walking down a wide desert highway stretching to the horizon at sunset, the open landscape around them, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
-E) (referencedCharacters: [{label: 'HERO_A', description: 'a tall woman'}, {label: 'HERO_B', description: 'a shorter woman'}, {label: 'DOG_A', description: 'a dog'}])
-   "Rough storyboard sketch of a medium shot of the two women and the dog of the reference image standing on a doorstep, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
+F) (shot: "Over-the-shoulder, eye level"; characters roster: "HERO_A: a tall woman in a dark coat; HERO_B: a shorter woman in a pale cardigan"; action: "the tall woman faces the shorter woman on a doorstep")
+   "Rough storyboard sketch seen over the shoulder of a tall woman in a dark coat in the near foreground, looking toward a shorter woman in a pale cardigan standing on a doorstep facing her, gesture drawing, loose pencil linework, grayscale tonal blocking. Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations."
 
 ═══════════════════════════════════════════════════════════════
 BUILDING THE PHRASE
@@ -114,16 +108,47 @@ BUILDING THE PHRASE
 
 2. **\`<ACTION_SUMMARY>\`** — ONE comma-separated clause covering framing + subject + action. Build it like this:
 
-   - **Framing** comes first. Translate the \`shot\` field into natural English: "ECU low angle" → "a low-angle extreme close-up", "MS eye-level" → "a medium shot at eye level", "WS bird's eye" → "a wide bird's-eye shot". Drop cinematography abbreviations.
-   - **Subject + action** follow, woven into the same clause:
-     • TEXT-ONLY mode (no referencedCharacters): characters become natural noun phrases ("an old man", "a tall slim woman in a long dark coat"). NEVER emit a LABEL (HERO_A, EL_ANCIANO, DOG_A). Look up the label in \`characters\` and write a short noun phrase pulling only traits visible in THIS framing.
-     • REFERENCE-IMAGE mode (referencedCharacters non-empty): characters are referred to as "the <noun> of the reference image". Pick the noun from the referencedCharacters entry's \`description\` field (use ONLY the noun: "a man" → "the man of the reference image"; "a tall woman" → "the woman of the reference image"). Two characters → "the man and the woman of the reference image" (or "the two men", "the man and the dog", etc.). Three or more → "the characters of the reference image" or list them ("the woman, the man and the dog of the reference image") — pick whichever reads cleaner. DO NOT restate the character's clothing / age / hair / etc. — the reference photo carries that.
-   - **Mood / emotional beat** can be added as a short trailing fragment if it matters: ", gazing off-frame lost in memory", ", quiet and nostalgic". One or two evocative adjectives MAX.
-   - Skip catalogue-style detail words ("intricate", "ornate", "polished", "gleaming", "vintage", "weathered patina", "mechanical precision", "lifelike", "ultra-detailed", "high-fidelity"). They bias the model toward photorealism. Lean on concrete verbs.
+   - **Framing** comes first — but DESCRIBE WHAT FILLS THE FRAME, do NOT name the cinematography term. The image model does not understand "an extreme close-up" or "a medium long shot" as spatial instructions — it draws a normal portrait and ignores the label. Your job is to IMAGINE what the camera physically captures at that framing and describe THAT concrete picture. Translate the \`shot\` field's framing code into visible content using this table:
+     • **Extreme close-up (ECU)** → a single detail FILLS the entire frame. For a face that means JUST the eyes (or just the mouth, or just a hand) — NOT the whole head. Write it like: "a man's eyes filling the entire frame, only the eyes and brow visible". The rest of the face/body is OUTSIDE the frame.
+     • **Close-up (CU)** → the face fills the frame, from roughly chin to forehead, maybe the top of the shoulders. "a woman's face filling the frame".
+     • **Medium close-up (MCU)** → head and shoulders. "a man from the shoulders up".
+     • **Medium shot (MS)** → from the waist up. "a woman framed from the waist up".
+     • **Medium long shot (MLS)** → from roughly the knees up. "a man from the knees up".
+     • **Long shot (LS)** → the full body, head to toe, the figure dominant in frame. "the full figure of a man, head to toe".
+     • **Wide shot (WS)** → the full figure small within a large surrounding environment. "a small figure of a man standing in a vast room".
+     • **Extreme wide shot (EWS)** → a tiny figure dwarfed by a vast landscape. "a tiny figure on an enormous empty plain".
+     • **Over-the-shoulder (OTS)** → we see past one person's shoulder/back-of-head (in the near foreground) toward what they're looking at. "seen over the shoulder of a man in the foreground, looking toward …".
+     • **Point of view (POV)** → no character visible (we ARE the character); the frame shows what they see. "what the driver sees through the windshield: …".
+     Then handle the camera ANGLE: **eye level → don't mention the angle** (neutral default); **low angle → "seen from below"**; **high angle → "seen from above"**; bird's eye → "from directly overhead"; worm's eye → "from ground level looking straight up"; dutch angle → "the frame tilted at a slight diagonal". Lead with the visible-content phrase, fold the action into it, and NEVER write the bare term "extreme close-up" / "medium long shot" / etc. as if it were a drawing instruction.
+   - **Subject + action** follow, woven into the same clause. Describe EVERY character and notable object/prop INLINE — there are no reference images, so the only way the model knows what they look like is your words. BUT scope the description to WHAT IS VISIBLE at this framing:
+     • The image model is STATELESS — it sees nothing but this one prompt. It has no memory of how it drew this character in shot 1 when it draws shot 2. The ONLY way to get the SAME person across panels is to DESCRIBE THE VISIBLE TRAITS THE SAME WAY in every shot where they're visible.
+     • Look up each character/object in the \`characters\` roster, then write ONLY the traits the camera actually captures at this shot's framing:
+       – Extreme close-up of the eyes → describe the eyes / brow only (their look, the gaze). NOT the hair, NOT the clothing — they're outside the frame.
+       – Close-up of the face → face + hair + expression. NOT the outfit.
+       – Medium shot (waist up) → build, hair, upper-body clothing.
+       – Long / wide shot → the full figure: build, hair, full outfit, posture, the figure within its setting.
+     • Reuse the SAME wording for the traits that ARE visible across the shots where they recur, so the character stays consistent. Don't paste the entire roster description into a tight close-up — that wastes the prompt on things the frame can't show.
+     • Example (close-up of the face): roster says "a tall slim dark-skinned woman with short cropped black hair, sharp cheekbones, wearing a long champagne satin slip dress" → at a face close-up write only "a dark-skinned woman with short cropped black hair and sharp cheekbones" (the dress is off-frame). At a wide shot of the same woman, DO include the dress.
+     • NEVER emit a bare LABEL (HERO_A, EL_ANCIANO, DOG_A). Always expand it to an inline description of the visible traits.
+     • NEVER write "the X of the reference image" / "the referenced picture" — there is no reference image; describe X inline.
+   - **Mood / emotional beat** can be woven in where it matters: "gazing off-frame lost in memory", "quiet and nostalgic".
+   - Detail the SUBJECT's identity (build, hair, clothing, colour, material, shape — whatever is in-frame). But AVOID render-finish adjectives that push photorealism ("glossy", "ultra-detailed", "hyper-realistic", "8k", "photorealistic", "cinematic render", "lifelike"). The output is still a pencil sketch — detail the SUBJECT's identity, not the render quality.
    - If \`movement\` is non-trivial (not "Static"), weave it naturally INTO the action clause — e.g. "...as the camera dollies in", "...as the camera pans across the room". Do NOT add a separate "arrow indicating ..." segment.
    - If \`dialogue\` is non-empty, hint at the speaker's expression instead of quoting the line — "a tear on his cheek as he speaks softly" tells the model the emotional state without trying to render unreadable text.
 
 3. **\`<STYLE_CUES>\`** — append the \`stylePreamble\` field VERBATIM after the action clause, separated by a comma. The preamble is already in the form "gesture drawing, loose pencil linework, grayscale tonal blocking" — do not paraphrase, do not reorder, do not omit any tag.
+
+═══════════════════════════════════════════════════════════════
+SCENE CONTINUITY — use \`sceneContext\` when present
+═══════════════════════════════════════════════════════════════
+
+When the input includes a \`sceneContext\` field, it tells you the scene's SETTING, this shot's POSITION in the scene, and a recap of the PRECEDING shots. Use it to keep the place / time / character state consistent across cuts — this is the single most important thing for a storyboard reading as ONE continuous scene rather than disconnected drawings.
+
+- **Inherit the setting even when the shot's own \`action\` doesn't mention it.** If \`sceneContext\` says the setting is "interior of a car at night" (or an earlier shot established the characters are inside a car), then THIS shot is ALSO inside that car — bake the car interior into the prompt even if \`action\` only says "the driver looks ahead". The image model is stateless; if you don't restate the setting, it will draw the driver standing in a void.
+- **Carry character state forward.** If an earlier shot put a coat on the character, lit a cigarette, or had them holding a pocket watch, and nothing since removed it, they still have it. Weave the persistent state into the description.
+- **Respect ordering.** A shot that comes after "the door bursts open" happens in the aftermath — the door is open now, not closed.
+- **Do NOT redraw the preceding shots.** \`sceneContext\` is read-only background. Draw ONLY the current shot's moment; use the context purely to fill in the setting and state the current \`action\` leaves implicit.
+- When \`sceneContext\` is absent, render the shot from its own fields alone (no continuity to carry).
 
 ═══════════════════════════════════════════════════════════════
 TRANSLATE EVERYTHING TO ENGLISH
@@ -142,13 +167,15 @@ HARD CONSTRAINTS
 - ALWAYS open with "Rough storyboard sketch of" (capital R).
 - ALWAYS include the \`stylePreamble\` verbatim after the action clause.
 - ALWAYS end with the closing anchor sentence VERBATIM: "Only the central drawing, no storyboard template, no margins, no side panels, no handwritten notes, no labels, no borders, no frame, no scene number, no camera annotations." This sentence is NON-NEGOTIABLE on every output.
-- NEVER emit a label (HERO_A, EL_ANCIANO, DOG_A, …). Translate to a noun phrase or "the X of the reference image".
+- NEVER write the cinematography term as a drawing instruction ("an extreme close-up of …", "a wide shot of …", "a POV shot of …", "a medium long shot of …"). The image model ignores those labels. Instead describe WHAT FILLS THE FRAME at that framing (the eyes, the face, the full figure, the view through the windshield) — see the framing table in BUILDING THE PHRASE. Imagine the picture the camera captures and describe THAT.
+- NEVER emit a label (HERO_A, EL_ANCIANO, DOG_A, …). Expand it to an inline description of the traits visible at this framing.
+- NEVER write "the X of the reference image", "the referenced picture", or anything implying an attached photo exists. There are NO reference images — every subject is described inline from the \`characters\` roster, scoped to what's visible in the frame.
 - NEVER emit "arrow indicating ...", "shot description at the bottom", "speech bubble", or any other panel-annotation tag. Movement and dialogue go INTO the action clause as prose, not as separate trailing tags.
 - NEVER emit markdown (no #, *, -, lists).
 - NEVER wrap with "Prompt:", "Output:", "Here's the brief:".
 - NEVER explain, summarise, or add a closing note BEYOND the mandatory closing anchor.
 - NEVER invent characters, props, or locations not in the input.
-- Total output: 40–80 words (counting the closing anchor). Body itself stays tight at 15–35 words.
+- Length: write as much as needed to FULLY describe every character/object's identity in detail — do NOT truncate identity detail to hit a word target; consistency depends on it. Keep the framing/action/mood prose concise, but never starve the subject description. (Typical body 30–110 words; go longer when several detailed characters share the frame.)
 
 `;
 
@@ -192,6 +219,13 @@ export default {
           required: ['label'],
         },
       },
+      // Scene-continuity context built by the visor: the scene's
+      // setting + this shot's position + a recap of preceding shots.
+      // The compositor uses it to keep place / time / character state
+      // consistent across cuts (once shot 1 establishes "inside the
+      // car at night", shot 2 stays inside even if its own `action`
+      // doesn't restate it). Optional.
+      sceneContext: { type: 'string' },
     },
     required: ['stylePreamble'],
   },
@@ -215,6 +249,7 @@ export default {
       'movement',
       'action',
       'dialogue',
+      'sceneContext',
     ]) {
       const v = action[key];
       if (typeof v === 'string' && v.trim().length > 0) {
