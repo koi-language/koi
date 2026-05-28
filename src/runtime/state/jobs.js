@@ -33,6 +33,34 @@ import { EventEmitter } from 'node:events';
 
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
+// Media-generation job types that MUST produce an output file/URL to count
+// as a success. A `generate_video` job that resolves with `success !== false`
+// but NO artifact (no savedTo / url / path / …) is NOT a real success — it
+// typically means the provider returned instantly without rendering (the
+// "Video generated ✓ at 0s" phantom the user reported). We downgrade those to
+// `failed` so the chat banner, await_job, and the agent all see reality.
+const MEDIA_FILE_JOB_TYPES = new Set([
+  'generate_image', 'generate_video', 'generate_audio',
+  'outpaint_image', 'upscale_image', 'background_removal',
+  'generate_avatar_video', 'extract_frame',
+]);
+
+/** True when a media-tool result carries an actual output artifact. */
+function _hasMediaArtifact(r) {
+  if (!r || typeof r !== 'object') return false;
+  const keys = [
+    'savedTo', 'url', 'path', 'filePath', 'outputPath', 'mediaPath',
+    'videoPath', 'imagePath', 'audioPath', 'savedPaths', 'files',
+    'frames', 'outputs', 'results',
+  ];
+  for (const k of keys) {
+    const v = r[k];
+    if (typeof v === 'string' && v.trim()) return true;
+    if (Array.isArray(v) && v.length > 0) return true;
+  }
+  return false;
+}
+
 // Process-local registry of live AbortControllers, keyed by jobId.
 // Only valid for jobs started in THIS process — restored jobs from
 // disk have no controller.
@@ -198,10 +226,21 @@ export function startJob({ type, params, runner }) {
         // produced any output.
         const explicitFailure =
             result && typeof result === 'object' && result.success === false;
+        // A media-generation job that resolves "ok" but produced no output
+        // artifact is a phantom success (provider returned instantly, refs
+        // missing, malformed payload). Treat it as a failure so no green ✓
+        // is painted on a clip/image/audio that doesn't exist.
+        const mediaWithoutArtifact =
+            MEDIA_FILE_JOB_TYPES.has(j.type) && !_hasMediaArtifact(result);
         if (explicitFailure) {
           j.status = 'failed';
           j.error = result.error || j.error || 'Job runner reported success=false';
           j.result = result;
+        } else if (mediaWithoutArtifact) {
+          j.status = 'failed';
+          j.error = (result && typeof result === 'object' && result.error)
+            || `${j.type} reported success but produced no output file (no savedTo / url / path) — treated as failure.`;
+          j.result = result ?? null;
         } else {
           j.status = 'succeeded';
           j.result = result ?? null;

@@ -155,6 +155,7 @@ const generateImageAction = {
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
+      metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover — e.g. a visual storyboard sheet links back to its source interactive storyboard with `metadata: { sourceStoryboard: "/Users/…/.koi/storyboards/<id>.json", storyboardPart: 2, storyboardParts: 3 }` so a later step can re-attach the storyboard when rendering the video. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
       cameraAngles: {
         type: 'object',
         description: 'Discrete camera-control sliders for view-synthesis edit models (currently `fal-ai/qwen-image-edit-2511-multiple-angles`). Only set this when the user asks for a different camera angle / viewpoint of an existing image. The model rotates the camera around the subject and re-renders the scene from the new position — generic image-edit models will ignore this field. EACH slider is independently optional: include ONLY the axes the user moved. Omitted axes hit the model at its default (no change on that axis). At least one of horizontal / vertical / zoom must be present.',
@@ -1091,6 +1092,14 @@ const generateImageAction = {
       for (const img of savedImages) {
         if (img.savedTo) {
           await saveGeneratedImage(img.savedTo, {
+            // Caller-supplied passthrough metadata FIRST so the tool's
+            // authoritative fields below always win on key collisions.
+            // Lets a visual storyboard sheet record `sourceStoryboard`
+            // (the interactive storyboard JSON it belongs to) so a later
+            // step can re-attach it when rendering the video.
+            ...(action.metadata && typeof action.metadata === 'object' && !Array.isArray(action.metadata)
+                ? action.metadata
+                : {}),
             prompt: action.prompt,
             negativePrompt: action.negativePrompt || null,
             // Prefer the slug the router actually resolved to; fall back
