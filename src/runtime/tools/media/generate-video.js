@@ -372,7 +372,7 @@ const generateVideoAction = {
       endFrame:        { type: 'string',  description: 'LITERAL last frame of the output video — the exact image the generated video must end on. Same semantics as `startFrame` (literal, not stylistic). Also accepts a `@mention` handle.' },
       referenceImages: { type: 'array',   description: 'Visual REFERENCES — style sheets, storyboards, character designs, mood boards, subject photos — that the model may use as guidance for look/composition/identity but NOT as the literal first frame. Use this whenever the image is "what the result should LOOK like or RESEMBLE", never "what frame 1 must be". For a storyboard or multi-panel sheet, list every panel here. Routes to multi-image reference-to-video models when available; if the catalog only has image-to-video slugs the call will fail rather than silently treating the first reference as a start frame. Accepts file paths, attachment IDs (att-N), or `@mention` handles (e.g. "@tom"); `@`-handles resolve via MediaLibrary against whatever tag_media last pinned to that handle, most-recent-first when several match — same model the chat input bar uses.', items: { type: 'string' } },
       referenceVideos: { type: 'array',   description: 'Video REFERENCES for style/motion/continuation guidance — NOT a literal frame source. Local video paths, https URLs, or `@mention` handles. Local paths are uploaded to the gateway transparently; `@name` resolves via MediaLibrary the same way as referenceImages. Only honored when the selected model advertises videoToVideo.', items: { type: 'string' } },
-      withAudio:       { type: 'boolean', description: 'Generate audio track alongside video (default: false)' },
+      withAudio:       { type: 'boolean', description: 'Generate an audio track (SFX, dialogue, voiceover, ambient) alongside the video. DEFAULT: true — videos come back WITH sound unless you explicitly pass false. Only set false for a deliberately silent clip. NOTE: this does NOT control background music; excluding music is done via the prompt text, not by silencing the whole clip.' },
       cameraMovement:  { type: 'string',  description: 'Camera movement / shot type, e.g. "static", "pan_left", "zoom_in", "dolly_in", "orbit_right". Provider-dependent — unknown values are ignored.' },
       characterOrientation: { type: 'string', enum: ['image', 'video'], description: 'Motion-transfer models only (label="motion-transfer"): "image" preserves the still photo\'s character pose/orientation while inheriting motion from the reference video (default — natural for "make my character do that"); "video" reorients the character to match the reference video\'s pose (use for dance / body-mimicry where the reference body shape is the target). Ignored by every other model.' },
       keepOriginalSound: { type: 'boolean', description: 'Motion-transfer models only (label="motion-transfer"): when true (default) preserves the audio track of the reference video in the output. Ignored by every other model.' },
@@ -685,7 +685,7 @@ const generateVideoAction = {
           endFrame: action.endFrame ? { data: '_peek' } : undefined,
           referenceImages: action.referenceImages,
           referenceVideos: action.referenceVideos,
-          withAudio: !!action.withAudio,
+          withAudio: action.withAudio !== false,
           shots: action.shots,
           label: action.label,
           excludeModels: action.excludeModels,
@@ -896,7 +896,13 @@ const generateVideoAction = {
     // Padded variants flow through transparently.
     const globalReferenceVideos = await _resolveReferenceVideos(paddedRefVideos, caps, resolved);
 
-    const withAudio = action.withAudio || false;
+    // Audio is ON by default — a generated video keeps its scene sound (SFX,
+    // dialogue, voiceover, ambient) unless the caller EXPLICITLY opts out with
+    // withAudio:false. Agents kept shipping silent clips by omitting the flag
+    // (old default was false) or by setting false to "exclude music" — but
+    // withAudio governs the whole audio track, not music. Music exclusion is a
+    // prompt concern; silence is opt-in only.
+    const withAudio = action.withAudio !== false;
     if (withAudio && !caps.withAudio) {
       channel.log('video', `Provider ${resolved.provider}/${resolved.model} does not support audio generation — ignoring withAudio`);
     }
@@ -2479,7 +2485,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     fields.push('optional "referenceVideos" — array of local video file paths (mp4/mov/webm) OR https URLs. Local files are uploaded to the gateway automatically. Use this for video-to-video (style transfer, continuation, restyle).');
   }
   if (caps.anyAudio) {
-    fields.push('optional "withAudio" — boolean; generate an audio track alongside the video (default false).');
+    fields.push('optional "withAudio" — boolean; generate an audio track (SFX/dialogue/voiceover/ambient) alongside the video. DEFAULT true — pass false ONLY for a deliberately silent clip. Does NOT control background music.');
   }
   if (caps.cameraMovements?.length) {
     const list = caps.cameraMovements.map((v) => `"${v}"`).join(', ');

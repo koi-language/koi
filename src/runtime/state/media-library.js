@@ -279,6 +279,36 @@ export class MediaLibrary {
     if (voices > 0) {
       process.stderr.write(`[MediaLibrary] migration: indexed ${voices} voice(s)\n`);
     }
+
+    // Storyboards: disk-only until now. Scan ~/.koi/storyboards/*.json
+    // and index each one so existing storyboards become first-class
+    // gallery rows (chronological in the drawer, searchable, deletable).
+    // Idempotent — `saveStoryboardEntry` upserts by path, so re-running
+    // on every startup just refreshes. New storyboards created after this
+    // are mirrored live via the `storyboardSaved` WS message.
+    let storyboards = 0;
+    const sbDir = path.join(os.homedir(), '.koi', 'storyboards');
+    if (fs.existsSync(sbDir)) {
+      try {
+        const { saveStoryboardEntry } = await import('./media-library.js');
+        for (const f of fs.readdirSync(sbDir)) {
+          if (!f.endsWith('.json')) continue;
+          const fp = path.join(sbDir, f);
+          try {
+            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            await saveStoryboardEntry(fp, body, null);
+            storyboards++;
+          } catch (e) {
+            process.stderr.write(`[MediaLibrary] migrate storyboard ${f} skipped: ${e.message}\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[MediaLibrary] migrate storyboards skipped: ${e.message}\n`);
+      }
+    }
+    if (storyboards > 0) {
+      process.stderr.write(`[MediaLibrary] migration: indexed ${storyboards} storyboard(s)\n`);
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
@@ -310,6 +340,7 @@ export class MediaLibrary {
     favorite = false,
     replaceByPath = false,
     visible,
+    createdAt,
   }) {
     const table = await this._ensureTable();
     const buffer = fs.readFileSync(filePath);
@@ -426,7 +457,12 @@ export class MediaLibrary {
       file_path: filePath,
       width: dims.width,
       height: dims.height,
-      created_at: new Date().toISOString(),
+      // Honour an explicit createdAt (the backfill passes the
+      // storyboard's real authored date so historical items don't all
+      // cluster at "now"); default to now for fresh saves.
+      created_at: (typeof createdAt === 'string' && createdAt)
+        ? createdAt
+        : new Date().toISOString(),
       favorite: favorite ? 1 : 0,
       description: description || '',
       metadata_json: JSON.stringify(metadata),
@@ -1445,6 +1481,67 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider) {
     description,
     embedding,
     replaceByPath: true,
+  });
+}
+
+/**
+ * Save (or upsert) a STORYBOARD entry — points at the storyboard JSON
+ * at `~/.koi/storyboards/<id>.json`. Mirrors `saveTimelineEntry`: the
+ * JSON file is the authoritative artefact, the DB row is the index that
+ * makes the storyboard a first-class creation (shows in the drawer with
+ * a real `created_at`, interleaved chronologically; searchable; deletable
+ * through the gallery). `replaceByPath` keeps one row per file across
+ * edits.
+ *
+ * @param {string} filePath - Absolute path to the storyboard JSON.
+ * @param {Object} storyboard - Parsed storyboard JSON (v6 schema).
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
+ */
+export async function saveStoryboardEntry(filePath, storyboard, llmProvider) {
+  const lib = MediaLibrary.global();
+  const name = storyboard?.name || path.basename(filePath, '.json');
+  const scenes = Array.isArray(storyboard?.scenes) ? storyboard.scenes : [];
+  const sceneCount = scenes.length;
+  let shotCount = 0;
+  for (const sc of scenes) {
+    if (Array.isArray(sc?.shots)) shotCount += sc.shots.length;
+  }
+  const aspect = storyboard?.aspect || '16:9';
+  const description =
+    `Storyboard "${name}" — ${sceneCount} scene${sceneCount === 1 ? '' : 's'}, ` +
+    `${shotCount} shot${shotCount === 1 ? '' : 's'}, ${aspect}.`;
+  let embedding = null;
+  if (llmProvider) {
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
+  }
+  const metadata = {
+    source: 'storyboard',
+    storyboardId: storyboard?.id,
+    name,
+    sceneCount,
+    shotCount,
+    aspect,
+    updatedAt: storyboard?.updatedAt || null,
+  };
+  // Preserve the storyboard's REAL authored date so backfilled rows land
+  // at their true position in "Latest" instead of clustering at "now".
+  // Prefer the JSON's createdAt, then updatedAt, then the file mtime.
+  let createdAt = (typeof storyboard?.createdAt === 'string' && storyboard.createdAt)
+    ? storyboard.createdAt
+    : (typeof storyboard?.updatedAt === 'string' && storyboard.updatedAt)
+        ? storyboard.updatedAt
+        : null;
+  if (!createdAt) {
+    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to now */ }
+  }
+  return lib.save({
+    filePath,
+    mediaType: 'storyboard',
+    metadata,
+    description,
+    embedding,
+    replaceByPath: true,
+    createdAt,
   });
 }
 
