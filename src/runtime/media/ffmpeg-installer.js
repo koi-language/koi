@@ -9,7 +9,7 @@
  * ╔═══════════════════════════════════════════════════════════════╗
  * ║  Pinned version: ffmpeg 8.1.1 (released 2025-11)              ║
  * ║  macOS:    evermeet.cx versioned archives                      ║
- * ║  Linux:    BtbN/FFmpeg-Builds release autobuild-2026-05-13-13-53 ║
+ * ║  Linux:    BtbN/FFmpeg-Builds release autobuild-2026-05-29-14-08 ║
  * ║  Windows:  same BtbN release                                   ║
  * ║  All assets pinned by URL AND verified by sha256 post-download. ║
  * ║  Any drift on either side → integrity check fails → install     ║
@@ -50,11 +50,15 @@ import { Readable } from 'node:stream';
  *  you care about disk. */
 const PINNED_VERSION = '8.1.1';
 
-/** BtbN release tag (the `autobuild-YYYY-MM-DD-HH-MM` form is immutable;
- *  the `latest` rolling tag is not). Linux + Windows assets resolve
- *  against this tag. */
-const BTBN_TAG = 'autobuild-2026-05-13-13-53';
-const BTBN_FILE_STEM = 'ffmpeg-n8.1.1-1-g1068a26663';
+/** BtbN release tag. Heads-up: BtbN creates a NEW `autobuild-YYYY-MM-DD-HH-MM`
+ *  release on every build and PRUNES old ones — a pinned dated tag 404s within
+ *  a couple of weeks. When that happens, repin: list the current releases via
+ *  `gh api repos/BtbN/FFmpeg-Builds/releases` (or the GitHub releases API),
+ *  grab the newest `autobuild-*` tag + its `ffmpeg-n8.1.1-<N>-g<hash>` stem,
+ *  download the 4 `*-gpl-8.1.*` assets, recompute their sha256, and update the
+ *  table below. Linux + Windows assets resolve against this tag. */
+const BTBN_TAG = 'autobuild-2026-05-29-14-08';
+const BTBN_FILE_STEM = 'ffmpeg-n8.1.1-9-g58d4114d36';
 
 const BTBN_BASE = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 
@@ -86,7 +90,7 @@ const ASSETS = {
       {
         kind: 'tar-xz',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linux64-gpl-8.1.tar.xz`,
-        sha256: 'c54d9aa134b7b9b63948256ad992eea83bf0c4d44665ed87b936c91c6f6dfbd5',
+        sha256: '1ae376a8a603ff68e0b5917796b0b9005e1d588cad88c99b32fb7de0b73db7c6',
         binariesIn: 'bin', // <archive-stem>/bin/{ffmpeg,ffprobe}
       },
     ],
@@ -96,7 +100,7 @@ const ASSETS = {
       {
         kind: 'tar-xz',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linuxarm64-gpl-8.1.tar.xz`,
-        sha256: 'd24ff68cd6580b738ec248256a01691ea44a990f5ac9468f823981dd0a39a386',
+        sha256: '6bdf78a620f060924f4fb8f5f82cd2ad78d501875055ade864246f61b9c83122',
         binariesIn: 'bin',
       },
     ],
@@ -108,7 +112,7 @@ const ASSETS = {
       {
         kind: 'zip-binaries',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-win64-gpl-8.1.zip`,
-        sha256: '6f2470425037ebd047cbe6c028284d1f7f01302bc0e9149596ab5a7890a8cf27',
+        sha256: 'efe11c1e305371896c7887fd02275d9664794371537683373d574bb7acbb30e7',
         binariesIn: 'bin',
       },
     ],
@@ -118,7 +122,7 @@ const ASSETS = {
       {
         kind: 'zip-binaries',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-winarm64-gpl-8.1.zip`,
-        sha256: 'bfaccd3c6567aff265ee5229c15b4973cfc031c1ab820078ef9843836620a6a2',
+        sha256: 'ed81ff67784c92f012db7f94099a3e60d00e3fa6c41151a4fcc647bea173195f',
         binariesIn: 'bin',
       },
     ],
