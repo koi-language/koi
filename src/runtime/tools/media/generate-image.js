@@ -328,6 +328,116 @@ const generateImageAction = {
     // We resolve the gallery row for each handle and merge BEFORE the
     // capacity slice so explicit refs always win the cap budget.
     let _explicitRefs = action.referenceImages || [];
+
+    // Storyboard-driven SCOPED auto-attach. The agent owns the scope
+    // (which shots from the source storyboard belong to THIS sheet);
+    // the tool only enforces "within that scope, every `references`
+    // entry MUST reach the model — no quiet drops".
+    //
+    // Activation contract (both required):
+    //   • `metadata.sourceStoryboard` — absolute path to the source
+    //     interactive storyboard JSON.
+    //   • `metadata.storyboardShotIds` — array of shot ids that
+    //     define this sheet's panel scope (e.g. ["sh1","sh2","sh3"]).
+    //     Refs from shots OUTSIDE this list are NOT auto-attached —
+    //     a multi-sheet storyboard's later-shot references stay
+    //     scoped to their own sheet.
+    //
+    // Scope rule: a shot's refs are in scope iff the shot id is in
+    // `storyboardShotIds`. A scene's refs are in scope iff at least
+    // one of the scene's shots is in `storyboardShotIds`. The
+    // storyboard-root refs are always in scope (they're global anchors,
+    // not panel-specific). The agent stays in charge of WHAT counts as
+    // the sheet's scope; the tool only stops the agent from quietly
+    // omitting refs once that scope is declared.
+    //
+    // Why this is here at all: real reported failure mode — the user
+    // attached 3 photos of a Ferrari to shot 1 (front / side / rear),
+    // the agent only passed 1 of them to generate_image, and the
+    // model invented the back of the car. The skill tells the agent
+    // to collect all three; this guarantees the agent's declared
+    // scope is actually honored on the wire.
+    if (caps.referenceImages
+        && typeof action.metadata?.sourceStoryboard === 'string'
+        && action.metadata.sourceStoryboard
+        && Array.isArray(action.metadata.storyboardShotIds)
+        && action.metadata.storyboardShotIds.length > 0) {
+      const _sbPath = action.metadata.sourceStoryboard;
+      const _scope = new Set(
+        action.metadata.storyboardShotIds.filter((s) => typeof s === 'string' && s),
+      );
+      let _sb = null;
+      try {
+        if (fs.existsSync(_sbPath)) {
+          _sb = JSON.parse(fs.readFileSync(_sbPath, 'utf8'));
+        } else {
+          channel.log('image',
+            `Storyboard auto-attach skipped: ${_sbPath} does not exist on disk.`);
+        }
+      } catch (e) {
+        channel.log('image',
+          `Storyboard auto-attach skipped: ${_sbPath} unreadable (${e.message}).`);
+      }
+      if (_sb && typeof _sb === 'object' && _scope.size > 0) {
+        const _collected = [];
+        const _push = (arr, source) => {
+          if (!Array.isArray(arr)) return;
+          for (const r of arr) {
+            if (typeof r === 'string' && r.trim()) {
+              _collected.push({ ref: r.trim(), source });
+            }
+          }
+        };
+        // Storyboard-level: always in scope.
+        _push(_sb.references, 'storyboard');
+        if (Array.isArray(_sb.scenes)) {
+          for (const sc of _sb.scenes) {
+            const scId = (typeof sc?.id === 'string' && sc.id) ? sc.id : 'scene';
+            const _shots = Array.isArray(sc?.shots) ? sc.shots : [];
+            const _shotsInScope = _shots.filter(
+              (sh) => typeof sh?.id === 'string' && _scope.has(sh.id),
+            );
+            // Scene refs: in scope iff this scene contributes at
+            // least one shot to the current sheet.
+            if (_shotsInScope.length > 0) {
+              _push(sc?.references, scId);
+            }
+            for (const sh of _shotsInScope) {
+              const shId = sh.id;
+              _push(sh?.references, shId);
+            }
+          }
+        }
+
+        if (_collected.length > 0) {
+          const _existingResolved = await absolutizeMediaRefs(_explicitRefs);
+          const _seen = new Set(_existingResolved.map((r) => r.absPath));
+          const _perSource = new Map();
+          for (const { source } of _collected) {
+            _perSource.set(source, (_perSource.get(source) || 0) + 1);
+          }
+          const _counters = new Map();
+          const _added = [];
+          for (const { ref, source } of _collected) {
+            const _r = await absolutizeMediaRefs([ref]);
+            const absPath = _r[0]?.absPath;
+            if (!absPath || _seen.has(absPath)) continue;
+            _seen.add(absPath);
+            const total = _perSource.get(source) || 1;
+            const n = (_counters.get(source) || 0) + 1;
+            _counters.set(source, n);
+            const alias = total > 1 ? `${source}_ref_${n}` : `${source}_ref`;
+            _explicitRefs = [..._explicitRefs, { alias, path: ref }];
+            _added.push(`${alias}=${ref}`);
+          }
+          if (_added.length > 0) {
+            channel.log('image',
+              `Auto-attached in-scope storyboard refs from ${_sbPath} ` +
+              `(shotIds=[${[..._scope].join(',')}]): ${_added.join(', ')}`);
+          }
+        }
+      }
+    }
     {
       const _autoRes = await autoAttachMentions({
         prompt,
@@ -449,19 +559,71 @@ const generateImageAction = {
       }
     }
 
-    // Build the final prompt: if any reference carries an alias, prepend a
-    // short legend so the provider's model can map "boat"/"placement_guide"
-    // to ref #1/#2/... regardless of how the underlying API presents them.
+    // Build the final prompt: prepend a positional legend ("IMAGE 1 =
+    // <alias>, IMAGE 2 = ...") so the provider's model can map the
+    // names the agent uses in the prompt body to actual reference
+    // slots, regardless of how the underlying API presents them.
+    //
+    // We ALSO post-process the agent's prompt body to auto-annotate
+    // any backtick `alias` mention with its positional "(IMAGE N)"
+    // index. Reason: the agent doesn't reliably know which slot a
+    // given alias ended up in (their `referenceImages` array order
+    // may not match the order they inspected files in or the order
+    // they reasoned about), and a hand-typed position from the agent
+    // is a common off-by-one mistake — the agent claims the rear of
+    // the car is at position 4 while their array put it at slot 3,
+    // so the model lines up the wrong photo with the wrong
+    // description and invents bodywork. Injecting the index here
+    // means the runtime — the piece that actually controls the slot
+    // ordering — is the single source of truth. If the agent
+    // hand-wrote a position (correct or wrong), we strip it first
+    // and re-write the authoritative one. Skills should write
+    // positional references as "IMAGE N" inline (see the
+    // visual-storyboard SKILL); the backtick-alias auto-annotation
+    // here is a safety net for skills that still emit aliases.
     let effectivePrompt = prompt;
     if (_refAliases.some((a) => a && a.length > 0)) {
       const legendLines = _refAliases.map((alias, i) => {
         const n = i + 1;
-        return alias ? `  • reference #${n} = "${alias}"` : `  • reference #${n} = (unnamed)`;
+        return alias ? `  • IMAGE ${n} = "${alias}"` : `  • IMAGE ${n} = (unnamed)`;
       });
+      // alias → position lookup. Aliases with empty/missing values are
+      // skipped (positional-only refs don't have a backtick form to find).
+      const _aliasToIndex = new Map();
+      for (let i = 0; i < _refAliases.length; i++) {
+        const a = _refAliases[i];
+        if (a && a.length > 0) _aliasToIndex.set(a, i + 1);
+      }
+      let annotatedBody = prompt;
+      if (_aliasToIndex.size > 0) {
+        // Sort longest first so a `ferrari_e_a` mention isn't partially
+        // matched by a shorter `ferrari_e` alias if both exist.
+        const aliases = [..._aliasToIndex.keys()].sort((a, b) => b.length - a.length);
+        // Pass 1 — strip any pre-existing positional annotation the
+        // agent may have hand-typed (`(IMAGE N)` or `(reference #N)`).
+        // The agent's count is unreliable; we discard it so pass 2 can
+        // write the authoritative number.
+        for (const alias of aliases) {
+          const esc = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const stripRe = new RegExp(
+            '`' + esc + '`\\s*\\((?:IMAGE\\s*|reference\\s*#\\s*)\\d+\\s*\\)',
+            'g',
+          );
+          annotatedBody = annotatedBody.replace(stripRe, '`' + alias + '`');
+        }
+        // Pass 2 — append the correct `(IMAGE N)` to every backtick
+        // mention of each alias.
+        for (const alias of aliases) {
+          const n = _aliasToIndex.get(alias);
+          const esc = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const re = new RegExp('`' + esc + '`', 'g');
+          annotatedBody = annotatedBody.replace(re, '`' + alias + '` (IMAGE ' + n + ')');
+        }
+      }
       effectivePrompt =
         `Reference images (by position):\n${legendLines.join('\n')}\n\n` +
-        `When the prompt below mentions a name in backticks (e.g. \`boat\`), it is referring to the reference image of that alias.\n\n` +
-        prompt;
+        `When the prompt below references "IMAGE N", it points to the reference image at that position above. The "(IMAGE N)" annotations the runtime added next to any backtick alias are authoritative — trust them over any number the prompt's author may have written.\n\n` +
+        annotatedBody;
       channel.log('image', `Reference aliases: ${_refAliases.map((a, i) => `${i + 1}=${a || '-'}`).join(', ')}`);
     }
 
@@ -483,6 +645,17 @@ const generateImageAction = {
     // gateway's auto-retry (`_isInputShapeError`) picks a different
     // slug.
     const MAX_REF_ASPECT_RATIO = 3;
+    // Capture the caller's EXPLICIT output-dim intent BEFORE the loop —
+    // it's our signal that the aspect-cap pad must not hijack the
+    // output size. Both `resolution` and `targetSize{width,height}`
+    // count; either one means "the caller chose the canvas, don't
+    // override it from the base ref". Captured once up front because
+    // the loop itself mutates `action.targetSize` further down, and we
+    // need the pre-loop value to make the right call on every iteration.
+    const _callerSetExplicitOutputDim = !!(
+      action.resolution
+      || (action.targetSize?.width && action.targetSize?.height)
+    );
     if (referenceImages?.length > 0) {
       try {
         const sharp = (await import('sharp')).default;
@@ -503,7 +676,21 @@ const generateImageAction = {
           // Record geometry for the FIRST padded ref only — the model's
           // output normally matches the base ref's canvas, so recovering
           // from the base ref's rect is the right strategy.
-          if (!_outputRecoveryGeom) {
+          //
+          // EXCEPTION — when the caller passed an explicit output dim
+          // (`resolution` OR `targetSize{width,height}`), the agent is
+          // NOT editing the base ref's canvas: they want a fresh
+          // generation at the requested size (e.g. a visual-storyboard
+          // sheet at 4K that just happens to use the base ref as
+          // identity input, or an outpaint where the caller pre-computed
+          // the target canvas). Setting targetSize to the padded ref
+          // dims here would hijack the output back to the ref's size —
+          // exactly the "I asked for 4K, got 1200×704" bug. Skip both
+          // the targetSize hint AND the recovery geometry in that case;
+          // the in-memory pad still happens so fal accepts the ref, the
+          // model emits at the caller's chosen dim, and there's no
+          // recovery crop because there's no base canvas to recover to.
+          if (!_outputRecoveryGeom && !_callerSetExplicitOutputDim) {
             _outputRecoveryGeom = geom;
             // Pass the padded dims as the explicit target so any
             // adapter that supports `{width, height}` (seedream family,

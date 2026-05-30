@@ -158,16 +158,35 @@ export default {
     }
 
     const coerced = [];
+    const forcedMulti = [];
     for (const field of fields) {
-      const hasFiles = field.files && typeof field.files === 'object';
+      let hasFiles = field.files && typeof field.files === 'object';
       const hasOptions = Array.isArray(field.options) && field.options.length > 0;
       if (!hasFiles && !hasOptions && looksLikeFileField(field)) {
         field.files = { multiple: true };
+        hasFiles = true;
         coerced.push(field.label || field.question || '<unnamed>');
+      }
+      // Deterministic safety net: every files-field allows multiple
+      // selections. The LLM frequently picks `multiple: false` for
+      // "reference image for X" / "logo" / "screenshot" prompts where
+      // the user actually has several variants to attach — and the GUI
+      // dutifully replaces the prior pick instead of accumulating. The
+      // single-file niche (e.g. "upload your profile picture") still
+      // works fine when multiple is allowed: the user uploads one,
+      // submits, the agent reads paths[0]. Inverse (forcing single
+      // when user wants many) is the failure mode that actually
+      // blocks work, so we err on the permissive side.
+      if (hasFiles && field.files.multiple === false) {
+        field.files.multiple = true;
+        forcedMulti.push(field.label || field.question || '<unnamed>');
       }
     }
     if (coerced.length > 0) {
       console.warn(`[prompt_form] Auto-coerced text field(s) to file-picker because the label/question/hint matched file-attachment keywords: ${coerced.join(', ')}. Set "files" explicitly next time.`);
+    }
+    if (forcedMulti.length > 0) {
+      console.warn(`[prompt_form] Forced multiple=true on files field(s) ${forcedMulti.join(', ')} — single-file file pickers block users who have multiple attachments to share. If you truly only need one, just use paths[0] from the response.`);
     }
 
     channel.clearProgress();
