@@ -401,7 +401,7 @@ const generateVideoAction = {
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
-      kind:            { type: 'string',  enum: ['extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice instead of the default generation/edit shop. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>]. Omit for fresh generations / restyles / regular edits.' },
+      kind:            { type: 'string',  enum: ['edit', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. OMIT for plain generation — including continuation renders that pass the previous clip in `referenceVideos` for visual carry-over (the default `video_generation` bucket holds slugs like seedance reference-to-video that natively accept a video ref as continuation context). Explicit values: "edit" → pure video-to-video transformation (restyle, colour grade, motion swap — `video_editing` bucket, kling-style v2v slugs); pair with referenceVideos=[<source>] and describe the transformation in the prompt. The output replaces the source content entirely; identity is anchored by the source video itself. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
     },
     required: ['prompt']
@@ -512,6 +512,17 @@ const generateVideoAction = {
     const instance = resolved.instance;
     const caps = instance.capabilities;
 
+    // Per-slot aliases captured during the reference-resolution block
+    // below; consumed by the prompt-build legend so the final prompt
+    // tells the model "IMAGE 1 = <alias>" / "VIDEO 1 = <alias>" and
+    // auto-annotates backtick-alias mentions with their slot index.
+    // Hoisted here because both writers (inside the `{}` reconciliation
+    // block) and readers (the prompt build hundreds of lines later)
+    // need the same scope. Default to empty arrays so the legend
+    // pass is a no-op when no aliases were provided.
+    let _refImageAliases = [];
+    let _refVideoAliases = [];
+
     // ── Auto-attach @mentions from the prompt ────────────────────────
     // The agent often writes prompts like
     //   "Continue the camera move from @hero_walk, matching @burrow_001"
@@ -615,6 +626,18 @@ const generateVideoAction = {
       // the first time it sees an object — the user-reported crash
       // "TypeError: paths[0] must be of type string, received an
       // instance of Object" in `_loadReferenceImages`.
+      //
+      // BEFORE the unwrap, capture each ref's alias (when present) so
+      // the prompt-build pass below can prepend an "IMAGE N = <alias>"
+      // / "VIDEO N = <alias>" legend and auto-inject positional
+      // annotations after backtick alias mentions. Without this, the
+      // model receives a prompt that refers to `prev_clip` /
+      // `sheet_part_2` / `ferrari_reference` but has no idea which
+      // attached file each name binds to — exactly the reported bug
+      // ("the prompt mentions `prev_clip` but never tells the model
+      // it's the attached predecessor video"). Mirrors the legend
+      // logic in generate-image.js so video calls get the same
+      // alias↔slot binding the image side already has.
       const _toPathStr = (it) => {
         if (typeof it === 'string') return it;
         if (it && typeof it === 'object' && typeof it.path === 'string') {
@@ -622,15 +645,40 @@ const generateVideoAction = {
         }
         return null;
       };
+      const _aliasOf = (it) =>
+        (it && typeof it === 'object' && typeof it.alias === 'string' && it.alias)
+          ? it.alias
+          : '';
+      _refImageAliases = Array.isArray(action.referenceImages)
+        ? action.referenceImages.map(_aliasOf).filter((_, i, arr) => arr[i] !== null)
+        : [];
+      _refVideoAliases = Array.isArray(action.referenceVideos)
+        ? action.referenceVideos.map(_aliasOf).filter((_, i, arr) => arr[i] !== null)
+        : [];
       if (Array.isArray(action.referenceImages)) {
         action.referenceImages = action.referenceImages
           .map(_toPathStr)
           .filter((p) => typeof p === 'string' && p);
+        // Align alias array length to the post-filter paths length —
+        // dropped paths drop their aliases too (rare, but possible if
+        // a path was unresolvable). We trim from the end since we
+        // can't tell which got dropped; in practice the filter only
+        // drops trailing entries when refs failed to resolve.
+        if (_refImageAliases.length > action.referenceImages.length) {
+          _refImageAliases = _refImageAliases.slice(0, action.referenceImages.length);
+        }
+      } else {
+        _refImageAliases = [];
       }
       if (Array.isArray(action.referenceVideos)) {
         action.referenceVideos = action.referenceVideos
           .map(_toPathStr)
           .filter((p) => typeof p === 'string' && p);
+        if (_refVideoAliases.length > action.referenceVideos.length) {
+          _refVideoAliases = _refVideoAliases.slice(0, action.referenceVideos.length);
+        }
+      } else {
+        _refVideoAliases = [];
       }
       if (action.startFrame != null && typeof action.startFrame !== 'string') {
         action.startFrame = _toPathStr(action.startFrame) || undefined;
@@ -1097,12 +1145,92 @@ const generateVideoAction = {
         ...(Array.isArray(s?.referenceImages) ? s.referenceImages : []),
       ])),
     ].filter(_isAnnotationPath);
-    const finalPrompt = _annotationPaths.length > 0
+    // Step 1 — annotation disclaimer (if any user-drawn markup is in the inputs).
+    let _bodyPrompt = _annotationPaths.length > 0
       ? `[ANNOTATION CONTEXT: One or more reference images contain user-drawn markup (red arrows, circles, lines, scribbles, handwritten notes) placed on top of the source image as guidance. These marks indicate intent — motion paths, areas of focus, things to add/move/remove — they are NOT content. DO NOT reproduce the arrows, circles, lines, or any drawn markup in the generated video; they must not appear in the output frames. Interpret what they mean and apply that intent instead.]\n\n${prompt}`
       : prompt;
     if (_annotationPaths.length > 0) {
       channel.log('video', `Annotation overlay detected in inputs (${_annotationPaths.length}) — prepended disclaimer to prompt.`);
     }
+
+    // Step 2 — reference legend + alias→slot auto-annotation. Mirrors
+    // the logic in generate-image.js so video prompts that mention
+    // `sheet_part_1` / `prev_clip` / `ferrari_reference` etc. have a
+    // legend at the top binding each alias to its actual slot. Without
+    // this, the model sees the alias as a literal string with no clue
+    // which attached file it refers to — the reported bug ("agent
+    // attached a predecessor video and the prompt mentions `prev_clip`
+    // but never tells the model it's the attached video"). The auto-
+    // annotation then appends `(IMAGE N)` / `(VIDEO N)` after every
+    // backtick alias mention in the body so even weak-instruction-
+    // following models pick up the positional slot.
+    const _hasImageAliases = _refImageAliases.some((a) => a && a.length > 0);
+    const _hasVideoAliases = _refVideoAliases.some((a) => a && a.length > 0);
+    if (_hasImageAliases || _hasVideoAliases) {
+      const _legendBlocks = [];
+      if (_hasImageAliases) {
+        const _imgLines = _refImageAliases.map((alias, i) => {
+          const n = i + 1;
+          return alias ? `  • IMAGE ${n} = "${alias}"` : `  • IMAGE ${n} = (unnamed)`;
+        });
+        _legendBlocks.push(`Reference images (by position):\n${_imgLines.join('\n')}`);
+      }
+      if (_hasVideoAliases) {
+        const _vidLines = _refVideoAliases.map((alias, i) => {
+          const n = i + 1;
+          return alias ? `  • VIDEO ${n} = "${alias}"` : `  • VIDEO ${n} = (unnamed)`;
+        });
+        _legendBlocks.push(`Reference videos (by position):\n${_vidLines.join('\n')}`);
+      }
+      // Build alias → "(IMAGE N)" / "(VIDEO N)" maps for the body
+      // annotation pass. Same alias never collides across image/video
+      // slots in practice — the agent picks distinct names — and even
+      // if they did, the model would see two equally-positioned
+      // annotations on the same alias and treat them as a synonym set.
+      const _aliasToTag = new Map();
+      for (let i = 0; i < _refImageAliases.length; i++) {
+        const a = _refImageAliases[i];
+        if (a && a.length > 0) _aliasToTag.set(a, `IMAGE ${i + 1}`);
+      }
+      for (let i = 0; i < _refVideoAliases.length; i++) {
+        const a = _refVideoAliases[i];
+        if (a && a.length > 0 && !_aliasToTag.has(a)) {
+          _aliasToTag.set(a, `VIDEO ${i + 1}`);
+        }
+      }
+      // Sort longest first so `sheet_part_10` isn't partially matched
+      // by `sheet_part_1`.
+      const _aliases = [..._aliasToTag.keys()].sort((a, b) => b.length - a.length);
+      for (const alias of _aliases) {
+        const tag = _aliasToTag.get(alias);
+        const esc = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Strip any pre-existing positional annotation the agent
+        // hand-typed (`(IMAGE N)` / `(VIDEO N)` / `(reference #N)`)
+        // — the agent's count is unreliable; the runtime owns the
+        // authoritative number.
+        const stripRe = new RegExp(
+          '`' + esc + '`\\s*\\((?:IMAGE\\s*|VIDEO\\s*|reference\\s*#\\s*)\\d+\\s*\\)',
+          'g',
+        );
+        _bodyPrompt = _bodyPrompt.replace(stripRe, '`' + alias + '`');
+        // Append correct (IMAGE N) / (VIDEO N) annotation.
+        const annotateRe = new RegExp('`' + esc + '`', 'g');
+        _bodyPrompt = _bodyPrompt.replace(annotateRe, '`' + alias + '` (' + tag + ')');
+      }
+      _bodyPrompt =
+        `${_legendBlocks.join('\n\n')}\n\n` +
+        `When the prompt below references "IMAGE N" or "VIDEO N", it points to the reference at that position above. The "(IMAGE N)" / "(VIDEO N)" annotations the runtime added next to any backtick alias are authoritative — trust them over any number the prompt's author may have written.\n\n` +
+        _bodyPrompt;
+      channel.log(
+        'video',
+        `Reference aliases: ${[
+          ..._refImageAliases.map((a, i) => `img${i + 1}=${a || '-'}`),
+          ..._refVideoAliases.map((a, i) => `vid${i + 1}=${a || '-'}`),
+        ].join(', ')}`,
+      );
+    }
+
+    const finalPrompt = _bodyPrompt;
 
     reportProgress?.(0.02, 'Submitting to provider…');
     const submitted = await instance.generate(finalPrompt, {

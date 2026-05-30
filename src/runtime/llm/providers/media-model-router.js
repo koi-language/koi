@@ -509,17 +509,61 @@ function _filterByRequires(models, presence) {
  *  ignoring the user's data. See [_filterByRequires].
  */
 export function pickVideoModel(models, req = {}) {
+  const { wantedBucket, pool } = _resolveVideoBucketAndPool(models, req);
+  return _pickByBucket('video', pool, req, wantedBucket).slug;
+}
+
+/** Same as pickVideoModel but returns the full model OBJECT — see
+ *  peekImageModel for rationale. */
+export function peekVideoModel(models, req = {}) {
+  const { wantedBucket, pool } = _resolveVideoBucketAndPool(models, req);
+  return _pickByBucket('video', pool, req, wantedBucket);
+}
+
+/** Pick the bucket AND pre-filter the pool for a video routing decision.
+ *  Shared by pickVideoModel / peekVideoModel.
+ *
+ *  Buckets:
+ *   • `kind: 'avatar'`              → video_avatar
+ *   • `kind: 'extend'`              → video_extend
+ *   • `kind: 'bg-remove' | …`       → video_background_removal
+ *   • `kind: 'edit'`                → video_editing  (pure v2v transform)
+ *   • else                          → video_generation
+ *
+ *  Note: `referenceVideos > 0` alone is NOT an editing signal — it's
+ *  just a richer reference (the storyboard-to-video continuation flow
+ *  passes the previous clip there to lock continuity). An earlier
+ *  version of this picker treated any video ref as an "edit" and
+ *  routed to `video_editing`, which narrowed the pool to kling-style
+ *  video-to-video edit slugs and skipped seedance reference-to-video
+ *  (which lives in `video_generation`, declares `videoToVideo: true`,
+ *  and is the natural pick for a continuation render). Removing that
+ *  rule fixes the reported bug ("why does it use kling when seedance
+ *  is right there?"). Pure editing intents now require an EXPLICIT
+ *  `kind: 'edit'` — the v2v transform path (restyle, colour grade,
+ *  motion swap) where the source video's content IS the subject and
+ *  the prompt describes the transformation. The agent that just wants
+ *  visual continuity carry-over (PART K-of-N continuation, identity
+ *  lock) does NOT pass `kind` — that's plain generation with a richer
+ *  reference.
+ *
+ *  The `_filterByRequires` step still drops slugs that DECLARE
+ *  `referenceVideos` as required when the caller didn't send one (and
+ *  vice versa), so the pool stays compatible with the request shape.
+ *  The ranker then picks among compatible slugs by shape match, label,
+ *  price, etc.
+ */
+function _resolveVideoBucketAndPool(models, req) {
   const kind = req.kind || '';
-  const videoRefsCount = req.videoRefsCount || 0;
   const wantedBucket =
     kind === 'avatar' ? 'video_avatar' :
     kind === 'extend' ? 'video_extend' :
     (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
-    videoRefsCount > 0 ? 'video_editing' :
+    kind === 'edit' ? 'video_editing' :
     'video_generation';
 
   if (!Array.isArray(models) || models.length === 0) {
-    return _pickByBucket('video', models, req, wantedBucket).slug;
+    return { wantedBucket, pool: models };
   }
 
   // Build the presence snapshot mirroring the keys of VideoRequires.
@@ -539,35 +583,8 @@ export function pickVideoModel(models, req = {}) {
   // and the agent can react — better than throwing `no_model_matches`
   // with a misleading reason.
   const pool = filtered.length > 0 ? filtered : models;
-  return _pickByBucket('video', pool, req, wantedBucket).slug;
-}
 
-/** Same as pickVideoModel but returns the full model OBJECT — see
- *  peekImageModel for rationale. */
-export function peekVideoModel(models, req = {}) {
-  const kind = req.kind || '';
-  const videoRefsCount = req.videoRefsCount || 0;
-  const wantedBucket =
-    kind === 'avatar' ? 'video_avatar' :
-    kind === 'extend' ? 'video_extend' :
-    (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
-    videoRefsCount > 0 ? 'video_editing' :
-    'video_generation';
-  if (!Array.isArray(models) || models.length === 0) {
-    return _pickByBucket('video', models, req, wantedBucket);
-  }
-  const presence = {
-    startFrame: !!req.hasStartFrame,
-    endFrame: !!req.hasEndFrame,
-    referenceImages: (req.refsCount || 0) > 0,
-    referenceVideos: (req.videoRefsCount || 0) > 0,
-    imageUrl: !!req.hasImageUrl,
-    audioUrl: !!req.hasAudioUrl,
-    characterOrientation: !!req.characterOrientation,
-  };
-  const filtered = _filterByRequires(models, presence);
-  const pool = filtered.length > 0 ? filtered : models;
-  return _pickByBucket('video', pool, req, wantedBucket);
+  return { wantedBucket, pool };
 }
 
 // ── Audio ───────────────────────────────────────────────────────────────────
