@@ -495,11 +495,12 @@ function _filterByRequires(models, presence) {
  *  `requires` populated from the adapter, see
  *  `backend/src/modules/gateway/adapters/_shared.ts::VideoRequires`).
  *
- *  Bucket selection:
+ *  Bucket selection (mirrors image routing — symmetric defaults):
  *   • `kind: 'avatar'`              → video_avatar
  *   • `kind: 'extend'`              → video_extend
  *   • `kind: 'bg-remove' | …`       → video_background_removal
- *   • `videoRefsCount > 0`          → video_editing  (video-to-video)
+ *   • `kind: 'continuation'`        → video_generation (carry-over opt-out)
+ *   • `kind: 'edit'` OR `videoRefsCount > 0` → video_editing (v2v)
  *   • else                          → video_generation
  *
  *  Shape filter: applied INSIDE the chosen bucket. A model whose
@@ -527,25 +528,31 @@ export function peekVideoModel(models, req = {}) {
  *   • `kind: 'avatar'`              → video_avatar
  *   • `kind: 'extend'`              → video_extend
  *   • `kind: 'bg-remove' | …`       → video_background_removal
+ *   • `kind: 'continuation'`        → video_generation (carry-over with
+ *                                     refs — explicit opt-out of editing)
  *   • `kind: 'edit'`                → video_editing  (pure v2v transform)
+ *   • `videoRefsCount > 0`          → video_editing  (image-symmetry
+ *                                     default — see history note below)
  *   • else                          → video_generation
  *
- *  Note: `referenceVideos > 0` alone is NOT an editing signal — it's
- *  just a richer reference (the storyboard-to-video continuation flow
- *  passes the previous clip there to lock continuity). An earlier
- *  version of this picker treated any video ref as an "edit" and
- *  routed to `video_editing`, which narrowed the pool to kling-style
- *  video-to-video edit slugs and skipped seedance reference-to-video
- *  (which lives in `video_generation`, declares `videoToVideo: true`,
- *  and is the natural pick for a continuation render). Removing that
- *  rule fixes the reported bug ("why does it use kling when seedance
- *  is right there?"). Pure editing intents now require an EXPLICIT
- *  `kind: 'edit'` — the v2v transform path (restyle, colour grade,
- *  motion swap) where the source video's content IS the subject and
- *  the prompt describes the transformation. The agent that just wants
- *  visual continuity carry-over (PART K-of-N continuation, identity
- *  lock) does NOT pass `kind` — that's plain generation with a richer
- *  reference.
+ *  Symmetry with image routing: `pickImageModel` defaults `refsCount > 0`
+ *  to `image_editing` and the agent never has to mark anything. We
+ *  brought the same rule back for video so a user prompt like "modify
+ *  this video" naturally lands on `video_editing` (kling-style v2v)
+ *  instead of falling through to `video_generation`.
+ *
+ *  History: an earlier version of this picker already had this rule,
+ *  then dropped it because passing the previous clip as a `references`
+ *  for a STORYBOARD-TO-VIDEO continuation also looks like "video
+ *  reference present" and got mis-routed to editing, narrowing the
+ *  pool to kling and excluding the natural pick (seedance
+ *  reference-to-video, which lives in `video_generation`). The fix
+ *  back then was "no auto-route, require explicit `kind: 'edit'`",
+ *  but it broke the much more common "modify this video" case. The
+ *  current contract puts the burden the other way: the auto-edit
+ *  default mirrors image, and the continuation flow opts OUT with
+ *  `kind: 'continuation'` (a new enum value documented in
+ *  generate-video.js's schema).
  *
  *  The `_filterByRequires` step still drops slugs that DECLARE
  *  `referenceVideos` as required when the caller didn't send one (and
@@ -555,11 +562,13 @@ export function peekVideoModel(models, req = {}) {
  */
 function _resolveVideoBucketAndPool(models, req) {
   const kind = req.kind || '';
+  const hasVideoRefs = (req.videoRefsCount || 0) > 0;
   const wantedBucket =
     kind === 'avatar' ? 'video_avatar' :
     kind === 'extend' ? 'video_extend' :
     (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
-    kind === 'edit' ? 'video_editing' :
+    kind === 'continuation' ? 'video_generation' :
+    (kind === 'edit' || hasVideoRefs) ? 'video_editing' :
     'video_generation';
 
   if (!Array.isArray(models) || models.length === 0) {

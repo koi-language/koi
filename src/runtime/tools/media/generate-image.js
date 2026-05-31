@@ -559,6 +559,56 @@ const generateImageAction = {
       }
     }
 
+    // Ask the router which image slug it would dispatch to so we adapt
+    // inputs against THAT model's restrictions (not some hardcoded
+    // conservative cap). Same fetch + pick path the gateway dispatcher
+    // uses, but without firing the call. Mirrors `generate-avatar-video.js`
+    // — that tool does the same dance for `imageUrl`; we do it here for
+    // `referenceImages`.
+    if (referenceImages?.length) {
+      let pickedImageModel = null;
+      try {
+        const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
+        const mediaCaps = await fetchMediaCapabilities('image');
+        if (mediaCaps && Array.isArray(mediaCaps.models) && mediaCaps.models.length > 0) {
+          pickedImageModel = peekImageModel(mediaCaps.models, {
+            intent: typeof action.intent === 'string' ? action.intent : (action.operation || ''),
+            refsCount: referenceImages.length,
+            hasMaskImage: !!action.maskImage,
+            hasSourceImage: !!action.sourceImage,
+            hasTargetSize: !!(action.targetSize?.width && action.targetSize?.height),
+          }) || null;
+        }
+      } catch { /* no peek → no restriction → ship originals */ }
+
+      // Generic constraint-aware adaptation. The helper applies dim
+      // caps first (maxWidth / maxHeight / maxArea on `referenceImages`),
+      // then iterative lossless PNG shrink for any remaining maxBytes
+      // overshoot. No-op when the adapter declared nothing.
+      // adaptImageInput emits its own `[detect]` / `[shrink]` /
+      // `[apply ]` lines via channel.log('constraints', …) so the
+      // operator can trace every restriction action without this tool
+      // duplicating those messages.
+      try {
+        const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
+        for (let i = 0; i < referenceImages.length; i++) {
+          const ref = referenceImages[i];
+          const adapted = await adaptImageInput(ref.data, pickedImageModel, 'referenceImages');
+          if (adapted.changed) {
+            referenceImages[i] = { data: adapted.buffer, mimeType: adapted.mimeType };
+          }
+        }
+      } catch (err) {
+        // Sharp parse / re-encode failed — fall back to the original
+        // bytes and let the model try its luck. Logging only so the
+        // user can see why an oversized ref might still slip through.
+        channel.log(
+          'image',
+          `generate_image: adapt-image step skipped (${err?.message || err}) — uploading originals`,
+        );
+      }
+    }
+
     // Build the final prompt: prepend a positional legend ("IMAGE 1 =
     // <alias>, IMAGE 2 = ...") so the provider's model can map the
     // names the agent uses in the prompt body to actual reference
