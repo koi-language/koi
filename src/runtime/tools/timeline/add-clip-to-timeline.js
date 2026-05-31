@@ -410,31 +410,36 @@ export default {
       // the black-flicker / black-band artefacts the user reported).
       try {
         const isVideoTrack = typeof created?.track === 'string' && created.track[0] === 'V';
-        const settings = timeline?.settings || {};
-        const fpsAlreadySet = Number.isFinite(settings.fps) && settings.fps > 0;
-        const dimsAlreadySet =
-          Number.isFinite(settings.width) && settings.width > 0 &&
-          Number.isFinite(settings.height) && settings.height > 0;
-        if (isVideoTrack && (!fpsAlreadySet || !dimsAlreadySet)) {
-          // Count video clips currently on the timeline. We only inherit
-          // when this is the FIRST — later clips on a populated timeline
-          // shouldn't silently switch the project's framerate.
+        if (isVideoTrack) {
+          // Count video clips currently on the timeline (excluding the
+          // one we just added). When this is the FIRST video clip, the
+          // timeline ALWAYS adopts that clip's fps + dimensions —
+          // regardless of whatever defaults a client (the Flutter GUI
+          // writes `projectFps: 30` on every timeline save; an agent
+          // might `create_timeline` with no fps and the storage layer
+          // back-fills one) may have written into settings. This is
+          // the user-visible contract: "el timeline se auto-ajusta al
+          // primer clip que se pone, lo decide la API del timeline,
+          // no el cliente". If the user genuinely wants a different
+          // fps / canvas than the first clip's, they call
+          // `update_timeline { fps, width, height }` AFTER the first
+          // drop — that path is the explicit override and isn't
+          // affected by subsequent clip drops (the videoClipsBefore
+          // gate below blocks inheritance for everything past clip #1).
           const videoClipsBefore = (timeline?.clips || [])
             .filter((c) => typeof c?.track === 'string' && c.track[0] === 'V' && c.id !== created.id)
             .length;
           if (videoClipsBefore === 0 && typeof created?.path === 'string') {
             const meta = await _probeVideoMeta(created.path);
             const patch = {};
-            if (!fpsAlreadySet && Number.isFinite(meta.fps)) patch.fps = meta.fps;
-            if (!dimsAlreadySet) {
-              if (Number.isFinite(meta.width)) patch.width = meta.width;
-              if (Number.isFinite(meta.height)) patch.height = meta.height;
-            }
+            if (Number.isFinite(meta.fps)) patch.fps = meta.fps;
+            if (Number.isFinite(meta.width)) patch.width = meta.width;
+            if (Number.isFinite(meta.height)) patch.height = meta.height;
             if (Object.keys(patch).length > 0) {
               timeline = setTimelineSettings(id, patch);
               channel.log(
                 'timeline',
-                `add_clip_to_timeline: inherited ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(', ')} from first video clip (${path.basename(created.path)})`,
+                `add_clip_to_timeline: auto-adjusted timeline to first video clip — ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(', ')} (${path.basename(created.path)})`,
               );
             }
           }
