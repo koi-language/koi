@@ -29,6 +29,25 @@ export async function showQuotaExceededDialog(errOrPayload) {
 
   channel.clearProgress();
 
+  // GUI mode: hand the whole thing to Flutter, which renders a dedicated
+  // blocking "subscription required" popup with nice chrome instead of the
+  // inline chat select menu. The popup owns the interaction from here
+  // (open_url / buy credits / use API keys / quit the whole app), so we
+  // fire-and-forget and return — the agent loop parks itself afterwards so
+  // it won't re-fire the same 402. Terminal mode keeps the select below.
+  const isGui = process.env.KOI_GUI_MODE === '1';
+  if (isGui && typeof channel.showSubscriptionDialog === 'function') {
+    try {
+      channel.showSubscriptionDialog({
+        message,
+        options,
+        hasPlan: !!payload.hasPlan,
+        isTopPlan: !!payload.isTopPlan,
+      });
+    } catch { /* best-effort */ }
+    return;
+  }
+
   if (options.length === 0) {
     // No actionable options — just surface the message so the user sees why
     // their request was blocked.
