@@ -159,8 +159,17 @@ function _getMediaCaps(model) {
 //
 // Returns null on any failure (offline, unauth, 5xx). Callers treat that
 // as "unknown, fall back to static defaults".
-
-const _mediaCapabilitiesPromises = { image: null, video: null, audio: null };
+//
+// NO CACHE — every call fetches a fresh `/models/{kind}.json`. We had a
+// process-lifetime memo here once and it bit us hard: a Seedance row
+// that no longer carried `video_editing` in its `categories[]` still
+// got picked for v2v requests for hours on already-running clients
+// because the cached entry pinned the stale category list. The backend
+// already returns a compact, gzip-friendly JSON, the call lands inside
+// a tool invocation (not a hot loop), and the freshness matters more
+// than the saved roundtrip. If we ever bring memoisation back, do it
+// with a short TTL (≤60s) and tie it to a backoffice publish event so
+// changes propagate the same minute they happen.
 
 const _splitCsv = (s) => {
   if (typeof s !== 'string') return [];
@@ -284,29 +293,28 @@ const _aggregateByKind = {
 };
 
 /**
- * Fetch + cache the active media models of a given kind plus a union of the
- * user-facing capability signals the runtime tools need to build dynamic
- * schemas. Cached for the process lifetime. Returns null on any failure.
+ * Fetch the active media models of a given kind plus a union of the
+ * user-facing capability signals the runtime tools need to build
+ * dynamic schemas. **Always hits the network** — no in-memory cache
+ * (see the long note above the `_aggregateByKind` table). Returns null
+ * on any failure (offline, unauth, 5xx). Callers treat null as
+ * "unknown, fall back to static defaults".
  */
-export function fetchMediaCapabilities(kind) {
-  if (!_mediaCapabilitiesPromises.hasOwnProperty(kind)) {
-    return Promise.resolve(null);
+export async function fetchMediaCapabilities(kind) {
+  if (!Object.prototype.hasOwnProperty.call(_aggregateByKind, kind)) {
+    return null;
   }
-  if (_mediaCapabilitiesPromises[kind]) return _mediaCapabilitiesPromises[kind];
-  _mediaCapabilitiesPromises[kind] = (async () => {
-    try {
-      const res = await fetch(`${getGatewayBase()}/models/${kind}.json`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return null;
-      const models = await res.json();
-      if (!Array.isArray(models) || models.length === 0) return null;
-      return _aggregateByKind[kind](models);
-    } catch {
-      return null;
-    }
-  })();
-  return _mediaCapabilitiesPromises[kind];
+  try {
+    const res = await fetch(`${getGatewayBase()}/models/${kind}.json`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    const models = await res.json();
+    if (!Array.isArray(models) || models.length === 0) return null;
+    return _aggregateByKind[kind](models);
+  } catch {
+    return null;
+  }
 }
 
 // ── Client-side media model resolver ────────────────────────────────────────

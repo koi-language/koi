@@ -401,8 +401,9 @@ const generateVideoAction = {
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
-      kind:            { type: 'string',  enum: ['edit', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. OMIT for plain generation — including continuation renders that pass the previous clip in `referenceVideos` for visual carry-over (the default `video_generation` bucket holds slugs like seedance reference-to-video that natively accept a video ref as continuation context). Explicit values: "edit" → pure video-to-video transformation (restyle, colour grade, motion swap — `video_editing` bucket, kling-style v2v slugs); pair with referenceVideos=[<source>] and describe the transformation in the prompt. The output replaces the source content entirely; identity is anchored by the source video itself. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
+      kind:            { type: 'string',  enum: ['edit', 'continuation', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. DEFAULT behaviour mirrors `generate_image`: OMIT for plain text-to-video generation; pass `referenceVideos` (without `kind`) and the request automatically routes to `video_editing` (v2v transform — restyle, colour grade, repaint, motion swap; pool = kling-style v2v slugs). The transformation replaces the source content; identity is anchored by the source itself. EXPLICIT VALUES — use ONLY when you want to override the default: "continuation" → opt OUT of editing when the previous clip is being passed in `referenceVideos` purely as a STYLE / IDENTITY carry-over (storyboard-to-video continuity, multi-shot character lock); routes back to `video_generation` so seedance reference-to-video and similar continuation-aware slugs stay in the pool. Use this when the prompt describes a NEW scene that should keep the look of the reference, not a transformation of the reference itself. "edit" → explicit alias for the default v2v editing path; redundant when `referenceVideos` is already present, but accepted for clarity. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
+      summary:         { type: 'string',  description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari pulling out of garage — opening shot", "Continuation of shot 2 with rain". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
     },
     required: ['prompt']
   },
@@ -411,7 +412,10 @@ const generateVideoAction = {
     { intent: 'generate_video', prompt: 'A drone shot flying over a misty forest at sunrise', duration: 10, aspectRatio: '16:9' },
     { intent: 'generate_video', prompt: 'Product rotating on a turntable', startFrame: '/tmp/product.png', duration: 5 },
     { intent: 'generate_video', prompt: 'Animated character walking', referenceImages: ['/tmp/character.png'], withAudio: true },
+    // Auto-routes to video_editing (kling-style v2v) because referenceVideos is present and no `kind` overrides it.
     { intent: 'generate_video', prompt: 'Apply cinematic grading and add slow motion', referenceVideos: ['/tmp/source.mp4'], duration: 5 },
+    // Continuation example — opts out of editing so the picker stays in `video_generation` and seedance reference-to-video can win.
+    { intent: 'generate_video', prompt: 'The astronaut now floats in zero-g inside the cabin, same character, same lighting style', referenceVideos: ['/tmp/previous-shot.mp4'], kind: 'continuation', duration: 5 },
     {
       intent: 'generate_video',
       prompt: 'Short teaser about an astronaut',
@@ -931,14 +935,34 @@ const generateVideoAction = {
 
     // ── Top-level (global) resolution — used directly for single-shot,
     //    and as fallback defaults for each entry in shots[] ──────────
-    const globalStartFrame = await _loadFrame(paddedStartFrame, caps.startFrame, resolved, 'start');
+    let globalStartFrame = await _loadFrame(paddedStartFrame, caps.startFrame, resolved, 'start');
     if (globalStartFrame?._error) return { success: false, error: globalStartFrame._error };
 
-    const globalEndFrame = await _loadFrame(action.endFrame, caps.endFrame, resolved, 'end');
+    let globalEndFrame = await _loadFrame(action.endFrame, caps.endFrame, resolved, 'end');
     if (globalEndFrame?._error) return { success: false, error: globalEndFrame._error };
 
-    const globalReferenceImages = await _loadReferenceImages(action.referenceImages, caps, resolved);
+    let globalReferenceImages = await _loadReferenceImages(action.referenceImages, caps, resolved);
     if (globalReferenceImages?._error) return { success: false, error: globalReferenceImages._error };
+
+    // Per-model INPUT restrictions for image-typed frames. The router
+    // already resolved `pickedModelSlug` above; look up the full
+    // catalog row to read `constraints.inputs.{startFrame|endFrame|
+    // referenceImages}` and shrink any oversized buffer BEFORE
+    // dispatch. Same pattern as `generate-avatar-video.js` (which
+    // adapts `imageUrl`) and `generate-image.js` (which adapts
+    // `referenceImages`). No-op when the adapter declares nothing.
+    let pickedVideoModelObj = null;
+    if (pickedModelSlug) {
+      try {
+        const mediaCaps = await fetchMediaCapabilities('video');
+        if (mediaCaps && Array.isArray(mediaCaps.models)) {
+          pickedVideoModelObj = mediaCaps.models.find((m) => m && m.slug === pickedModelSlug) || null;
+        }
+      } catch { /* peek failed → no restriction → ship originals */ }
+    }
+    globalStartFrame      = await _adaptFrameToConstraints(globalStartFrame, pickedVideoModelObj, 'startFrame');
+    globalEndFrame        = await _adaptFrameToConstraints(globalEndFrame, pickedVideoModelObj, 'endFrame');
+    globalReferenceImages = await _adaptFramesToConstraints(globalReferenceImages, pickedVideoModelObj, 'referenceImages');
 
     // Videos are uploaded (not inlined) — see _uploadVideoRef above.
     // Padded variants flow through transparently.
@@ -1028,20 +1052,29 @@ const generateVideoAction = {
           // Frame/ref resolution per shot, with inheritance. Any missing
           // override reuses the top-level artifact we already loaded so
           // we don't re-read the same file N times.
-          const shotStart = s.startFrame
+          // Per-shot loads run through the same constraint-adapt pass
+          // as the globals above. When the shot inherits a global,
+          // it's already adapted; only freshly-loaded override buffers
+          // need the extra call.
+          let shotStart = s.startFrame
             ? await _loadFrame(s.startFrame, caps.startFrame, resolved, `shot[${i}].start`)
             : globalStartFrame;
           if (shotStart?._error) return { success: false, error: shotStart._error };
+          if (s.startFrame) shotStart = await _adaptFrameToConstraints(shotStart, pickedVideoModelObj, 'startFrame');
 
-          const shotEnd = s.endFrame
+          let shotEnd = s.endFrame
             ? await _loadFrame(s.endFrame, caps.endFrame, resolved, `shot[${i}].end`)
             : globalEndFrame;
           if (shotEnd?._error) return { success: false, error: shotEnd._error };
+          if (s.endFrame) shotEnd = await _adaptFrameToConstraints(shotEnd, pickedVideoModelObj, 'endFrame');
 
-          const shotRefImgs = Array.isArray(s.referenceImages)
+          let shotRefImgs = Array.isArray(s.referenceImages)
             ? await _loadReferenceImages(s.referenceImages, caps, resolved)
             : globalReferenceImages;
           if (shotRefImgs?._error) return { success: false, error: shotRefImgs._error };
+          if (Array.isArray(s.referenceImages)) {
+            shotRefImgs = await _adaptFramesToConstraints(shotRefImgs, pickedVideoModelObj, 'referenceImages');
+          }
 
           const shotRefVideos = Array.isArray(s.referenceVideos)
             ? await _resolveReferenceVideos(s.referenceVideos, caps, resolved)
@@ -1287,6 +1320,11 @@ const generateVideoAction = {
       referenceVideoPaths: Array.isArray(action.referenceVideos) ? action.referenceVideos : [],
       shotCount: shots?.length || numShots || 1,
       saveTo: action.saveTo || null,
+      // Forwarded to MediaLibrary.save({summary}) → per-session ledger.
+      // The same generationParams object is reused for the primary
+      // save AND each multishot saveGeneratedVideo call below, so the
+      // summary lands on every produced clip without per-call wiring.
+      summary: typeof action.summary === 'string' ? action.summary : undefined,
     };
 
     if (submitted.id) _stashJobMetadata(submitted.id, generationParams);
@@ -2397,6 +2435,42 @@ async function _loadReferenceImages(pathArr, caps, resolved) {
     out.push({ data, mimeType: normalized.mimeType });
   }
   return out;
+}
+
+/** Adapt a single loaded frame against the picked model's declared
+ *  input restrictions for `role` — same generic adapter the avatar
+ *  tool uses, just wired for each of the video tool's canonical image
+ *  roles (`startFrame` / `endFrame` / `referenceImages`). No-op when
+ *  the frame is missing, when the model declared no constraint for
+ *  this role, or when the original bytes already fit. Mirrors the
+ *  block in `generate-avatar-video.js` — keeping the constraint-aware
+ *  upload path consistent across every media tool. */
+async function _adaptFrameToConstraints(frame, model, role) {
+  if (!frame || frame._error || !model) return frame;
+  try {
+    const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
+    const adapted = await adaptImageInput(frame.data, model, role);
+    if (adapted.changed) {
+      return { data: adapted.buffer, mimeType: adapted.mimeType };
+    }
+  } catch (err) {
+    channel.log(
+      'video',
+      `generate_video: adapt-image skipped for ${role} (${err?.message || err}) — uploading original`,
+    );
+  }
+  return frame;
+}
+
+/** Array variant — adapts each entry in place. Safe with undefined /
+ *  empty / `_error` payloads (`_loadReferenceImages` either returns
+ *  an array or a `{_error}` sentinel). */
+async function _adaptFramesToConstraints(frames, model, role) {
+  if (!Array.isArray(frames) || frames.length === 0 || !model) return frames;
+  for (let i = 0; i < frames.length; i++) {
+    frames[i] = await _adaptFrameToConstraints(frames[i], model, role);
+  }
+  return frames;
 }
 
 /** Upload a list of reference videos to the gateway storage and return

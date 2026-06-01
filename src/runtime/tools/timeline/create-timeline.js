@@ -50,6 +50,7 @@ export default {
         type: 'object',
         description: 'Alternative to settings+clips: a full timeline state object to seed from.',
       },
+      summary: { type: 'string', description: 'OPTIONAL. One-line "what is this timeline for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Final edit of Duelo bajo la Tormenta", "Rough cut of product demo intro". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the timeline\'s description ("Timeline X — N clips, Ys.") which is functional but less semantic.' },
     },
   },
 
@@ -60,6 +61,7 @@ export default {
         settings: params.settings,
         clips: params.clips,
         state: params.state,
+        summary: params.summary,
       });
       return { success: true, id: tl.id, timeline: tl };
     } catch (e) {

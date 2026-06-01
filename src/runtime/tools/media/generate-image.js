@@ -155,7 +155,8 @@ const generateImageAction = {
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
-      metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover — e.g. a visual storyboard sheet links back to its source interactive storyboard with `metadata: { sourceStoryboard: "/Users/…/.koi/storyboards/<id>.json", storyboardPart: 2, storyboardParts: 3 }` so a later step can re-attach the storyboard when rendering the video. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
+      summary:         { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari hero shot for video ad opening", "Burrow front view, 9:16, used in storyboard sheet 2". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
+      metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover. **When `label: "visual_storyboard"` is set this field is effectively REQUIRED** — the visual-storyboard → visual-storyboard-to-video pipeline depends on it. Two valid shapes: (A) sheet derived from an interactive storyboard JSON → `metadata: { sourceStoryboard: "/Users/…/.koi/storyboards/<id>.json", storyboardPart: K, storyboardParts: K_total, storyboardShotIds: ["sh1","sh2",…] }` (the downstream renderer re-attaches the JSON and reads per-shot durations / dialogue / SFX from it); (B) sheet derived from idea + refs only, no JSON exists → `metadata: { storyboardOrigin: "idea" }` (explicit declaration so the downstream tools know not to look). Omitting both for a `visual_storyboard` call returns a soft warning in the result and breaks the downstream link. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
       cameraAngles: {
         type: 'object',
         description: 'Discrete camera-control sliders for view-synthesis edit models (currently `fal-ai/qwen-image-edit-2511-multiple-angles`). Only set this when the user asks for a different camera angle / viewpoint of an existing image. The model rotates the camera around the subject and re-renders the scene from the new position — generic image-edit models will ignore this field. EACH slider is independently optional: include ONLY the axes the user moved. Omitted axes hit the model at its default (no change on that axis). At least one of horizontal / vertical / zoom must be present.',
@@ -214,6 +215,47 @@ const generateImageAction = {
       const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
       const _guard = await requireToolInfoFirst('generate_image', agent);
       if (_guard) return _guard;
+    }
+
+    // Per-call warning bag. Populated below for soft-enforcement issues
+    // (missing metadata that downstream tools depend on, etc). Returned
+    // alongside `success: true` so the agent sees them on the next turn
+    // and can self-correct in subsequent calls. Hard errors still go
+    // through `return { success: false, error }`; this bag is for "the
+    // call worked, but you broke a downstream contract you should fix".
+    const _warnings = [];
+
+    // Visual-storyboard provenance guard.
+    //
+    // When the agent calls us with `label: "visual_storyboard"` (the
+    // route the `visual-storyboard` skill uses), the produced PNG is
+    // expected to carry a metadata link back to where it came from —
+    // either `sourceStoryboard` (path to the interactive storyboard
+    // JSON) or `storyboardOrigin: "idea"` (explicit declaration that
+    // there's no JSON, the sheet was built from a raw prompt). Without
+    // ONE of those, the downstream `visual-storyboard-to-video` skill
+    // can't re-attach the source JSON when rendering the final video,
+    // and (reported bug) the agent falls back to disk-searching the
+    // storyboards folder and confabulating which JSON "matches" the
+    // pixels. Surface a loud warning so the agent fixes the call shape.
+    if (action.label === 'visual_storyboard') {
+      const m = action.metadata && typeof action.metadata === 'object' ? action.metadata : null;
+      const hasSourceLink = m && typeof m.sourceStoryboard === 'string' && m.sourceStoryboard.length > 0;
+      const isIdeaOrigin = m && m.storyboardOrigin === 'idea';
+      if (!hasSourceLink && !isIdeaOrigin) {
+        const msg =
+          'generate_image was called with `label: "visual_storyboard"` but ' +
+          '`metadata.sourceStoryboard` is missing AND `metadata.storyboardOrigin` ' +
+          'is not "idea". The visual-storyboard skill REQUIRES one of those so ' +
+          'the downstream `visual-storyboard-to-video` skill can re-attach the ' +
+          'source storyboard JSON (or know there is none). Pass `metadata: ' +
+          '{ sourceStoryboard: "<abs-path>", storyboardPart: K, storyboardParts: ' +
+          'K_total, storyboardShotIds: [...] }` when the sheet derives from an ' +
+          'interactive storyboard JSON, OR `metadata: { storyboardOrigin: "idea" }` ' +
+          'when there is no source JSON.';
+        try { channel.log('image', `⚠ ${msg}`); } catch { /* best-effort log */ }
+        _warnings.push({ code: 'visual_storyboard_missing_source_link', message: msg });
+      }
     }
 
     // Model selection policy:
@@ -556,6 +598,56 @@ const generateImageAction = {
             channel.log('image', `Media library ref save failed (non-fatal): ${mlErr.message}`);
           }
         }
+      }
+    }
+
+    // Ask the router which image slug it would dispatch to so we adapt
+    // inputs against THAT model's restrictions (not some hardcoded
+    // conservative cap). Same fetch + pick path the gateway dispatcher
+    // uses, but without firing the call. Mirrors `generate-avatar-video.js`
+    // — that tool does the same dance for `imageUrl`; we do it here for
+    // `referenceImages`.
+    if (referenceImages?.length) {
+      let pickedImageModel = null;
+      try {
+        const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
+        const mediaCaps = await fetchMediaCapabilities('image');
+        if (mediaCaps && Array.isArray(mediaCaps.models) && mediaCaps.models.length > 0) {
+          pickedImageModel = peekImageModel(mediaCaps.models, {
+            intent: typeof action.intent === 'string' ? action.intent : (action.operation || ''),
+            refsCount: referenceImages.length,
+            hasMaskImage: !!action.maskImage,
+            hasSourceImage: !!action.sourceImage,
+            hasTargetSize: !!(action.targetSize?.width && action.targetSize?.height),
+          }) || null;
+        }
+      } catch { /* no peek → no restriction → ship originals */ }
+
+      // Generic constraint-aware adaptation. The helper applies dim
+      // caps first (maxWidth / maxHeight / maxArea on `referenceImages`),
+      // then iterative lossless PNG shrink for any remaining maxBytes
+      // overshoot. No-op when the adapter declared nothing.
+      // adaptImageInput emits its own `[detect]` / `[shrink]` /
+      // `[apply ]` lines via channel.log('constraints', …) so the
+      // operator can trace every restriction action without this tool
+      // duplicating those messages.
+      try {
+        const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
+        for (let i = 0; i < referenceImages.length; i++) {
+          const ref = referenceImages[i];
+          const adapted = await adaptImageInput(ref.data, pickedImageModel, 'referenceImages');
+          if (adapted.changed) {
+            referenceImages[i] = { data: adapted.buffer, mimeType: adapted.mimeType };
+          }
+        }
+      } catch (err) {
+        // Sharp parse / re-encode failed — fall back to the original
+        // bytes and let the model try its luck. Logging only so the
+        // user can see why an oversized ref might still slip through.
+        channel.log(
+          'image',
+          `generate_image: adapt-image step skipped (${err?.message || err}) — uploading originals`,
+        );
       }
     }
 
@@ -1339,6 +1431,10 @@ const generateImageAction = {
             ...(typeof result?.providerRequestId === 'string'
                 ? { providerRequestId: result.providerRequestId }
                 : {}),
+            // Forwarded to MediaLibrary.save({summary}) → the per-
+            // session creations ledger. See the field doc in the
+            // schema for why this lives here.
+            summary: typeof action.summary === 'string' ? action.summary : undefined,
           }, agent?.llmProvider || null);
           channel.log('image', `Saved to media library: ${img.savedTo}`);
         }
@@ -1383,6 +1479,11 @@ const generateImageAction = {
       imageCount: savedImages.length,
       images: savedImages,
       usage: result.usage,
+      // Non-fatal contract violations surface here. Currently used by the
+      // `visual_storyboard` label to flag missing source-JSON metadata —
+      // the call succeeded but the downstream `visual-storyboard-to-video`
+      // link is broken (see _warnings collection at the top of execute()).
+      ...(_warnings.length > 0 ? { warnings: _warnings } : {}),
     };
   }
 };

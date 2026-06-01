@@ -531,7 +531,16 @@ async function _mirrorToMediaLibrary(filePath, state) {
     // we don't want to make every save block on a network round-trip.
     // The migration / a later embed-on-idle pass can fill in vectors
     // for rows that landed without one.
-    await saveTimelineEntry(filePath, state, null);
+    //
+    // `state.summary` is the agent-supplied "what is this timeline
+    // for". When present, it flows down to the per-session creations
+    // ledger via saveTimelineEntry → save({summary}). Only the FIRST
+    // save of a new file path actually appends to the ledger (see
+    // `wasReplacement` in media-library.js) — subsequent edits keep
+    // refreshing the row but never duplicate the ledger entry.
+    await saveTimelineEntry(filePath, state, null, {
+      summary: typeof state?.summary === 'string' ? state.summary : undefined,
+    });
   } catch (e) {
     process.stderr.write(`[timelines] mirror to media-library failed: ${e.message}\n`);
   }
@@ -544,7 +553,7 @@ async function _mirrorToMediaLibrary(filePath, state) {
  * `state` argument that follows the JSON schema documented at the top
  * of this file (id and timestamps are filled in for you).
  */
-export function createTimeline({ name, settings, clips, state } = {}) {
+export function createTimeline({ name, settings, clips, state, summary } = {}) {
   const id = _newId();
   let toWrite;
   if (state && typeof state === 'object') {
@@ -557,6 +566,13 @@ export function createTimeline({ name, settings, clips, state } = {}) {
       settings,
       clips: clips || [],
     });
+  }
+  // Stamp the agent-supplied "what is this timeline for" onto the
+  // state so `_mirrorToMediaLibrary` can forward it to the per-
+  // session creations ledger. Persisted alongside the rest of the
+  // state — a later `inspect_creation` surfaces it.
+  if (typeof summary === 'string' && summary.trim()) {
+    toWrite.summary = summary.trim();
   }
   _write(toWrite);
   return toWrite;

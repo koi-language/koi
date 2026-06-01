@@ -228,6 +228,7 @@ export default {
         type: 'object',
         description: 'Full storyboard object (v6 schema). See description for required fields.',
       },
+      summary: { type: 'string', description: 'OPTIONAL. One-line "what is this storyboard for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Duelo bajo la Tormenta — full storyboard", "Product demo intro storyboard, vertical 9:16". Keep it short and self-evident; the agent is the one who will read it back later. Only attached on the FIRST save of a given storyboard id; subsequent edits do not overwrite it. When omitted, the ledger falls back to the storyboard\'s description.' },
     },
     required: ['storyboard'],
   },
@@ -275,9 +276,13 @@ export default {
 
     // Index in MediaLibrary so the storyboard shows in the drawer at
     // its real authored date. Best-effort: a DB hiccup must not lose
-    // the file write.
+    // the file write. The optional `summary` only lands on the FIRST
+    // save (subsequent edits hit the wasReplacement gate inside
+    // MediaLibrary.save and skip the ledger append).
     try {
-      await saveStoryboardEntry(filePath, normalized, agent?.llmProvider);
+      await saveStoryboardEntry(filePath, normalized, agent?.llmProvider, {
+        summary: typeof action.summary === 'string' ? action.summary : undefined,
+      });
     } catch (err) {
       channel.log('save_storyboard',
         `MediaLibrary index failed for ${filePath} (${err.message}); file still written.`);
