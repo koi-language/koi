@@ -155,6 +155,7 @@ const generateImageAction = {
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
       saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
+      summary:         { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari hero shot for video ad opening", "Burrow front view, 9:16, used in storyboard sheet 2". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
       metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover — e.g. a visual storyboard sheet links back to its source interactive storyboard with `metadata: { sourceStoryboard: "/Users/…/.koi/storyboards/<id>.json", storyboardPart: 2, storyboardParts: 3 }` so a later step can re-attach the storyboard when rendering the video. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
       cameraAngles: {
         type: 'object',
@@ -1389,6 +1390,10 @@ const generateImageAction = {
             ...(typeof result?.providerRequestId === 'string'
                 ? { providerRequestId: result.providerRequestId }
                 : {}),
+            // Forwarded to MediaLibrary.save({summary}) → the per-
+            // session creations ledger. See the field doc in the
+            // schema for why this lives here.
+            summary: typeof action.summary === 'string' ? action.summary : undefined,
           }, agent?.llmProvider || null);
           channel.log('image', `Saved to media library: ${img.savedTo}`);
         }

@@ -92,7 +92,8 @@ const generateAudioAction = {
       videoFile:    { type: 'string', description: 'Optional path to a reference video (sfx mode). When provided, the router picks a video-conditioned model (e.g. mmaudio-v2) that synchronises the generated SFX / Foley to the visible action — preferred when adding audio to a silent video. The video is uploaded to fal storage automatically. Omit for prompt-only SFX (faster / cheaper).' },
       // Transcribe mode fields
       audioFile:    { type: 'string', description: 'Path to audio file to transcribe (transcribe mode)' },
-      language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' }
+      language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' },
+      summary:      { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Narrator opening line in Spanish", "Stone door slam for shot 3". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt / text — usable but less semantic.' }
       // `model` is intentionally NOT declared here. Model selection is the
       // auto-picker's job — the agent should describe what it wants
       // (mode, voice, label) and let the client-side router
@@ -236,6 +237,7 @@ const generateAudioAction = {
           fileSize: result.audio.length,
           ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
           ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+          summary: typeof action.summary === 'string' ? action.summary : undefined,
         }, agent?.llmProvider || null);
         channel.log('audio', `Saved to media library: ${savePath}`);
       } catch (mlErr) {
@@ -341,6 +343,7 @@ const generateAudioAction = {
           fileSize: result.audio.length,
           ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
           ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+          summary: typeof action.summary === 'string' ? action.summary : undefined,
         }, agent?.llmProvider || null);
         channel.log('audio', `Saved to media library: ${savePath}`);
       } catch (mlErr) {
@@ -410,6 +413,7 @@ const generateAudioAction = {
           fileSize: result.audio.length,
           ...(typeof result?.creditsCost === 'number' ? { creditsCost: result.creditsCost } : {}),
           ...(typeof result?.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
+          summary: typeof action.summary === 'string' ? action.summary : undefined,
         }, agent?.llmProvider || null);
         channel.log('audio', `Saved to media library: ${savePath}`);
       } catch (mlErr) {

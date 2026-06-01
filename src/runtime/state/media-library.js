@@ -341,6 +341,15 @@ export class MediaLibrary {
     replaceByPath = false,
     visible,
     createdAt,
+    /// Optional one-liner the agent passes via the creation tool's
+    /// `summary` field (image / video / audio / timeline / storyboard
+    /// / voice). Appended to the per-session creations ledger so the
+    /// agent can recall what it produced this session — preventing
+    /// the "find . -name ..." regression where the agent searched the
+    /// filesystem and mixed in stale files from other sessions. When
+    /// the agent didn't supply one, the auto-record below falls back
+    /// to description → metadata.prompt → filename.
+    summary,
   }) {
     const table = await this._ensureTable();
     const buffer = fs.readFileSync(filePath);
@@ -371,7 +380,19 @@ export class MediaLibrary {
     // identity (timelines, voices). Drop any existing row at that path
     // BEFORE the dedup checks so the new content (and its updated
     // metadata / embedding / categories) wins.
+    //
+    // Side effect tracked here so the creations-ledger hook below only
+    // fires the FIRST time we save a given path. Without this, every
+    // timeline/storyboard mutation (which delete+reinsert under the
+    // same path) would append a fresh ledger entry — the user would
+    // see the same timeline listed N times, one per edit.
+    let wasReplacement = false;
     if (replaceByPath) {
+      try {
+        const existing = await table.query()
+          .where(`file_path = '${escPath}'`).limit(1).toArray();
+        wasReplacement = existing.length > 0;
+      } catch { /* table empty — treat as fresh */ }
       try {
         await table.delete(`file_path = '${escPath}'`);
       } catch { /* nothing to delete */ }
@@ -471,6 +492,35 @@ export class MediaLibrary {
     };
 
     await table.add([row]);
+
+    // Per-session creations ledger. Single point: every NEW MediaLibrary
+    // row appends one line to `.koi/sessions/<id>/creations.jsonl` so
+    // the agent's `recall_creations` tool can list what THIS session
+    // produced, ordered chronologically. Skipped for replace-by-path
+    // UPDATES (same timeline edited many times → one ledger entry,
+    // not N). No-op outside an active session (boot, batch jobs).
+    // Summary resolution prefers the caller-supplied `summary` because
+    // it's the only one the agent explicitly wrote as "what was this
+    // for"; everything else is best-effort fallback. Fire-and-forget —
+    // a ledger I/O hiccup must not fail the save itself.
+    if (!wasReplacement) {
+      try {
+        const { recordCreation } = await import('./creations-ledger.js');
+        const prompt = (metadata && typeof metadata.prompt === 'string')
+          ? metadata.prompt : '';
+        const fallback = description || prompt || row.filename || '';
+        const resolvedSummary = (typeof summary === 'string' && summary.trim())
+          ? summary.trim()
+          : (fallback.length > 200 ? fallback.slice(0, 197) + '…' : fallback);
+        recordCreation({
+          id,
+          kind: resolvedType,
+          summary: resolvedSummary,
+          filePath,
+        });
+      } catch { /* ledger import failure must never block a save */ }
+    }
+
     return { id, isNew: true };
   }
 
@@ -1378,6 +1428,10 @@ export async function saveGeneratedImage(filePath, generationParams, llmProvider
     metadata: { ...generationParams, source: 'generated' },
     description,
     embedding,
+    // Forward the agent-supplied "what was this for" summary down to
+    // the ledger hook. Optional — when omitted, MediaLibrary.save
+    // falls back to description / prompt / filename automatically.
+    summary: generationParams.summary,
   });
 
   // Fire-and-forget vision-describe enrichment for image rows. The
@@ -1445,7 +1499,7 @@ export async function saveGeneratedAudio(filePath, generationParams, llmProvider
  *   description (project name + clip count + duration) and metadata.
  * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
  */
-export async function saveTimelineEntry(filePath, timeline, llmProvider) {
+export async function saveTimelineEntry(filePath, timeline, llmProvider, opts = {}) {
   const lib = MediaLibrary.global();
   const name = timeline?.name || path.basename(filePath, '.json');
   const clipCount = Array.isArray(timeline?.clips) ? timeline.clips.length : 0;
@@ -1481,6 +1535,12 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider) {
     description,
     embedding,
     replaceByPath: true,
+    // Agent-supplied "what is this timeline for" — only fires the
+    // ledger on the FIRST save of this filePath (subsequent edits
+    // skip via the wasReplacement gate in save()). When omitted,
+    // ledger falls back to `description` ("Timeline 'X' — N clips,
+    // …s.") which is already a usable handle.
+    summary: opts.summary,
   });
 }
 
@@ -1497,7 +1557,7 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider) {
  * @param {Object} storyboard - Parsed storyboard JSON (v6 schema).
  * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
  */
-export async function saveStoryboardEntry(filePath, storyboard, llmProvider) {
+export async function saveStoryboardEntry(filePath, storyboard, llmProvider, opts = {}) {
   const lib = MediaLibrary.global();
   const name = storyboard?.name || path.basename(filePath, '.json');
   const scenes = Array.isArray(storyboard?.scenes) ? storyboard.scenes : [];
@@ -1542,6 +1602,7 @@ export async function saveStoryboardEntry(filePath, storyboard, llmProvider) {
     embedding,
     replaceByPath: true,
     createdAt,
+    summary: opts.summary,
   });
 }
 
@@ -1553,7 +1614,7 @@ export async function saveStoryboardEntry(filePath, storyboard, llmProvider) {
  * @param {Object} voice - Voice registry entry.
  * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
  */
-export async function saveVoiceEntry(filePath, voice, llmProvider) {
+export async function saveVoiceEntry(filePath, voice, llmProvider, opts = {}) {
   const lib = MediaLibrary.global();
   const name = voice?.name || path.basename(filePath, path.extname(filePath));
   const provider = voice?.provider || 'unknown';
@@ -1583,6 +1644,7 @@ export async function saveVoiceEntry(filePath, voice, llmProvider) {
     description,
     embedding,
     replaceByPath: true,
+    summary: opts.summary,
   });
 }
 

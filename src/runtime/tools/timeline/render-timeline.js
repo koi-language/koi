@@ -52,6 +52,7 @@ export default {
       rangeMs: { type: 'object', description: 'Optional { startMs, endMs } to render only a slice of the timeline' },
       outputPath: { type: 'string', description: 'Output file path. Defaults to .koi/renders/<timelineId>-<timestamp>.<ext>' },
       wait: { type: 'boolean', description: 'Block until the render finishes and return the result inline. Default false (async).' },
+      summary: { type: 'string', description: 'OPTIONAL. One-line "what is this rendered video for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Final render of Duelo bajo la Tormenta", "Rough cut export for client review". The timeline itself was already ledgered when it was created; this entry registers the RENDERED video alongside.' },
     },
     required: ['id'],
   },
@@ -95,7 +96,7 @@ export default {
         if (signal.aborted) throw new Error('aborted');
 
         const totalDurUs = plan.durationMs * 1000;
-        return await new Promise((resolve, reject) => {
+        const renderResult = await new Promise((resolve, reject) => {
           const child = spawn(ffmpeg, plan.argv, { stdio: ['ignore', 'pipe', 'pipe'] });
           let stderrTail = '';
           let lastProgressMs = 0;
@@ -155,6 +156,35 @@ export default {
             setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000);
           }, { once: true });
         });
+
+        // Register the rendered MP4 in MediaLibrary so it shows up
+        // both in the GUI's creations drawer AND in this session's
+        // creations ledger (where the agent can `recall_creations`
+        // it later instead of running `find` on disk). Same flow
+        // generate_video uses — saveGeneratedVideo delegates to
+        // MediaLibrary.save, which auto-appends to the ledger.
+        // Best-effort: a DB hiccup must not fail the render itself.
+        try {
+          const { saveGeneratedVideo } = await import('../../state/media-library.js');
+          await saveGeneratedVideo(renderResult.outputPath, {
+            source: 'render-timeline',
+            timelineId: tl.id,
+            timelineName: tl.name || null,
+            format: renderResult.format,
+            width: renderResult.width,
+            height: renderResult.height,
+            fps: renderResult.fps,
+            durationMs: renderResult.durationMs,
+            summary: typeof action.summary === 'string' ? action.summary : undefined,
+          }, null);
+        } catch (mlErr) {
+          // Logged via stderr — the ledger / drawer is opportunistic;
+          // the rendered file is canonical and already on disk.
+          process.stderr.write(
+            `[render-timeline] media-library save failed for ${renderResult.outputPath}: ${mlErr.message}\n`,
+          );
+        }
+        return renderResult;
       },
     });
 

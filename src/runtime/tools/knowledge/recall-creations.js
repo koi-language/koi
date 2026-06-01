@@ -1,0 +1,92 @@
+/**
+ * Recall Creations Action — list the creations PRODUCED IN THE CURRENT
+ * SESSION so the agent can resolve them by id without searching the
+ * filesystem.
+ *
+ * Why this exists:
+ *   The user reported the agent forgetting what it just made and
+ *   resorting to `find . -name "*tl-…*"` to locate a freshly-rendered
+ *   timeline — which often surfaces files from OTHER sessions and
+ *   produces wrong assumptions. Every creation tool now appends to a
+ *   per-session ledger at `.koi/sessions/<id>/creations.jsonl` (via
+ *   `MediaLibrary.save()` → `recordCreation()`). This action exposes
+ *   that ledger to the agent. Output is reverse-chronological (most
+ *   recent first) so "what did we just make?" is the cheapest lookup.
+ *
+ * NOT a filesystem walk. NOT a global MediaLibrary search. ONLY entries
+ * the AGENT created in the current session, with the "summary" line it
+ * supplied (or the auto-derived fallback) and the canonical media id
+ * a follow-up `inspect_creation` can resolve to a file path + metadata.
+ */
+
+import { readCreations } from '../../state/creations-ledger.js';
+
+const _VALID_KINDS = new Set([
+  'image', 'video', 'audio', 'timeline', 'storyboard', 'voice', 'document',
+]);
+
+function _err(msg) { return { success: false, error: `recall_creations: ${msg}` }; }
+
+export default {
+  type: 'recall_creations',
+  intent: 'recall_creations',
+  description:
+    'List the creations (images, videos, audio, timelines, storyboards, voices) PRODUCED IN THE CURRENT SESSION. ' +
+    'Use this INSTEAD of `find` / `ls` / `read_dir` when you need to remember "what did I just make?" — the ledger has the canonical id, kind, file path, and the one-line summary you (or the previous tool) attached at create time. ' +
+    'Reverse-chronological output (newest first). Filterable by `kind` and capped by `limit`.\n\n' +
+    'Workflow: call `recall_creations` first, pick the id of the artefact you need, then either pass it to `inspect_creation` for full metadata + absolute path, or feed it directly to a downstream tool (show_result, assign to a clip, etc.).\n\n' +
+    'Returns: { success, creations: [{ id, kind, summary, filePath, ts }, …], count }.',
+  thinkingHint: (action) =>
+    `Recalling${action?.kind ? ' ' + action.kind : ''} creations`,
+  permission: null,
+  hidden: false,
+
+  schema: {
+    type: 'object',
+    properties: {
+      kind: {
+        type: 'string',
+        enum: ['image', 'video', 'audio', 'timeline', 'storyboard', 'voice', 'document'],
+        description:
+          'OPTIONAL. Filter by media kind. Mirrors `media_type` in MediaLibrary. Omit to get every kind.',
+      },
+      limit: {
+        type: 'number',
+        description:
+          'OPTIONAL. Max entries to return after the reverse-chronological sort. Default unlimited.',
+      },
+      since: {
+        type: 'number',
+        description:
+          'OPTIONAL. Epoch milliseconds — only return entries with ts >= since. Use when you want "what changed in the last N minutes" (compute the epoch yourself).',
+      },
+    },
+  },
+
+  examples: [
+    { actionType: 'direct', intent: 'recall_creations' },
+    { actionType: 'direct', intent: 'recall_creations', kind: 'timeline' },
+    { actionType: 'direct', intent: 'recall_creations', kind: 'video', limit: 5 },
+  ],
+
+  async execute(action) {
+    const kind = typeof action?.kind === 'string' ? action.kind.trim() : '';
+    if (kind && !_VALID_KINDS.has(kind)) {
+      return _err(
+        `invalid kind "${kind}". Allowed: ${[..._VALID_KINDS].join(', ')}.`,
+      );
+    }
+    const limit = (typeof action?.limit === 'number' && action.limit > 0)
+      ? Math.floor(action.limit) : undefined;
+    const since = (typeof action?.since === 'number' && action.since > 0)
+      ? Math.floor(action.since) : undefined;
+
+    let creations;
+    try {
+      creations = await readCreations({ kind: kind || undefined, limit, since });
+    } catch (err) {
+      return _err(`failed to read ledger: ${err.message}`);
+    }
+    return { success: true, count: creations.length, creations };
+  },
+};

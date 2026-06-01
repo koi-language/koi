@@ -403,6 +403,7 @@ const generateVideoAction = {
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
       kind:            { type: 'string',  enum: ['edit', 'continuation', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. DEFAULT behaviour mirrors `generate_image`: OMIT for plain text-to-video generation; pass `referenceVideos` (without `kind`) and the request automatically routes to `video_editing` (v2v transform — restyle, colour grade, repaint, motion swap; pool = kling-style v2v slugs). The transformation replaces the source content; identity is anchored by the source itself. EXPLICIT VALUES — use ONLY when you want to override the default: "continuation" → opt OUT of editing when the previous clip is being passed in `referenceVideos` purely as a STYLE / IDENTITY carry-over (storyboard-to-video continuity, multi-shot character lock); routes back to `video_generation` so seedance reference-to-video and similar continuation-aware slugs stay in the pool. Use this when the prompt describes a NEW scene that should keep the look of the reference, not a transformation of the reference itself. "edit" → explicit alias for the default v2v editing path; redundant when `referenceVideos` is already present, but accepted for clarity. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
+      summary:         { type: 'string',  description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari pulling out of garage — opening shot", "Continuation of shot 2 with rain". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
     },
     required: ['prompt']
   },
@@ -1319,6 +1320,11 @@ const generateVideoAction = {
       referenceVideoPaths: Array.isArray(action.referenceVideos) ? action.referenceVideos : [],
       shotCount: shots?.length || numShots || 1,
       saveTo: action.saveTo || null,
+      // Forwarded to MediaLibrary.save({summary}) → per-session ledger.
+      // The same generationParams object is reused for the primary
+      // save AND each multishot saveGeneratedVideo call below, so the
+      // summary lands on every produced clip without per-call wiring.
+      summary: typeof action.summary === 'string' ? action.summary : undefined,
     };
 
     if (submitted.id) _stashJobMetadata(submitted.id, generationParams);
