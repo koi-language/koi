@@ -139,18 +139,21 @@ export async function listConversations({ projectRoot = null, limit = 50, after 
   if (projectRoot) wheres.push(`projectRoot = '${_escapeSqlString(projectRoot)}'`);
   if (after) wheres.push(`updatedAt < '${_escapeSqlString(after)}'`);
   const where = wheres.length ? wheres.join(' AND ') : null;
-  // The adapter's query builder doesn't have ORDER BY — pull what fits
-  // and sort client-side. With realistic session counts (low
-  // thousands) this is fine; if it ever bites we add ORDER BY into
-  // the adapter.
-  const rows = where
-    ? await table.query().where(where).limit(Math.max(limit * 4, 200)).toArray()
-    : await table.query().limit(Math.max(limit * 4, 200)).toArray();
-  rows.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  // Sort + limit pushed into SQL via the adapter's ORDER BY support so
+  // we only ever pull the rows we actually return. The previous
+  // client-side sort over `LIMIT 200` silently truncated newer rows
+  // once the table grew past 200 entries — the adapter picks rows in
+  // ROWID (insertion) order, so the most recent sessions all live past
+  // the 200 cutoff and never surfaced in the GUI's "Open Session"
+  // dialog (the reported bug: "the recents stop at ~1w ago, no new
+  // sessions appear").
+  let q = table.query().orderBy('updatedAt', 'desc').limit(limit);
+  if (where) q = q.where(where);
+  const rows = await q.toArray();
   // Strip the embedding from list responses — it's a 6 KB float blob
   // per row that the GUI never needs in this codepath. Search is the
   // only consumer, and search reads it directly from SQLite.
-  return rows.slice(0, limit).map(_stripEmbedding);
+  return rows.map(_stripEmbedding);
 }
 
 /**
