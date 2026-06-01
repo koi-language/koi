@@ -2,7 +2,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { KoiTranspiler, KoiSemanticError } from '../compiler/transpiler.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -557,16 +557,40 @@ async function runFile(sourcePath, options = {}) {
 
   // Prefer the local tsx binary bundled with @koi-language/koi.
   // Fall back to global tsx / npx tsx only if the local one is missing.
+  // On Windows, .bin/ wrappers are shell scripts that can't be spawned directly;
+  // instead invoke node + tsx's dist/cli.cjs (CJS build avoids ESM URL issues).
+  // We also pass only the filename (basename) and set cwd to jsPath's directory
+  // so tsx never receives an absolute Windows path as an ESM specifier.
   const { existsSync: _exists } = await import('fs');
+  const tsxCliCjs = path.join(__dirname, '../../node_modules/tsx/dist/cli.cjs');
+  const tsxCliMjs = path.join(__dirname, '../../node_modules/tsx/dist/cli.mjs');
   const tsxLocal = path.join(__dirname, '../../node_modules/.bin/tsx');
-  const [tsxBin, tsxArgs] = _exists(tsxLocal)
-    ? [tsxLocal, [jsPath]]
-    : ['npx', ['tsx', jsPath]];
+  const jsDir = path.dirname(jsPath);
+  const jsBasename = './' + path.basename(jsPath);
+  let tsxBin, tsxArgs, tsxCwd;
+  if (process.platform === 'win32' && _exists(tsxCliCjs)) {
+    tsxBin = process.execPath;
+    tsxArgs = [tsxCliCjs, jsBasename];
+    tsxCwd = jsDir;
+  } else if (_exists(tsxCliMjs)) {
+    tsxBin = process.execPath;
+    tsxArgs = [tsxCliMjs, jsBasename];
+    tsxCwd = jsDir;
+  } else if (_exists(tsxLocal) && process.platform !== 'win32') {
+    tsxBin = tsxLocal;
+    tsxArgs = [jsPath];
+    tsxCwd = undefined;
+  } else {
+    tsxBin = 'npx';
+    tsxArgs = ['tsx', jsPath];
+    tsxCwd = undefined;
+  }
 
   const child = spawn(tsxBin, tsxArgs, {
     stdio: 'inherit',
     env,
-    shell: false
+    shell: false,
+    ...(tsxCwd ? { cwd: tsxCwd } : {}),
   });
 
   return new Promise((resolve, reject) => {
@@ -640,9 +664,18 @@ process.exit = (code) => {
   fs.writeFileSync(serveScriptPath, serveScript);
 
   const tsxLocal = path.join(__dirname, '../../node_modules/.bin/tsx');
-  const [tsxBin, tsxArgs] = _exists(tsxLocal)
-    ? [tsxLocal, [serveScriptPath]]
-    : ['npx', ['tsx', serveScriptPath]];
+  const tsxCliMjsServe = path.join(__dirname, '../../node_modules/tsx/dist/cli.mjs');
+  let tsxBin, tsxArgs;
+  if (_exists(tsxCliMjsServe)) {
+    tsxBin = process.execPath;
+    tsxArgs = [tsxCliMjsServe, serveScriptPath];
+  } else if (_exists(tsxLocal) && process.platform !== 'win32') {
+    tsxBin = tsxLocal;
+    tsxArgs = [serveScriptPath];
+  } else {
+    tsxBin = 'npx';
+    tsxArgs = ['tsx', serveScriptPath];
+  }
 
   const child = _spawn(tsxBin, tsxArgs, {
     stdio: ['inherit', 'inherit', 'inherit'],

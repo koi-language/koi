@@ -862,7 +862,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       // explicit and includes the verbatim call shape.
       if (activeIsImage && active && (active.path || active.url)) {
         const activeLoc = active.path || active.url;
-        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        const saveDir = path.dirname(activeLoc);
         lines.push('');
         lines.push('## ⚠ Active document is an IMAGE — `generate_video` rules');
         lines.push('');
@@ -899,7 +899,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         // some adapters reject duplicates.
         const animRefList = [activeOverlay].filter(Boolean);
         const animRefJson = JSON.stringify(animRefList);
-        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        const saveDir = path.dirname(activeLoc);
         lines.push('');
         lines.push('## ⚠ ACTIVE document is a photomontage — act, do not ask');
         lines.push('');
@@ -953,7 +953,7 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
       // planner picks the right pipeline up-front.
       if (active && active.type === 'video' && active.path) {
         const activeLoc = active.path;
-        const saveDir = activeLoc.replace(/\/[^/]+$/, '');
+        const saveDir = path.dirname(activeLoc);
         const videoAnns = Array.isArray(active.bundle?.annotations)
           ? active.bundle.annotations.filter((a) => a?.role === 'video-frame-composite')
           : [];
