@@ -35,7 +35,12 @@ export default {
     'Use this INSTEAD of `find` / `ls` / `read_dir` when you need to remember "what did I just make?" — the ledger has the canonical id, kind, file path, and the one-line summary you (or the previous tool) attached at create time. ' +
     'Reverse-chronological output (newest first). Filterable by `kind` and capped by `limit`.\n\n' +
     'Workflow: call `recall_creations` first, pick the id of the artefact you need, then either pass it to `inspect_creation` for full metadata + absolute path, or feed it directly to a downstream tool (show_result, assign to a clip, etc.).\n\n' +
-    'Returns: { success, creations: [{ id, kind, summary, filePath, ts }, …], count }.',
+    '**Wrong use — NEVER do these:**\n' +
+    '  • To resolve a demonstrative ("este", "esto", "this", "este storyboard") when the `# WORKING AREA` block in your system prompt names an active document — the active doc IS what the user is pointing at, use its path directly.\n' +
+    '  • As a precursor to a filesystem search: if `recall_creations` returns `count: 0` you must NOT then run `ls`, `find`, `read_dir`, `shell` globbing or any other disk lookup to "find" the artefact yourself. Disk fallback is forbidden for resolving user references. Ask the user instead.\n' +
+    '  • To look for creations from PRIOR sessions — the ledger only covers the current session by design. For cross-session lookup use `recall_memory` / `inspect_creation` with a known id, never disk search.\n\n' +
+    'Returns: { success, creations: [{ id, kind, summary, filePath, ts }, …], count }. ' +
+    'When `count` is 0: the ledger has no matching entry; either the artefact is in the active doc / working area already, or the user is referring to something you don\'t have — ASK, do not search disk.',
   thinkingHint: (action) =>
     `Recalling${action?.kind ? ' ' + action.kind : ''} creations`,
   permission: null,
