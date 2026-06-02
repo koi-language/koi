@@ -14,9 +14,10 @@
  * that, especially on a delegate's first turn, and ends up calling
  * `generate_image` (or _video, _audio, etc.) without ever seeing
  * the per-model catalog block. That block is where it learns about
- * available `label`s (`erotic`, `porn`, `motion-transfer`, …),
- * `excludeModels`, `excludeProviders`, the live aspect/resolution
- * enums, and which models are gated for which intents. Skipping it
+ * available `label`s (live list pulled from the backend catalog — see
+ * the per-tool "Label glossary" section), `excludeModels`,
+ * `excludeProviders`, the live aspect/resolution enums, and which
+ * models are gated for which intents. Skipping it
  * means the picker resolves to a default that frequently doesn't
  * match the request (gpt-image-2 with a strict content checker for
  * an explicit prompt, etc.) and the call wastes a round-trip.

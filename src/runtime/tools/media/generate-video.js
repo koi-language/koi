@@ -374,8 +374,8 @@ const generateVideoAction = {
       referenceVideos: { type: 'array',   description: 'Video REFERENCES for style/motion/continuation guidance — NOT a literal frame source. Local video paths, https URLs, or `@mention` handles. Local paths are uploaded to the gateway transparently; `@name` resolves via MediaLibrary the same way as referenceImages. Only honored when the selected model advertises videoToVideo.', items: { type: 'string' } },
       withAudio:       { type: 'boolean', description: 'Generate an audio track (SFX, dialogue, voiceover, ambient) alongside the video. DEFAULT: true — videos come back WITH sound unless you explicitly pass false. Only set false for a deliberately silent clip. NOTE: this does NOT control background music; excluding music is done via the prompt text, not by silencing the whole clip.' },
       cameraMovement:  { type: 'string',  description: 'Camera movement / shot type, e.g. "static", "pan_left", "zoom_in", "dolly_in", "orbit_right". Provider-dependent — unknown values are ignored.' },
-      characterOrientation: { type: 'string', enum: ['image', 'video'], description: 'Motion-transfer models only (label="motion-transfer"): "image" preserves the still photo\'s character pose/orientation while inheriting motion from the reference video (default — natural for "make my character do that"); "video" reorients the character to match the reference video\'s pose (use for dance / body-mimicry where the reference body shape is the target). Ignored by every other model.' },
-      keepOriginalSound: { type: 'boolean', description: 'Motion-transfer models only (label="motion-transfer"): when true (default) preserves the audio track of the reference video in the output. Ignored by every other model.' },
+      characterOrientation: { type: 'string', enum: ['image', 'video'], description: 'Only consumed by models that perform pose / motion transfer from a reference video onto a still character (see the catalog snapshot — the label slug for this family lives in the per-model labels list, alongside its glossary entry). "image" preserves the still photo\'s character pose/orientation while inheriting motion from the reference video (default — natural for "make my character do that"); "video" reorients the character to match the reference video\'s pose (use for dance / body-mimicry where the reference body shape is the target). Ignored by every other model.' },
+      keepOriginalSound: { type: 'boolean', description: 'Only consumed by models that perform motion transfer from a reference video (see the catalog snapshot — same family as `characterOrientation`). When true (default) preserves the audio track of the reference video in the output. Ignored by every other model.' },
       numShots:        { type: 'number',  description: 'Number of independent clips to emit in a single call (multishot). Default 1. Only models with maxShots > 1 honor it. Ignored when "shots" is present.' },
       shots:           {
         type: 'array',
@@ -1139,11 +1139,12 @@ const generateVideoAction = {
 
     // Forward the agent's `label` selector down to the gateway so the
     // client-side router can apply it as a model-variant filter (e.g.
-    // "sketch-guided" routes to a model that interprets drawn marks).
-    // Without this, the agent's label was silently dropped here and the
-    // router fell through to the "no label requested" branch, which
-    // pins to non-labelled models — picking the cheapest generic instead
-    // of the specialised variant the agent explicitly asked for.
+    // "storyboard-to-video" or "motion-transfer" route to specific
+    // models tuned for those workloads). Without this, the agent's
+    // label was silently dropped here and the router fell through to
+    // the "no label requested" branch, which pins to non-labelled
+    // models — picking the cheapest generic instead of the specialised
+    // variant the agent explicitly asked for.
     const label = typeof action.label === 'string' && action.label.trim()
       ? action.label.trim()
       : null;

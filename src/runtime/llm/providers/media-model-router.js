@@ -262,12 +262,26 @@ function _pickByBucket(kind, models, req, wantedBucket) {
   });
 
   let eligible = _filter(/* useLabel */ true);
+  // Tracks whether the label filter was dropped by the fallback below.
+  // When it WAS dropped, the subsequent `_rankSort` must also be told
+  // the label is gone — otherwise the ranker's `wantLabel`-truthy branch
+  // gives every surviving model the same `labelRank = 1` (no model has
+  // the requested specialised label, by definition of why we fell back),
+  // they tie on label, and the tiebreaker falls to price. With
+  // `preferQuality: true` (default) that picks the MOST EXPENSIVE generic
+  // model. Real-world bug: an agent asked for `label: "sketch-guided"`,
+  // no slug in the catalog carried it, fallback ran, ranker tied every
+  // model on labelRank, price won → Veo 3.1 ($0.40/s) beat Seedance
+  // image-to-video ($0.014/1000 tokens, carries the curated `default`
+  // label that should have anchored it at labelRank=0).
+  let labelDropped = false;
   if (eligible.length === 0 && wantLabel) {
     // Label fallback: when the requested label exists nowhere in the
     // target bucket, retry without it so a specialised label doesn't
     // dead-end a routing call when a generic model would do the job.
     eligible = _filter(/* useLabel */ false);
     if (eligible.length > 0) {
+      labelDropped = true;
       try {
         // eslint-disable-next-line no-console
         console.warn(
@@ -309,7 +323,11 @@ function _pickByBucket(kind, models, req, wantedBucket) {
       },
     );
   }
-  _rankSort(eligible, req);
+  // If the label fallback ran, rank as if no label was requested in the
+  // first place — that activates the `default > unlabelled > others`
+  // preference instead of tying every model on labelRank and letting
+  // price decide.
+  _rankSort(eligible, labelDropped ? { ...req, label: null } : req);
   // Log the decision so future "why did the picker land here?" debug
   // doesn't require reconstructing the catalog state from memory. Each
   // line includes the bucket, the winning slug, and the ranked

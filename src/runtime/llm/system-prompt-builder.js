@@ -922,12 +922,6 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('**Critical**: `startFrame` is mandatory for image-to-video. Omitting it causes the call to fail with `body.image_url: Field required` because the gateway only sets `image_url` when a `startFrame` is provided (see `gateway.service.ts`).');
         if (hasDrawnMarks) {
           lines.push('');
-          lines.push('**Sketch-guided routing**: when `label: "sketch-guided"` appears in the `generate_video` schema enum, ADD it to the call. That label selects a model variant trained to interpret drawn marks (arrows, crosses, scribbles) as motion / edit hints visually — not just from prose. Without the label the router picks a generic image-to-video model that only sees the clean source frame + your prompt, which is why complex trajectories (swerve, overtake, multi-segment paths) often come out wrong. Example with the label:');
-          lines.push('');
-          lines.push('```json');
-          lines.push(`{ "intent": "generate_video", "label": "sketch-guided", "prompt": "<...>", "startFrame": "${activeLoc}", "referenceImages": ${animRefJson}, "saveTo": "${saveDir}" }`);
-          lines.push('```');
-          lines.push('');
           lines.push('**Required workflow when annotations carry drawn marks (whether you call `generate_image` OR `generate_video`):**');
           lines.push('');
           lines.push('5. ');
@@ -1023,8 +1017,6 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
           lines.push('```json');
           lines.push(`{ "intent": "generate_video", "prompt": "<numbered, timestamp-anchored directives per step 3>", "referenceVideos": ["${activeLoc}"], "referenceImages": ${refImagesJson}, "saveTo": "${saveDir}" }`);
           lines.push('```');
-          lines.push('');
-          lines.push('**Sketch-guided routing**: when `label: "sketch-guided"` appears in the `generate_video` schema enum, ADD it. That label selects a model variant trained to read drawn marks visually (arrows = motion vectors, crosses = removal regions) instead of relying purely on prose. Without it the router picks a generic v2v / i2v model that only sees the source + your prompt, and complex per-frame intent gets lost.');
           lines.push('');
           _pushSurgicalAnnotationGuide(lines);
         }
