@@ -18,31 +18,39 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import yaml from 'yaml';
 import { listAdminPluginDirs } from '../../plugins/admin-root.js';
 
 /**
  * Parse YAML frontmatter from a SKILL.md file.
  * Extracts name and description from the --- delimited YAML block.
+ *
+ * Uses the `yaml` package so folded scalars (`description: >\n  …`) and
+ * literal block scalars (`description: |\n  …`) parse correctly. The
+ * previous hand-rolled line-by-line parser only saw the first line of
+ * a folded value and ended up returning the literal `>` as the
+ * description (the reported bug — visible in the agent's catalog as
+ * `### visual-storyboard\n>` instead of the actual paragraph).
  */
 function parseFrontmatter(content) {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
   if (!match) return null;
 
-  const yaml = match[1];
-  const result = {};
+  let parsed;
+  try {
+    parsed = yaml.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
 
-  for (const line of yaml.split('\n')) {
-    const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) continue;
-    const key = line.substring(0, colonIdx).trim();
-    let value = line.substring(colonIdx + 1).trim();
-    // Strip surrounding quotes if present
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (key === 'name' || key === 'description' || key === 'compatibility' || key === 'license') {
-      result[key] = value;
+  const result = {};
+  for (const key of ['name', 'description', 'compatibility', 'license']) {
+    const v = parsed[key];
+    if (typeof v === 'string') {
+      // Folded scalars (`>`) keep a trailing newline; whitespace-trim for
+      // a clean single-line description.
+      result[key] = v.trim();
     }
   }
 
