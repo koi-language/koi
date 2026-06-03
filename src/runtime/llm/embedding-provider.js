@@ -145,10 +145,15 @@ export class EmbeddingProvider {
    *  from `getEmbedding` after the cache misses. */
   async _getEmbeddingUncached(text) {
     const MAX_RETRIES = 1;
-    // Short timeout: this is a blocking best-effort READ on the agent's hot
-    // path, not a background job. 8s is plenty for a healthy gateway; beyond
-    // that we'd rather fail and let recall degrade than freeze the turn.
-    const TIMEOUT_MS = 8000;
+    // Per-attempt timeout. 8s was too tight: the gateway (single replica)
+    // has legitimate latency spikes — observed gemini round-trips of ~11.7s
+    // and embedding round-trips in that ballpark under load. At 8s those
+    // slow-but-WORKING requests were force-failed, which tripped the circuit
+    // breaker and blacked out recall. Back to 15s so a normal spike rides
+    // through; the circuit breaker (below) still caps a genuinely-down
+    // gateway to a couple of slow failures, then fast-fails — so we get
+    // resilience WITHOUT false-failing healthy-but-slow embeddings.
+    const TIMEOUT_MS = 15000;
     const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
     // Fail fast when no credentials are configured — retrying the same 'none'
     // provider with backoff just wastes the startup window while the
