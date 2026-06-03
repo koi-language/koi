@@ -20,29 +20,39 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import yaml from 'yaml';
 import { listAdminPluginDirs } from '../plugins/admin-root.js';
 
+/**
+ * Parse YAML frontmatter from a workflow file.
+ *
+ * Uses the `yaml` package so folded scalars (`description: >\n  …`) and
+ * literal block scalars (`description: |\n  …`) parse correctly. The
+ * previous hand-rolled line-by-line parser only captured the first line
+ * of a folded value and returned the literal `>` as the description —
+ * the same bug that hit the SKILL.md parser.
+ */
 function parseFrontmatter(content) {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
   if (!match) return null;
 
-  const yaml = match[1];
-  const result = {};
+  let parsed;
+  try {
+    parsed = yaml.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
 
-  for (const line of yaml.split('\n')) {
-    const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) continue;
-    const key = line.substring(0, colonIdx).trim();
-    let value = line.substring(colonIdx + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
+  const result = {};
+  for (const key of ['name', 'description', 'compatibility', 'license']) {
+    const v = parsed[key];
+    if (typeof v === 'string') {
+      result[key] = v.trim();
     }
-    if (key === 'name' || key === 'description' || key === 'compatibility' || key === 'license') {
-      result[key] = value;
-    } else if (key === 'requireConfirmation') {
-      result.requireConfirmation = value === 'true';
-    }
+  }
+  if (parsed.requireConfirmation === true || parsed.requireConfirmation === 'true') {
+    result.requireConfirmation = true;
   }
 
   return (result.name && result.description) ? result : null;

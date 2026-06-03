@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { isNetworkError } from './is-network-error.js';
 
 /**
  * EmbeddingProvider — extracted from LLMProvider.
@@ -49,6 +50,21 @@ export class EmbeddingProvider {
     this._embeddingCache = new Map();
     this._embeddingCacheTtlMs = 30_000;
     this._embeddingCacheMaxEntries = 64;
+
+    // ── Circuit breaker ─────────────────────────────────────────────
+    // Embeddings power a BEST-EFFORT enhancement (semantic memory recall).
+    // Every caller already treats a failure as non-fatal (try/catch →
+    // proceed without recall). The historical failure mode was not a
+    // crash but a HANG: when the gateway is unreachable the provider would
+    // burn up to 3×timeout + serial backoff (~45-75s) per call, on EVERY
+    // turn, freezing the agent for minutes. The breaker turns that into a
+    // single slow failure followed by instant (<1ms) fail-fast for a
+    // cooldown window, so a flaky/down gateway degrades gracefully instead
+    // of stalling the turn. Reset on the first success.
+    this._embConsecutiveNetFailures = 0;
+    this._embCircuitOpenUntil = 0;
+    this._embCircuitThreshold = 3;     // trip after 3 consecutive network failures
+    this._embCircuitCooldownMs = 30_000; // stay open 30s, then probe again
   }
 
   _embeddingCacheGet(text) {
@@ -112,6 +128,9 @@ export class EmbeddingProvider {
 
     const promise = this._getEmbeddingUncached(text)
       .then((vec) => {
+        // Any success closes the circuit breaker immediately.
+        this._embConsecutiveNetFailures = 0;
+        this._embCircuitOpenUntil = 0;
         this._embeddingCachePut(text, vec);
         return vec;
       })
@@ -125,20 +144,35 @@ export class EmbeddingProvider {
   /** Original embedding logic — bypasses the dedup cache. Called only
    *  from `getEmbedding` after the cache misses. */
   async _getEmbeddingUncached(text) {
-    const MAX_RETRIES = 2;
-    const TIMEOUT_MS = 15000;
+    const MAX_RETRIES = 1;
+    // Short timeout: this is a blocking best-effort READ on the agent's hot
+    // path, not a background job. 8s is plenty for a healthy gateway; beyond
+    // that we'd rather fail and let recall degrade than freeze the turn.
+    const TIMEOUT_MS = 8000;
     const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
     // Fail fast when no credentials are configured — retrying the same 'none'
-    // provider with 2s+4s backoff just wastes the startup window while the
+    // provider with backoff just wastes the startup window while the
     // agent is blocked on memory restore / semantic index warmup.
     if (_provider === 'none') {
       throw new Error('No embedding provider available (need KOI_AUTH_TOKEN, OPENAI_API_KEY, or GEMINI_API_KEY)');
     }
+
+    // Circuit breaker: if the embedding backend has failed repeatedly with
+    // network errors, fail INSTANTLY for a cooldown window instead of paying
+    // another timeout. Callers treat embedding failure as non-fatal (recall
+    // degrades), so this turns a multi-minute hang into an instant skip.
+    if (this._embCircuitOpenUntil > Date.now()) {
+      const secsLeft = Math.ceil((this._embCircuitOpenUntil - Date.now()) / 1000);
+      const err = new Error(`embedding circuit open (gateway unreachable, retrying in ${secsLeft}s)`);
+      err.code = 'EMB_CIRCUIT_OPEN';
+      throw err;
+    }
+
     let lastError;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
-        const delay = 2000 * attempt; // 2s, 4s
+        const delay = 500; // single quick retry; the breaker handles a down backend
         this._log('memory', `Embedding retry ${attempt}/${MAX_RETRIES} after ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
       }
@@ -208,6 +242,18 @@ export class EmbeddingProvider {
           }
         } catch (_e) {
           if (_e === error) throw error;
+        }
+        // Track network-level failures for the circuit breaker. A timeout
+        // (gateway not responding) counts the same as a connection error —
+        // both mean "the backend is not reachable right now".
+        if (isTimeout || isNetworkError(error)) {
+          this._embConsecutiveNetFailures++;
+          if (this._embConsecutiveNetFailures >= this._embCircuitThreshold) {
+            this._embCircuitOpenUntil = Date.now() + this._embCircuitCooldownMs;
+            this._log('memory', `Embedding circuit OPEN: ${this._embConsecutiveNetFailures} consecutive network failures — fast-failing recall for ${this._embCircuitCooldownMs / 1000}s`);
+            // Don't burn the remaining retry once the circuit is open.
+            throw lastError;
+          }
         }
         // Retry on timeout or 5xx errors; don't retry auth/validation errors
         const status = error.status || 0;
