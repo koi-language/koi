@@ -159,6 +159,20 @@ function _normalize(sb, existing) {
       ? existing.seed
       : Math.floor(Math.random() * 1_000_000_000);
   const rootRefs = _normRefs(sb.references);
+  // Authoritative production totals, stamped on every save so any reader
+  // (esp. the visual-storyboard skill's chunking step) consumes ONE number
+  // instead of re-summing per-shot durations by hand — which the agent gets
+  // wrong: a 40 s storyboard (13 + 4.5 + 22.5) was mis-read as "20 s" and
+  // chunked into 2 PART sheets instead of 3. Computed here, the single write
+  // choke point, so it can never drift from the actual shots.
+  let _shotCount = 0;
+  let _totalDuration = 0;
+  for (const sc of sb.scenes) {
+    for (const sh of sc.shots) {
+      _shotCount += 1;
+      if (Number.isFinite(sh.duration)) _totalDuration += sh.duration;
+    }
+  }
   const out = {
     id: sb.id,
     name: sb.name.trim(),
@@ -166,6 +180,8 @@ function _normalize(sb, existing) {
     createdAt,
     updatedAt: now,
     aspect: sb.aspect,
+    shotCount: _shotCount,
+    totalDurationSeconds: Math.round(_totalDuration * 10) / 10,
     seed,
     characters: _isStr(sb.characters) ? sb.characters : '',
     lighting: _isStr(sb.lighting) ? sb.lighting : '',
