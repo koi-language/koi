@@ -692,6 +692,46 @@ const generateVideoAction = {
       }
     }
 
+    // ── Guard: prompt cites positional refs that aren't attached ─────
+    // The positional convention (defined by this tool + the visual-storyboard
+    // skills) is that the prompt body cites `Image 1`, `Image 2`, `Video 1` …
+    // and the matching files ride in referenceImages / referenceVideos in that
+    // order (position 1 = Image 1). When the agent writes those citations but
+    // forgets to attach the files — the storyboard sheet, the character refs,
+    // the previous clip for continuity — the model generates from TEXT ALONE:
+    // no visual blueprint, no identity lock, no seam continuity, and the prompt
+    // points at images that don't exist. (Reported: a storyboard→video clip
+    // whose prompt said "Use Image 1 as the blueprint" but attached nothing.)
+    // This matches a structural token the skill defines, not free-form intent —
+    // so it's a lint, not NL classification. Fail fast and force a re-issue.
+    {
+      const _promptStr = typeof action.prompt === 'string' ? action.prompt : '';
+      const _maxCited = (re) => {
+        let m; let max = 0;
+        while ((m = re.exec(_promptStr)) !== null) {
+          const n = parseInt(m[1], 10);
+          if (Number.isFinite(n) && n > max) max = n;
+        }
+        return max;
+      };
+      const _imgCited = _maxCited(/\bimage\s+(\d+)\b/gi);
+      const _vidCited = _maxCited(/\bvideo\s+(\d+)\b/gi);
+      const _imgHave = Array.isArray(action.referenceImages) ? action.referenceImages.length : 0;
+      const _vidHave = Array.isArray(action.referenceVideos) ? action.referenceVideos.length : 0;
+      const _missing = [];
+      if (_imgCited > _imgHave) _missing.push(`prompt cites "Image ${_imgCited}" but only ${_imgHave} reference image(s) are attached`);
+      if (_vidCited > _vidHave) _missing.push(`prompt cites "Video ${_vidCited}" but only ${_vidHave} reference video(s) are attached`);
+      if (_missing.length > 0) {
+        return {
+          success: false,
+          error:
+            `generate_video did NOT run — ${_missing.join('; ')}. ` +
+            `Your prompt cites positional references (Image N / Video N) but the matching files were not attached, so the model would have nothing to follow (no storyboard blueprint, no character identity, no previous-clip continuity). ` +
+            `Re-issue with the references populated IN ORDER. For a storyboard clip: referenceImages = [ the sheet itself (→ Image 1), then any prior PART sheets, then character/product/location refs ]; for clip K≥2 also pass the previous clip in referenceVideos (→ Video 1). The Image N / Video N citations in your prompt must each map to an attached file.`,
+        };
+      }
+    }
+
     // ── Pad-if-too-small for provider input minimums ─────────────────
     // The user's reference inputs may come from the GUI's clip cropper
     // honouring an arbitrary canvas rect — sometimes well under the
