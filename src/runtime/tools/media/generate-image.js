@@ -432,20 +432,25 @@ const generateImageAction = {
         };
         // Storyboard-level: always in scope.
         _push(_sb.references, 'storyboard');
+        // Subject references are IDENTITY ANCHORS for the whole production,
+        // not per-panel decor: a character's reference photo is attached to
+        // the shot where they first appear (often scene 1), but that same
+        // character recurs in LATER scenes that land on OTHER PART sheets.
+        // Scoping refs to only the current sheet's shots dropped the returning
+        // characters' refs — e.g. PART 2 (Yoda's bathroom) kept Yoda's photo
+        // but lost Luke/Obi-Wan's (attached to a scene-1 shot) even though
+        // they re-enter in scene 3. So collect refs from EVERY scene/shot of
+        // the storyboard and carry them on every sheet (deduped below; the
+        // downstream maxReferenceImages cap trims if a storyboard is ref-heavy).
+        // This matches the skill's stated rule: each sheet gets the subject
+        // references, same as sheet 1.
         if (Array.isArray(_sb.scenes)) {
           for (const sc of _sb.scenes) {
             const scId = (typeof sc?.id === 'string' && sc.id) ? sc.id : 'scene';
+            _push(sc?.references, scId);
             const _shots = Array.isArray(sc?.shots) ? sc.shots : [];
-            const _shotsInScope = _shots.filter(
-              (sh) => typeof sh?.id === 'string' && _scope.has(sh.id),
-            );
-            // Scene refs: in scope iff this scene contributes at
-            // least one shot to the current sheet.
-            if (_shotsInScope.length > 0) {
-              _push(sc?.references, scId);
-            }
-            for (const sh of _shotsInScope) {
-              const shId = sh.id;
+            for (const sh of _shots) {
+              const shId = (typeof sh?.id === 'string' && sh.id) ? sh.id : scId;
               _push(sh?.references, shId);
             }
           }
@@ -474,8 +479,8 @@ const generateImageAction = {
           }
           if (_added.length > 0) {
             channel.log('image',
-              `Auto-attached in-scope storyboard refs from ${_sbPath} ` +
-              `(shotIds=[${[..._scope].join(',')}]): ${_added.join(', ')}`);
+              `Auto-attached storyboard subject refs (identity anchors, whole storyboard) from ${_sbPath} ` +
+              `(sheet shotIds=[${[..._scope].join(',')}]): ${_added.join(', ')}`);
           }
         }
       }
