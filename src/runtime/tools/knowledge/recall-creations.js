@@ -65,13 +65,18 @@ export default {
         description:
           'OPTIONAL. Epoch milliseconds — only return entries with ts >= since. Use when you want "what changed in the last N minutes" (compute the epoch yourself).',
       },
+      storyboard: {
+        type: 'string',
+        description:
+          'OPTIONAL but STRONGLY RECOMMENDED when working on a specific storyboard/video. The storyboard id (e.g. "star-wars-laser-comedy" — the `id` field of the storyboard JSON, == the source filename without `.json`). Scopes the recall to creations made FOR THAT storyboard only. A single session often produces several DIFFERENT videos; without this filter the list mixes them and you may grab another video\'s sheet as a reference. When generating a multi-part sheet, ALWAYS pass the storyboard id you are working on.',
+      },
     },
   },
 
   examples: [
     { actionType: 'direct', intent: 'recall_creations' },
     { actionType: 'direct', intent: 'recall_creations', kind: 'timeline' },
-    { actionType: 'direct', intent: 'recall_creations', kind: 'video', limit: 5 },
+    { actionType: 'direct', intent: 'recall_creations', kind: 'image', storyboard: 'star-wars-laser-comedy' },
   ],
 
   async execute(action) {
@@ -85,13 +90,15 @@ export default {
       ? Math.floor(action.limit) : undefined;
     const since = (typeof action?.since === 'number' && action.since > 0)
       ? Math.floor(action.since) : undefined;
+    const storyboard = (typeof action?.storyboard === 'string' && action.storyboard.trim())
+      ? action.storyboard.trim() : undefined;
 
     let creations;
     try {
-      creations = await readCreations({ kind: kind || undefined, limit, since });
+      creations = await readCreations({ kind: kind || undefined, limit, since, storyboard });
     } catch (err) {
       return _err(`failed to read ledger: ${err.message}`);
     }
-    return { success: true, count: creations.length, creations };
+    return { success: true, count: creations.length, creations, ...(storyboard ? { storyboard } : {}) };
   },
 };

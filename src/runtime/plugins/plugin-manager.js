@@ -379,7 +379,7 @@ class PluginManager {
     const FETCH_TIMEOUT_MS = 120000;
 
     const httpGet = (url, asJson = false) => new Promise((resolve, reject) => {
-      const req = https.default.get(url, {
+      const req = https.get(url, {
         headers: {
           'User-Agent': 'koi-cli',
           'Accept': asJson ? 'application/vnd.github.v3+json' : '*/*',

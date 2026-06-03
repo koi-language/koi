@@ -792,13 +792,20 @@ export class GatewayImageGen extends BaseImageGen {
         if (!id) throw new Error('Gateway image submit returned no id');
 
         // Poll. Fal usually completes in a few seconds for fast slugs and
-        // 30–90s for gpt-image-2 + refs. Cap at ~5 min to bound runaway jobs.
-        const pollDeadline = Date.now() + 5 * 60 * 1000;
+        // 30–90s for gpt-image-2 + refs — BUT heavy 4K + multi-reference jobs
+        // on nano-banana-pro / gpt-image-2 routinely run several minutes under
+        // load (observed real gens >5 min). The old 5-min cap cut those off
+        // mid-flight. This poll runs in the background (generate_image is a
+        // backgrounded action), so a longer cap doesn't freeze the turn — it
+        // just lets a slow-but-live job finish. Default 10 min; override via
+        // KOI_IMAGE_POLL_TIMEOUT_MS (milliseconds) to tune without a rebuild.
+        const _imgPollTimeoutMs = Number(process.env.KOI_IMAGE_POLL_TIMEOUT_MS) || 10 * 60 * 1000;
+        const pollDeadline = Date.now() + _imgPollTimeoutMs;
         let pollDelay = 1500;
         // eslint-disable-next-line no-constant-condition
         while (true) {
           if (Date.now() > pollDeadline) {
-            throw new Error(`Gateway image timeout after 5 min waiting on ${id}`);
+            throw new Error(`Gateway image timeout after ${Math.round(_imgPollTimeoutMs / 60000)} min waiting on ${id}`);
           }
           await new Promise(r => setTimeout(r, pollDelay));
           pollDelay = Math.min(pollDelay * 1.4, 5000);
@@ -861,23 +868,44 @@ export class GatewayImageGen extends BaseImageGen {
           return ret;
         }
       } catch (callErr) {
-        if (_isRouteableError(callErr)) {
-          // Routeable failure on this slug — exclude it and try the
-          // next candidate. Covers BOTH content-policy rejections
-          // (provider's moderation) AND input-shape mismatches (the
-          // picker landed on a model whose adapter requires inputs
-          // the canonical request didn't carry). Same retry tactic
-          // works for both: re-resolve with the failed slug excluded
-          // and let the picker walk to the next-best.
+        // Input-shape mismatch is MECHANICAL (the picker landed on a model
+        // whose adapter requires inputs the canonical request didn't carry).
+        // A different shape-family model in the same bucket may fit, and
+        // these errors return fast, so exclude this slug and walk to the
+        // next-best — the cascade is cheap.
+        if (_isInputShapeError(callErr)) {
           _policyExcluded.add(resolvedModel);
           _lastError = callErr;
           _policyAttempt += 1;
-          const _shape = _isInputShapeError(callErr) ? 'input-shape' : 'content-policy';
           channel.log(
             'image',
-            `${_shape} reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model`,
+            `input-shape reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model`,
           );
           continue;
+        }
+        // Content-policy / safety rejection: STOP immediately — do NOT
+        // cascade through fallback models. Silently re-routing across up to
+        // MAX_POLICY_RETRIES models (each a multi-minute call) is the
+        // reported bug: the GUI banner spun ~8 min on a job that was already
+        // blocked, with zero feedback, and the user only found out by
+        // killing it manually. By product decision a moderation block is
+        // TERMINAL and user-facing. Throw a classified error → generate-
+        // image.js maps it to a blocked result → the banner wrapper fires
+        // mediaToolEnd (spinner closes at once) → the agent surfaces it to
+        // the user and asks how to proceed, instead of churning models or
+        // retrying the same flagged concept.
+        if (_isContentPolicyError(callErr)) {
+          channel.log(
+            'image',
+            `content-policy reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — STOPPING (no fallback) and surfacing to the user`,
+          );
+          const err = new Error(
+            `Image generation blocked by ${resolvedModel}'s content policy: ${callErr.message}`,
+          );
+          err.cause = callErr;
+          err.contentPolicyBlocked = true;
+          err.blockedModel = resolvedModel;
+          throw err;
         }
         // Any other failure (network, timeout, provider 500, …): don't
         // retry. Switching models won't help and would burn quota.
@@ -1927,23 +1955,41 @@ export class GatewayVideoGen extends BaseVideoGen {
           usage: { durationSec: opts.duration || 5 },
         };
       } catch (callErr) {
-        if (_isRouteableError(callErr)) {
-          // Routeable failure on this slug — exclude it and try the
-          // next candidate. Same logic as the image branch: covers
-          // content-policy rejections and input-shape mismatches.
-          // CRITICAL: opts (and thus referenceImages / startFrame /
-          // referenceVideos / shots) is preserved across the retry —
-          // that's the whole point of looping here instead of letting
-          // the agent reissue with a stripped-down JSON.
+        // Input-shape mismatch is MECHANICAL — exclude this slug and walk
+        // to the next-best candidate. CRITICAL: opts (and thus
+        // referenceImages / startFrame / referenceVideos / shots) is
+        // preserved across the retry — that's the whole point of looping
+        // here instead of letting the agent reissue with a stripped-down
+        // JSON. These errors return fast, so the cascade is cheap.
+        if (_isInputShapeError(callErr)) {
           _policyExcluded.add(resolvedModel);
           _lastError = callErr;
           _policyAttempt += 1;
-          const _shape = _isInputShapeError(callErr) ? 'input-shape' : 'content-policy';
           channel.log(
             'video',
-            `${_shape} reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model (refs preserved: images=${opts.referenceImages?.length || 0}, videos=${opts.referenceVideos?.length || 0}, startFrame=${!!opts.startFrame?.data}, endFrame=${!!opts.endFrame?.data})`,
+            `input-shape reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — trying next-best model (refs preserved: images=${opts.referenceImages?.length || 0}, videos=${opts.referenceVideos?.length || 0}, startFrame=${!!opts.startFrame?.data}, endFrame=${!!opts.endFrame?.data})`,
           );
           continue;
+        }
+        // Content-policy / safety rejection: STOP immediately — do NOT
+        // cascade through fallback models (same product decision as the
+        // image branch). Silently re-routing across multi-minute model
+        // calls left the GUI banner spinning for minutes on an
+        // already-blocked job. Throw a classified error so the tool maps it
+        // to a blocked result, the banner closes at once, and the agent
+        // surfaces it to the user instead of churning models.
+        if (_isContentPolicyError(callErr)) {
+          channel.log(
+            'video',
+            `content-policy reject from ${resolvedModel} (${(callErr.message || '').slice(0, 120)}) — STOPPING (no fallback) and surfacing to the user`,
+          );
+          const err = new Error(
+            `Video generation blocked by ${resolvedModel}'s content policy: ${callErr.message}`,
+          );
+          err.cause = callErr;
+          err.contentPolicyBlocked = true;
+          err.blockedModel = resolvedModel;
+          throw err;
         }
         // Any other failure (network, timeout, provider 500, …): don't
         // retry. Switching models won't help and would burn quota.

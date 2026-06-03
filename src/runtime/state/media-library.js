@@ -512,11 +512,25 @@ export class MediaLibrary {
         const resolvedSummary = (typeof summary === 'string' && summary.trim())
           ? summary.trim()
           : (fallback.length > 200 ? fallback.slice(0, 197) + '…' : fallback);
+        // Tie the creation to its storyboard/project so a multi-video session
+        // can scope a recall to one project (prevents a Part-2 generation from
+        // grabbing another video's sheet). Prefer the explicit source link;
+        // for a storyboard row itself, fall back to its own id.
+        const _sbRaw = (metadata && (metadata.sourceStoryboard || metadata.storyboardId || metadata.storyboard)) || '';
+        let storyboard = '';
+        if (typeof _sbRaw === 'string' && _sbRaw) {
+          // `sourceStoryboard` is an absolute path to the storyboard JSON;
+          // its id is the basename without extension (matches the JSON's "id").
+          storyboard = path.basename(_sbRaw).replace(/\.json$/i, '');
+        } else if (resolvedType === 'storyboard' && metadata && typeof metadata.id === 'string') {
+          storyboard = metadata.id;
+        }
         recordCreation({
           id,
           kind: resolvedType,
           summary: resolvedSummary,
           filePath,
+          storyboard,
         });
       } catch { /* ledger import failure must never block a save */ }
     }

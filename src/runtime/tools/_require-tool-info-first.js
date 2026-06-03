@@ -77,20 +77,28 @@ export async function requireToolInfoFirst(toolName, agent) {
     };
   }
 
-  // Mirror the get_tool_info result shape so the agent sees a
-  // familiar payload and reaches for the same continuation. The
-  // `_guardedAutoExpand: true` flag is documentation for the dev
-  // reading the log — it has no semantic effect at the consumer.
+  // CRITICAL: report `success: false`. The guard returned the schema
+  // INSTEAD of executing — so for a generation tool NOTHING was produced
+  // (no image/video/audio file, no media id). Reporting `success: true`
+  // (to mirror get_tool_info's shape) made fast models read this as "the
+  // generation succeeded": they'd store a "Part 1 generated" memory, look
+  // for an output file that never existed, and — failing to find it — go
+  // hunting on disk and splice in an artefact from a DIFFERENT project.
+  // A blocked generation is a failure; surface it as one and force a
+  // re-issue. The `_guardedAutoExpand` flag is dev-facing log breadcrumb only.
   return {
-    success: true,
+    success: false,
     tool: toolName,
     documentation: doc,
     expansionIter,
     _guardedAutoExpand: true,
-    hint:
-      `\`${toolName}\` was invoked without first calling \`get_tool_info("${toolName}")\`. ` +
-      `Returning the schema so you can see every parameter (labels, excludeProviders, ` +
-      `excludeModels, aspect/resolution enums, the live per-model catalog). ` +
-      `Re-issue your call now — this time the schema is in your context.`,
+    error:
+      `${toolName} did NOT run — nothing was generated or saved (no file, no media id). ` +
+      `It was invoked without first calling get_tool_info("${toolName}"), so the call was ` +
+      `blocked and the schema returned instead. Do NOT treat this as a completed generation: ` +
+      `do not store a "done"/"generated" memory, do not look for an output file, do not ` +
+      `substitute any other file. The full schema is now in your context (labels, ` +
+      `excludeProviders, excludeModels, aspect/resolution enums, live per-model catalog). ` +
+      `Re-issue the SAME ${toolName} call now to actually run it.`,
   };
 }

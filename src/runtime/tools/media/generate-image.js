@@ -1365,11 +1365,26 @@ const generateImageAction = {
       }
     }
 
-    // Auto-save generated images to media library (non-blocking)
+    // Auto-save generated images to media library (non-blocking).
+    //
+    // EXCEPTION — storyboard panel thumbnails. The interactive storyboard
+    // visor (Flutter `storyboard_tab.dart`) renders every shot card via
+    // generate_image with `label: "storyboard_card"`, then immediately
+    // MOVES the produced PNG into its own cache dir
+    // (`~/.koi/storyboards/.storyboard_cache/<hash>.png`). Those are
+    // ephemeral working thumbnails, not user-facing outputs, and must
+    // never appear in the creations drawer / cajón. Auto-saving them left
+    // a MediaLibrary row (pointing at a now-moved path) AND a
+    // creations.jsonl ledger entry; on `regenerate` the visor's move
+    // sometimes falls back to copy (cross-fs), so the original PNG
+    // lingered at the saved path and its row surfaced in the cajón — the
+    // reported bug ("algunas acaban en el cajón como creaciones"). Note
+    // the `visual_storyboard` label (the final exported sheet) IS a real
+    // creation and is intentionally NOT covered by this skip.
     try {
       const { saveGeneratedImage } = await import('../../state/media-library.js');
       for (const img of savedImages) {
-        if (img.savedTo) {
+        if (img.savedTo && action.label !== 'storyboard_card') {
           await saveGeneratedImage(img.savedTo, {
             // Caller-supplied passthrough metadata FIRST so the tool's
             // authoritative fields below always win on key collisions.

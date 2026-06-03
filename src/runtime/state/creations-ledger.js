@@ -62,6 +62,14 @@ function _ledgerPath() {
  *                                    just writes what it's given.
  * @param {string} [entry.filePath] — absolute path of the produced file,
  *                                    for tools that show paths to users.
+ * @param {string} [entry.storyboard] — id of the storyboard/project this
+ *                                    creation belongs to (e.g. derived from
+ *                                    `metadata.sourceStoryboard`). Lets a
+ *                                    single session that produced several
+ *                                    DIFFERENT videos scope a recall to one
+ *                                    project, so a Part-2 generation never
+ *                                    grabs another video's sheet. Empty when
+ *                                    the creation isn't tied to a storyboard.
  */
 export async function recordCreation(entry) {
   if (!entry || !entry.id || !entry.kind) return;
@@ -73,6 +81,7 @@ export async function recordCreation(entry) {
     kind: entry.kind,
     summary: entry.summary || '',
     filePath: entry.filePath || '',
+    storyboard: entry.storyboard || '',
     ts: typeof entry.ts === 'number' ? entry.ts : Date.now(),
   }) + '\n';
   try {
@@ -97,8 +106,12 @@ export async function recordCreation(entry) {
  *                                  `ts >= since` (epoch ms).
  * @param {number} [opts.limit]  — when set, cap result length AFTER
  *                                  reverse-chronological sort.
+ * @param {string} [opts.storyboard] — when set, return only entries tied to
+ *                                  this storyboard/project id. Entries with
+ *                                  no storyboard link are excluded by the
+ *                                  filter (they belong to no project).
  * @returns {Promise<Array<{id:string,kind:string,summary:string,
- *                           filePath:string,ts:number}>>}
+ *                           filePath:string,storyboard:string,ts:number}>>}
  */
 export async function readCreations(opts = {}) {
   const fp = _ledgerPath();
@@ -117,6 +130,7 @@ export async function readCreations(opts = {}) {
     try { obj = JSON.parse(trimmed); } catch { continue; }
     if (!obj || !obj.id) continue;
     if (opts.kind && obj.kind !== opts.kind) continue;
+    if (opts.storyboard && (obj.storyboard || '') !== opts.storyboard) continue;
     if (typeof opts.since === 'number' && (obj.ts || 0) < opts.since) continue;
     out.push(obj);
   }
