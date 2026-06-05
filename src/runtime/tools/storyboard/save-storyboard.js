@@ -35,6 +35,31 @@ const _VALID_ASPECTS = new Set([
   '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9',
 ]);
 
+// Shot-type presets — the EXACT set the GUI visor offers in its shot
+// picker. The GUI is the single source of truth (`kShotPresets` in
+// storyboard_prompt.dart); it passes the list to the engine at spawn time
+// via the env var KOI_SHOT_PRESETS (a JSON array of the full preset labels).
+// So when the user grows that list, the agent sees the new values here
+// automatically — nothing is hardcoded in the agent/skill. When the env is
+// absent (CLI / no GUI), the `shot` field stays unconstrained (old free-text
+// behaviour), so non-GUI storyboards never break.
+function _loadShotPresets() {
+  try {
+    const raw = process.env.KOI_SHOT_PRESETS;
+    if (!raw) return null;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr) && arr.length > 0 && arr.every((s) => typeof s === 'string')) {
+      return arr;
+    }
+  } catch { /* malformed → treat as absent */ }
+  return null;
+}
+const _shotSlug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+const _SHOT_PRESETS = _loadShotPresets();
+const _SHOT_PRESET_SLUGS = _SHOT_PRESETS
+  ? new Set(_SHOT_PRESETS.map((p) => _shotSlug(p)))
+  : null;
+
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_storyboard: ${msg}` }; }
@@ -100,6 +125,16 @@ function _validate(sb) {
         return `${tag}.duration must be a positive number (seconds, e.g. 3.0 — not "3s").`;
       }
       if (!_isStr(sh.shot)) return `${tag}.shot must be a string (e.g. "MCU low angle").`;
+      // The shot type MUST be one of the presets the app currently offers —
+      // the agent does NOT get to invent or combine arbitrary framings/angles
+      // (e.g. "Medium long shot, high angle" is not a real preset and renders
+      // without a thumbnail in the visor). Enforced only when the GUI supplied
+      // the live list via KOI_SHOT_PRESETS.
+      if (_SHOT_PRESET_SLUGS && !_SHOT_PRESET_SLUGS.has(_shotSlug(sh.shot))) {
+        return `${tag}.shot ${JSON.stringify(sh.shot)} is not one of the available shot presets. ` +
+          `It MUST be EXACTLY one of (copy ONE verbatim): ${_SHOT_PRESETS.map((p) => `"${p}"`).join(', ')}. ` +
+          `Pick the closest available preset — do NOT invent or combine framings/angles.`;
+      }
       if (!_isStr(sh.movement)) return `${tag}.movement must be a string (e.g. "Static", "Dolly in").`;
       if (!_isStr(sh.action)) return `${tag}.action must be a string.`;
       for (const k of ['dialogue', 'sfx', 'music', 'location', 'notes']) {

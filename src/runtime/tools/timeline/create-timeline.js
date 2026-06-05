@@ -63,7 +63,21 @@ export default {
         state: params.state,
         summary: params.summary,
       });
-      return { success: true, id: tl.id, timeline: tl };
+      return {
+        success: true,
+        id: tl.id,
+        timeline: tl,
+        // Runtime nudge against the recurring "confirm the timeline's path
+        // on disk" behaviour. The id below is authoritative and is how
+        // every other timeline tool addresses this timeline — there is
+        // nothing to look up or verify on disk.
+        hint:
+          `Timeline ready — address it everywhere by id "${tl.id}" ` +
+          `(add_clip_to_timeline, render_timeline, get_timeline, show_result all take this id). ` +
+          `The id is authoritative: do NOT search the disk to "confirm its path" and never ` +
+          `shell/find/ls/read_dir on .koi/timelines. If you ever lose the id, the only lookup is ` +
+          `recall_creations({ kind: "timeline" }) → inspect_creation — never the filesystem.`,
+      };
     } catch (e) {
       return { success: false, error: e.message };
     }
