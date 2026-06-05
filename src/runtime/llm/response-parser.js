@@ -130,6 +130,29 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
           } catch { /* fall through */ }
         }
       }
+      // The model answered in plain PROSE — it never even tried to emit a
+      // JSON action. This is common when a model just "answers the question"
+      // directly (e.g. it watched a video and wrote the whole shot-list table
+      // as its reply). Throwing here discards a perfectly good answer AND
+      // forces a retry that often makes the agent thrash into other tools
+      // (shell / ffmpeg). So when there is NO JSON structure at all — the
+      // response doesn't start with `{` or `[`, and every extraction fallback
+      // above came up empty — treat the entire response as a `print`: surface
+      // the answer to the user verbatim instead of erroring.
+      //
+      // We do this ONLY for clear prose. A response that DID start with `{` /
+      // `[` but failed to parse is a genuinely malformed / truncated JSON
+      // action — that still throws to retry, so we never silently swallow a
+      // half-formed tool call (the exact anti-pattern the user banned).
+      const _trimmed = cleaned.trim();
+      if (_trimmed.length > 0 && !_trimmed.startsWith('{') && !_trimmed.startsWith('[')) {
+        return normalizeReactiveAction({
+          actionType: 'direct',
+          intent: 'print',
+          message: _trimmed,
+        });
+      }
+
       // No recovery via a secondary LLM: we must NEVER invent actions the
       // agent did not explicitly emit. A second model "fixing" a malformed
       // response is guessing intent on behalf of the real agent — the same

@@ -1378,7 +1378,19 @@ CRITICAL RULES:
                Array.isArray(e.result?.attachments) &&
                e.result.attachments.some(a => a.type === t)
         );
-      const _requiresVideo = !!session._hasVideoAttachments || _hasFileTypeAtt('video');
+      // Tie the requirement to the actual video BYTES, not a one-shot flag.
+      // `_hasVideoAttachments` is cleared right after model selection (below),
+      // but the video may still be queued (`_pendingMcpVideos`) or have just
+      // been consumed/re-queued for a retry (`_consumedVideosThisCall`). If we
+      // only checked the one-shot flag, a retry/continuation turn would drop
+      // `requiresVideo` → the selector could pick a BLIND model (e.g.
+      // gemini-3.5-flash, which has no inputVideo) and then skip the video
+      // entirely. So: as long as a video is in play, we ALWAYS require a
+      // video-capable model.
+      const _requiresVideo = !!session._hasVideoAttachments
+        || !!(session._pendingMcpVideos?.length)
+        || !!(session._consumedVideosThisCall?.length)
+        || _hasFileTypeAtt('video');
       const _requiresAudio = !!session._hasAudioAttachments || _hasFileTypeAtt('audio');
       const _requiresFile  = !!session._hasFileAttachments  || _hasFileTypeAtt('file') || _hasFileTypeAtt('document') || _hasFileTypeAtt('pdf');
 

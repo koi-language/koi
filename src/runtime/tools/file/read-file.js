@@ -341,6 +341,65 @@ async function _queueVideoFramesForVision(videoPath, session, opts = {}) {
   return sampledMs;
 }
 
+/** Downscale a video so it fits under `targetBytes` for NATIVE inline upload.
+ *  For analysis we don't need full quality, so this walks a ladder of
+ *  progressively smaller settings (resolution / fps / crf / drop-audio) and
+ *  returns the first .mp4 output under the target — far better than degrading
+ *  to a handful of sampled frames. Returns { path, bytes } (the smallest we
+ *  managed, even if still over target so the caller can decide), or null when
+ *  ffmpeg is unavailable / every pass errored. */
+async function _transcodeVideoForUpload(videoPath, targetBytes) {
+  let ffmpegBin;
+  try {
+    const installer = await import('../../media/ffmpeg-installer.js');
+    const r = await installer.ensureFfmpeg();
+    ffmpegBin = r.ffmpeg;
+  } catch {
+    return null;
+  }
+  const { spawn } = await import('child_process');
+  const tmpDir = path.join(
+    os.tmpdir(),
+    'koi-read-file-video',
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  // [scale height, fps (null = keep), crf, keep audio]. Each rung is smaller
+  // than the last; Gemini understands video at ~1 fps anyway, so dropping
+  // resolution/fps costs nothing for content analysis.
+  const ladder = [
+    [480, null, 30, true],
+    [360, 15, 32, false],
+    [288, 8, 34, false],
+  ];
+  let best = null;
+  for (let i = 0; i < ladder.length; i++) {
+    const [h, fps, crf, audio] = ladder[i];
+    const outPath = path.join(tmpDir, `reduced-${i}.mp4`);
+    const argv = [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-i', videoPath,
+      '-vf', `scale=-2:${h}`,
+      ...(fps ? ['-r', String(fps)] : []),
+      '-c:v', 'libx264', '-crf', String(crf), '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+      ...(audio ? ['-c:a', 'aac', '-b:a', '40k'] : ['-an']),
+      '-movflags', '+faststart',
+      outPath,
+    ];
+    const ok = await new Promise((resolve) => {
+      const child = spawn(ffmpegBin, argv, { stdio: ['ignore', 'ignore', 'pipe'] });
+      child.on('error', () => resolve(false));
+      child.on('exit', (code) => resolve(code === 0));
+    });
+    if (!ok || !fs.existsSync(outPath)) continue;
+    const bytes = fs.statSync(outPath).size;
+    if (!best || bytes < best.bytes) best = { path: outPath, bytes };
+    if (bytes <= targetBytes) return best;
+  }
+  return best;
+}
+
 /** Best-effort metadata probe via ffprobe. Returns null when ffprobe
  *  isn't installed or the file is unreadable — caller falls back to
  *  basic file-stat info. The 2-second timeout protects against a
@@ -581,13 +640,13 @@ async function _queueActiveDocumentForVision(doc, agent, originalRequestPath) {
 export default {
   type: 'read_file',
   intent: 'read_file',
-  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos, 4 evenly-spaced frames are sampled and attached so you can reason about the content visually without per-frame extraction. For SCANNED PDFs (pages with no text layer), Tesseract OCR runs automatically with a shared worker across all pages; pass `language` to specify the language(s) (default "eng+spa"). The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs), optional "language" (OCR language for scanned PDFs — string or array, e.g. "spa" or ["spa","eng"]). If path is a directory, lists its contents.',
+  description: 'Read a file\'s contents. Supports text files, PDF files, images (PNG, JPG, GIF, WebP, …) and videos (MP4, MOV, WebM, …). For images, the file is attached as vision input — you will see it on your next response. For videos (MP4, MOV, WebM, …) the WHOLE video is attached natively — the model watches it as a single video block (motion + audio + every frame), so you can describe shots, timing, what happens, transcribe speech, etc. Large videos are auto-downscaled to fit; if a video is so huge it cannot fit even downscaled, read_file FAILS with a clear message (telling the user to trim/compress it) rather than degrading — it never silently falls back to a few frames. NEVER shell out to ffmpeg/ffprobe to "look at" a video — read_file IS how you watch it. For SCANNED PDFs (pages with no text layer), Tesseract OCR runs automatically with a shared worker across all pages; pass `language` to specify the language(s) (default "eng+spa"). The "path" field accepts: an absolute or relative file path, an attachment ID (e.g. "att-1"), or a `@mention` handle (e.g. "@hero_script", "@tom") — `@`-handles resolve via the cross-project MediaLibrary to the most-recent asset (image / video / audio / document) tagged with that handle, so you NEVER have to look up the physical path yourself. Fields: "path" (file path / att-N / @handle), optional "offset" (start line, 1-based, default 1), optional "limit" (number of lines, default 2000), optional "pages" (page range for PDFs), optional "language" (OCR language for scanned PDFs — string or array, e.g. "spa" or ["spa","eng"]). If path is a directory, lists its contents.',
   instructions: `read_file rules:
 - For text files, prefer 50-150 lines per read with offset + limit
 - 200-line soft cap per read, UNLESS the task genuinely needs the whole file (e.g. a small config / prompt / script you must read end-to-end, a search where you don't know where the answer lives, generating a full review/edit). In that case omit limit (or set it high) and read the whole file in one go — paginating just to satisfy the cap wastes turns
 - For large files (>500 lines), still paginate: read targeted ranges with offset + limit, don't dump the whole thing
 - For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
-- For videos (.mp4, .mov, .webm, …): read_file samples 4 evenly-spaced frames and attaches them as vision input — same UX as reading an image. Treat that as "you've now seen the video"; do not fall back to other tools to inspect it.
+- For videos (.mp4, .mov, .webm, …): read_file attaches the WHOLE video natively — the model watches it (motion + audio + every frame), same UX as reading an image, just call read_file with the path. Large files are auto-downscaled to fit. Treat it as "you've now actually watched the video." NEVER use shell/ffmpeg/ffprobe to detect cuts, extract frames, or otherwise "inspect" a video — that is exactly what read_file does for you, natively and better.
 - \`@mention\` handles work directly: \`{"intent":"read_file","path":"@hero_script"}\` resolves the handle via the cross-project MediaLibrary to the most recent tagged asset. Do NOT enumerate the library by hand to look up the path first — the resolver does it for you. Same for \`@tom\` (image), \`@narrator\` (audio), etc.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
@@ -809,18 +868,37 @@ export default {
         // understands video.
         const totalDurMs = await _probeVideoDurationMs(resolvedPath);
         const totalDurSec = totalDurMs != null ? (totalDurMs / 1000) : null;
-        const _MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB safety cap
+        // base64 inflates raw bytes by ~33% and Gemini's inline request cap
+        // is ~20 MB total, so keep the RAW upload under ~14 MB. Videos over
+        // that are DOWNSCALED with ffmpeg (analysis doesn't need full quality)
+        // and STILL sent whole — only if even the smallest transcode won't fit
+        // do we degrade to sampled frames.
+        const _TARGET_RAW_BYTES = 14 * 1024 * 1024;
         try {
-          const stat = fs.statSync(resolvedPath);
-          if (stat.size <= _MAX_UPLOAD_BYTES) {
-            const ext = path.extname(resolvedPath).slice(1).toLowerCase();
+          const origBytes = fs.statSync(resolvedPath).size;
+          let uploadPath = resolvedPath;
+          let uploadBytes = origBytes;
+          let downscaled = false;
+          if (origBytes > _TARGET_RAW_BYTES) {
+            const reduced = await _transcodeVideoForUpload(resolvedPath, _TARGET_RAW_BYTES);
+            if (reduced && reduced.bytes <= _TARGET_RAW_BYTES) {
+              uploadPath = reduced.path;
+              uploadBytes = reduced.bytes;
+              downscaled = true;
+            }
+          }
+          if (uploadBytes <= _TARGET_RAW_BYTES) {
+            const srcExt = path.extname(uploadPath).slice(1).toLowerCase();
             const mimeType =
-              ext === 'mp4' ? 'video/mp4' :
-              ext === 'mov' ? 'video/mp4' : // OR sends mov as mp4-compat
-              ext === 'webm' ? 'video/webm' :
-              ext === 'mpeg' || ext === 'mpg' ? 'video/mpeg' :
-              `video/${ext}`;
-            const data = fs.readFileSync(resolvedPath).toString('base64');
+              downscaled ? 'video/mp4' :
+              srcExt === 'mp4' ? 'video/mp4' :
+              srcExt === 'mov' ? 'video/mp4' : // OR sends mov as mp4-compat
+              srcExt === 'webm' ? 'video/webm' :
+              srcExt === 'mpeg' || srcExt === 'mpg' ? 'video/mpeg' :
+              `video/${srcExt}`;
+            const data = fs.readFileSync(uploadPath).toString('base64');
+            // Best-effort cleanup of the transcoded temp file once read.
+            if (downscaled) { try { fs.unlinkSync(uploadPath); } catch { /* */ } }
             if (!session._pendingMcpVideos) session._pendingMcpVideos = [];
             session._pendingMcpVideos.push({
               mimeType,
@@ -833,7 +911,7 @@ export default {
             session._hasVideoAttachments = true;
             channel.log(
               'read_file',
-              `Video attached for native video input (${Math.round(stat.size / 1024)}KB, ${mimeType}): ${filePath}` +
+              `Video attached for native video input (${Math.round(uploadBytes / 1024)}KB${downscaled ? `, downscaled from ${Math.round(origBytes / 1024)}KB` : ''}, ${mimeType}): ${filePath}` +
               (totalDurSec != null ? ` — duration ${totalDurSec.toFixed(2)}s` : ''),
             );
             const durationHint = totalDurSec != null
@@ -844,39 +922,34 @@ export default {
               path: filePath,
               type: 'video',
               attachedAs: 'video_url',
-              sizeBytes: stat.size,
+              sizeBytes: origBytes,
+              ...(downscaled ? { downscaledBytes: uploadBytes } : {}),
               ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
-              message: `Video attached natively for visual analysis on the next turn — you will see it as a single video block (motion + audio + frames intact).${durationHint}`,
+              message: `Video attached natively for visual analysis on the next turn — you will see it as a single video block (motion + audio + frames intact)${downscaled ? ', downscaled for size — quality reduced but the full timeline is intact' : ''}.${durationHint}`,
             };
           }
         } catch (e) {
-          channel.log('read_file', `[video] upload path failed (${e?.message || e}); falling back to frame sampling`);
-        }
-
-        // (3) Fallback: sampled frames. Triggered when the file is too
-        // big or the upload path threw.
-        const sampledMs = await _queueVideoFramesForVision(resolvedPath, session, { count: 4 });
-        if (sampledMs.length > 0) {
-          const stamps = sampledMs.map((ms) => _formatDuration(ms / 1000)).join(', ');
-          channel.log(
-            'read_file',
-            `Video sampled for vision (${sampledMs.length} frames): ${filePath}` +
-            (totalDurSec != null ? ` — duration ${totalDurSec.toFixed(2)}s` : ''),
-          );
-          const durationHint = totalDurSec != null
-            ? ` Total video duration: **${totalDurSec.toFixed(2)} seconds** — use this exact value for any \`durationSeconds\` parameter on follow-up calls (generate_audio, etc.).`
-            : '';
+          channel.log('read_file', `[video] native upload path failed: ${e?.message || e}`);
           return {
-            success: true,
-            path: filePath,
+            success: false,
             type: 'video',
-            attachedAs: 'frames',
-            sampledFrames: sampledMs.length,
-            sampledTimestampsMs: sampledMs,
-            ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
-            message: `Video attached as ${sampledMs.length} sampled frames at ${stamps} (file too large for native upload). Reason about progression / motion from the sequence.${durationHint}`,
+            error: `Could not attach "${path.basename(filePath)}" for analysis (${e?.message || e}). Surface this to the user; do NOT fall back to ffmpeg/shell to inspect the video.`,
           };
         }
+
+        // Too large to send whole, even after maximum downscaling → FAIL
+        // CLEARLY. We deliberately do NOT degrade to sampled frames: a few
+        // stills can't answer shot-by-shot / temporal questions, so an honest
+        // failure the user can act on (trim / pre-compress) beats a misleading
+        // partial result.
+        const _durLabel = totalDurSec != null ? `${totalDurSec.toFixed(0)}s long` : 'of unknown length';
+        return {
+          success: false,
+          type: 'video',
+          tooLarge: true,
+          ...(totalDurMs != null ? { durationMs: totalDurMs, durationSec: totalDurSec } : {}),
+          error: `The video "${path.basename(filePath)}" (${_durLabel}) is too large to analyse even after maximum downscaling — it exceeds the model's ~20 MB native-video input limit. Tell the user the clip is too big/long to analyse as-is and ask them to trim it to a shorter segment or pre-compress it. Do NOT fall back to ffmpeg frame extraction or any other tool.`,
+        };
       }
       return {
         success: false,

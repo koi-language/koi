@@ -1619,21 +1619,29 @@ export class Agent {
         } catch { /* non-fatal */ }
       }
 
-      // Cross-agent session log replay (delegates only).
+      // Cross-agent session log replay (ALL agents — the user-visible
+      // conversation is SHARED, not private).
       //
-      // Per-agent `conversation-<name>.json` only carries what THAT
-      // agent saw — Worker spawned to handle task #2 has no access
-      // to the user input that System received and routed. Result:
-      // delegate re-asks questions the user already answered to
-      // System (the "Diluvio Repentino re-asked" failure mode).
+      // Every `user_input` + every visible assistant `print` is part of the
+      // conversation the USER sees, so EVERY agent that may talk to the user
+      // must have access to it. Per-agent `conversation-<name>.json` only
+      // carries what THAT agent itself ran, which leaves two blind spots:
+      //   • a DELEGATE has no access to the user input System routed to it
+      //     (the "Diluvio Repentino re-asked" failure mode), AND
+      //   • the COORDINATOR (System) has no access to a delegate's prints —
+      //     e.g. a Worker watched a video and printed a full shot-list table
+      //     to the user, then returned only a short summary. System never saw
+      //     the table, so on "hazme un storyboard con esta info" it had no
+      //     data and went hunting the filesystem for a file that doesn't
+      //     exist. (Reported bug.)
       //
-      // dialogue.jsonl is the canonical SESSION log: every
-      // user_input + every visible assistant message (`print`)
-      // across ALL agents, in chronological order. We tail the last
-      // ~12 entries and replay them into the delegate's buffer so
-      // it sees the recent multi-agent dialogue. Bounded so the
-      // prompt doesn't balloon on long sessions.
-      if (isDelegate) {
+      // dialogue.jsonl is the canonical SESSION log of those user-visible
+      // events across ALL agents in chronological order. We tail it and
+      // replay the recent events into THIS agent's buffer — DEDUPED against
+      // what it already has (so an agent never re-injects its own messages),
+      // bounded so the prompt doesn't balloon. Tool noise (shell, read_file,
+      // …) is intentionally excluded. Runs for every agent, delegate or root.
+      {
         try {
           const dialoguePath = path.join(sessionTracker.gitDir, 'dialogue.jsonl');
           if (fs.existsSync(dialoguePath)) {
@@ -1697,7 +1705,7 @@ export class Agent {
             if (injected > 0) {
               channel.log(
                 'session',
-                `Replayed ${injected} cross-agent dialogue events into ${this.name} (delegate session-log restore)`,
+                `Replayed ${injected} cross-agent dialogue events into ${this.name} (shared user-visible conversation)`,
               );
             }
           }
@@ -3518,9 +3526,25 @@ export class Agent {
             }
           }
 
-          // Log action results to dialogue
+          // Log action results to dialogue.
+          //
+          // USER-VISIBLE assistant output (`print` / `assistant_message` /
+          // `show_result`) IS the shared conversation that every agent replays
+          // (see the cross-agent replay near line 1622) — so it must be stored
+          // IN FULL. Truncating it (the old `substring(0, 200)`) meant a
+          // delegate that printed a long shot-list table only persisted its
+          // first 200 chars, so the coordinator replayed a headless snippet
+          // with zero rows and still had nothing to work from. Everything else
+          // is tool noise (shell, read_file, …) → keep a short preview so the
+          // log doesn't balloon.
           if (intent !== 'prompt_user' && sessionTracker) {
-            const resultPreview = result ? JSON.stringify(result).substring(0, 200) : 'null';
+            const _isUserVisible =
+              intent === 'print' || intent === 'assistant_message' || intent === 'show_result';
+            const resultPreview = result
+              ? (_isUserVisible
+                  ? (typeof result === 'string' ? result : JSON.stringify(result))
+                  : JSON.stringify(result).substring(0, 200))
+              : 'null';
             sessionTracker.appendDialogue({ ts: Date.now(), type: 'action', intent, result: resultPreview });
           }
 
