@@ -30,6 +30,7 @@ import { fileURLToPath } from 'url';
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { channel } from '../../io/channel.js';
+import { commandCreationDirHit, creationDirHit, creationDirBlockedMessage } from '../_creation-dir-guard.js';
 
 // ── sudo askpass support ──────────────────────────────────────────────────────
 // When a command uses sudo, we set SUDO_ASKPASS to a platform-specific script
@@ -502,6 +503,18 @@ When a command requires sudo, just use sudo normally in the command. The system 
 
     if (!command) {
       throw new Error('shell: "command" field is required');
+    }
+
+    // Creation-dir guard: the shell tool must never browse/search the shared
+    // `.koi` creation dirs (timelines/storyboards/images/videos/renders) — that
+    // returns another session's/project's files. Those lookups belong to
+    // recall_media / recall_creations → inspect_creation. We scan both the raw
+    // command text and an explicit cwd.
+    {
+      const _hit = commandCreationDirHit(command) || creationDirHit(cwd);
+      if (_hit) {
+        throw new Error(creationDirBlockedMessage('shell', _hit, cwd || undefined));
+      }
     }
 
     // ── Hard caps ─────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ import Tesseract from 'tesseract.js';
 
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
+import { creationDirHit, creationDirBlockedError } from '../_creation-dir-guard.js';
 import { channel } from '../../io/channel.js';
 
 async function extractPdfPageImages(page, pdfjsLib) {
@@ -775,6 +776,14 @@ export default {
 
     const stat = fs.statSync(resolvedPath);
     if (stat.isDirectory()) {
+      // Creation-dir guard: LISTING a shared `.koi` creation dir
+      // (timelines/storyboards/images/videos/renders) is forbidden — it
+      // surfaces other sessions'/projects' files. Reading a SPECIFIC file
+      // inside one (the path a recall tool returned) stays allowed; this
+      // branch only fires for a directory target.
+      const _hit = creationDirHit(resolvedPath);
+      if (_hit) return creationDirBlockedError('read_file', _hit, filePath);
+
       const entries = fs.readdirSync(resolvedPath);
       const listing = entries.map(e => {
         const full = path.join(resolvedPath, e);

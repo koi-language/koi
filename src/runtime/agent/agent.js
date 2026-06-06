@@ -1690,12 +1690,46 @@ export class Agent {
                 replay.push({ role: 'assistant', content: text });
               }
             }
-            // Cap replay to the last 12 events so we surface "what
-            // just happened" without flooding the delegate's prompt
-            // with the entire session history.
+            // ── Attachment paths ALWAYS prevail ───────────────────────
+            // A file the user attached is CRITICAL conversation data the
+            // agent must never "forget": its absolute path is the only
+            // clean way to re-open it (read_file) instead of hunting the
+            // disk (`find ~/.koi -name "*pepsi*"` → another session's
+            // file). The 40-line tail above + the 12-event cap below can
+            // push an early attachment out of the window (a video attached
+            // first, then dozens of tool calls). So scan the FULL dialogue
+            // — not just the tail — and pin EVERY user_input that carries
+            // attachments, independent of both caps. This ALSO recovers
+            // attachments sent with NO accompanying text, which the
+            // `if (!text) continue` in the replay loop above silently drops.
+            const pinnedAtt = [];
+            for (const line of raw.split('\n')) {
+              const t = line.trim();
+              if (!t) continue;
+              let entry;
+              try { entry = JSON.parse(t); } catch { continue; }
+              if (entry?.type !== 'user_input') continue;
+              const _atts = Array.isArray(entry.attachments)
+                ? entry.attachments.filter(a => a && a.path) : [];
+              if (_atts.length === 0) continue;
+              const _text = String(entry.text || '').trim();
+              const _bullets = _atts.map(a => `- ${a.path}`).join('\n');
+              const content = `${_text ? _text + '\n\n' : ''}**Attached files:**\n${_bullets}`;
+              pinnedAtt.push({ role: 'user', content });
+            }
+            // Generous bound so a pathological session can't flood the
+            // prompt, while keeping every attachment a real session would
+            // ever have ("always prevail" in practice).
+            const pinnedTail = pinnedAtt.slice(-20);
+
+            // Cap the GENERAL replay to the last 12 events so we surface
+            // "what just happened" without flooding the prompt with the
+            // entire session history. Attachments are injected FIRST and
+            // are exempt from this cap (deduped against the tail so a
+            // recent attachment isn't added twice).
             const tail = replay.slice(-12);
             let injected = 0;
-            for (const msg of tail) {
+            for (const msg of [...pinnedTail, ...tail]) {
               const key = `${msg.role}|${(msg.content || '').slice(0, 200)}`;
               if (existing.has(key)) continue;
               contextMemory.add(msg.role, msg.content);

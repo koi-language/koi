@@ -1312,6 +1312,39 @@ const generateVideoAction = {
 
     const finalPrompt = _bodyPrompt;
 
+    // ── Cost confirmation ───────────────────────────────────────────────
+    // JUST BEFORE dispatching to the gateway, confirm the maximum credit cost
+    // with the user (skipped when auto-approved this session or KOI_YES=1).
+    // The resolver already picked the slug (`pickedModelSlug`); read its
+    // learned `maxCredits` watermark from the live catalog. Declining cancels.
+    try {
+      let _costMax = (pickedCaps && pickedCaps.maxCredits != null) ? pickedCaps.maxCredits : null;
+      let _costName = pickedModelSlug || null;
+      if (pickedModelSlug) {
+        const _caps = await fetchMediaCapabilities('video');
+        const _models = (_caps && Array.isArray(_caps.models)) ? _caps.models : [];
+        const _row = _models.find((m) => m.slug === pickedModelSlug);
+        if (_row) {
+          if (_costMax == null && _row.maxCredits != null) _costMax = _row.maxCredits;
+          _costName = _row.displayName || pickedModelSlug;
+        }
+      }
+      const { confirmMediaCost } = await import('./cost-permission.js');
+      const _ok = await confirmMediaCost(channel, {
+        kind: 'video',
+        model: _costName || 'Auto',
+        resolution: globalResolution || null,
+        aspectRatio: globalAspect || null,
+        maxCredits: _costMax,
+        abortSignal: action?.abortSignal,
+      });
+      if (!_ok) {
+        return { success: false, denied: true, message: 'User declined the media generation cost.' };
+      }
+    } catch (_costErr) {
+      channel.log('video', `cost-confirm skipped (${_costErr?.message || _costErr})`);
+    }
+
     reportProgress?.(0.02, 'Submitting to provider…');
     const submitted = await instance.generate(finalPrompt, {
       duration: globalDuration,

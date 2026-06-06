@@ -82,9 +82,28 @@ function _validate(sb) {
   if (sb.seed !== undefined && !Number.isInteger(sb.seed)) {
     return '"seed" (when provided) must be an integer.';
   }
+  // `synopsis` is MANDATORY. It is the story PREMISE injected into EVERY shot's
+  // image prompt so renders never contradict the story's logic. Models routinely
+  // omit it when only instructed in prose, so it is enforced here: reject the save
+  // and the agent (whose flow retries on success:false) is forced to author it.
+  if (!_isStr(sb.synopsis) || !sb.synopsis.trim()) {
+    return '"synopsis" is REQUIRED and must be a non-empty string: the story PREMISE/logic, in the user\'s language — who wants what, what is or isn\'t reachable, and why the ending lands (1–3 sentences). It is injected into EVERY shot\'s image prompt so the renders never contradict the story (e.g. "the Pepsi button is mounted high, out of reach — that is why he stacks cans to climb"). Author it from the storyboard you just built and call save_storyboard again. The ONLY exception is a bare, unconnected shot list with no narrative — extremely rare.';
+  }
   for (const k of ['characters', 'lighting', 'stylePrompt']) {
     if (sb[k] !== undefined && !_isStr(sb[k])) {
       return `"${k}" (when provided) must be a string. Got ${typeof sb[k]}.`;
+    }
+  }
+  // `continuity` is the CONTINUITY LOCK: a list of absolute, story-wide
+  // invariants the renders must NEVER break or "fix" — the world-rules a
+  // single shot's `action` can't carry (e.g. "the button stays mounted high,
+  // out of the child's reach", "the cans used as a step must stay intact, never
+  // crushed"). Injected verbatim into EVERY shot's image/video prompt as
+  // hard constraints. Optional (a bare shot list has none) but each entry must
+  // be a non-empty string.
+  if (sb.continuity !== undefined) {
+    if (!Array.isArray(sb.continuity) || sb.continuity.some((s) => !_isStr(s))) {
+      return '"continuity" (when provided) must be an array of strings — the CONTINUITY LOCK rules: absolute story-wide invariants every panel must obey and never contradict (e.g. "The Pepsi button stays mounted high, above the child\'s reach", "Never make the child taller or lower the button", "The cans he stacks to climb must stay intact — never crushed"). Each rule is injected verbatim into every shot\'s render prompt.';
     }
   }
   if (sb.references !== undefined) {
@@ -103,6 +122,11 @@ function _validate(sb) {
       return `scenes[${si}].id must be a kebab-case string. Got ${JSON.stringify(sc.id)}.`;
     }
     if (!_isStr(sc.title)) return `scenes[${si}].title must be a string.`;
+    for (const k of ['notes', 'location', 'synopsis']) {
+      if (sc[k] !== undefined && !_isStr(sc[k])) {
+        return `scenes[${si}].${k} (when provided) must be a string. Got ${typeof sc[k]}.`;
+      }
+    }
     if (sc.references !== undefined) {
       if (!Array.isArray(sc.references) || sc.references.some((s) => !_isStr(s))) {
         return `scenes[${si}].references (when provided) must be an array of strings.`;
@@ -137,7 +161,7 @@ function _validate(sb) {
       }
       if (!_isStr(sh.movement)) return `${tag}.movement must be a string (e.g. "Static", "Dolly in").`;
       if (!_isStr(sh.action)) return `${tag}.action must be a string.`;
-      for (const k of ['dialogue', 'sfx', 'music', 'location', 'notes']) {
+      for (const k of ['dialogue', 'sfx', 'music', 'location', 'notes', 'state']) {
         if (sh[k] !== undefined && !_isStr(sh[k])) {
           return `${tag}.${k} (when provided) must be a string.`;
         }
@@ -175,6 +199,18 @@ function _normRefs(v) {
   return out.length > 0 ? out : undefined;
 }
 
+// Normalise a free-text string list (e.g. the `continuity` LOCK rules):
+// trim each entry, drop empties, return undefined when nothing's left so the
+// key is omitted rather than written as an empty array.
+function _normStrList(v) {
+  if (!Array.isArray(v)) return undefined;
+  const out = v
+    .filter((s) => typeof s === 'string')
+    .map((s) => s.trim())
+    .filter((s) => s !== '');
+  return out.length > 0 ? out : undefined;
+}
+
 function _normalize(sb, existing) {
   // Carry forward the original createdAt across saves so the
   // MediaLibrary "Latest" ordering stays anchored to when the
@@ -194,6 +230,7 @@ function _normalize(sb, existing) {
       ? existing.seed
       : Math.floor(Math.random() * 1_000_000_000);
   const rootRefs = _normRefs(sb.references);
+  const continuity = _normStrList(sb.continuity);
   // Authoritative production totals, stamped on every save so any reader
   // (esp. the visual-storyboard skill's chunking step) consumes ONE number
   // instead of re-summing per-shot durations by hand — which the agent gets
@@ -218,6 +255,11 @@ function _normalize(sb, existing) {
     shotCount: _shotCount,
     totalDurationSeconds: Math.round(_totalDuration * 10) / 10,
     seed,
+    // `synopsis` is validated as required+non-empty above, so it's always a
+    // real string here. Persisted so the GUI/compositor can inject it as the
+    // STORY PREMISE into every shot prompt — dropping it here was the bug that
+    // made renders contradict the story even though the agent authored it.
+    synopsis: sb.synopsis.trim(),
     characters: _isStr(sb.characters) ? sb.characters : '',
     lighting: _isStr(sb.lighting) ? sb.lighting : '',
     stylePrompt: _isStr(sb.stylePrompt) ? sb.stylePrompt : '',
@@ -237,18 +279,24 @@ function _normalize(sb, existing) {
             movement: sh.movement,
             action: sh.action,
           };
-          for (const k of ['dialogue', 'sfx', 'music']) {
-            if (_isStr(sh[k])) shotOut[k] = sh[k];
+          for (const k of ['dialogue', 'sfx', 'music', 'state']) {
+            if (_isStr(sh[k]) && sh[k].trim()) shotOut[k] = sh[k];
           }
           const shotRefs = _normRefs(sh.references);
           if (shotRefs) shotOut.references = shotRefs;
           return shotOut;
         }),
       };
+      // SCENE-level synopsis — the per-scene premise, same role as the root
+      // synopsis scoped to this scene. Was also being dropped on write.
+      if (_isStr(sc.synopsis) && sc.synopsis.trim()) {
+        sceneOut.synopsis = sc.synopsis.trim();
+      }
       if (sceneRefs) sceneOut.references = sceneRefs;
       return sceneOut;
     }),
   };
+  if (continuity) out.continuity = continuity;
   if (rootRefs) out.references = rootRefs;
   return out;
 }
@@ -259,9 +307,10 @@ export default {
   description:
     'Write a storyboard document to ~/.koi/storyboards/<id>.json with STRUCTURED args (the storyboard as an OBJECT, not a JSON string). ' +
     'Use for BOTH creating new storyboards and updating existing ones — same call shape; the tool detects which one and preserves createdAt across edits. ' +
-    'Call shape: { storyboard: { id, name, aspect, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, references?, shots: [{ id, number, duration, shot, movement, action, dialogue?, sfx?, music?, references? }] }] } }. ' +
-    'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.aspect (one of 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9), storyboard.scenes (non-empty array). ' +
-    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, MUST be sequential across ALL scenes), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. dialogue/sfx/music are optional strings. ' +
+    'Call shape: { storyboard: { id, name, aspect, synopsis, continuity?, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, movement, action, state?, dialogue?, sfx?, music?, references? }] }] } }. ' +
+    'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.aspect (one of 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9), storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
+    'storyboard.continuity is an OPTIONAL (strongly recommended for any narrative with physical/spatial logic) array of strings — the CONTINUITY LOCK: absolute, story-wide invariants every panel must obey and never contradict or "fix" (e.g. ["The Pepsi button stays mounted high, above the child\'s reach until he climbs", "Never make the child taller or lower the button", "The cans he stacks as a step stay intact — never crushed"]). Injected verbatim into EVERY shot\'s render prompt as hard constraints; this is how you stop the renderer from silently making the unreachable reachable or breaking an object that must stay whole. ' +
+    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, MUST be sequential across ALL scenes), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. shot.state is an OPTIONAL but high-value string — the world/character STATE that is TRUE in THIS exact panel (the continuity-table row): where the character is, what they are on/holding, and the state of every key object (e.g. "Boy standing ON the two stacked cans; cans intact under his feet; Pepsi button now within reach; his finger touching it"). The compositor injects it as CURRENT PANEL STATE so the render shows this exact state instead of resetting to a default or jumping ahead. dialogue/sfx/music are optional strings. ' +
     'references is an OPTIONAL array of strings (each entry is an `@handle` or absolute file path) that can sit at the storyboard root, on a scene, or on a single shot — the downstream visual renderer collects all three levels per panel. Preserve whatever references the agent passes (or the user added via the visor); never drop them on a round-trip read→mutate→save. ' +
     'Auto-set by the tool: version=1, updatedAt=now (UTC ISO), createdAt preserved from existing file or set to now, seed defaulted to a random integer when omitted. ' +
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',
@@ -296,7 +345,33 @@ export default {
 
     const home = process.env.HOME || os.homedir();
     const dir = path.join(home, '.koi', 'storyboards');
-    const filePath = path.join(dir, `${sb.id}.json`);
+    let filePath = path.join(dir, `${sb.id}.json`);
+
+    // CREATE-vs-UPDATE collision guard. A genuine UPDATE reads the existing
+    // JSON (which carries `createdAt`) and saves the whole mutated object back,
+    // so `sb.createdAt` is present. A CREATE builds a fresh object and — per the
+    // skill — omits `createdAt`. If a CREATE lands on an id whose file already
+    // exists, the agent has unwittingly reused a taken slug: saving would
+    // OVERWRITE the other storyboard and resurrect ITS cached panel images
+    // (the "new storyboard shows shots from an old one" bug). Auto-uniquify the
+    // id so a "new" storyboard is ALWAYS genuinely new. Fail-safe: the worst case
+    // is an extra file, never a clobbered one.
+    const isUpdateIntent = _isStr(sb.createdAt) && !!sb.createdAt.trim();
+    let collisionRenamedFrom = null;
+    try {
+      if (!isUpdateIntent && fs.existsSync(filePath)) {
+        const baseId = sb.id;
+        let n = 2;
+        let candidateId = `${baseId}-${n}`;
+        while (fs.existsSync(path.join(dir, `${candidateId}.json`)) && n < 1000) {
+          n += 1;
+          candidateId = `${baseId}-${n}`;
+        }
+        collisionRenamedFrom = baseId;
+        sb.id = candidateId;
+        filePath = path.join(dir, `${sb.id}.json`);
+      }
+    } catch { /* ignore — fall through to write under the original id */ }
 
     // Read the existing file (if any) so we can preserve createdAt
     // and so the `created` flag in the response is accurate.
@@ -345,7 +420,8 @@ export default {
     channel.log('save_storyboard',
       `${existed ? 'updated' : 'created'} ${filePath} ` +
       `(${sceneCount} scene${sceneCount === 1 ? '' : 's'}, ` +
-      `${shotCount} shot${shotCount === 1 ? '' : 's'}).`);
+      `${shotCount} shot${shotCount === 1 ? '' : 's'})` +
+      `${collisionRenamedFrom ? ` [id "${collisionRenamedFrom}" was taken → saved as "${normalized.id}" to avoid overwriting it]` : ''}.`);
 
     return {
       success: true,
@@ -354,6 +430,10 @@ export default {
       created: !existed,
       sceneCount,
       shotCount,
+      ...(collisionRenamedFrom
+        ? { renamedFrom: collisionRenamedFrom,
+            note: `The id "${collisionRenamedFrom}" already existed, so this NEW storyboard was saved as "${normalized.id}" to avoid overwriting the existing one. Use this id from now on.` }
+        : {}),
     };
   },
 };

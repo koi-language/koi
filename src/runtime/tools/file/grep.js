@@ -13,6 +13,7 @@ import path from 'path';
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { discoverFiles, IGNORE_DIRS, SOURCE_EXTS } from '../../code/file-discovery.js';
+import { creationDirHit, creationDirBlockedError } from '../_creation-dir-guard.js';
 import { channel } from '../../io/channel.js';
 
 /**
@@ -112,6 +113,13 @@ export default {
   async execute(action, agent) {
     const pattern = action.pattern;
     if (!pattern) return { success: false, error: 'grep: "pattern" field is required' };
+
+    // Creation-dir guard: grepping the shared `.koi` creation dirs returns
+    // other sessions'/projects' files. Only block an explicit `path` into one.
+    if (action.path) {
+      const _hit = creationDirHit(action.path);
+      if (_hit) return creationDirBlockedError('grep', _hit, action.path);
+    }
 
     const searchPath = path.resolve(action.path || process.cwd());
     const contextLines = typeof action.context === 'number' ? Math.max(0, action.context) : 0;

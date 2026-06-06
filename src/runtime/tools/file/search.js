@@ -18,6 +18,7 @@ import path from 'path';
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { discoverFiles } from '../../code/file-discovery.js';
+import { creationDirHit, creationDirBlockedError } from '../_creation-dir-guard.js';
 import { channel } from '../../io/channel.js';
 
 // ─── BM25 Inverted Index ────────────────────────────────────────────────
@@ -189,6 +190,14 @@ export default {
   },
 
   async execute(action, agent) {
+    // Creation-dir guard: searching the shared `.koi` creation dirs returns
+    // other sessions'/projects' files. Only block when the caller explicitly
+    // points `path` into one — a default (cwd) search is untouched.
+    if (action && action.path) {
+      const _hit = creationDirHit(action.path);
+      if (_hit) return creationDirBlockedError('search', _hit, action.path);
+    }
+
     const resolvedPath = path.resolve(action.path || process.cwd());
     const maxResults = action.maxResults || 20;
 
