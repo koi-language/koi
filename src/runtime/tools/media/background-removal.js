@@ -121,6 +121,28 @@ const backgroundRemovalAction = {
 
     channel.log('image', `background_removal: ${resolved.provider} (auto-select), input=${path.basename(resolvedPath)} (${(imgBuf.length / 1024).toFixed(0)}KB)`);
 
+    // ── Cost confirmation ───────────────────────────────────────────────
+    // Background removal bills like any media op, so warn before dispatch.
+    // `confirmCost` defaults to true; programmatic callers pass false to skip.
+    if (action.confirmCost !== false) try {
+      const { fetchMediaCapabilities } = await import('../../llm/providers/gateway.js');
+      const { confirmMediaCost } = await import('./cost-permission.js');
+      const _slug = resolved.model || null;
+      let _name = _slug, _max = null;
+      if (_slug) {
+        const _caps = await fetchMediaCapabilities('image');
+        const _row = (_caps?.models || []).find((m) => m.slug === _slug);
+        if (_row) { _max = _row.maxCredits ?? null; _name = _row.displayName || _slug; }
+      }
+      const _ok = await confirmMediaCost(channel, {
+        kind: 'image', model: _name || 'Auto', resolution: null, aspectRatio: null,
+        maxCredits: _max, abortSignal: action?.abortSignal,
+      });
+      if (!_ok) return { success: false, denied: true, message: 'User declined the media generation cost.' };
+    } catch (_costErr) {
+      channel.log('image', `cost-confirm skipped (${_costErr?.message || _costErr})`);
+    }
+
     let result;
     try {
       result = await instance.runOperation('background-removal', imgB64, {

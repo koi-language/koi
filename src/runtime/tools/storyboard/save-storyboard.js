@@ -193,9 +193,31 @@ function _validate(sb) {
 // mode that causes "I attached refs but the sheet ignored them" — the
 // rendering pipeline collects refs from all three levels, so losing
 // any level means losing the user's intent.
+// Image extensions the downstream renderer can use as a reference. `references`
+// are IMAGE identity anchors that generate_image attaches to every panel — a
+// video/audio path (e.g. the source clip a storyboard was based on) does NOT
+// belong here: Sharp can't decode it and the panel render crashes. Agents
+// sometimes drop the source video into references anyway, so strip non-image
+// file paths at the single write choke point. `@handles` and bare attachment
+// ids (no extension) are kept — they resolve to images downstream.
+const _IMG_REF_EXT = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff',
+  '.heic', '.heif', '.avif',
+]);
+
+function _refIsUsable(s) {
+  const ref = s.trim();
+  if (ref.startsWith('@')) return true; // gallery handle
+  const dot = ref.lastIndexOf('.');
+  const slash = Math.max(ref.lastIndexOf('/'), ref.lastIndexOf('\\'));
+  if (dot <= slash) return true; // no extension (e.g. attachment id) → keep
+  const ext = ref.slice(dot).toLowerCase();
+  return _IMG_REF_EXT.has(ext);
+}
+
 function _normRefs(v) {
   if (!Array.isArray(v)) return undefined;
-  const out = v.filter((s) => typeof s === 'string' && s.trim() !== '');
+  const out = v.filter((s) => typeof s === 'string' && s.trim() !== '' && _refIsUsable(s));
   return out.length > 0 ? out : undefined;
 }
 

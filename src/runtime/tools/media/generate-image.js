@@ -422,11 +422,31 @@ const generateImageAction = {
       }
       if (_sb && typeof _sb === 'object' && _scope.size > 0) {
         const _collected = [];
+        // Image extensions Sharp can decode. A storyboard can carry a
+        // VIDEO/AUDIO subject reference (e.g. the source clip the user dropped
+        // in) — those are NOT usable as image references: normalizeImageForProvider
+        // runs Sharp on every ref, Sharp can't decode an .mp4, and the whole
+        // generate_image call throws ("Input file contains unsupported image
+        // format") and the agent retries the same thing forever. Skip non-image
+        // refs here; the sheet still renders from the text prompt. Refs WITHOUT
+        // an extension (attachment ids like "att-1") pass through and resolve
+        // downstream.
+        const _IMG_REF_EXT = new Set([
+          '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff',
+          '.heic', '.heif', '.avif',
+        ]);
         const _push = (arr, source) => {
           if (!Array.isArray(arr)) return;
           for (const r of arr) {
             if (typeof r === 'string' && r.trim()) {
-              _collected.push({ ref: r.trim(), source });
+              const _ref = r.trim();
+              const _ext = path.extname(_ref).toLowerCase();
+              if (_ext && !_IMG_REF_EXT.has(_ext)) {
+                channel.log('image',
+                  `Storyboard ref skipped (not an image, can't be used as a reference): ${path.basename(_ref)}`);
+                continue;
+              }
+              _collected.push({ ref: _ref, source });
             }
           }
         };
@@ -1167,46 +1187,10 @@ const generateImageAction = {
       genOpts.onStatus = (info) => action._emitMediaStatus(info);
     }
 
-    // ── Cost confirmation ───────────────────────────────────────────────
-    // JUST BEFORE dispatching to the gateway, confirm the maximum credit cost
-    // with the user (skipped when auto-approved this session or KOI_YES=1).
-    // We predict the slug the gateway will bill — a pinned model wins,
-    // otherwise the same peek the dispatcher uses — and read its learned
-    // `maxCredits` watermark from the live catalog. Declining cancels.
-    try {
-      let _costSlug = (action.model && action.model !== 'auto') ? action.model : null;
-      const _caps = await fetchMediaCapabilities('image');
-      const _models = (_caps && Array.isArray(_caps.models)) ? _caps.models : [];
-      if (!_costSlug && _models.length) {
-        try {
-          const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
-          const _picked = peekImageModel(_models, {
-            intent: typeof action.intent === 'string' ? action.intent : (action.operation || ''),
-            refsCount: referenceImages?.length || 0,
-            hasMaskImage: !!action.maskImage,
-            hasSourceImage: !!action.sourceImage,
-            hasTargetSize: !!(action.targetSize?.width && action.targetSize?.height),
-          });
-          _costSlug = _picked?.slug || _picked?.model || null;
-        } catch { /* peek failed → unknown slug, card shows "cost not available" */ }
-      }
-      const _row = _costSlug ? _models.find((m) => m.slug === _costSlug) : null;
-      const { confirmMediaCost } = await import('./cost-permission.js');
-      const _ok = await confirmMediaCost(channel, {
-        kind: 'image',
-        model: (_row?.displayName) || _costSlug || 'Auto',
-        resolution: effectiveResolution || null,
-        aspectRatio: effectiveAspect || null,
-        maxCredits: _row?.maxCredits ?? null,
-        abortSignal: action?.abortSignal,
-      });
-      if (!_ok) {
-        return { success: false, denied: true, message: 'User declined the media generation cost.' };
-      }
-    } catch (_costErr) {
-      // Never block a generation on confirmation plumbing — log and proceed.
-      channel.log('image', `cost-confirm skipped (${_costErr?.message || _costErr})`);
-    }
+    // Cost consent is handled UP FRONT by the media banner wrapper
+    // (action-registry.js → preflightMediaCost), before the banner and before
+    // we get here — so by this point the user has already approved (or
+    // auto-approved). No per-tool confirmation needed.
 
     let result;
     try {

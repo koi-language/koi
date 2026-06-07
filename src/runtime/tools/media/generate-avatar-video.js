@@ -227,6 +227,10 @@ const generateAvatarVideoAction = {
     const abortSignal = agent?.abortSignal;
     const reportProgress = typeof agent?.reportProgress === 'function' ? agent.reportProgress : null;
 
+    // Cost consent is handled UP FRONT by the media banner wrapper
+    // (action-registry.js → preflightMediaCost), before the banner and any
+    // request — so by this point the user has already approved.
+
     reportProgress?.(0.02, 'Submitting to provider…');
     let submitted;
     try {

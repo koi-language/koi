@@ -648,6 +648,32 @@ function _wrapWithBanner(action) {
     if (act && act._suppressBanner) {
       return await _orig.call(this, act, agent);
     }
+    // ── Cost consent BEFORE anything happens ────────────────────────────
+    // The user MUST consent before we show the "Generating…" banner OR send
+    // any request to the server. This runs here — ahead of mediaToolStart and
+    // the wrapped execute() — so a pending confirmation never sits behind a
+    // banner that looks like generation already started. Declining returns a
+    // clean denied result without ever touching the gateway.
+    //
+    // BUT only ask on a call that will ACTUALLY generate. Every media tool's
+    // FIRST blind call returns its documentation instead of running
+    // (requireToolInfoFirst); get_tool_info populates the same `_expandedTools`
+    // map, so a tool present there means the upcoming execute() will really
+    // dispatch. Prompting on the doc-return call would ask consent for a
+    // generation that isn't happening yet. Fail-open on plumbing errors.
+    const _toolName = action.intent || action.type;
+    const _willGenerate = agent
+      && agent._expandedTools instanceof Map
+      && agent._expandedTools.has(_toolName);
+    if (_willGenerate) {
+      try {
+        const { preflightMediaCost } = await import('../tools/media/cost-permission.js');
+        const _ok = await preflightMediaCost(action.bannerKind, act, agent);
+        if (!_ok) {
+          return { success: false, denied: true, message: 'User declined the media generation cost.' };
+        }
+      } catch { /* never block generation on confirmation plumbing */ }
+    }
     const id = `media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const slug = act?.model || null;
     const expectedDurationMs = await _resolveExpectedDurationMs(action.bannerKind, slug);

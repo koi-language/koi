@@ -185,43 +185,10 @@ const generateAudioAction = {
       ? (info) => action._emitMediaStatus(info)
       : undefined;
 
-    // ── Cost confirmation ───────────────────────────────────────────────
-    // JUST BEFORE dispatching to the gateway, confirm the maximum credit cost
-    // with the user (skipped when auto-approved this session or KOI_YES=1).
-    // Only the generative modes are gated — `transcribe` is speech-to-text,
-    // not media generation. `resolved.model` is the slug the gateway will
-    // bill; read its learned `maxCredits` watermark from the live catalog.
-    // Audio has no resolution / aspect ratio, so those rows are omitted.
-    if (mode !== 'transcribe') {
-      try {
-        const _slug = resolved.model || null;
-        let _costName = _slug;
-        let _costMax = null;
-        if (_slug) {
-          const _caps = await fetchMediaCapabilities('audio');
-          const _models = (_caps && Array.isArray(_caps.models)) ? _caps.models : [];
-          const _row = _models.find((m) => m.slug === _slug);
-          if (_row) {
-            _costMax = _row.maxCredits ?? null;
-            _costName = _row.displayName || _slug;
-          }
-        }
-        const { confirmMediaCost } = await import('./cost-permission.js');
-        const _ok = await confirmMediaCost(channel, {
-          kind: 'audio',
-          model: _costName || 'Auto',
-          resolution: null,
-          aspectRatio: null,
-          maxCredits: _costMax,
-          abortSignal: action?.abortSignal,
-        });
-        if (!_ok) {
-          return { success: false, denied: true, message: 'User declined the media generation cost.' };
-        }
-      } catch (_costErr) {
-        channel.log('audio', `cost-confirm skipped (${_costErr?.message || _costErr})`);
-      }
-    }
+    // Cost consent is handled UP FRONT by the media banner wrapper
+    // (action-registry.js → preflightMediaCost), before the banner and any
+    // request — so by this point the user has already approved. (transcribe is
+    // exempt there too, since it's speech-to-text, not generation.)
 
     // ── Speech mode (TTS) ─────────────────────────────────────────────
     if (mode === 'speech') {
