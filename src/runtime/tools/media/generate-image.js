@@ -211,7 +211,21 @@ const generateImageAction = {
     // `_internalDelegate: true` on the action; we then bypass the
     // guard because the delegating tool is responsible for matching
     // the schema, not the agent.
-    if (action._internalDelegate !== true) {
+    // A camera-angle call (slider-driven: cameraAngles {horizontal/vertical/zoom})
+    // is a PRECISE, deterministic request — it doesn't need the get_tool_info
+    // catalog tutorial, and blocking it is actively harmful: the doc-guard
+    // returns the schema, forcing a re-issue, and the weak routing model
+    // routinely drops/mangles `cameraAngles` on that second attempt → the
+    // router no longer sees the sliders → it falls back to a generic edit model
+    // (gpt-image-2) instead of the angle LoRA. So skip the guard whenever
+    // numeric cameraAngles are present (same spirit as the `_internalDelegate`
+    // bypass: the caller already produced a fully-formed, schema-correct call).
+    const _hasCameraAngles = action.cameraAngles
+      && typeof action.cameraAngles === 'object'
+      && (typeof action.cameraAngles.horizontal === 'number'
+        || typeof action.cameraAngles.vertical === 'number'
+        || typeof action.cameraAngles.zoom === 'number');
+    if (action._internalDelegate !== true && !_hasCameraAngles) {
       const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
       const _guard = await requireToolInfoFirst('generate_image', agent);
       if (_guard) return _guard;

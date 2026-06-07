@@ -514,11 +514,13 @@ class PluginManager {
         if (!fs.existsSync(skillsTarget)) fs.mkdirSync(skillsTarget, { recursive: true });
         for (const skill of caps.skills) {
           const dest = path.join(skillsTarget, skill.name);
-          if (!fs.existsSync(dest)) {
-            this._copyRecursive(skill.dir, dest);
-            installedPaths.skills.push(dest);
-            skillsCopied++;
-          }
+          // Always overwrite: a (re)install MUST land the freshest code.
+          // Autoinstall runs install() on every boot precisely so plugins
+          // update — skip-if-exists froze users on stale versions forever.
+          if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
+          this._copyRecursive(skill.dir, dest);
+          installedPaths.skills.push(dest);
+          skillsCopied++;
         }
       }
 
@@ -533,20 +535,19 @@ class PluginManager {
           // supports compiling them on the fly.
           if (!agent.path.endsWith('.md')) continue;
           const dest = path.join(agentsTarget, path.basename(agent.path));
-          if (!fs.existsSync(dest)) {
-            fs.copyFileSync(agent.path, dest);
-            installedPaths.agents.push(dest);
-            agentsCopied++;
-          }
+          // Always overwrite — see skills note above (re)install = update.
+          if (fs.existsSync(dest)) fs.rmSync(dest, { force: true });
+          fs.copyFileSync(agent.path, dest);
+          installedPaths.agents.push(dest);
+          agentsCopied++;
         }
       }
 
       // Workflows — copy each `workflows/<name>/` directory (containing a
       // WORKFLOW.md) into the runtime's scanned location so
       // workflows-catalog.js picks it up automatically (no restart).
-      // Same skip-if-exists policy as skills/agents: a re-install never
-      // clobbers a workflow the user (or another plugin) may have
-      // edited locally.
+      // Always overwrite — see skills note above: a (re)install MUST land
+      // the freshest code so autoinstall actually updates on each boot.
       let workflowsCopied = 0;
       if (caps.workflows) {
         const workflowsTarget = isProject
@@ -555,11 +556,10 @@ class PluginManager {
         if (!fs.existsSync(workflowsTarget)) fs.mkdirSync(workflowsTarget, { recursive: true });
         for (const workflow of caps.workflows) {
           const dest = path.join(workflowsTarget, workflow.name);
-          if (!fs.existsSync(dest)) {
-            this._copyRecursive(workflow.dir, dest);
-            installedPaths.workflows.push(dest);
-            workflowsCopied++;
-          }
+          if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
+          this._copyRecursive(workflow.dir, dest);
+          installedPaths.workflows.push(dest);
+          workflowsCopied++;
         }
       }
 
