@@ -662,9 +662,22 @@ function _wrapWithBanner(action) {
     // dispatch. Prompting on the doc-return call would ask consent for a
     // generation that isn't happening yet. Fail-open on plumbing errors.
     const _toolName = action.intent || action.type;
-    const _willGenerate = agent
+    // Some calls BYPASS the schema-first guard and generate on their FIRST
+    // call — notably generate_image with numeric `cameraAngles` (the orbital
+    // / camera-angle one-shot, see generate-image.js: the guard is skipped so
+    // the LLM doesn't mangle the angles on a forced re-issue). Those never
+    // populate `_expandedTools`, so keying cost consent off that map alone let
+    // camera-angle generations spend credits WITHOUT asking. Detect the same
+    // bypass here so they still hit preflightMediaCost. Mirrors the
+    // `_hasCameraAngles` test in generate-image.js — keep the two in sync.
+    const _ca = act && act.cameraAngles;
+    const _bypassesGuard = !!(_ca && typeof _ca === 'object'
+      && (typeof _ca.horizontal === 'number'
+        || typeof _ca.vertical === 'number'
+        || typeof _ca.zoom === 'number'));
+    const _willGenerate = _bypassesGuard || (agent
       && agent._expandedTools instanceof Map
-      && agent._expandedTools.has(_toolName);
+      && agent._expandedTools.has(_toolName));
     if (_willGenerate) {
       try {
         const { preflightMediaCost } = await import('../tools/media/cost-permission.js');
