@@ -42,6 +42,13 @@ class MCPRegistry {
     client.description = typeof config.description === 'string' ? config.description : '';
     client.lazy = config.lazy === false ? false : true;
 
+    // Keep the raw config + the optional `media` block on the client so the
+    // media facade (mcp-media-resolver.js) can route generate_image/upscale/…
+    // through this server. Without this the `media` map declared in .mcp.json
+    // would be silently dropped here. See docs/mcp-media-facade.md.
+    client.config = config || {};
+    client.media = config && typeof config.media === 'object' ? config.media : null;
+
     this.clients.set(name, client);
   }
 

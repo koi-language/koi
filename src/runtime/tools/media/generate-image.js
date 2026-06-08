@@ -562,7 +562,12 @@ const generateImageAction = {
             ? available.join(', ')
             : '(no @-handles tagged yet — use tag_media to assign one)';
           return {
+            // Pre-flight lint (no provider call, no charge): the agent will
+            // re-issue with the prompt/references fixed, so flag it as a
+            // validation failure and let the banner middleware remove the
+            // banner instead of flashing red mid-correction.
             success: false,
+            validationError: true,
             error:
               `Prompt references @-handles that don't match any gallery item OR any attached reference slot: ${_fix.leftover.join(', ')}.\n` +
               `Either remove them, attach matching references in referenceImages, or use one of the tagged handles: ${availableStr}`,

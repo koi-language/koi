@@ -527,7 +527,11 @@ export class OpenAIResponsesLLM extends BaseLLM {
         model: this.model,
         instructions: systemPrompt,
         input: inputMessages,
-        text: { format: { type: 'json_object' } },
+        // No forced `json_object` format: the reactive agent now emits YAML
+        // (parsed by response-parser.js, which accepts YAML and JSON alike).
+        // Forcing json_object here would override the YAML contract and pin
+        // reasoning models to JSON. Sub-calls that genuinely need JSON pass
+        // responseFormat through `complete()` instead.
         max_output_tokens: this.maxTokens,
         stream: true
       };

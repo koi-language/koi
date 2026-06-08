@@ -317,6 +317,39 @@ export async function fetchMediaCapabilities(kind) {
   }
 }
 
+/**
+ * Fetch the RAW active media model rows for a kind — a lean projection
+ * { slug, displayName, categories, labels } per active model (price != null,
+ * mirroring the router's active filter). Unlike fetchMediaCapabilities (which
+ * aggregates capability columns), this preserves per-model identity so callers
+ * can bind catalog slugs to an external provider's model ids (e.g. the MCP media
+ * mapper mapping `fal-ai/nano-banana-pro/edit` → Magnific `imagen-nano-banana-2`).
+ * Returns [] on any failure — callers treat empty as "no catalog to map against".
+ */
+export async function fetchMediaModelRows(kind) {
+  if (!Object.prototype.hasOwnProperty.call(_aggregateByKind, kind)) return [];
+  try {
+    const res = await fetch(`${getGatewayBase()}/models/${kind}.json`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return [];
+    const models = await res.json();
+    if (!Array.isArray(models)) return [];
+    return models
+      .filter((m) => m && typeof m.slug === 'string' && m.pricePerUnit != null)
+      .map((m) => ({
+        slug: m.slug,
+        displayName: typeof m.displayName === 'string' ? m.displayName : '',
+        categories: Array.isArray(m.categories) ? m.categories : [],
+        labels: Array.isArray(m.labels)
+          ? m.labels.map((l) => (typeof l === 'string' ? l : l && l.slug)).filter(Boolean)
+          : [],
+      }));
+  } catch {
+    return [];
+  }
+}
+
 // ── Client-side media model resolver ────────────────────────────────────────
 //
 // Mirrors how text LLMs work: the backend is a dumb proxy that runs whatever
@@ -794,28 +827,47 @@ export class GatewayImageGen extends BaseImageGen {
         // Poll. Fal usually completes in a few seconds for fast slugs and
         // 30–90s for gpt-image-2 + refs — BUT heavy 4K + multi-reference jobs
         // on nano-banana-pro / gpt-image-2 routinely run several minutes under
-        // load (observed real gens >5 min). The old 5-min cap cut those off
-        // mid-flight. This poll runs in the background (generate_image is a
-        // backgrounded action), so a longer cap doesn't freeze the turn — it
-        // just lets a slow-but-live job finish. Default 10 min; override via
-        // KOI_IMAGE_POLL_TIMEOUT_MS (milliseconds) to tune without a rebuild.
-        const _imgPollTimeoutMs = Number(process.env.KOI_IMAGE_POLL_TIMEOUT_MS) || 10 * 60 * 1000;
-        const pollDeadline = Date.now() + _imgPollTimeoutMs;
+        // load (observed real gens >5 min), and a wall-clock cap surfaced a
+        // client error even when the image DID finish server-side. This poll
+        // runs in the background (generate_image is a backgrounded action),
+        // so there's nothing to unblock by giving up — we wait while the job
+        // is alive (IN_QUEUE / IN_PROGRESS) and let the backend either return
+        // the image or report FAILED. A finite cap can still be forced via
+        // KOI_IMAGE_POLL_TIMEOUT_MS (milliseconds); unset / 0 ⇒ no deadline.
+        const _imgPollTimeoutMs = Number(process.env.KOI_IMAGE_POLL_TIMEOUT_MS);
+        const _imgHasDeadline = Number.isFinite(_imgPollTimeoutMs) && _imgPollTimeoutMs > 0;
+        const pollDeadline = _imgHasDeadline ? Date.now() + _imgPollTimeoutMs : Infinity;
         let pollDelay = 1500;
+        // With no wall-clock cap a slow job runs hundreds of polls, so a
+        // single transient blip (network drop, gateway 5xx/429) must not
+        // kill a job that's still alive server-side. Tolerate a handful of
+        // CONSECUTIVE transient failures, resetting on any good response.
+        // FAILED status, auth/quota and other 4xx stay fatal-immediate.
+        const MAX_POLL_ERRORS = 8;
+        let pollErrors = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
-          if (Date.now() > pollDeadline) {
+          if (_imgHasDeadline && Date.now() > pollDeadline) {
             throw new Error(`Gateway image timeout after ${Math.round(_imgPollTimeoutMs / 60000)} min waiting on ${id}`);
           }
           await new Promise(r => setTimeout(r, pollDelay));
           pollDelay = Math.min(pollDelay * 1.4, 5000);
 
-          const pollRes = await fetch(
-            `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
-            { headers: getAuthHeaders(), signal: opts.abortSignal },
-          );
+          let pollRes;
+          try {
+            pollRes = await fetch(
+              `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
+              { headers: getAuthHeaders(), signal: opts.abortSignal },
+            );
+          } catch (netErr) {
+            if (opts.abortSignal?.aborted) throw netErr;
+            if (++pollErrors >= MAX_POLL_ERRORS) throw netErr;
+            continue; // transient network error — the job may still be alive
+          }
           await throwIfQuotaExceeded(pollRes);
           if (!pollRes.ok) {
+            const _transient = pollRes.status >= 500 || pollRes.status === 408 || pollRes.status === 429;
+            if (_transient && ++pollErrors < MAX_POLL_ERRORS) continue;
             const bodyText = await pollRes.text().catch(() => '');
             let structured = null;
             try { structured = JSON.parse(bodyText); } catch {}
@@ -826,6 +878,7 @@ export class GatewayImageGen extends BaseImageGen {
             if (structured) err.details = structured;
             throw err;
           }
+          pollErrors = 0;
           const data = await pollRes.json();
           if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') {
             // Bubble the raw fal status up to the caller (the tool layer)
@@ -1108,23 +1161,40 @@ export class GatewayAudioGen extends BaseAudioGen {
     const { id } = await submitRes.json();
     if (!id) throw new Error('Gateway audio submit returned no id');
 
-    // Poll. Speech is usually < 10 s, sfx 5–30 s, music 30–90 s. Cap at
-    // 5 min so a stuck job doesn't dangle the tool indefinitely.
-    const pollDeadline = Date.now() + 5 * 60 * 1000;
+    // Poll. Speech is usually < 10 s, sfx 5–30 s, music 30–90 s. We wait
+    // while the job is alive (IN_QUEUE / IN_PROGRESS) and let the backend
+    // either return the audio or report FAILED — no wall-clock cap, so a
+    // slow-but-live job is never killed mid-flight. A finite cap can be
+    // forced via KOI_AUDIO_POLL_TIMEOUT_MS (ms); unset / 0 ⇒ no deadline.
+    const _audPollTimeoutMs = Number(process.env.KOI_AUDIO_POLL_TIMEOUT_MS);
+    const _audHasDeadline = Number.isFinite(_audPollTimeoutMs) && _audPollTimeoutMs > 0;
+    const pollDeadline = _audHasDeadline ? Date.now() + _audPollTimeoutMs : Infinity;
     let pollDelay = 1200;
+    // Tolerate transient blips on long waits (see image poll above).
+    const MAX_POLL_ERRORS = 8;
+    let pollErrors = 0;
     while (true) {
-      if (Date.now() > pollDeadline) {
-        throw new Error(`Gateway audio timeout after 5 min waiting on ${id}`);
+      if (_audHasDeadline && Date.now() > pollDeadline) {
+        throw new Error(`Gateway audio timeout after ${Math.round(_audPollTimeoutMs / 60000)} min waiting on ${id}`);
       }
       await new Promise(r => setTimeout(r, pollDelay));
       pollDelay = Math.min(pollDelay * 1.4, 4000);
 
-      const pollRes = await fetch(
-        `${getGatewayBase()}/media/audio/${kind}/result?id=${encodeURIComponent(id)}`,
-        { headers: getAuthHeaders(), signal: opts.abortSignal },
-      );
+      let pollRes;
+      try {
+        pollRes = await fetch(
+          `${getGatewayBase()}/media/audio/${kind}/result?id=${encodeURIComponent(id)}`,
+          { headers: getAuthHeaders(), signal: opts.abortSignal },
+        );
+      } catch (netErr) {
+        if (opts.abortSignal?.aborted) throw netErr;
+        if (++pollErrors >= MAX_POLL_ERRORS) throw netErr;
+        continue; // transient network error — the job may still be alive
+      }
       await throwIfQuotaExceeded(pollRes);
       if (!pollRes.ok) {
+        const _transient = pollRes.status >= 500 || pollRes.status === 408 || pollRes.status === 429;
+        if (_transient && ++pollErrors < MAX_POLL_ERRORS) continue;
         const bodyText = await pollRes.text().catch(() => '');
         let structured = null;
         try { structured = JSON.parse(bodyText); } catch {}
@@ -1135,6 +1205,7 @@ export class GatewayAudioGen extends BaseAudioGen {
         if (structured) err.details = structured;
         throw err;
       }
+      pollErrors = 0;
       const data = await pollRes.json();
       if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') {
         if (typeof opts.onStatus === 'function') {

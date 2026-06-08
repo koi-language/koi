@@ -47,9 +47,9 @@ export class AnthropicLLM extends BaseLLM {
     const systemPrompt = messages.find(m => m.role === 'system')?.content || '';
     const chatMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
 
-    // Append JSON-only reminder to last user message (Anthropic tends to add preamble)
+    // Append YAML-only reminder to last user message (Anthropic tends to add preamble)
     const lastUserIdx = chatMessages.map(m => m.role).lastIndexOf('user');
-    const _jsonReminder = '\n\nRespond with ONLY a valid JSON object. No text, no explanation, no preamble. Start with {';
+    const _jsonReminder = '\n\nRespond with ONLY a valid YAML document (block style, 2-space indent). No text, no explanation, no preamble, no code fences. Start with a top-level key such as `actionType:` or `batch:`.';
     const messagesWithReminder = chatMessages.map((m, i) => {
       if (i !== lastUserIdx) return m;
       if (Array.isArray(m.content)) {

@@ -24,6 +24,8 @@ import { GeminiLLM, GeminiEmbedding } from './gemini.js';
 import { BraveSearch } from './brave.js';
 import { TavilySearch } from './tavily.js';
 import { GatewayEmbedding, GatewaySearch, GatewayImageGen, GatewayAudioGen, GatewayVideoGen } from './gateway.js';
+import { activeFor as mcpMediaActiveFor } from './mcp-media-resolver.js';
+import { McpMediaProvider } from './mcp-media.js';
 // Image and video generation always go through the backend gateway.
 // There used to be direct-to-fal / direct-to-Google client adapters
 // here (banana.js, kling.js, seedance.js, OpenAIImageGen, etc.) — they
@@ -262,16 +264,27 @@ function _resolveSearch(req) {
 
 function _resolveImage(req) {
   const { model: requestedModel } = req;
-  // Image generation always goes through the backend gateway. The
-  // per-model adapters (fal nano-banana / fal qwen / fal seedream /
-  // openai-gpt-image / etc.) live in backend/src/modules/gateway/
-  // adapters/image/ — never in the client. KOI_AUTH_TOKEN is the
-  // proof the user is logged in to Braxil; without it there is no
-  // gateway and no image generation.
+  const model = requestedModel || 'auto';
+
+  // Media facade: when a connected MCP has an (agent-generated) media map
+  // covering image, route image generation / operations through it. It delegates
+  // uncovered methods to the gateway fallback, so the two coexist per-operation.
+  // See docs/mcp-media-facade.md.
+  const mcp = mcpMediaActiveFor('image');
+  if (mcp) {
+    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayImageGen(model) : null;
+    const instance = new McpMediaProvider({ kind: 'image', server: mcp.server, media: mcp.media, fallback });
+    return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
+  }
+
+  // Otherwise image generation goes through the backend gateway. The per-model
+  // adapters (fal nano-banana / qwen / seedream / openai-gpt-image / etc.) live
+  // in backend/src/modules/gateway/adapters/image/ — never in the client.
+  // KOI_AUTH_TOKEN is the proof the user is logged in to Braxil; without it
+  // there is no gateway and no image generation.
   if (!process.env.KOI_AUTH_TOKEN) {
     throw new Error('Image generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
   }
-  const model = requestedModel || 'auto';
   const instance = new GatewayImageGen(model);
   return { instance, provider: 'koi-gateway', model, useThinking: false };
 }
@@ -282,6 +295,17 @@ function _resolveImage(req) {
 
 function _resolveAudio(req) {
   const { clients, model: requestedModel } = req;
+
+  // Media facade: route TTS/music through a connected media MCP when one
+  // declares audio capabilities. Uncovered methods (sfx, voice cloning,
+  // transcription) delegate to the gateway fallback. See mcp-media-facade.md.
+  const mcp = mcpMediaActiveFor('audio');
+  if (mcp) {
+    const model = requestedModel || 'auto';
+    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayAudioGen(model) : null;
+    const instance = new McpMediaProvider({ kind: 'audio', server: mcp.server, media: mcp.media, fallback });
+    return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
+  }
 
   // Gateway mode
   if (process.env.KOI_AUTH_TOKEN) {
@@ -305,13 +329,25 @@ function _resolveAudio(req) {
 
 function _resolveVideo(req) {
   const { model: requestedModel } = req;
-  // Video generation always goes through the backend gateway, same
-  // reasoning as _resolveImage. Direct-to-fal client adapters (kling,
-  // seedance, OpenAIVideoGen, GeminiVideoGen) were removed.
+  const model = requestedModel || 'auto';
+
+  // Media facade: route video (and avatar, which shares the video provider)
+  // through a connected media MCP when one declares video capabilities. Video
+  // is a DEFERRED job — the MCP provider returns { id, status:'pending' } and
+  // the tool polls it via getStatus(), exactly like the gateway. See
+  // docs/mcp-media-facade.md.
+  const mcp = mcpMediaActiveFor('video');
+  if (mcp) {
+    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayVideoGen(model) : null;
+    const instance = new McpMediaProvider({ kind: 'video', server: mcp.server, media: mcp.media, fallback });
+    return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
+  }
+
+  // Otherwise video generation goes through the backend gateway, same
+  // reasoning as _resolveImage.
   if (!process.env.KOI_AUTH_TOKEN) {
     throw new Error('Video generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
   }
-  const model = requestedModel || 'auto';
   const instance = new GatewayVideoGen(model);
   return { instance, provider: 'koi-gateway', model, useThinking: false };
 }

@@ -648,7 +648,7 @@ export default {
 - For large files (>500 lines), still paginate: read targeted ranges with offset + limit, don't dump the whole thing
 - For images (.png, .jpg, .gif, .webp): just call read_file with the path — the image will be attached for visual analysis on your next turn.
 - For videos (.mp4, .mov, .webm, …): read_file attaches the WHOLE video natively — the model watches it (motion + audio + every frame), same UX as reading an image, just call read_file with the path. Large files are auto-downscaled to fit. Treat it as "you've now actually watched the video." NEVER use shell/ffmpeg/ffprobe to detect cuts, extract frames, or otherwise "inspect" a video — that is exactly what read_file does for you, natively and better.
-- \`@mention\` handles work directly: \`{"intent":"read_file","path":"@hero_script"}\` resolves the handle via the cross-project MediaLibrary to the most recent tagged asset. Do NOT enumerate the library by hand to look up the path first — the resolver does it for you. Same for \`@tom\` (image), \`@narrator\` (audio), etc.`,
+- \`@mention\` handles work directly: \`intent: read_file\` with \`path: "@hero_script"\` resolves the handle via the cross-project MediaLibrary to the most recent tagged asset. Do NOT enumerate the library by hand to look up the path first — the resolver does it for you. Same for \`@tom\` (image), \`@narrator\` (audio), etc.`,
   thinkingHint: (action) => `Reading ${action.path ? path.basename(action.path) : 'file'}`,
   permission: 'read',
   hidden: false,

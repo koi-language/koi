@@ -4,6 +4,20 @@
  */
 
 import { channel } from '../io/channel.js';
+import { parse as parseYaml } from 'yaml';
+
+// Recognised top-level keys of a real action / batch. Used to tell a genuine
+// (if malformed) action object apart from a prose sentence that YAML happened
+// to coerce into a map (e.g. "Note: done." → { Note: 'done.' }).
+const _ACTION_KEYS = new Set([
+  'actionType', 'intent', 'type', 'batch', 'parallel', 'actions',
+  'data', 'summary', 'message', 'text', 'result', 'answer', 'user_request_compliance',
+]);
+function _looksLikeAction(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  if (Array.isArray(obj)) return true; // a sequence of actions
+  return Object.keys(obj).some(k => _ACTION_KEYS.has(k));
+}
 
 /**
  * Log a debug message (only when KOI_DEBUG_LLM=1).
@@ -28,8 +42,9 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
   // Clean markdown code blocks
   let cleaned = responseText.trim();
   if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    cleaned = cleaned.replace(/^```(?:ya?ml|json)?\n?/i, '').replace(/\n?```$/, '').trim();
   }
+  const _rawCleaned = cleaned; // pre-strip copy, used for the prose fallback
 
   // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
   // Find the first { or [ that starts valid JSON and discard everything before it.
@@ -79,8 +94,34 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
 
   let parsed;
   try {
-    parsed = JSON.parse(cleaned);
+    // PRIMARY: parse as YAML. YAML is a strict superset of JSON, so this
+    // accepts BOTH the YAML the agent now emits AND any legacy/stray JSON,
+    // which is our safety net during the migration. The `yaml` package uses
+    // the 1.2 core schema, so `yes/no/on/off` stay strings (no "Norway
+    // problem") and only true/false/null are booleans.
+    parsed = parseYaml(cleaned, { uniqueKeys: false });
+    if (parsed === undefined) throw new Error('empty YAML document');
+    // A bare scalar (string/number/bool) means the model answered in PROSE,
+    // not an action map/sequence — surface it verbatim as a print (same as
+    // the prose fallback in the catch below). YAML is lenient enough that a
+    // sentence with no colon parses as a plain string.
+    if (parsed === null || typeof parsed !== 'object') {
+      return normalizeReactiveAction({
+        actionType: 'direct', intent: 'print', message: String(parsed ?? '').trim(),
+      });
+    }
+    // YAML coerced prose-with-a-colon ("Note: done.") into a 1-key map. If
+    // NONE of the keys look like a real action, it was prose, not a tool
+    // call — print the original text instead of throwing on a bogus action.
+    if (!_looksLikeAction(parsed)) {
+      return normalizeReactiveAction({
+        actionType: 'direct', intent: 'print', message: _rawCleaned.trim(),
+      });
+    }
   } catch (firstErr) {
+    // YAML parse failed (genuinely malformed / truncated). Fall through to
+    // the JSON-specific repair ladder below — it handles bad escapes,
+    // concatenated objects and truncation that YAML can't recover either.
     // Fallback 0: Fix malformed escape sequences and literal newlines/tabs inside JSON string values.
     // Some models (Gemini) emit literal newlines within strings instead of \n,
     // or produce invalid escape sequences like \a, \p, \s etc. in diff content.
@@ -159,9 +200,9 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
       // anti-pattern the user has banned. Surface the parse failure instead
       // so the real agent retries with a valid JSON action.
       throw new Error(
-        `Your response was not valid JSON and could not be parsed. ${firstErr.message}. ` +
+        `Your response was not valid YAML (or JSON) and could not be parsed. ${firstErr.message}. ` +
         `Response received: ${cleaned.substring(0, 300)}. ` +
-        `Retry with a valid JSON action (e.g. {"actionType":"direct","intent":"print","message":"..."}).`
+        `Retry with a valid YAML action, e.g.:\nactionType: direct\nintent: print\nmessage: "..."`
       );
     }
   }
@@ -297,9 +338,9 @@ export function normalizeReactiveAction(parsed) {
       parsed.data = { success: true, summary: _text };
     } else {
       throw new Error(
-        `Your response did not contain a valid action. Expected JSON with an "intent" or "actionType" field (e.g. {"actionType":"direct","intent":"print","message":"..."}). ` +
+        `Your response did not contain a valid action. Expected YAML with an "intent" or "actionType" key (e.g.\nactionType: direct\nintent: print\nmessage: "..."). ` +
         `Got: ${JSON.stringify(parsed).substring(0, 300)}. ` +
-        `Retry with a valid action. If you wanted to finish the task, emit {"actionType":"direct","intent":"return","data":{...}} explicitly.`
+        `Retry with a valid action. If you wanted to finish the task, emit:\nactionType: direct\nintent: return\ndata:\n  ...`
       );
     }
   }

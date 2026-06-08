@@ -621,7 +621,13 @@ const generateVideoAction = {
           ? available.join(', ')
           : '(no @-handles tagged yet — use tag_media to assign one)';
         return {
+          // Pre-flight lint: the agent built the prompt with handles that
+          // don't bind to anything. Nothing was submitted to the provider
+          // (no charge) and the agent is expected to silently re-issue, so
+          // flag it as a validation failure — the banner middleware removes
+          // the banner instead of flashing a red error mid-correction.
           success: false,
+          validationError: true,
           error:
             `Prompt references @-handles that don't match any gallery item OR any attached reference slot: ${_leftover.join(', ')}.\n` +
             `Either remove them from the prompt, attach matching references in referenceImages/referenceVideos, or use one of the tagged handles: ${availableStr}`,
@@ -729,7 +735,13 @@ const generateVideoAction = {
       if (_vidCited > _vidHave) _missing.push(`prompt cites "Video ${_vidCited}" but only ${_vidHave} reference video(s) are attached`);
       if (_missing.length > 0) {
         return {
+          // Pre-flight lint (no provider call, no charge): the prompt cites
+          // positional refs that aren't attached. The agent re-issues with
+          // the slots populated, so this is a validation failure — the
+          // banner middleware silently removes the banner rather than
+          // flashing red while the agent corrects itself.
           success: false,
+          validationError: true,
           error:
             `generate_video did NOT run — ${_missing.join('; ')}. ` +
             `Your prompt cites positional references (Image N / Video N) but the matching files were not attached, so the model would have nothing to follow (no storyboard blueprint, no character identity, no previous-clip continuity). ` +
@@ -1088,7 +1100,11 @@ const generateVideoAction = {
         channel.log('video', `Provider ${resolved.provider}/${resolved.model} is single-shot — ignoring shots[]`);
       } else if (action.shots.length > maxShots) {
         return {
+          // Pre-flight lint (no charge): too many shots for this model. The
+          // agent re-issues with fewer shots, so treat as a validation
+          // failure (banner removed, no red flash).
           success: false,
+          validationError: true,
           error: `Model ${resolved.model} supports at most ${maxShots} shots per call; got ${action.shots.length}.`,
         };
       } else {
@@ -1481,9 +1497,7 @@ const generateVideoAction = {
       abortSignal,
       reportProgress,
       onTick: _onPollTick,
-      timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
-        ? action.timeoutMs
-        : DEFAULT_TIMEOUT_MS,
+      timeoutMs: _resolveTimeoutMs(action),
       pollIntervalMs: typeof action.pollIntervalMs === 'number' && action.pollIntervalMs > 0
         ? action.pollIntervalMs
         : DEFAULT_POLL_INTERVAL_MS,
@@ -1831,9 +1845,27 @@ const generateVideoAction = {
 
 // ── Provider polling (collapsed from the old await_video_generation) ─
 const DEFAULT_POLL_INTERVAL_MS = 8000;
-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min — seedance reference-to-video on 15s clips has been observed at ~11 min, Kling / Veo / Sora can run longer on high-res or extended durations
 const MIN_POLL_INTERVAL_MS = 2000;
 const MAX_POLL_INTERVAL_MS = 30000;
+
+// No wall-clock timeout by default. As long as the provider keeps
+// reporting the job is alive (IN_QUEUE / IN_PROGRESS) we keep waiting —
+// fal jobs like seedance reference-to-video routinely run 10-20 min and
+// occasionally longer, and the old 20-min cap surfaced a client error
+// even when the video DID finish server-side. The only things that stop
+// the wait now are: a terminal state (completed/failed), the user
+// cancelling (abortSignal), or the provider going silent (the
+// consecutive-error backstop inside _pollUntilTerminal). A finite cap
+// can still be set explicitly via `action.timeoutMs` (ms) or the
+// KOI_VIDEO_POLL_TIMEOUT_MS env var for callers that want one.
+export const _resolveTimeoutMs = (action) => {
+  if (action && typeof action.timeoutMs === 'number' && action.timeoutMs > 0) {
+    return action.timeoutMs;
+  }
+  const env = Number(process.env.KOI_VIDEO_POLL_TIMEOUT_MS);
+  if (Number.isFinite(env) && env > 0) return env;
+  return Infinity; // wait while the job is alive
+};
 
 const _sleep = (ms, signal) => new Promise((resolve, reject) => {
   const t = setTimeout(resolve, ms);
@@ -1855,7 +1887,10 @@ const _sleep = (ms, signal) => new Promise((resolve, reject) => {
  */
 export async function _pollUntilTerminal(instance, submitted, { abortSignal, reportProgress, timeoutMs, pollIntervalMs, onTick }) {
   const pollMs = Math.min(MAX_POLL_INTERVAL_MS, Math.max(MIN_POLL_INTERVAL_MS, pollIntervalMs));
-  const deadline = Date.now() + timeoutMs;
+  // `timeoutMs` of Infinity / 0 / non-positive ⇒ no wall-clock deadline:
+  // wait while the provider keeps reporting the job is alive.
+  const hasDeadline = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  const deadline = hasDeadline ? Date.now() + timeoutMs : Infinity;
   const t0 = Date.now();
 
   // `onTick(result)` — optional, fires after every successful poll
@@ -1910,11 +1945,17 @@ export async function _pollUntilTerminal(instance, submitted, { abortSignal, rep
     // Time-elapsed driven progress: 0.05..0.92 reserved for polling.
     if (reportProgress) {
       const elapsed = Date.now() - t0;
-      const pct = Math.min(0.92, 0.05 + 0.87 * Math.min(1, elapsed / Math.max(1, timeoutMs)));
+      // With a finite deadline, scale linearly to it. With no deadline,
+      // ease toward (but never reach) 0.92 on a half-life curve so the
+      // bar still advances on long, open-ended waits.
+      const frac = hasDeadline
+        ? Math.min(1, elapsed / Math.max(1, timeoutMs))
+        : 1 - Math.pow(0.5, elapsed / (5 * 60 * 1000));
+      const pct = Math.min(0.92, 0.05 + 0.87 * frac);
       reportProgress(pct, `Waiting for provider… ${Math.round(elapsed / 1000)}s`);
     }
 
-    if (Date.now() + pollMs > deadline) {
+    if (hasDeadline && Date.now() + pollMs > deadline) {
       return {
         ...result,
         status: 'pending',
@@ -2055,9 +2096,7 @@ async function _runHybridExtendChain({
   const final = await _pollUntilTerminal(instance, submitted, {
     abortSignal: agent?.abortSignal,
     reportProgress,
-    timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
-      ? action.timeoutMs
-      : DEFAULT_TIMEOUT_MS,
+    timeoutMs: _resolveTimeoutMs(action),
     pollIntervalMs: typeof action.pollIntervalMs === 'number' && action.pollIntervalMs > 0
       ? action.pollIntervalMs
       : DEFAULT_POLL_INTERVAL_MS,

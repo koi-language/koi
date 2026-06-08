@@ -21,7 +21,7 @@ import path from 'path';
 import sharp from 'sharp';
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
-import { _stashJobMetadata, getJobMetadata, clearJobMetadata, saveVideoFromUrl, _pollUntilTerminal } from './generate-video.js';
+import { _stashJobMetadata, getJobMetadata, clearJobMetadata, saveVideoFromUrl, _pollUntilTerminal, _resolveTimeoutMs } from './generate-video.js';
 import { channel } from '../../io/channel.js';
 
 // Fal's hard cap for file_too_large is 10 MB / 10485760 bytes (see
@@ -42,7 +42,6 @@ import { channel } from '../../io/channel.js';
 // longer carries shrink-loop parameters.
 
 const DEFAULT_POLL_INTERVAL_MS = 8000;
-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 
 const generateAvatarVideoAction = {
   type: 'generate_avatar_video',
@@ -296,9 +295,7 @@ const generateAvatarVideoAction = {
       abortSignal,
       reportProgress,
       onTick: _onPollTick,
-      timeoutMs: typeof action.timeoutMs === 'number' && action.timeoutMs > 0
-        ? action.timeoutMs
-        : DEFAULT_TIMEOUT_MS,
+      timeoutMs: _resolveTimeoutMs(action),
       pollIntervalMs: typeof action.pollIntervalMs === 'number' && action.pollIntervalMs > 0
         ? action.pollIntervalMs
         : DEFAULT_POLL_INTERVAL_MS,

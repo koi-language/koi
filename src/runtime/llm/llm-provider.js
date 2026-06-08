@@ -930,7 +930,9 @@ export class LLMProvider {
           'user',
           `SESSION RESUMED. The conversation history above is from a previous session.
 
-Your ONLY next action is: { "intent": "prompt_user" } — ask the user what they need.
+Your ONLY next action is this YAML:
+intent: prompt_user
+— ask the user what they need.
 
 CRITICAL RULES:
 - Do NOT repeat, summarize, or reference anything from the conversation history above.
@@ -1985,11 +1987,9 @@ CRITICAL RULES:
     // (_fmtTk defined above for input token estimate)
 
     // Streaming print state machine
-    let _spState = 'init';       // 'init' | 'found_print' | 'streaming' | 'done' | 'skip'
-    let _spBuf = '';             // accumulated raw JSON text
-    let _spMsgOffset = -1;      // offset where message string content starts
-    let _spInEscape = false;     // inside a \ escape
-    let _spPendingUnicode = null; // collecting \uXXXX hex digits
+    let _spState = 'init';       // 'init' | 'streaming' | 'done' | 'skip'
+    let _spBuf = '';             // accumulated raw YAML text of the response
+    let _spEmittedLen = 0;       // chars of the decoded print message already streamed
     let _printStreamed = false;  // true once streaming print was active
     let _lineBuf = '';           // line buffer — holds partial line until \n
     let _tableBuf = [];          // buffered table rows for batch rendering
@@ -2074,57 +2074,127 @@ CRITICAL RULES:
       }
     };
 
-    // Process a delta chunk while in 'streaming' state — unescape JSON string chars
-    // and buffer by line. Detects the closing " to transition to 'done'.
-    const _processStreamingChars = (delta) => {
-      for (let i = 0; i < delta.length; i++) {
-        if (_spState !== 'streaming') break;
-        const ch = delta[i];
-
-        if (_spPendingUnicode !== null) {
-          _spPendingUnicode += ch;
-          if (_spPendingUnicode.length === 4) {
-            _lineBuf += String.fromCharCode(parseInt(_spPendingUnicode, 16));
-            _spPendingUnicode = null;
-          }
+    // Decode a YAML double-quoted scalar starting at buf[from] === '"'.
+    // Returns { text, terminated }. `terminated` = the closing quote arrived.
+    const _decodeDQuote = (buf, from) => {
+      let out = '';
+      for (let i = from + 1; i < buf.length; i++) {
+        const c = buf[i];
+        if (c === '\\') {
+          const n = buf[i + 1];
+          if (n === undefined) break;              // escape split across chunks — wait
+          if (n === 'n') out += '\n';
+          else if (n === 't') out += '\t';
+          else if (n === 'r') out += '\r';
+          else if (n === '"') out += '"';
+          else if (n === '\\') out += '\\';
+          else if (n === '/') out += '/';
+          else if (n === 'u') {
+            const hex = buf.substr(i + 2, 4);
+            if (hex.length < 4) { i = buf.length; break; } // \uXXXX incomplete — wait
+            out += String.fromCharCode(parseInt(hex, 16) || 0);
+            i += 4;
+          } else out += n;
+          i += 1;
           continue;
         }
-
-        if (_spInEscape) {
-          _spInEscape = false;
-          if (ch === 'n') _lineBuf += '\n';
-          else if (ch === 'r') _lineBuf += '\r';
-          else if (ch === 't') _lineBuf += '\t';
-          else if (ch === '"') _lineBuf += '"';
-          else if (ch === '\\') _lineBuf += '\\';
-          else if (ch === '/') _lineBuf += '/';
-          else if (ch === 'u') { _spPendingUnicode = ''; }
-          else _lineBuf += ch;
-          continue;
-        }
-
-        if (ch === '\\') { _spInEscape = true; continue; }
-        if (ch === '"') {
-          // End of JSON string value — flush any remaining partial line
-          _flushLines(true);
-          _spState = 'done';
-          _printStreamed = true;
-          // Don't call printStreamingEnd here — the print action will clear
-          // the streaming area when it commits the markdown-formatted text,
-          // avoiding a visual "double display".
-          break;
-        }
-        _lineBuf += ch;
+        if (c === '"') return { text: out, terminated: true };
+        out += c;
       }
-      // After processing the delta, emit any complete lines we've accumulated
-      if (_spState === 'streaming') _flushLines(false);
+      return { text: out, terminated: false };
     };
 
-    // Transition to streaming state: emit any buffered message content
-    const _startStreaming = () => {
-      _spState = 'streaming';
-      const buffered = _spBuf.slice(_spMsgOffset);
-      if (buffered) _processStreamingChars(buffered);
+    // Decode a YAML single-quoted scalar starting at buf[from] === "'".
+    // In single-quoted YAML the only escape is '' → a literal '.
+    const _decodeSQuote = (buf, from) => {
+      let out = '';
+      for (let i = from + 1; i < buf.length; i++) {
+        const c = buf[i];
+        if (c === "'") {
+          if (buf[i + 1] === "'") { out += "'"; i += 1; continue; } // '' → '
+          if (buf[i + 1] === undefined) return { text: out, terminated: false };
+          return { text: out, terminated: true };
+        }
+        out += c;
+      }
+      return { text: out, terminated: false };
+    };
+
+    // Incrementally decode a `print` action's `message` straight from the raw
+    // YAML token stream so the user sees it appear live. Recompute-and-diff:
+    // re-derive the full decoded message-so-far from the buffer each chunk and
+    // emit only the new tail. Handles the scalar styles the agent uses for
+    // `message`: block (`|`/`>`), double-quoted, single-quoted and plain.
+    // Returns { status:'undecided' | 'skip' | 'go', text?, terminated? }.
+    const _extractYamlPrint = (buf) => {
+      // 1) intent — only trust a COMPLETE intent line (one that ends in \n),
+      // so we never decide on a half-streamed value. Matches `intent: print`,
+      // `- intent: print`, quoted forms, and a trailing # comment.
+      const im = buf.match(
+        /(?:^|\n)[ \t]*-?[ \t]*intent[ \t]*:[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\r\n#]*?))[ \t]*(?:#[^\r\n]*)?\r?\n/,
+      );
+      if (!im) return buf.length > 600 ? { status: 'skip' } : { status: 'undecided' };
+      const intentVal = (im[1] ?? im[2] ?? im[3] ?? '').trim();
+      if (intentVal !== 'print') return { status: 'skip' };
+
+      // 2) the `message:` key line — capture its indent and inline remainder.
+      const mm = buf.match(/(?:^|\n)([ \t]*)message[ \t]*:[ \t]*([^\r\n]*)(\r?\n|$)/);
+      if (!mm) return buf.length > 8000 ? { status: 'skip' } : { status: 'undecided' };
+      const keyIndent = mm[1].length;
+      const rest = mm[2];
+      const restEndsLine = mm[3] === '\n' || mm[3] === '\r\n';
+      const restTrim = rest.trim();
+      const restStart = mm.index + mm[0].length - mm[3].length - rest.length;
+
+      // 3) block scalar `|` / `>` (with optional chomping/indent indicators)
+      if (/^[|>][+\-]?\d*$/.test(restTrim)) {
+        if (!restEndsLine) return { status: 'go', text: '', terminated: false };
+        const contentStart = restStart + rest.length + mm[3].length;
+        const endsWithNL = buf.endsWith('\n');
+        const rawLines = buf.slice(contentStart).split('\n');
+        // block indent = indentation of the first non-empty content line
+        let blockIndent = -1;
+        for (const ln of rawLines) {
+          if (ln.trim() === '') continue;
+          blockIndent = ln.length - ln.trimStart().length;
+          break;
+        }
+        if (blockIndent === -1) return { status: 'go', text: '', terminated: false };
+        if (blockIndent <= keyIndent) return { status: 'go', text: '', terminated: true };
+        const complete = [];   // de-indented lines already closed by a \n
+        let partial = '';      // de-indented last line still streaming (no \n yet)
+        let terminated = false;
+        for (let li = 0; li < rawLines.length; li++) {
+          const ln = rawLines[li];
+          const isPartial = li === rawLines.length - 1 && !endsWithNL;
+          if (ln.trim() !== '') {
+            const ind = ln.length - ln.trimStart().length;
+            if (ind < blockIndent) { if (!isPartial) terminated = true; break; } // dedent ends block
+          }
+          if (isPartial) partial = ln.slice(blockIndent);
+          else complete.push(ln.slice(blockIndent));
+        }
+        // YAML clips trailing blank lines, but only when nothing is still extending the block.
+        if (!partial) while (complete.length && complete[complete.length - 1] === '') complete.pop();
+        // Completed lines keep their trailing \n so the renderer flushes each one
+        // the instant it lands; the partial line streams on without a \n.
+        return { status: 'go', text: complete.map((l) => l + '\n').join('') + partial, terminated };
+      }
+
+      // 4) quoted scalars
+      if (restTrim.startsWith('"')) {
+        const r = _decodeDQuote(buf, buf.indexOf('"', restStart));
+        return { status: 'go', text: r.text, terminated: r.terminated };
+      }
+      if (restTrim.startsWith("'")) {
+        const r = _decodeSQuote(buf, buf.indexOf("'", restStart));
+        return { status: 'go', text: r.text, terminated: r.terminated };
+      }
+
+      // 5) plain scalar — single line (the agent is told to use `|` for
+      // multi-line). Strip a trailing # comment and surrounding spaces.
+      if (restEndsLine) return { status: 'go', text: restTrim.replace(/[ \t]+#.*$/, ''), terminated: true };
+      return { status: 'go', text: restTrim, terminated: false };
     };
 
     let _complianceAborted = false;
@@ -2138,43 +2208,31 @@ CRITICAL RULES:
 
       _spBuf += _delta;
 
-      // Early compliance detection: if we see "wont_do" in the stream, abort immediately.
-      // This saves tokens — no need to wait for the full response.
-      if (!_complianceAborted && _spBuf.includes('"wont_do"')) {
+      // Early compliance detection: if the model declares it won't comply,
+      // abort the stream immediately (saves tokens). YAML form:
+      // `user_request_compliance: wont_do`.
+      if (!_complianceAborted && /\bwont_do\b/.test(_spBuf)) {
         _complianceAborted = true;
         _spState = 'skip';
-        channel.log('llm', `[compliance] Early abort: detected "wont_do" in stream`);
+        channel.log('llm', `[compliance] Early abort: detected wont_do in stream`);
         return;
       }
 
-      if (_spState === 'init') {
-        // Wait for intent field
-        const intentMatch = _spBuf.match(/"intent"\s*:\s*"([^"]*)"/);
-        if (intentMatch) {
-          if (intentMatch[1] === 'print') {
-            _spState = 'found_print';
-            // Check if message value already started
-            const msgMatch = _spBuf.match(/"message"\s*:\s*"/);
-            if (msgMatch) {
-              _spMsgOffset = msgMatch.index + msgMatch[0].length;
-              _startStreaming();
-            }
-          } else {
-            _spState = 'skip';
-          }
-        } else if (_spBuf.length > 300) {
-          _spState = 'skip';
-        }
-      } else if (_spState === 'found_print') {
-        // Intent is print — waiting for message field
-        const msgMatch = _spBuf.match(/"message"\s*:\s*"/);
-        if (msgMatch) {
-          _spMsgOffset = msgMatch.index + msgMatch[0].length;
-          _startStreaming();
-        }
-      } else if (_spState === 'streaming') {
-        // Already streaming — process new delta characters only
-        _processStreamingChars(_delta);
+      // Recompute the decoded print message-so-far from the raw YAML buffer
+      // and stream only the newly-decoded tail through the markdown renderer.
+      const _pm = _extractYamlPrint(_spBuf);
+      if (_pm.status === 'skip') { _spState = 'skip'; return; }
+      if (_pm.status === 'undecided') return;
+      if (_spState === 'init') _spState = 'streaming';
+      if (_pm.text.length > _spEmittedLen) {
+        _lineBuf += _pm.text.slice(_spEmittedLen);
+        _spEmittedLen = _pm.text.length;
+        _flushLines(false);
+      }
+      if (_pm.terminated) {
+        _flushLines(true);
+        _spState = 'done';
+        _printStreamed = true;
       }
     };
 
@@ -2477,8 +2535,14 @@ CRITICAL RULES:
     // Parse the response into a single action
     const action = await this._parseReactiveResponse(responseText, agent);
 
-    // If streaming print was active but didn't see closing quote, finalize now
+    // If streaming print was active but the scalar wasn't terminated in-stream
+    // (e.g. a block scalar that ends at EOF), flush the remaining buffered line
+    // and finalize now. Mark _printStreamed so the print action skips its own
+    // channel.print() — otherwise it re-emits the whole message at once on top
+    // of what we already streamed ("shows the print all at once").
     if (_spState === 'streaming') {
+      _flushLines(true);
+      _printStreamed = true;
       channel.printStreamingEnd();
     }
 

@@ -63,7 +63,7 @@ function _resolveFfmpegInfo() {
  *  agent\'s reasoning to the user (so they catch wrong picks before a
  *  generation is wasted) and reduces hallucinated subject mappings. */
 function _pushAnnotationTranscribeGuide(lines) {
-  lines.push('**TRANSCRIBE every annotation as INTERNAL reasoning BEFORE acting.** The single most common failure mode is the agent looking at a mark, guessing which subject it refers to, and getting it wrong because the mark sat near multiple candidates. To prevent that, walk through the transcription IN YOUR HEAD (thinking tokens if the model supports them, otherwise just as careful internal reasoning before writing the action JSON). For EACH distinct mark, mentally fill out:');
+  lines.push('**TRANSCRIBE every annotation as INTERNAL reasoning BEFORE acting.** The single most common failure mode is the agent looking at a mark, guessing which subject it refers to, and getting it wrong because the mark sat near multiple candidates. To prevent that, walk through the transcription IN YOUR HEAD (thinking tokens if the model supports them, otherwise just as careful internal reasoning before writing the action YAML). For EACH distinct mark, mentally fill out:');
   lines.push('');
   lines.push('   - mark type — X / arrow / scribble / circle / text-label / freehand');
   lines.push('   - position of the mark on the frame');
@@ -470,13 +470,20 @@ You are running in non-interactive (headless) mode. There is no human to answer 
 OUTPUT CONTRACT (MUST FOLLOW)
 ========================================
 
-Return exactly ONE valid JSON object and nothing else.
-- No markdown
+Return exactly ONE valid YAML document and nothing else.
+- No markdown code fences
 - No explanations
-- No prose
-- Response must start with { and end with }
+- No prose outside the YAML
+- The ENTIRE response is the YAML: either a single action mapping (top-level keys like actionType/intent) or a "batch:" mapping.
 
-Never output invalid JSON. Invalid JSON crashes the system.
+Use block style with 2-space indentation. For ANY multi-line or punctuation-heavy text value (a prompt, a message, a director's brief), use a YAML block scalar with "|" so colons, quotes, "#" and newlines inside it are safe:
+
+intent: print
+message: |
+  Multi-line text goes here.
+  Colons (a: b), "quotes", and # are all safe inside a | block.
+
+Never output invalid YAML. Invalid YAML crashes the system.
 
 ========================================
 GOLDEN RULE (ABSOLUTE)
@@ -507,14 +514,14 @@ Correctness beats fewer steps.
 ACTION MODEL
 ========================================
 
-Every action object MUST include:
-- "actionType"
-- "intent"
+Every action mapping MUST include:
+- actionType
+- intent
 
-ONE action = ONE intent = ONE object. Each object contains ONLY the fields defined for that specific intent. NEVER add fields from a different intent into the same object — extra fields are silently ignored and the second action will NOT execute. If you need two actions, use a batch with two separate objects.
+ONE action = ONE intent = ONE mapping. Each mapping contains ONLY the fields defined for that specific intent. NEVER add fields from a different intent into the same mapping — extra fields are silently ignored and the second action will NOT execute. If you need two actions, use a batch with two separate mappings.
 
 Valid action types:
-- "direct"${hasTeams ? '\n- "delegate"' : ''}
+- direct${hasTeams ? '\n- delegate' : ''}
 
 Intent rules:
 - For direct actions: "intent" MUST be exactly one of AVAILABLE ACTIONS.${hasTeams ? '\n- For delegate actions: "intent" MUST follow "agentKey::eventName" and refer to a valid available agent/event.' : ''}
@@ -522,29 +529,38 @@ Intent rules:
 - Never put descriptive text inside "intent". Put that text in "query", "pattern", "message", "question", or other parameters.
 
 Invalid:
-{ "actionType": "direct", "intent": "semantic index supported languages" }
+actionType: direct
+intent: semantic index supported languages
 
 Valid:
-{ "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index language parser support" }
+actionType: direct
+intent: semantic_code_search
+query: semantic index language parser support
 
 ========================================
 BATCH
 ========================================
 
-"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with "actionType", "intent", or any other action field. If you need to do multiple things in one turn (e.g. print + phase_done), use a batch:
+"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with actionType, intent, or any other action field. If you need to do multiple things in one turn (e.g. print + phase_done), use a batch — a "batch:" key whose value is a sequence ("- ") of action mappings:
 
-{ "batch": [
-  { "actionType": "direct", "intent": "print", "message": "Here is the result." },
-  { "actionType": "direct", "intent": "phase_done" }
-]}
+batch:
+  - actionType: direct
+    intent: print
+    message: "Here is the result."
+  - actionType: direct
+    intent: phase_done
 
 ========================================
 EXECUTION FLOW
 ========================================
 
-Your response MUST be ONE JSON object per step and it MUST be one of two forms — never mix them:
-1. A single action: { "actionType": "direct", "intent": "...", ... }
-2. A batch: { "batch": [ ...actions... ] }
+Your response MUST be ONE YAML document per step and it MUST be one of two forms — never mix them:
+1. A single action mapping:
+   actionType: direct
+   intent: ...
+2. A batch:
+   batch:
+     - ...action mappings...
 
 Use sequential steps only when later actions depend on earlier results.
 
@@ -555,36 +571,40 @@ Parallelism is mandatory:
 Examples:
 
 Single action:
-{ "actionType": "direct", "intent": "semantic_code_search", "query": "authentication login session token" }
+actionType: direct
+intent: semantic_code_search
+query: authentication login session token
 
 Parallel:
-{
-  "batch": [
-    {
-      "parallel": [
-        { "actionType": "direct", "intent": "semantic_code_search", "query": "semantic index build embed vector store" },
-        { "actionType": "direct", "intent": "semantic_code_search", "query": "language support parser javascript typescript python" }
-      ]
-    }
-  ]
-}
+batch:
+  - parallel:
+      - actionType: direct
+        intent: semantic_code_search
+        query: semantic index build embed vector store
+      - actionType: direct
+        intent: semantic_code_search
+        query: language support parser javascript typescript python
 
 Sequential then parallel:
-{
-  "batch": [
-    { "actionType": "direct", "intent": "read_file", "path": "src/index.ts", "offset": 0, "limit": 120 },
-    {
-      "parallel": [
-        { "actionType": "direct", "intent": "grep", "pattern": "semanticIndex" },
-        { "actionType": "direct", "intent": "grep", "pattern": "supportedLanguages" }
-      ]
-    }
-  ]
-}
+batch:
+  - actionType: direct
+    intent: read_file
+    path: src/index.ts
+    offset: 0
+    limit: 120
+  - parallel:
+      - actionType: direct
+        intent: grep
+        pattern: semanticIndex
+      - actionType: direct
+        intent: grep
+        pattern: supportedLanguages
 
-Only emit:
-{ "actionType": "direct", "intent": "return", "data": { ... } }
-when the full task is complete.
+Only emit this when the full task is complete:
+actionType: direct
+intent: return
+data:
+  ...
 
 Do not return early.
 Do not treat exploration alone as task completion.
@@ -603,7 +623,7 @@ FINAL NON-NEGOTIABLE RULES
 
 ${resourceSection}${intentNesting}
 
-CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
+CRITICAL: Return a single YAML action mapping, or a "batch:" with a sequence of them. Block style, 2-space indent. No markdown, no code fences, no prose outside the YAML.`;
 
   // ── Working area: documents the user has open in the GUI ──
   // Pulled from the in-memory store (open-documents-store), populated by the
@@ -868,8 +888,13 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('');
         lines.push('When the user asks to ANIMATE / move / "darle vida a" / "make a video out of" this image — or any similar request whose subject is the active image — the call MUST be:');
         lines.push('');
-        lines.push('```json');
-        lines.push(`{ "intent": "generate_video", "startFrame": "${activeLoc}", "prompt": "<short, concrete motion brief — what moves, how, camera behaviour>", "duration": 5, "saveTo": "${saveDir}" }`);
+        lines.push('```yaml');
+        lines.push(`intent: generate_video
+startFrame: "${activeLoc}"
+prompt: |
+  <short, concrete motion brief — what moves, how, camera behaviour>
+duration: 5
+saveTo: "${saveDir}"`);
         lines.push('```');
         lines.push('');
         lines.push('Hard rules (violating any of these is a bug):');
@@ -909,14 +934,23 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('2. Then dispatch the real work: `generate_image` for edits/compositions, `background_removal`, `upscale_image`, or — when the user asks to animate / move / "give it life" / make a video out of it — `generate_video`.');
         lines.push('3. For `generate_image` use EXACTLY this shape (base → composite → sources):');
         lines.push('');
-        lines.push('```json');
-        lines.push(`{ "intent": "generate_image", "prompt": "Edit the FIRST reference image. The SECOND is a composite snapshot showing EXACTLY where and at what size/angle the pasted elements land — use as PLACEMENT guide. The REMAINING refs are the high-fidelity sources. Apply: <paraphrase the user's request>.", "referenceImages": ${refJson}, "saveTo": "${saveDir}" }`);
+        lines.push('```yaml');
+        lines.push(`intent: generate_image
+prompt: |
+  Edit the FIRST reference image. The SECOND is a composite snapshot showing EXACTLY where and at what size/angle the pasted elements land — use as PLACEMENT guide. The REMAINING refs are the high-fidelity sources. Apply: <paraphrase the user's request>.
+referenceImages: ${refJson}
+saveTo: "${saveDir}"`);
         lines.push('```');
         lines.push('');
         lines.push('4. For `generate_video` (animate the marked image) — image-to-video models REQUIRE the source image as `startFrame` (the first frame of the animation). The annotated composite goes in `referenceImages` as supplementary visual context — DO NOT put the base image in both fields, that\'s redundant and some adapters reject duplicates.');
         lines.push('');
-        lines.push('```json');
-        lines.push(`{ "intent": "generate_video", "prompt": "<detailed brief — describe the marked subject by physical attributes + position + pose, name what should move/change, then explicitly list what to keep static/intact>", "startFrame": "${activeLoc}", "referenceImages": ${animRefJson}, "saveTo": "${saveDir}" }`);
+        lines.push('```yaml');
+        lines.push(`intent: generate_video
+prompt: |
+  <detailed brief — describe the marked subject by physical attributes + position + pose, name what should move/change, then explicitly list what to keep static/intact>
+startFrame: "${activeLoc}"
+referenceImages: ${animRefJson}
+saveTo: "${saveDir}"`);
         lines.push('```');
         lines.push('');
         lines.push('**Critical**: `startFrame` is mandatory for image-to-video. Omitting it causes the call to fail with `body.image_url: Field required` because the gateway only sets `image_url` when a `startFrame` is provided (see `gateway.service.ts`).');
@@ -960,8 +994,12 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('');
         lines.push('"Cambia el color", "make it slow-motion", "apply cinematic grading", "remove the watermark", "extend", "restyle", "add audio". The motion of the source is preserved; only its look / length / audio changes. → v2v: call `generate_video` with the active path in `referenceVideos`.');
         lines.push('');
-        lines.push('```json');
-        lines.push(`{ "intent": "generate_video", "prompt": "<paraphrase the user's request, describing the desired result>", "referenceVideos": ["${activeLoc}"], "saveTo": "${saveDir}" }`);
+        lines.push('```yaml');
+        lines.push(`intent: generate_video
+prompt: |
+  <paraphrase the user's request, describing the desired result>
+referenceVideos: ["${activeLoc}"]
+saveTo: "${saveDir}"`);
         lines.push('```');
         lines.push('');
         lines.push('### B) REUSE the SUBJECTS of the video in a NEW scene');
@@ -1014,8 +1052,13 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
           lines.push('');
           lines.push('5. **Write the `generate_video` call.** Include the source video AND every annotation composite as references (the composites let the model VISUALLY locate the marked subjects — the red mark itself is part of the reference image; combined with the timestamp-anchored prose this makes the intent unambiguous):');
           lines.push('');
-          lines.push('```json');
-          lines.push(`{ "intent": "generate_video", "prompt": "<numbered, timestamp-anchored directives per step 3>", "referenceVideos": ["${activeLoc}"], "referenceImages": ${refImagesJson}, "saveTo": "${saveDir}" }`);
+          lines.push('```yaml');
+          lines.push(`intent: generate_video
+prompt: |
+  <numbered, timestamp-anchored directives per step 3>
+referenceVideos: ["${activeLoc}"]
+referenceImages: ${refImagesJson}
+saveTo: "${saveDir}"`);
           lines.push('```');
           lines.push('');
           _pushSurgicalAnnotationGuide(lines);
@@ -1078,9 +1121,15 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('');
         lines.push(`**\`durationSeconds\` is non-negotiable**: copy it VERBATIM from the \`durationSec\` field in your \`read_file\` result (or the clip\'s duration if a clip is selected). NEVER round to 10, 12, 15, etc. Audio that runs longer than the source plays past the end of the video — the SFX track and the visual cease being in sync. If you can\'t see a numeric \`durationSec\` in the previous tool results, re-read the file before calling this.`);
         lines.push('');
-        lines.push('```json');
+        lines.push('```yaml');
         const _durExample = _scopeDurationMs != null ? (_scopeDurationMs / 1000).toFixed(2) : '<exact durationSec from read_file — do NOT default to 10>';
-        lines.push(`{ "intent": "generate_audio", "mode": "sfx", "prompt": "<concrete sound description anchored in what's on-screen>", "videoFile": "${_scopePath}", "durationSeconds": ${_durExample}, "saveTo": "<absolute path>.mp3" }`);
+        lines.push(`intent: generate_audio
+mode: sfx
+prompt: |
+  <concrete sound description anchored in what's on-screen>
+videoFile: "${_scopePath}"
+durationSeconds: ${_durExample}
+saveTo: "<absolute path>.mp3"`);
         lines.push('```');
         lines.push('');
         lines.push('Even with the video-conditioned model, the prompt still matters — it disambiguates which sounds to emphasise. Specific sensory prompts ("crackling fire, collapsing wooden beams, distant shouts and metal buckets clanging") produce specific audio; vague prompts ("background sound") get vague audio.');
@@ -1089,8 +1138,13 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         lines.push('');
         lines.push('Music is text-only, NOT video-conditioned — the model does not watch the frames. Read the active doc anyway so you can describe the mood / genre / pacing that fits the visuals, then call `generate_audio` with `mode: "music"`. **Do NOT pass `videoFile`** — in music mode it would be ignored.');
         lines.push('');
-        lines.push('```json');
-        lines.push(`{ "intent": "generate_audio", "mode": "music", "prompt": "<mood + instrumentation + tempo + structure, e.g. 'epic orchestral score with cellos and percussion, slow build into a crescendo at 0:20'>", "durationSeconds": <duration>, "saveTo": "<absolute path>.mp3" }`);
+        lines.push('```yaml');
+        lines.push(`intent: generate_audio
+mode: music
+prompt: |
+  <mood + instrumentation + tempo + structure, e.g. 'epic orchestral score with cellos and percussion, slow build into a crescendo at 0:20'>
+durationSeconds: <duration>
+saveTo: "<absolute path>.mp3"`);
         lines.push('```');
         lines.push('');
         lines.push('### Disambiguation C vs D — STRICT keyword rules');
@@ -1115,14 +1169,17 @@ CRITICAL: Return a single JSON action or { "batch": [...] }. No markdown.`;
         const isText = active.type === 'text' || active.type === 'html';
         lines.push('');
         lines.push('Example — read the active document:');
-        lines.push('```json');
-        lines.push(`{ "intent": "read_file", "path": "${activeLoc}" }`);
+        lines.push('```yaml');
+        lines.push(`intent: read_file
+path: "${activeLoc}"`);
         lines.push('```');
         if (isText) {
           lines.push('');
           lines.push('Example — write into the active text document (default target for "add/write/fill" requests):');
-          lines.push('```json');
-          lines.push(`{ "intent": "write_file", "path": "${activeLoc}", "content": "..." }`);
+          lines.push('```yaml');
+          lines.push(`intent: write_file
+path: "${activeLoc}"
+content: "..."`);
           lines.push('```');
         }
       }
@@ -1540,13 +1597,13 @@ export function buildExpandedResourceSection(resources, agent) {
   // ── INVOCATION SYNTAX ───────────────────────────────────────────────────
   doc += '---\n';
   doc += 'To execute an action (intent MUST be an exact name from AVAILABLE ACTIONS):\n';
-  doc += '{ "actionType": "direct", "intent": "<action_name>", "<param1>": "<value1>", "<param2>": "<value2>" }\n\n';
+  doc += 'actionType: direct\nintent: <action_name>\n<param1>: <value1>\n<param2>: <value2>\n\n';
 
   if (delegateResources.length > 0) {
     const ex = delegateResources[0];
     const exEvent = ex.intents[0]?.name ?? 'handle';
     doc += 'To call an agent:\n';
-    doc += `{ "actionType": "delegate", "intent": "${ex.agentPureName}::${exEvent}", "data": { ... } }\n\n`;
+    doc += `actionType: delegate\nintent: ${ex.agentPureName}::${exEvent}\ndata:\n  ...\n\n`;
     doc += 'The intent for a delegate action must use the format agentKey::eventName\n';
   }
 
@@ -1558,7 +1615,7 @@ export function buildExpandedResourceSection(resources, agent) {
     const ex = eager ?? mcpResources[0];
     const exTool = ex.intents[0]?.name ?? 'tool_name';
     doc += '\nTo call an MCP tool (ALWAYS use this format — NEVER use delegate for MCP tools):\n';
-    doc += `{ "actionType": "direct", "intent": "call_mcp", "mcp": "${ex.name}", "tool": "${exTool}", "input": { ... } }\n`;
+    doc += `actionType: direct\nintent: call_mcp\nmcp: ${ex.name}\ntool: ${exTool}\ninput:\n  ...\n`;
     if (!eager) {
       doc += 'For lazy servers, first call open_mcp("<server>") to discover tool names, then get_mcp_tool_info for the exact parameter schema.\n';
     }

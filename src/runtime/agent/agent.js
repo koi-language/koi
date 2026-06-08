@@ -6195,7 +6195,7 @@ Many commands are inherently slow and produce little or no output for extended p
         doc += `  - ${handler.name}: ${handler.description}\n`;
       }
     }
-    doc += '\nTo delegate, use: { "intent": "handler_name", "data": {...} }\n';
+    doc += '\nTo delegate, use a mapping:\nactionType: delegate\nintent: handler_name\ndata: { ... }\n';
 
     return doc;
   }
@@ -6290,7 +6290,7 @@ Many commands are inherently slow and produce little or no output for extended p
     let doc = '\n\nDelegation actions (to team members):\n';
     for (const cap of capabilities) {
       // Build delegation description with inferred metadata
-      doc += `- { "actionType": "delegate", "intent": "${cap.intent}", "data": ${cap.inputParams} } - ${cap.description} → Returns: ${cap.returnType} (Delegate to ${cap.agent} [${cap.role}])\n`;
+      doc += `- { actionType: delegate, intent: ${cap.intent}, data: ${cap.inputParams} } - ${cap.description} → Returns: ${cap.returnType} (Delegate to ${cap.agent} [${cap.role}])\n`;
     }
 
     return doc;

@@ -662,6 +662,25 @@ function _wrapWithBanner(action) {
     // dispatch. Prompting on the doc-return call would ask consent for a
     // generation that isn't happening yet. Fail-open on plumbing errors.
     const _toolName = action.intent || action.type;
+    // Media facade: if a connected MCP (e.g. Magnific) is handling this kind,
+    // it bills the user's OWN provider account — not Koi credits. So skip the
+    // cost/consent gate entirely (decision 3) by marking the action, and grab
+    // the provider label to show on the banner ("vía Magnific"). The same
+    // resolver decides routing in factory.js, so banner ↔ routing never diverge.
+    let _mcpProviderLabel = null;
+    try {
+      // Auto-map: the first media generation after switching to a media MCP
+      // triggers an LLM to read the server's tools and build the `media` map
+      // (cached, hash-stamped). One call per toolset version. No profiles.
+      const { ensureMediaMapsForKind } = await import('../llm/providers/mcp-media-mapper.js');
+      await ensureMediaMapsForKind(action.bannerKind, agent);
+      const { activeFor } = await import('../llm/providers/mcp-media-resolver.js');
+      const _mcp = activeFor(action.bannerKind);
+      if (_mcp) {
+        _mcpProviderLabel = _mcp.label;
+        if (act && typeof act === 'object') act.confirmCost = false; // no Koi credits → no cost card
+      }
+    } catch { /* resolver optional — fall through to normal backend behaviour */ }
     // Some calls BYPASS the schema-first guard and generate on their FIRST
     // call — notably generate_image with numeric `cameraAngles` (the orbital
     // / camera-angle one-shot, see generate-image.js: the guard is skipped so
@@ -698,6 +717,9 @@ function _wrapWithBanner(action) {
       label: action.bannerLabel || action.intent || action.type,
       iconId: action.bannerIconId || action.intent || action.type,
       expectedDurationMs,
+      // Non-null when an MCP media provider is handling this (e.g. "Magnific").
+      // The GUI shows it under the banner so the user knows whose quota is used.
+      provider: _mcpProviderLabel,
     });
     // Make the banner id + a fal-status emitter available to the wrapped
     // tool so its polling loop can pipe IN_QUEUE / IN_PROGRESS through to
@@ -729,7 +751,18 @@ function _wrapWithBanner(action) {
       // alongside the real one when generation runs on the retry call.
       // We flag it as cancelled so the GUI can REMOVE the banner
       // entirely instead of showing a misleading completion.
-      cancelled = !!(result && result._guardedAutoExpand === true);
+      //
+      // `validationError: true` is the same idea for a different reason: a
+      // pre-flight lint guard (e.g. generate_video's "prompt cites Image 2
+      // but only 1 reference attached", hallucinated @-handles, too many
+      // shots) refused the call BEFORE submitting to the provider — nothing
+      // was generated and nothing was charged, and the agent silently
+      // re-issues a corrected call. Routing it through `cancelled` removes
+      // the banner (no red error flashing mid-correction) AND skips the
+      // credit refresh below (there was no charge to reconcile). Real
+      // provider failures and timeouts do NOT set this flag, so they still
+      // close the banner red as before.
+      cancelled = !!(result && (result._guardedAutoExpand === true || result.validationError === true));
 
       // Async kickoff: when an async-capable tool is invoked with
       // `wait: false` it returns immediately with `{ success: true,
