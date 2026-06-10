@@ -2278,13 +2278,22 @@ CRITICAL RULES:
       ? (THINKING_INACTIVITY_MS[_effort] || THINKING_INACTIVITY_MS[EFFORT_LOW])
       : DEFAULT_INACTIVITY_MS;
     const STREAM_INACTIVITY_LABEL = `${STREAM_INACTIVITY_MS / 1000}s`;
+    // TIME-TO-FIRST-CHUNK is much more generous than the inter-chunk gap: a model
+    // (esp. Gemini / any thinking-capable one) can buffer / reason internally for
+    // a long while before emitting ANYTHING, and that is NOT a stall. The 120s
+    // inter-chunk limit was killing valid requests at the "no chunks received"
+    // stage. Once data starts flowing, a long gap IS a real stall → revert to
+    // the tighter inter-chunk limit.
+    const STREAM_FIRST_CHUNK_MS = Math.max(STREAM_INACTIVITY_MS, 240_000);
+    const STREAM_FIRST_CHUNK_LABEL = `${STREAM_FIRST_CHUNK_MS / 1000}s`;
     // Hard total timeout: absolute cap for a single LLM call (including thinking).
-    // Scales with effort — high-effort thinking models can legitimately take minutes.
-    const STREAM_TOTAL_MS = STREAM_INACTIVITY_MS * 2;
+    // Must accommodate the first-chunk wait PLUS the actual generation.
+    const STREAM_TOTAL_MS = STREAM_FIRST_CHUNK_MS + STREAM_INACTIVITY_MS * 2;
     const STREAM_TOTAL_LABEL = `${STREAM_TOTAL_MS / 1000}s`;
     const _inactivityCtrl = new AbortController();
     let _totalTimerFired = false;
-    let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
+    let _anyChunkSeen = false; // false until the first chunk (content or thinking)
+    let _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_FIRST_CHUNK_MS);
     const _totalTimer = setTimeout(() => {
       _totalTimerFired = true;
       channel.log('llm', `[stream] TOTAL timeout (${STREAM_TOTAL_LABEL}) — aborting stream`);
@@ -2293,6 +2302,7 @@ CRITICAL RULES:
     let _firstContentReceived = false;
     let _thinkingTokens = 0; // Accumulated thinking/reasoning tokens (for cost tracking)
     const _resetTimer = () => {
+      _anyChunkSeen = true;
       clearTimeout(_inactivityTimer);
       _inactivityTimer = setTimeout(() => _inactivityCtrl.abort(), STREAM_INACTIVITY_MS);
     };
@@ -2379,8 +2389,12 @@ CRITICAL RULES:
       // Convert inactivity abort to a recognizable error so agent retry logic kicks in
       // Note: message must contain 'timeout' to match the isTimeout check in agent.js
       if (_inactivityCtrl.signal.aborted && !abortSignal?.aborted) {
-        const _timeoutKind = _totalTimerFired ? 'total' : 'inactivity';
-        const _timeoutLabel = _totalTimerFired ? STREAM_TOTAL_LABEL : STREAM_INACTIVITY_LABEL;
+        const _timeoutKind = _totalTimerFired
+            ? 'total'
+            : (_anyChunkSeen ? 'inactivity' : 'first-chunk');
+        const _timeoutLabel = _totalTimerFired
+            ? STREAM_TOTAL_LABEL
+            : (_anyChunkSeen ? STREAM_INACTIVITY_LABEL : STREAM_FIRST_CHUNK_LABEL);
         channel.log('llm', `Stream ${_timeoutKind} timeout — ${_timeoutLabel}`);
         if (this._autoMode) {
           markModelTimeout(_effProvider, _effModel);

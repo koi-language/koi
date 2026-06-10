@@ -7,14 +7,14 @@
  * the version is a deliberate edit of the ASSETS table below.
  *
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║  Pinned version: ffmpeg 8.1.1 (released 2025-11)              ║
- * ║  macOS:    evermeet.cx versioned archives                      ║
- * ║  Linux:    BtbN/FFmpeg-Builds release autobuild-2026-05-29-14-08 ║
- * ║  Windows:  same BtbN release                                   ║
- * ║  All assets pinned by URL AND verified by sha256 post-download. ║
- * ║  Any drift on either side → integrity check fails → install     ║
- * ║  aborts loudly (we don't silently fall back to a "best effort"  ║
- * ║  version that could behave differently).                       ║
+ * ║  ffmpeg 8.1 line                                               ║
+ * ║  macOS:   evermeet.cx versioned archives — sha256-pinned.      ║
+ * ║  Linux:   BtbN/FFmpeg-Builds `latest` tag (n8.1) — permanent   ║
+ * ║  Windows: same BtbN `latest` tag.                              ║
+ * ║  BtbN's dated autobuild tags are ephemeral (deleted → 404), so ║
+ * ║  we use the permanent `latest` tag. It rebuilds over time, so  ║
+ * ║  BtbN assets are NOT sha256-pinned — validated by HTTPS + the   ║
+ * ║  post-extract `-version` smoke test. macOS stays sha-pinned.   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * Resolution order:
@@ -57,8 +57,16 @@ const PINNED_VERSION = '8.1.1';
  *  grab the newest `autobuild-*` tag + its `ffmpeg-n8.1.1-<N>-g<hash>` stem,
  *  download the 4 `*-gpl-8.1.*` assets, recompute their sha256, and update the
  *  table below. Linux + Windows assets resolve against this tag. */
-const BTBN_TAG = 'autobuild-2026-05-29-14-08';
-const BTBN_FILE_STEM = 'ffmpeg-n8.1.1-9-g58d4114d36';
+// BtbN's dated `autobuild-YYYY-MM-DD-HH-MM` tags are EPHEMERAL — BtbN
+// deletes old ones, so any pinned dated tag eventually 404s (it did, breaking
+// the Linux + Windows release builds). The `latest` tag is PERMANENT and
+// always carries the actively-maintained release lines, including
+// `ffmpeg-n8.1-latest-<plat>-gpl-8.1.<ext>`. Because `latest` is rebuilt over
+// time its bytes aren't stable, so the BtbN assets below carry NO sha256 pin —
+// they're validated by HTTPS + the post-extract `-version` smoke test instead.
+// macOS stays hash-pinned (evermeet ships immutable versioned archives).
+const BTBN_TAG = 'latest';
+const BTBN_FILE_STEM = 'ffmpeg-n8.1-latest';
 
 const BTBN_BASE = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 
@@ -90,7 +98,7 @@ const ASSETS = {
       {
         kind: 'tar-xz',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linux64-gpl-8.1.tar.xz`,
-        sha256: '1ae376a8a603ff68e0b5917796b0b9005e1d588cad88c99b32fb7de0b73db7c6',
+        sha256: null, // BtbN `latest` rebuilds over time — see BTBN_TAG note
         binariesIn: 'bin', // <archive-stem>/bin/{ffmpeg,ffprobe}
       },
     ],
@@ -100,7 +108,7 @@ const ASSETS = {
       {
         kind: 'tar-xz',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-linuxarm64-gpl-8.1.tar.xz`,
-        sha256: '6bdf78a620f060924f4fb8f5f82cd2ad78d501875055ade864246f61b9c83122',
+        sha256: null, // BtbN `latest` rebuilds over time — see BTBN_TAG note
         binariesIn: 'bin',
       },
     ],
@@ -112,7 +120,7 @@ const ASSETS = {
       {
         kind: 'zip-binaries',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-win64-gpl-8.1.zip`,
-        sha256: 'efe11c1e305371896c7887fd02275d9664794371537683373d574bb7acbb30e7',
+        sha256: null, // BtbN `latest` rebuilds over time — see BTBN_TAG note
         binariesIn: 'bin',
       },
     ],
@@ -122,7 +130,7 @@ const ASSETS = {
       {
         kind: 'zip-binaries',
         url: `${BTBN_BASE}/${BTBN_FILE_STEM}-winarm64-gpl-8.1.zip`,
-        sha256: 'ed81ff67784c92f012db7f94099a3e60d00e3fa6c41151a4fcc647bea173195f',
+        sha256: null, // BtbN `latest` rebuilds over time — see BTBN_TAG note
         binariesIn: 'bin',
       },
     ],
@@ -295,13 +303,18 @@ async function _fetchAndExtract(recipe, cacheDir, onProgress, fromPct, toPct) {
   const tmp = path.join(cacheDir, `.download-${crypto.randomBytes(4).toString('hex')}`);
   try {
     await _downloadFile(recipe.url, tmp, onProgress, fromPct, fromPct + (toPct - fromPct) * 0.85);
-    const got = await _sha256File(tmp);
-    if (got !== recipe.sha256) {
-      throw new Error(
-        `sha256 mismatch for ${path.basename(recipe.url)}\n` +
-        `  expected: ${recipe.sha256}\n  got:      ${got}\n` +
-        `Refusing to use a binary that doesn't match the pinned hash.`,
-      );
+    // sha256 is OPTIONAL: hash-pinned sources (evermeet) verify byte-identity;
+    // BtbN `latest` rebuilds over time so its assets ship null — they're
+    // validated by HTTPS + the post-extract `-version` smoke test instead.
+    if (recipe.sha256) {
+      const got = await _sha256File(tmp);
+      if (got !== recipe.sha256) {
+        throw new Error(
+          `sha256 mismatch for ${path.basename(recipe.url)}\n` +
+          `  expected: ${recipe.sha256}\n  got:      ${got}\n` +
+          `Refusing to use a binary that doesn't match the pinned hash.`,
+        );
+      }
     }
     onProgress?.(fromPct + (toPct - fromPct) * 0.9, `Verifying ${path.basename(recipe.url)}…`);
     if (recipe.kind === 'binary-zip') {
