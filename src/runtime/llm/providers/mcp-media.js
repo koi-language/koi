@@ -834,6 +834,7 @@ export class McpMediaProvider {
   }
 
   async _call(tool, args) {
+    try { channel.log('mcp', `[mcp-media] ${this.server}.${tool} args: ${JSON.stringify(args).slice(0, 2000)}`); } catch { /* */ }
     const raw = await mcpRegistry.callTool(this.server, tool, args);
     return this._normalize(raw);
   }
