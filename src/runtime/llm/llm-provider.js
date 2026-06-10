@@ -874,6 +874,10 @@ export class LLMProvider {
       }
       // Reset userMessage after compose resolver has consumed it —
       // it should only be non-null on the turn the user actually typed something.
+      // A fresh user message = a NEW turn → drop the previous turn's sticky
+      // vision so old images don't bleed into an unrelated request. Gated on the
+      // message actually being present, so this never fires mid-turn.
+      if (agent._lastUserMessage) session._stickyVision = null;
       agent._lastUserMessage = null;
       // If the compose resolver produced images (e.g. mobile screenshot),
       // inject them into the session's pending image queue for the next LLM call.
@@ -1643,10 +1647,28 @@ CRITICAL RULES:
       }
     }
 
+    // Sticky vision: re-hydrate the turn's vision images when nothing fresh is
+    // queued, so the model keeps SEEING them across the iterations of the SAME
+    // turn (get_tool_info round-trips, retries, model switches) — not just the
+    // single call right after read_file. Without this, tool-injected vision was
+    // a strict one-shot: a successful intermediate step (e.g. get_tool_info)
+    // dropped the images, and the call that did the real work (building a
+    // storyboard) — often after a timeout → model switch — ran BLIND. Bounded by
+    // a budget so we never re-send the bytes forever.
+    let _stickyRehydrated = false;
+    if ((!session._pendingMcpImages || session._pendingMcpImages.length === 0)
+        && session._stickyVision?.images?.length && session._stickyVision.budget > 0) {
+      session._pendingMcpImages = [...session._stickyVision.images];
+      session._stickyVision.budget -= 1;
+      _stickyRehydrated = true;
+    }
+
     // Inject MCP tool image results (e.g. get_screenshot) as multimodal content blocks.
     // Inject images into the LLM call so the agent can see them.
     // Coordinators also need vision to look at images before deciding who to delegate to.
     // Images are ALSO preserved for propagation to delegates.
+    // NOTE: `_pendingMcpImages` is a legacy name — it holds ALL tool-injected
+    // vision (read_file, get_screenshot, MCP tool images), not just MCP ones.
     if (session._pendingMcpImages?.length > 0) {
       // Defensive payload-size cap: every modern vision endpoint enforces
       // a per-request payload ceiling (Gemini ~20 MB, OpenAI ~20 MB,
@@ -1764,6 +1786,13 @@ CRITICAL RULES:
         // Keep a snapshot so the catch-retry path can re-inject them if the
         // call fails. Cleared on successful streamReactive return.
         session._consumedThisCall = [...session._pendingMcpImages];
+        // Open a sticky window so these images survive the next few iterations of
+        // THIS turn (see the re-hydrate block above). Only when they're FRESH —
+        // don't reset the budget when we're merely re-attaching an already-sticky
+        // set, or the window would never close.
+        if (!_stickyRehydrated) {
+          session._stickyVision = { images: [...session._pendingMcpImages], budget: 6 };
+        }
         session._pendingMcpImages = null;
       }
     }

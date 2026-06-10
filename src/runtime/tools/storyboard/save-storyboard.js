@@ -171,18 +171,35 @@ function _validate(sb) {
           return `${tag}.references (when provided) must be an array of strings (each entry is an \`@handle\` or absolute file path).`;
         }
       }
+      // `noCutBefore` (optional bool) — marks this shot as a CONTINUATION of the
+      // previous one (one continuous take, no cut). Continuation shots SHARE the
+      // previous shot's number rather than incrementing — see the cross-shot
+      // numbering check below.
+      if (sh.noCutBefore !== undefined && typeof sh.noCutBefore !== 'boolean') {
+        return `${tag}.noCutBefore (when provided) must be a boolean.`;
+      }
     }
   }
 
-  // Cross-shot: numbers should be sequential across the whole storyboard.
-  let expected = 1;
+  // Cross-shot numbering. Normally numbers are sequential across the whole
+  // storyboard (1,2,3…). A shot flagged `noCutBefore:true` is a continuation
+  // of the previous take, so it does NOT consume a new number — it SHARES the
+  // previous shot's number. The very first shot can never be a continuation.
+  let n = 0;
+  let first = true;
   for (const sc of sb.scenes) {
     for (const sh of sc.shots) {
+      const cont = sh.noCutBefore === true;
+      if (cont && first) {
+        return `the FIRST shot cannot have noCutBefore:true — there is no previous shot to continue (scenes[${sb.scenes.indexOf(sc)}].shots[${sc.shots.indexOf(sh)}]).`;
+      }
+      const expected = cont ? n : ++n;
       if (sh.number !== expected) {
-        return `shot numbers must be sequential across ALL scenes starting at 1; ` +
+        return `shot numbers must be sequential across ALL scenes starting at 1, ` +
+          `and a noCutBefore continuation must REPEAT the previous shot's number; ` +
           `expected ${expected} but got ${sh.number} at scenes[${sb.scenes.indexOf(sc)}].shots[${sc.shots.indexOf(sh)}].`;
       }
-      expected++;
+      first = false;
     }
   }
   return null;
@@ -304,6 +321,9 @@ function _normalize(sb, existing) {
           for (const k of ['dialogue', 'sfx', 'music', 'state']) {
             if (_isStr(sh[k]) && sh[k].trim()) shotOut[k] = sh[k];
           }
+          // Continuation flag — only persisted when true (a continuous take
+          // with the previous shot, no cut). Omitted = normal cut.
+          if (sh.noCutBefore === true) shotOut.noCutBefore = true;
           const shotRefs = _normRefs(sh.references);
           if (shotRefs) shotOut.references = shotRefs;
           return shotOut;
@@ -329,10 +349,10 @@ export default {
   description:
     'Write a storyboard document to ~/.koi/storyboards/<id>.json with STRUCTURED args (the storyboard as an OBJECT, not a JSON string). ' +
     'Use for BOTH creating new storyboards and updating existing ones — same call shape; the tool detects which one and preserves createdAt across edits. ' +
-    'Call shape: { storyboard: { id, name, aspect, synopsis, continuity?, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, movement, action, state?, dialogue?, sfx?, music?, references? }] }] } }. ' +
+    'Call shape: { storyboard: { id, name, aspect, synopsis, continuity?, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, movement, action, noCutBefore?, state?, dialogue?, sfx?, music?, references? }] }] } }. ' +
     'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.aspect (one of 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9), storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
     'storyboard.continuity is an OPTIONAL (strongly recommended for any narrative with physical/spatial logic) array of strings — the CONTINUITY LOCK: absolute, story-wide invariants every panel must obey and never contradict or "fix" (e.g. ["The Pepsi button stays mounted high, above the child\'s reach until he climbs", "Never make the child taller or lower the button", "The cans he stacks as a step stay intact — never crushed"]). Injected verbatim into EVERY shot\'s render prompt as hard constraints; this is how you stop the renderer from silently making the unreachable reachable or breaking an object that must stay whole. ' +
-    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, MUST be sequential across ALL scenes), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. shot.state is an OPTIONAL but high-value string — the world/character STATE that is TRUE in THIS exact panel (the continuity-table row): where the character is, what they are on/holding, and the state of every key object (e.g. "Boy standing ON the two stacked cans; cans intact under his feet; Pepsi button now within reach; his finger touching it"). The compositor injects it as CURRENT PANEL STATE so the render shows this exact state instead of resetting to a default or jumping ahead. dialogue/sfx/music are optional strings. ' +
+    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, sequential across ALL scenes — EXCEPT a continuation shot, which REPEATS the previous shot\'s number; see noCutBefore), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. shot.noCutBefore is an OPTIONAL boolean: when true this shot is a CONTINUATION of the previous one — one continuous take, the camera keeps moving and there is NO cut between them. A continuation shares the previous shot\'s number (do not increment) and the video pipeline renders the glued shots as a SINGLE clip; NEVER set it on the first shot. Use it to author a longer moving shot as several precise sub-takes (more descriptive than one vague panel). shot.state is an OPTIONAL but high-value string — the world/character STATE that is TRUE in THIS exact panel (the continuity-table row): where the character is, what they are on/holding, and the state of every key object (e.g. "Boy standing ON the two stacked cans; cans intact under his feet; Pepsi button now within reach; his finger touching it"). The compositor injects it as CURRENT PANEL STATE so the render shows this exact state instead of resetting to a default or jumping ahead. dialogue/sfx/music are optional strings. ' +
     'references is an OPTIONAL array of strings (each entry is an `@handle` or absolute file path) that can sit at the storyboard root, on a scene, or on a single shot — the downstream visual renderer collects all three levels per panel. Preserve whatever references the agent passes (or the user added via the visor); never drop them on a round-trip read→mutate→save. ' +
     'Auto-set by the tool: version=1, updatedAt=now (UTC ISO), createdAt preserved from existing file or set to now, seed defaulted to a random integer when omitted. ' +
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',

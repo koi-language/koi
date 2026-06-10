@@ -458,10 +458,17 @@ const generateVideoAction = {
         ...(Array.isArray(action.referenceImages)
           ? action.referenceImages.map((r, i) => [`referenceImages[${i}]`, r]) : []),
       ];
-      const unread = imgInputs.filter(([, v]) => isGatedLocalPath(v) && !wasRead(v));
+      // Bundled SKILL assets (a skill's `references/…`) are fixed trusted files,
+      // never a user image to confabulate about — exempt, like @mentions/URLs.
+      const _isSkillAsset = (v) => /\/skills\/[^/]+\/references\//.test(typeof v === 'string' ? v : (v?.path || v?.url || ''));
+      const unread = imgInputs.filter(([, v]) => isGatedLocalPath(v) && !wasRead(v) && !_isSkillAsset(v));
       if (unread.length) {
         return {
+          // Pre-flight lint (no provider call, no charge) — the agent re-issues
+          // after read_file'ing. validationError → banner middleware removes the
+          // banner instead of flashing red for our own internal control retry.
           success: false,
+          validationError: true,
           error:
             'read_file required first — you cannot animate or reference an image you have not read this session. ' +
             'Call read_file on each of these BEFORE generate_video, then retry:\n  ' +
@@ -1024,13 +1031,13 @@ const generateVideoAction = {
     // ── Top-level (global) resolution — used directly for single-shot,
     //    and as fallback defaults for each entry in shots[] ──────────
     let globalStartFrame = await _loadFrame(paddedStartFrame, caps.startFrame, resolved, 'start');
-    if (globalStartFrame?._error) return { success: false, error: globalStartFrame._error };
+    if (globalStartFrame?._error) return { success: false, validationError: true, error: globalStartFrame._error };
 
     let globalEndFrame = await _loadFrame(action.endFrame, caps.endFrame, resolved, 'end');
-    if (globalEndFrame?._error) return { success: false, error: globalEndFrame._error };
+    if (globalEndFrame?._error) return { success: false, validationError: true, error: globalEndFrame._error };
 
     let globalReferenceImages = await _loadReferenceImages(action.referenceImages, caps, resolved);
-    if (globalReferenceImages?._error) return { success: false, error: globalReferenceImages._error };
+    if (globalReferenceImages?._error) return { success: false, validationError: true, error: globalReferenceImages._error };
 
     // Per-model INPUT restrictions for image-typed frames. The router
     // already resolved `pickedModelSlug` above; look up the full
@@ -1151,19 +1158,19 @@ const generateVideoAction = {
           let shotStart = s.startFrame
             ? await _loadFrame(s.startFrame, caps.startFrame, resolved, `shot[${i}].start`)
             : globalStartFrame;
-          if (shotStart?._error) return { success: false, error: shotStart._error };
+          if (shotStart?._error) return { success: false, validationError: true, error: shotStart._error };
           if (s.startFrame) shotStart = await _adaptFrameToConstraints(shotStart, pickedVideoModelObj, 'startFrame');
 
           let shotEnd = s.endFrame
             ? await _loadFrame(s.endFrame, caps.endFrame, resolved, `shot[${i}].end`)
             : globalEndFrame;
-          if (shotEnd?._error) return { success: false, error: shotEnd._error };
+          if (shotEnd?._error) return { success: false, validationError: true, error: shotEnd._error };
           if (s.endFrame) shotEnd = await _adaptFrameToConstraints(shotEnd, pickedVideoModelObj, 'endFrame');
 
           let shotRefImgs = Array.isArray(s.referenceImages)
             ? await _loadReferenceImages(s.referenceImages, caps, resolved)
             : globalReferenceImages;
-          if (shotRefImgs?._error) return { success: false, error: shotRefImgs._error };
+          if (shotRefImgs?._error) return { success: false, validationError: true, error: shotRefImgs._error };
           if (Array.isArray(s.referenceImages)) {
             shotRefImgs = await _adaptFramesToConstraints(shotRefImgs, pickedVideoModelObj, 'referenceImages');
           }

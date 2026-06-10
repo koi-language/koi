@@ -241,12 +241,21 @@ const generateImageAction = {
     // (their refs are pre-validated by the delegating tool).
     if (action._internalDelegate !== true && Array.isArray(action.referenceImages)) {
       const refPath = (r) => (typeof r === 'string' ? r : (r && typeof r === 'object' ? (r.path || r.url || '') : ''));
+      // Bundled SKILL assets (e.g. a skill's `references/LAYOUT_TEMPLATE.png`)
+      // are fixed, trusted files shipped with the skill — never a user image the
+      // agent could confabulate about — so they're exempt, like @mentions/URLs.
+      const _isSkillAsset = (v) => /\/skills\/[^/]+\/references\//.test(v || '');
       const unread = action.referenceImages
         .map((r, i) => [`referenceImages[${i}]`, refPath(r)])
-        .filter(([, v]) => isGatedLocalPath(v) && !wasRead(v));
+        .filter(([, v]) => isGatedLocalPath(v) && !wasRead(v) && !_isSkillAsset(v));
       if (unread.length) {
         return {
+          // Pre-flight lint (no provider call, no charge): the agent re-issues
+          // after read_file'ing the refs. Flag as validationError so the banner
+          // middleware silently removes the banner instead of flashing a red
+          // "Error generating image" at the user for an internal control retry.
           success: false,
+          validationError: true,
           error:
             'read_file required first — you cannot use a local image as a reference unless you have read it this session. ' +
             'Call read_file on each of these BEFORE generate_image, then retry:\n  ' +
@@ -615,7 +624,8 @@ const generateImageAction = {
         // Load + normalise image bytes, track alias alignment.
         for (const { alias, absPath: resolvedPath } of _resolvedRefs.slice(0, maxRef)) {
           if (!fs.existsSync(resolvedPath)) {
-            return { success: false, error: `Reference image not found: ${resolvedPath}` };
+            // Our pre-flight guard (no provider call) → silent banner, not red.
+            return { success: false, validationError: true, error: `Reference image not found: ${resolvedPath}` };
           }
           // Transcode anything that isn't PNG/JPEG before upload — providers
           // reject WebP/HEIC/AVIF/TIFF/BMP/GIF inconsistently, and failing
@@ -635,6 +645,7 @@ const generateImageAction = {
             if (!meta?.width || !meta?.height || !meta?.format) {
               return {
                 success: false,
+                validationError: true, // our pre-flight guard → silent banner
                 errorType: 'reference_image_invalid',
                 error: `Reference image could not be decoded (${path.basename(resolvedPath)}). The file exists but is not a valid image — check the download, file size, and magic bytes.`,
                 referencePath: resolvedPath,
@@ -643,6 +654,7 @@ const generateImageAction = {
           } catch (decodeErr) {
             return {
               success: false,
+              validationError: true, // our pre-flight guard → silent banner
               errorType: 'reference_image_invalid',
               error: `Reference image is not a valid image (${path.basename(resolvedPath)}): ${decodeErr.message}`,
               referencePath: resolvedPath,

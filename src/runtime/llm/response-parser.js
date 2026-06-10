@@ -110,6 +110,14 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     }
   }
 
+  // Tolerate a frequent flash-model slip: the `batch` keyword emitted WITHOUT
+  // its colon at the head of a multi-action list ("batch\n  - actionType:…").
+  // A bare `batch` line is an invalid YAML implicit key and breaks the WHOLE
+  // batch. Scoped STRICTLY to the literal `batch` keyword directly followed by a
+  // YAML sequence item — restore the colon. `batch:` (already correct) and any
+  // other word are left untouched.
+  cleaned = cleaned.replace(/^([ \t]*)batch[ \t]*(\r?\n[ \t]*-[ \t])/m, '$1batch:$2');
+
   let parsed;
   try {
     // PRIMARY: parse as YAML. YAML is a strict superset of JSON, so this

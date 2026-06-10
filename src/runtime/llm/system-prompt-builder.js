@@ -10,6 +10,52 @@ import { channel } from '../io/channel.js';
 import * as memory from '../memory/index.js';
 import { listWorkflowsCatalog } from '../state/workflows-catalog.js';
 
+// ── Active-document kind classifier ─────────────────────────────────────────
+// Robustly identify WHAT the user is actually looking at, so the WORKING AREA
+// header label and the per-kind guidance blocks key off a reliable signal
+// instead of brittle `type !== 'video'`-style guesses (which mislabelled a .md
+// as an image and injected generate_video rules with the .md as startFrame).
+//
+// App-native doc types (timeline / storyboard / web) win first — their backing
+// file is a .json / URL whose extension isn't meaningful. Otherwise we classify
+// by file EXTENSION (unambiguous), falling back to the declared `type`.
+const _DOC_EXT_KINDS = {
+  image: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'heic', 'heif', 'avif', 'svg'],
+  video: ['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v'],
+  audio: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'],
+  pdf: ['pdf'],
+  document: ['doc', 'docx', 'odt', 'rtf', 'epub', 'pages'],
+  spreadsheet: ['csv', 'tsv', 'xls', 'xlsx', 'ods'],
+  markdown: ['md', 'markdown', 'mdx'],
+  code: ['js', 'ts', 'jsx', 'tsx', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'sh', 'json', 'yaml', 'yml', 'toml', 'html', 'css', 'koi', 'sql'],
+};
+const _DOC_EXT_LOOKUP = (() => {
+  const m = {};
+  for (const [kind, exts] of Object.entries(_DOC_EXT_KINDS)) for (const e of exts) m[e] = kind;
+  return m;
+})();
+
+/**
+ * Return the canonical kind of the active doc: image | video | audio | pdf |
+ * document | spreadsheet | markdown | code | timeline | storyboard | web |
+ * text | unknown. Used for both the WORKING AREA label and block gating.
+ */
+function _classifyDoc(active) {
+  if (!active) return 'unknown';
+  const t = active.type;
+  // App-native types take precedence over their .json/url backing extension.
+  if (t === 'timeline' || t === 'storyboard') return t;
+  if (t === 'html' || t === 'web') return 'web';
+  const loc = String(active.path || active.url || '').toLowerCase();
+  const m = loc.match(/\.([a-z0-9]+)(?:[?#].*)?$/);
+  const ext = m ? m[1] : '';
+  if (ext && _DOC_EXT_LOOKUP[ext]) return _DOC_EXT_LOOKUP[ext];
+  // No (or unknown) extension → trust the declared type, normalising aliases.
+  if (t === 'image' || t === 'video' || t === 'audio') return t;
+  if (t === 'html') return 'web';
+  return t || 'unknown';
+}
+
 // Pinned ffmpeg version installed by `ffmpeg-installer.js`. Mirrored
 // here as a constant so we don't have to import the installer (and
 // trigger its side effects) just to know the version string for the
@@ -696,7 +742,7 @@ CRITICAL: Return a single YAML action mapping, or a "batch:" with a sequence of 
       const lines = ['', '# WORKING AREA', ''];
       {
         const loc = active.path || active.url || '';
-        lines.push(`The user is currently looking at: [${active.type}] ${active.title}${loc ? ' — `' + loc + '`' : ''}`);
+        lines.push(`The user is currently looking at: [${_classifyDoc(active)}] ${active.title}${loc ? ' — `' + loc + '`' : ''}`);
         // For videos, surface the exact playhead position so the agent
         // knows which frame the user is paused on. The GUI stamps
         // `playheadMs` onto the video doc payload at submit time.
@@ -868,7 +914,11 @@ CRITICAL: Return a single YAML action mapping, or a "batch:" with a sequence of 
       // Image photomontage routing — only fires for image-type active
       // docs with at least one composite-snapshot annotation. Video docs
       // with annotations are handled in the video-to-video block below.
-      const activeIsImage = active && active.type !== 'video';
+      // ONLY genuine image docs, via the robust classifier (type + extension).
+      // The old `type !== 'video'` matched text/html/pdf/timeline/storyboard
+      // too, so a .md (type 'text') wrongly got the "Active document is an
+      // IMAGE — generate_video rules" block with the .md as `startFrame`.
+      const activeIsImage = _classifyDoc(active) === 'image';
       const activeAnnsForBlock = activeIsImage && active.bundle?.annotations
         ? active.bundle.annotations.filter((a) => a?.role === 'composite-snapshot')
         : [];
