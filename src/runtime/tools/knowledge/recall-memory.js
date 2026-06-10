@@ -22,7 +22,17 @@
  * response, not as a memory) and the human will tune it.
  */
 
+import path from 'path';
+import os from 'os';
 import * as memory from '../../memory/index.js';
+import { searchConversations } from '../../state/conversations.js';
+
+/** Resolve a conversation row to its verbatim transcript path. */
+function _dialoguePath(row) {
+  if (row?.sessionDir) return path.join(row.sessionDir, 'dialogue.jsonl');
+  if (row?.sessionId) return path.join(os.homedir(), '.koi', 'sessions', String(row.sessionId), 'dialogue.jsonl');
+  return null;
+}
 
 export default {
   type: 'recall_memory',
@@ -51,8 +61,12 @@ export default {
     '\n' +
     'Fields: `query` (required, free text — phrase as a question or topic), ' +
     '`filter` (optional, narrow by type / project / status / confidence), ' +
-    '`limit` (default 8). Returns an array of `{ title, score, frontmatter }` ' +
-    'objects ranked by combined relevance.',
+    '`limit` (default 8). Returns `results` (vault notes ranked by relevance) ' +
+    'PLUS `conversations` — matching PAST CHAT SESSIONS (federated from the ' +
+    'conversation index). This is your single recall surface: it finds ' +
+    'distilled notes, files the agent created, AND past conversations. ' +
+    'Each conversation match carries a `dialoguePath` — `read_file` it to read ' +
+    'that conversation VERBATIM and work from the raw transcript.',
   thinkingHint: 'Recalling memory',
   permission: null,
   hidden: false,
@@ -101,6 +115,18 @@ export default {
           'Max results to return. Default 8. Higher values include lower-scored ' +
           'matches (more recall, less precision).',
       },
+      includeConversations: {
+        type: 'boolean',
+        description:
+          'OPTIONAL. Default true — also search PAST CONVERSATIONS and return them ' +
+          'under `conversations`. Set false for a pure vault-note lookup.',
+      },
+      allProjects: {
+        type: 'boolean',
+        description:
+          'OPTIONAL. Default false → past conversations are scoped to the CURRENT ' +
+          'project. Set true to search conversations across all projects.',
+      },
     },
     required: ['query'],
   },
@@ -131,24 +157,30 @@ export default {
     if (!query || typeof query !== 'string') {
       return { success: false, error: 'recall_memory: query (string) is required' };
     }
+    const _limit = typeof limit === 'number' ? limit : 8;
 
+    // ── 1. Vault notes — distilled notes (decisions/learnings/insights) AND the
+    // auto-note left for every file the agent creates. Best-effort: a vault
+    // outage must not block the conversation search below. ──
+    let vaultResults = [];
     try {
       await memory.ensureInit(agent);
-    } catch {
-      return { success: true, results: [], message: 'Memory unavailable.' };
-    }
-
-    try {
       const results = await memory.retrieve({
         query,
         filter: filter || {},
-        limit: typeof limit === 'number' ? limit : 8,
+        limit: _limit,
         agent: agent?.name,
       });
-      return {
-        success: true,
-        count: results.length,
-        results: results.map((r) => ({
+      // Relevance floor. The fused RRF score tops out around 1/(rrf_k+1) ≈ 0.016
+      // (rrf_k=60); anything near ~0.002 is NOISE — a query that matches NOTHING
+      // still returns the closest junk (image-lineage notes for an email query,
+      // score 0.002), which misleads the agent into treating garbage as a hit.
+      // Drop sub-floor results so "nothing relevant" reads as nothing. Tunable
+      // via KOI_RECALL_MIN_SCORE.
+      const MIN_SCORE = Number(process.env.KOI_RECALL_MIN_SCORE) || 0.005;
+      vaultResults = results
+        .filter((r) => (r.score ?? 0) >= MIN_SCORE)
+        .map((r) => ({
           title: r.title,
           score: Number(r.score?.toFixed(3) ?? 0),
           type: r.frontmatter?.type ?? null,
@@ -157,10 +189,47 @@ export default {
           status: r.frontmatter?.status ?? null,
           confidence: r.frontmatter?.confidence ?? null,
           created: r.frontmatter?.created ?? null,
-        })),
-      };
-    } catch (err) {
-      return { success: false, error: `recall_memory failed: ${err.message}` };
+        }));
+    } catch { /* vault unavailable — still try conversations */ }
+
+    // ── 2. Federated: PAST CONVERSATIONS. They live in their own auto-built
+    // index (not the vault — dumping raw transcripts there would drown the
+    // curated notes), but recall_memory is the SINGLE recall surface, so we
+    // search it here too. Each match carries a `dialoguePath` the agent can
+    // `read_file` for the VERBATIM transcript. ──
+    let conversations = [];
+    if (action.includeConversations !== false) {
+      try {
+        const rows = await searchConversations({
+          query,
+          projectRoot: action.allProjects ? null : (process.env.KOI_PROJECT_ROOT || null),
+          k: Math.min(_limit, 5),
+          llmProvider: agent?.llmProvider,
+        });
+        conversations = (rows || [])
+          .map((r) => ({
+            sessionId: r.sessionId,
+            title: r.title || '',
+            summary: r.summary || '',
+            dialoguePath: _dialoguePath(r),
+          }))
+          .filter((c) => c.dialoguePath);
+      } catch { /* conversation index unavailable — best-effort */ }
     }
+
+    // ── 3. One response: notes + conversations. ──
+    const out = {
+      success: true,
+      count: vaultResults.length,
+      results: vaultResults,
+      conversations,
+      conversationCount: conversations.length,
+    };
+    if (vaultResults.length === 0 && conversations.length === 0) {
+      out.message = 'Nothing matched — no vault note and no past conversation for this query. Do NOT disk-search blindly; ask the user or proceed.';
+    } else if (conversations.length > 0) {
+      out.note = 'Past conversations matched — `read_file` a `dialoguePath` to read that conversation VERBATIM and work from the raw transcript.';
+    }
+    return out;
   },
 };

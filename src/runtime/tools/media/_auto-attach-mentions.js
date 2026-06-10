@@ -190,9 +190,9 @@ export async function autoAttachMentions({ prompt, refs = [], mediaKind, maxRefs
  * already-attached references by treating each unresolved handle as a
  * POSITIONAL ALIAS for the next ref without one. The agent often
  * writes prompts like
- *   "Edit @ref1 by removing the pedestrian, then use @ref2 as the
+ *   "Edit Image 1 by removing the pedestrian, then use Image 2 as the
  *    background"
- * and intends `@ref1` / `@ref2` to refer to the references it
+ * and intends `Image 1` / `Image 2` to refer to the references it
  * already wired up via `referenceImages` / `referenceVideos`. Those
  * handles aren't in the gallery — they're the agent's chosen names
  * for the positional slots — so this helper takes the unresolved
@@ -200,7 +200,7 @@ export async function autoAttachMentions({ prompt, refs = [], mediaKind, maxRefs
  * unaliased entries in the ref list (also in order). Downstream code
  * that builds a reference legend (system-prompt aliasing, model-
  * specific @Image1/@Video1 mapping, etc.) then sees `{alias, path}`
- * for those slots and the prompt's `@ref1` resolves correctly.
+ * for those slots and the prompt's `Image 1` resolves correctly.
  *
  * @param {Array} refs         Ref list (mix of strings and {alias,path}).
  * @param {string[]} unknown   Handles still unresolved after auto-attach

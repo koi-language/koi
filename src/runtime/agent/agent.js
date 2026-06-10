@@ -2566,30 +2566,33 @@ export class Agent {
         }
       }
 
-      // ── SAFETY: drop user-prompts from multi-action batches ────────────
-      // `prompt_user` / `prompt_form` / `prompt_files` are wait points —
-      // they block until the user replies. Batching them with other
-      // actions almost always assumes those other actions will succeed
-      // (and that the user wants to be asked something AFTER they ran).
-      // If one of the siblings fails, the prompt fires on broken state
-      // and the user sees "what next?" right after a silent error.
-      // Rule: when a prompt appears in a batch of length > 1, drop the
-      // prompt — execute the rest, and record a synthetic result so the
-      // agent learns to re-emit the prompt ALONE next iteration. Single-
-      // action batches (just `prompt_user`) are unaffected.
+      // ── A user-prompt is a WAIT POINT — it runs LAST, after everything ──
+      // `prompt_user` / `prompt_form` / `prompt_files` block until the user
+      // replies and the agent restarts fresh afterwards, so nothing can run
+      // after them. Instead of dropping a prompt that's batched with other
+      // actions, we MOVE it to the END of the batch: every other action runs
+      // first, then the prompt fires last (so "show_result + ask" / "print +
+      // ask" works in ONE turn, wherever the model placed the prompt). And
+      // because a batch STOPS at the first failing action, if a preceding
+      // sibling fails the prompt (now last) is never reached — it never fires
+      // on broken state. Only ONE wait point per turn — extra prompts in the
+      // same batch are dropped (you can't wait twice).
       const _PROMPT_INTENTS = new Set(['prompt_user', 'prompt_form', 'prompt_files']);
-      const _skippedPrompts = [];
+      const _droppedPrompts = [];
       if (actionBatch.length > 1) {
+        const _prompts = [];
         for (let i = actionBatch.length - 1; i >= 0; i--) {
-          const intent = actionBatch[i]?.intent || actionBatch[i]?.type || '';
-          if (_PROMPT_INTENTS.has(intent)) {
-            _skippedPrompts.push(actionBatch[i]);
+          if (_PROMPT_INTENTS.has(actionBatch[i]?.intent || actionBatch[i]?.type || '')) {
+            _prompts.unshift(actionBatch[i]); // preserve original order
             actionBatch.splice(i, 1);
           }
         }
-        if (_skippedPrompts.length > 0 && process.env.KOI_DEBUG_LLM) {
-          const _names = _skippedPrompts.map((a) => a.intent || a.type).join(', ');
-          console.error(`[Agent:${this.name}] ✂️  Dropped ${_skippedPrompts.length} prompt action(s) from a multi-action batch (${_names}) — prompts must be emitted alone.`);
+        if (_prompts.length > 0) {
+          actionBatch.push(_prompts[0]);          // the wait point goes LAST
+          _droppedPrompts.push(..._prompts.slice(1)); // extras can't run — drop
+          if (process.env.KOI_DEBUG_LLM) {
+            console.error(`[Agent:${this.name}] ↪️  Moved prompt to batch end${_prompts.length > 1 ? ` (dropped ${_prompts.length - 1} extra prompt(s))` : ''}.`);
+          }
         }
       }
 
@@ -3805,31 +3808,27 @@ export class Agent {
         }
       }
 
-      // Surface dropped prompts (see the SAFETY block at the top of the
-      // iteration). Inject one synthetic tool-result per skipped prompt
-      // so the next LLM iteration sees it and re-emits the prompt as
-      // its OWN batch instead of bundling it with stateful actions.
-      for (const _dp of _skippedPrompts) {
+      // Only EXTRA prompts get surfaced now (the first prompt was moved to the
+      // batch end and ran normally — see the SAFETY block above). A turn can
+      // have a single wait point, so any additional prompts were dropped; tell
+      // the agent to re-issue them on a later turn. In the common case
+      // (one prompt) this loop is empty — no synthetic "DROPPED" noise.
+      for (const _dp of _droppedPrompts) {
         const _intent = _dp.intent || _dp.type || 'prompt_*';
         const _q = typeof _dp.question === 'string'
           ? _dp.question
           : (typeof _dp.message === 'string' ? _dp.message : '');
         const _ctx = _q ? ` (question was: "${_q.length > 120 ? _q.substring(0, 120) + '…' : _q}")` : '';
         const _msg =
-          `⚠ ${_intent} was DROPPED because it appeared in a batch with other actions${_ctx}. ` +
-          `User-prompts are wait points — batching them with stateful actions like ` +
-          `add_clip_to_timeline / write_file / edit_file means the prompt would fire on ` +
-          `top of whatever state those actions left, including failures. ` +
-          `Re-emit the prompt ALONE in its own batch now that you can see the results of ` +
-          `the other actions you just ran.`;
+          `⚠ ${_intent} was not run${_ctx}: a turn can only have ONE user-prompt (wait point), and another prompt already took that slot this turn. Re-issue it on a later turn if you still need it.`;
         try {
           session.recordAction(_dp, { success: false, error: _msg, dropped: true });
         } catch { /* non-fatal */ }
         try {
           contextMemory.add(
             'user',
-            `❌ ${_intent} DROPPED: ${_msg}`,
-            `❌ ${_intent} dropped (batched with other actions)`,
+            `⏸ ${_intent} deferred: ${_msg}`,
+            `⏸ ${_intent} deferred (one wait point per turn)`,
             null,
           );
         } catch { /* non-fatal */ }

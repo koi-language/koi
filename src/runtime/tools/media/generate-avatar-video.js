@@ -277,7 +277,20 @@ const generateAvatarVideoAction = {
       : null;
     const _onPollTick = _emitBannerStatus
       ? (latest) => {
-          const falStatus = latest?.status === 'pending' ? 'IN_QUEUE'
+          // MCP providers report queued AND processing as `status:'pending'`
+          // and put the real word in `rawStatus` — derive from it first so
+          // the banner isn't stuck on "queued". See generate-video.js.
+          const rawLc = typeof latest?.rawStatus === 'string'
+            ? latest.rawStatus.toLowerCase() : '';
+          let falStatus = null;
+          if (rawLc) {
+            if (/(progress|process|running|generat|render|encod|upscal|active|start)/.test(rawLc)) {
+              falStatus = 'IN_PROGRESS';
+            } else if (/(queue|pending|wait|submit|creat|accept|init)/.test(rawLc)) {
+              falStatus = 'IN_QUEUE';
+            }
+          }
+          falStatus ??= latest?.status === 'pending' ? 'IN_QUEUE'
             : latest?.status === 'processing' ? 'IN_PROGRESS'
             : null;
           if (falStatus) {

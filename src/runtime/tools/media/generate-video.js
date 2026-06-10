@@ -619,7 +619,7 @@ const generateVideoAction = {
       // order and bind each handle as an alias to the next unaliased
       // ref — images first, then videos. The downstream prompt-
       // aliasing pass picks the alias up and the model resolves
-      // `@ref1` / `@whatever` correctly. Both worlds coexist: gallery
+      // `Image 1` / `@whatever` correctly. Both worlds coexist: gallery
       // handles bring in NEW refs from the catalogue; positional
       // handles label EXISTING refs the agent already wired.
       const _trulyUnknown = _imgRes.unknown; // invariant across mediaKind
@@ -1511,10 +1511,29 @@ const generateVideoAction = {
         // Fal-status passthrough to the chat banner. The runtime normalizes
         // fal's IN_QUEUE/IN_PROGRESS to 'pending'/'processing'; map back so
         // the GUI sees the original fal vocabulary it already understands.
+        //
+        // MCP providers (e.g. Magnific) report BOTH queued and processing as
+        // `status: 'pending'` (getStatus only distinguishes terminal vs not)
+        // and put the real provider word in `rawStatus`. Without consulting
+        // rawStatus the banner would be stuck on "queued" the whole time —
+        // exactly the reported bug. So derive from rawStatus first, then fall
+        // back to the normalized `status`.
         if (_emitBannerStatus) {
-          const falStatus = latest?.status === 'pending' ? 'IN_QUEUE'
-            : latest?.status === 'processing' ? 'IN_PROGRESS'
-            : null;
+          const rawLc = typeof latest?.rawStatus === 'string'
+            ? latest.rawStatus.toLowerCase() : '';
+          let falStatus = null;
+          if (rawLc) {
+            if (/(progress|process|running|generat|render|encod|upscal|active|start)/.test(rawLc)) {
+              falStatus = 'IN_PROGRESS';
+            } else if (/(queue|pending|wait|submit|creat|accept|init)/.test(rawLc)) {
+              falStatus = 'IN_QUEUE';
+            }
+          }
+          if (!falStatus) {
+            falStatus = latest?.status === 'pending' ? 'IN_QUEUE'
+              : latest?.status === 'processing' ? 'IN_PROGRESS'
+              : null;
+          }
           if (falStatus) {
             _emitBannerStatus({
               falStatus,

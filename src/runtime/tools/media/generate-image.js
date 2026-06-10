@@ -570,12 +570,12 @@ const generateImageAction = {
 
       // Positional reconciliation for handles not in the gallery.
       // The agent often writes prompts like
-      //   "Edit @ref1 to look like @ref2"
+      //   "Edit Image 1 to look like Image 2"
       // and means "the first / second reference I just attached".
       // Those aren't gallery handles — they're the agent's own labels
       // for the slots — so bind each one as an alias on the next
       // unaliased ref. Downstream prompt-aliasing then resolves
-      // `@ref1` → reference legend → model.
+      // `Image 1` → reference legend → model.
       if (_autoRes.unknown.length > 0) {
         const _fix = assignPositionalAliases(_explicitRefs, _autoRes.unknown);
         if (_fix.assigned.length > 0) {

@@ -177,6 +177,34 @@ export default {
     // Schedule background re-indexing after file changes
     try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}
 
+    // Auto-memory: every artefact the agent creates becomes recall-able later
+    // (so a future turn can `recall_memory` "the email sequence" and get the
+    // file path, instead of falling back to a disk search). Fire-and-forget,
+    // upserted by a stable per-path title so EDITS update the same note instead
+    // of piling up duplicates. Skips internal/scratch writes. Cheap — the
+    // "summary" is the first heading / first non-empty line, no LLM call.
+    if (!action.internal) {
+      (async () => {
+        try {
+          const memory = await import('../../memory/index.js');
+          await memory.ensureInit(agent);
+          const base = path.basename(resolvedPath);
+          let h = 0;
+          for (let i = 0; i < resolvedPath.length; i++) h = (h * 31 + resolvedPath.charCodeAt(i)) | 0;
+          const firstLine = (newContent.split('\n').find((l) => l.trim()) || '')
+            .replace(/^#+\s*/, '').trim().slice(0, 140);
+          await memory.write({
+            title: `creation-${base.replace(/\.[^.]+$/, '')}-${(h >>> 0).toString(36).slice(0, 5)}`,
+            description: `${resolvedPath} — ${firstLine || base}`.slice(0, 200),
+            type: 'insight',
+            project: ['creation', agent?.name || 'file'],
+            confidence: 'validated',
+            body: `File created/updated by the agent.\n\nPath: ${resolvedPath}\nFirst line: ${firstLine}\n\nTo read it verbatim, \`read_file\` this path.`,
+          });
+        } catch { /* auto-memory is best-effort — never block or fail the write */ }
+      })();
+    }
+
     return { success: true, path: filePath };
   }
 };
