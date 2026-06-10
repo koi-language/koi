@@ -32,6 +32,24 @@ import yaml from 'yaml';
 
 const MAX_POLL_ATTEMPTS = 40; // ~40 × up-to-25s long-polls = generous ceiling
 
+// Fallback host-knob → tool-param mapping, used ONLY when a server's map lacks
+// `inputs` (old/partial map). The live map's per-route `inputs` (LLM-generated at
+// connect) is the source of truth. Each entry: { koi, names (candidate tool
+// params, resolved against the live schema), norm? (value transform) }.
+// NOTE: there is intentionally NO generation-knob fallback table. Knob→param
+// mapping for generate routes comes 100% from the connect-time LLM map
+// (`route.inputs`), whose host-knob vocabulary is derived from Koi's OWN
+// generate_* action schemas (see mcp-media-mapper.js _hostKnobs). A static
+// name-guessing table here is exactly the hardcoding we're avoiding. Operations
+// keep a tiny fallback below only because they have no connect-time `inputs`.
+const _OP_INPUT_FALLBACK = [
+  { koi: 'upscaleFactor', names: ['scale', 'upscaleFactor', 'factor'] },
+  { koi: 'prompt', names: ['prompt', 'text'] },
+  { koi: 'creativity', names: ['creativity'] },
+  { koi: 'faceEnhancement', names: ['faceEnhancement', 'face_enhancement'] },
+  { koi: 'outputFormat', names: ['outputFormat', 'output_format', 'format'] },
+];
+
 /** Thrown when the MCP can't serve a route → caller falls back to the gateway. */
 export class MediaRouteUnavailable extends Error {}
 
@@ -101,25 +119,35 @@ export class McpMediaProvider {
 
     const tool = this._resolveToolName(route.tool);
     const args = {};
-    args[this._param(tool, ['prompt', 'text', 'query', 'video'], route.promptParam)] = prompt;
-    if (mappedModel) {
-      const mk = this._param(tool, [route.modelParam, 'mode', 'model', 'engine', 'slug'], route.modelParam, true);
-      if (mk) args[mk] = mappedModel;
-    }
-    if (opts.aspectRatio) {
-      const k = this._param(tool, ['aspectRatio', 'aspect_ratio', 'ratio', 'size'], route.aspectRatioParam, true);
-      if (k) args[k] = opts.aspectRatio;
-    }
-    if (typeof opts.n === 'number') {
-      const k = this._param(tool, ['count', 'numImages', 'n'], route.countParam, true);
-      if (k) args[k] = opts.n;
-    }
+    // Each value is resolved to the tool's REAL param name AND coerced to the
+    // shape that param's live schema declares (enum format, scalar→array,
+    // id→{type,identifier}, type casts). One generic engine — no per-quirk patches.
+    this._setArg(tool, args, ['prompt', 'text', 'query', 'video'], route.promptParam, prompt, { optional: false });
+    if (mappedModel) this._setArg(tool, args, [route.modelParam, 'mode', 'model', 'engine', 'slug'], route.modelParam, mappedModel);
+
+    // Forward the generation knobs the caller set. The mapping (which host knob
+    // → which tool param + value transform) is 100% DATA-DRIVEN from the map's
+    // `route.inputs` (LLM-generated at connect, host-knob vocabulary derived
+    // from Koi's generate_* schemas). No static fallback — a knob the map
+    // didn't capture is simply not sent (and the map regenerates on schema/
+    // version change).
+    this._applyInputs(tool, args, route.inputs, opts);
+
     if (Array.isArray(opts.referenceImages) && opts.referenceImages.length) {
       const ids = [];
-      for (const ref of opts.referenceImages) ids.push(await this._uploadOne(ref, opts));
-      const k = this._param(tool, ['references', 'reference_images', 'referenceImages', 'images'], route.refsParam, true);
-      if (k) args[k] = this._shapeRefs(tool, k, ids);
+      for (const ref of opts.referenceImages) ids.push(await this._uploadAsset(ref, opts));
+      this._setArg(tool, args, ['references', 'reference_images', 'referenceImages', 'images'], route.refsParam, ids);
     }
+
+    // startFrame / endFrame — the LITERAL first/last frame (image-to-video).
+    // First-class image inputs (like referenceImages): upload the file, then
+    // place the creation id at the mapped param. The param is whatever the
+    // map says (`route.startFrameParam` / `endFrameParam`) — flat for a flat
+    // tool, or a nested path like `video.clips[].keyframes.start` for a
+    // structured one; `_setImageInput` coerces the id to the leaf schema
+    // ({type,url} object, bare string, …) so it stays generic per server.
+    await this._setImageInput(tool, args, route.startFrameParam, opts.startFrame, opts);
+    await this._setImageInput(tool, args, route.endFrameParam, opts.endFrame, opts);
 
     // Video is a deferred job: submit and hand back an id for getStatus().
     if (this.kind === 'video') {
@@ -139,11 +167,12 @@ export class McpMediaProvider {
 
     const tool = this._resolveToolName(route.tool);
     const srcId = await this._uploadOne(image, opts);
-    const args = { [this._param(tool, ['creationIdentifier', 'identifier', 'id'], route.idParam)]: srcId };
-    if (operation === 'upscale' && typeof opts.upscaleFactor === 'number') {
-      const k = this._param(tool, ['scale', 'upscaleFactor', 'factor'], route.scaleParam, true);
-      if (k) args[k] = opts.upscaleFactor;
-    }
+    const args = {};
+    this._setArg(tool, args, ['creationIdentifier', 'identifier', 'id'], route.idParam, srcId, { optional: false });
+    // Operation knobs (scale, creativity, …) are data-driven from `route.inputs`;
+    // the code table is a fallback. `_coerceArg` turns e.g. upscaleFactor 2 → "2x"
+    // when the tool's scale param is an enum like ["2x","4x"].
+    this._applyInputs(tool, args, route.inputs, opts, _OP_INPUT_FALLBACK);
     if (route.params && typeof route.params === 'object') Object.assign(args, route.params);
 
     const images = await this._submitPollFetch(tool, args, opts, 'image', route);
@@ -165,11 +194,8 @@ export class McpMediaProvider {
     const imageId = imageBuf ? await this._uploadOne(imageBuf, opts) : null;
     const audioId = audioBuf ? await this._uploadOne({ data: audioBuf, mimeType: 'audio/mpeg' }, opts) : null;
     const args = {};
-    if (audioId) args[this._param(tool, ['audioUrl', 'audio', 'audioIdentifier'], route.audioParam)] = audioId;
-    if (imageId) {
-      const k = this._param(tool, ['imageUrl', 'image', 'imageIdentifier'], route.imageParam, true);
-      if (k) args[k] = imageId;
-    }
+    if (audioId) this._setArg(tool, args, ['audioUrl', 'audio', 'audioIdentifier'], route.audioParam, audioId, { optional: false });
+    if (imageId) this._setArg(tool, args, ['imageUrl', 'image', 'imageIdentifier'], route.imageParam, imageId);
     if (route.params && typeof route.params === 'object') Object.assign(args, route.params);
     const id = await this._submit(tool, args, opts, route);
     return { id, status: 'pending', model: `${this.server}:${tool}`, provider: this.model };
@@ -193,11 +219,23 @@ export class McpMediaProvider {
     const idParam = this._param(statusTool, ['creationIdentifier', 'identifiers', 'identifier', 'id'], a.statusIdParam || a.pollIdParam);
     const res = await this._call(statusTool, { [idParam]: this._maybeArray(statusTool, idParam, jobId) });
 
+    // Granular status string + ETA for the GUI progress badge/bar. Data-driven
+    // from the map's async config (`statusPath` for "queued"/"processing", new
+    // `etaPath` for the seconds-remaining the host uses to pace the bar — both
+    // LLM-mapped at connect). Generic fallback to a deep `status`/`state` field
+    // so an unmapped profile still surfaces something. Rides along on every
+    // return so the poller can relay it without a second call.
+    const rawStatus = (a.statusPath ? this._pathFirst(res, a.statusPath) : null)
+      || this._deepFindString(res, ['status', 'state']) || null;
+    let etaSeconds = null;
+    if (a.etaPath) { const n = Number(this._pathFirst(res, a.etaPath)); if (Number.isFinite(n)) etaSeconds = n; }
+    const meta = { rawStatus, etaSeconds };
+
     if (this._isFailed(res)) {
-      return { id: jobId, status: 'failed', model: this.model, error: this._deepFindString(res, ['error', 'message', 'failureReason']) || 'failed' };
+      return { id: jobId, status: 'failed', model: this.model, error: this._deepFindString(res, ['error', 'message', 'failureReason']) || 'failed', ...meta };
     }
     if (this._isPending(res)) {
-      return { id: jobId, status: 'pending', model: this.model };
+      return { id: jobId, status: 'pending', model: this.model, ...meta };
     }
     // Terminal → resolve the asset URL (inline in the status payload, else fetch).
     let url = this._resolveUrl(res);
@@ -208,7 +246,7 @@ export class McpMediaProvider {
         url = this._resolveUrl(fres);
       }
     }
-    return { id: jobId, status: url ? 'completed' : 'pending', url, model: this.model };
+    return { id: jobId, status: url ? 'completed' : 'pending', url, model: this.model, ...meta };
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
@@ -219,12 +257,12 @@ export class McpMediaProvider {
     const srcRef = (opts.referenceImages && opts.referenceImages[0]) || null;
     if (!srcRef) return this._fallback('generate', [prompt, opts], 'cameraAngles needs a reference image');
     const srcId = await this._uploadOne(srcRef, opts);
-    const args = { [this._param(tool, ['creationIdentifier', 'identifier', 'id'], route.idParam)]: srcId };
+    const args = {};
+    this._setArg(tool, args, ['creationIdentifier', 'identifier', 'id'], route.idParam, srcId, { optional: false });
     const map = route.map || {};
     for (const axis of ['horizontal', 'vertical', 'zoom']) {
       if (typeof opts.cameraAngles[axis] === 'number' && map[axis]) {
-        const k = this._param(tool, [map[axis]], map[axis], true);
-        if (k) args[k] = opts.cameraAngles[axis];
+        this._setArg(tool, args, [map[axis]], map[axis], opts.cameraAngles[axis]);
       }
     }
     const images = await this._submitPollFetch(tool, args, opts, 'image', route);
@@ -237,7 +275,7 @@ export class McpMediaProvider {
     if (!route) return this._fallback(mode === 'music' ? 'music' : 'speech', [input, opts]);
     const tool = this._resolveToolName(route.tool);
     const args = {};
-    args[this._param(tool, mode === 'music' ? ['prompt', 'text'] : ['text', 'prompt'], route.textParam || route.promptParam)] = input;
+    this._setArg(tool, args, mode === 'music' ? ['prompt', 'text'] : ['text', 'prompt'], route.textParam || route.promptParam, input, { optional: false });
     if (route.params && typeof route.params === 'object') Object.assign(args, route.params);
     const assets = await this._submitPollFetch(tool, args, opts, 'audio', route);
     const url = assets[0] && assets[0].url;
@@ -251,29 +289,221 @@ export class McpMediaProvider {
   }
 
   /**
-   * Shape an array of uploaded creation ids for a reference param, driven by the
-   * tool's LIVE inputSchema (no hardcoded per-provider assumptions). Some servers
-   * (e.g. Magnific) require objects — `references: [{ type:"image", identifier }]`
-   * — and reject bare id strings; others accept the ids directly. We read the
-   * param's `items` schema: object items with an id-ish (+ optional type) field →
-   * build objects (type defaults to "image" when that's an allowed enum value);
-   * otherwise pass the ids through unchanged.
+   * Resolve a logical value to a tool's REAL param name AND coerce it to the
+   * shape that param's live schema declares, then set it on `args`. This is the
+   * ONE place value-shaping happens — no per-quirk helpers. Skips silently when
+   * the param isn't declared (unless optional:false).
    */
-  _shapeRefs(tool, paramKey, ids) {
+  _setArg(tool, args, candidates, preferred, value, { optional = true } = {}) {
+    // NESTED PATH form ("a.b[].c"): the connect-time map can point a logical
+    // knob at a param buried inside a structured input (e.g. a video tool whose
+    // schema is `{ video: { clips: [{ prompt, slug, duration, references:[…] }] } }`
+    // → promptParam "video.clips[].prompt"). Resolve the LEAF param's schema by
+    // walking the path, coerce the value to it (so refs become [{type,url}],
+    // scalars wrap, enums snap — the SAME `_coerceArg` engine as flat params),
+    // then write it into the nested args. Fully generic: driven by the map, no
+    // per-server code. A bare name (no '.' / '[]') keeps the flat path below.
+    const pathParam = [preferred, ...(candidates || [])]
+      .find((c) => typeof c === 'string' && /[.[]/.test(c));
+    if (pathParam) {
+      const leaf = this._schemaAtPath(tool, pathParam);
+      this._setPath(args, pathParam, leaf ? this._coerceArg(leaf, value) : value);
+      return;
+    }
+    const key = this._param(tool, candidates, preferred, optional);
+    if (!key) return;
     const props = this._schemaProps(tool);
-    const items = props && props[paramKey] && props[paramKey].items;
-    const itemProps = items && (items.type === 'object' || items.properties) ? items.properties : null;
-    if (!itemProps || typeof itemProps !== 'object') return ids; // server takes bare ids
-    const idField = ['identifier', 'id', 'creationIdentifier', 'creationId', 'url'].find((f) => itemProps[f]) || 'identifier';
-    const typeField = ['type', 'kind', 'referenceType'].find((f) => itemProps[f]);
-    return ids.map((id) => {
-      const o = { [idField]: id };
-      if (typeField) {
-        const en = itemProps[typeField].enum;
-        o[typeField] = (Array.isArray(en) && en.includes('image')) ? 'image' : ((en && en[0]) || 'image');
+    const schema = props && props[key];
+    args[key] = schema ? this._coerceArg(schema, value) : value;
+  }
+
+  /**
+   * Place a single image input (startFrame / endFrame) at a mapped param.
+   * Uploads the file to a creation id, coerces it to the leaf param's schema
+   * (a bare string, or a `{type,url}` object for a keyframe), and writes it.
+   * No-op when the param isn't mapped or no image was given. Generic — works
+   * for a flat string param OR a nested path; the only media-specific touch is
+   * defaulting an object's required `type` to "image" when the schema declares
+   * it but offers no enum to pick from (e.g. keyframes.start.{type,url}).
+   */
+  async _setImageInput(tool, args, param, ref, opts) {
+    if (!param || !ref) return;
+    const id = await this._uploadAsset(ref, opts);
+    const leaf = this._schemaAtPath(tool, param);
+    let val = leaf ? this._coerceArg(leaf, id) : id;
+    if (val && typeof val === 'object' && !Array.isArray(val) && val.type == null
+        && leaf && leaf.properties && leaf.properties.type) {
+      val.type = 'image';
+    }
+    this._setPath(args, param, val);
+  }
+
+  /**
+   * Resolve the JSON-Schema of the LEAF param named by a nested path like
+   * "video.clips[].prompt": walk object properties via ".", descend into array
+   * items where a token ends with "[]". Returns null when the path can't be
+   * resolved against the live tool schema (caller then sets the raw value).
+   */
+  _schemaAtPath(tool, path) {
+    let props = this._schemaProps(tool);
+    if (!props) return null;
+    const tokens = String(path).split('.');
+    let schema = null;
+    for (let i = 0; i < tokens.length; i++) {
+      let name = tokens[i];
+      const intoArray = name.endsWith('[]');
+      if (intoArray) name = name.slice(0, -2);
+      schema = props ? props[name] : null;
+      if (!schema) return null;
+      const isLast = i === tokens.length - 1;
+      if (intoArray && !isLast) schema = schema.items || schema; // descend for deeper tokens
+      props = (schema && schema.properties) ? schema.properties
+        : (schema && schema.items && schema.items.properties) ? schema.items.properties
+          : null;
+    }
+    return schema;
+  }
+
+  /**
+   * Write `value` into `root` at a nested path like "video.clips[].references",
+   * creating intermediate objects/arrays as needed ("[]" → a single element).
+   * Mirrors _schemaAtPath's path grammar.
+   */
+  _setPath(root, path, value) {
+    const tokens = String(path).split('.');
+    let cur = root;
+    for (let i = 0; i < tokens.length; i++) {
+      let name = tokens[i];
+      const intoArray = name.endsWith('[]');
+      if (intoArray) name = name.slice(0, -2);
+      const isLast = i === tokens.length - 1;
+      if (isLast) {
+        cur[name] = (intoArray && !Array.isArray(value)) ? [value] : value;
+        return;
       }
-      return o;
-    });
+      if (intoArray) {
+        if (!Array.isArray(cur[name])) cur[name] = [];
+        if (!cur[name][0] || typeof cur[name][0] !== 'object') cur[name][0] = {};
+        cur = cur[name][0];
+      } else {
+        if (!cur[name] || typeof cur[name] !== 'object') cur[name] = {};
+        cur = cur[name];
+      }
+    }
+  }
+
+  /**
+   * Forward the caller's generation/operation knobs onto `args`, driven by the
+   * map's `routeInputs` (LLM-generated: [{ koi, param, lowercase?, valueMap? }]).
+   * The map says WHICH host knob → WHICH tool param + the value transform; the
+   * tool's live schema still does the final name resolution + coercion. When the
+   * map has no `inputs` (old/partial), fall back to `fallback` (code table) so
+   * nothing silently regresses. Either way a knob the tool doesn't declare is
+   * dropped by `_setArg`.
+   */
+  _applyInputs(tool, args, routeInputs, opts, fallback) {
+    // The map's `inputs` (LLM-generated) is authoritative for the MAPPING of a
+    // knob — its exact tool param + value transform. Build a lookup.
+    const fromMap = new Map();
+    if (Array.isArray(routeInputs)) {
+      for (const e of routeInputs) {
+        if (!e || typeof e.koi !== 'string' || typeof e.param !== 'string') continue;
+        fromMap.set(e.koi, {
+          names: [e.param],
+          norm: (v) => {
+            if (e.valueMap && typeof e.valueMap === 'object'
+              && Object.prototype.hasOwnProperty.call(e.valueMap, v)) return e.valueMap[v];
+            if (e.lowercase) return String(v).toLowerCase();
+            return v;
+          },
+        });
+      }
+    }
+    const set = (koi, rule) => {
+      const v = opts[koi];
+      if (v === undefined || v === null) return;
+      this._setArg(tool, args, rule.names, undefined, rule.norm ? rule.norm(v) : v);
+    };
+    // Iterate the canonical knob VOCABULARY (the host's contract — what Koi can
+    // send, which the MCP schema can't know) so no knob is ever forgotten, even
+    // if the map's `inputs` missed one. Prefer the map's precise mapping; else
+    // resolve the param by candidate names against the live schema.
+    const seen = new Set();
+    for (const f of (fallback || [])) {
+      seen.add(f.koi);
+      set(f.koi, fromMap.get(f.koi) || { names: f.names, norm: f.norm });
+    }
+    // Honour any provider-specific knob the map declares that isn't in the
+    // canonical list (e.g. a knob unique to this MCP).
+    for (const [koi, rule] of fromMap) {
+      if (!seen.has(koi)) set(koi, rule);
+    }
+  }
+
+  /**
+   * Generic, schema-driven value coercion. Given a JSON-Schema fragment for a
+   * param and a canonical value, return the value reshaped to FIT that schema —
+   * so a different server expressing the same thing differently "just works",
+   * with no per-tool patches:
+   *   - enum            → exact member, else a formatted/closest match (2 → "2x")
+   *   - array           → map members through items; wrap a scalar into [scalar]
+   *   - object          → wrap a scalar (e.g. a creation id) into the declared
+   *                       object, filling the id-ish field + required enum defaults
+   *                       (type → "image" when allowed); pass an existing object through
+   *   - number/integer/string/boolean → light type casts
+   * Anything it can't infer is returned unchanged (the server then validates).
+   * Structural/semantic cases beyond this belong in the LLM map (map-time, cached).
+   */
+  _coerceArg(schema, value) {
+    if (!schema || typeof schema !== 'object' || value == null) return value;
+
+    // Enum: exact member → as-is; else best-effort (number→"2x"/"x2"/"2",
+    // case-insensitive); else closest numeric member; else unchanged.
+    if (Array.isArray(schema.enum) && schema.enum.length) {
+      const en = schema.enum;
+      if (en.includes(value)) return value;
+      const want = [value, `${value}x`, `x${value}`, String(value)];
+      for (const w of want) {
+        const hit = en.find((e) => String(e).toLowerCase() === String(w).toLowerCase());
+        if (hit !== undefined) return hit;
+      }
+      const num = (s) => parseFloat(String(s).replace(/[^\d.]/g, ''));
+      const v = num(value);
+      if (!Number.isNaN(v)) {
+        const numeric = en.filter((e) => !Number.isNaN(num(e)));
+        if (numeric.length) return numeric.sort((a, b) => Math.abs(num(a) - v) - Math.abs(num(b) - v))[0];
+      }
+      return value;
+    }
+
+    // Array: coerce each member through the item schema; wrap a scalar.
+    if (schema.type === 'array' || schema.items) {
+      const arr = Array.isArray(value) ? value : [value];
+      return arr.map((v) => this._coerceArg(schema.items, v));
+    }
+
+    // Object: wrap a scalar (creation id) into the declared shape; pass objects through.
+    const props = schema.properties && typeof schema.properties === 'object' ? schema.properties : null;
+    if (props && (schema.type === 'object' || schema.type === undefined)) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+      const primary = ['identifier', 'id', 'creationIdentifier', 'creationId', 'url', 'value'].find((f) => props[f])
+        || Object.keys(props)[0];
+      const out = {};
+      if (primary) out[primary] = value;
+      for (const r of (Array.isArray(schema.required) ? schema.required : [])) {
+        if (r === primary || out[r] !== undefined) continue;
+        const ps = props[r];
+        if (ps && Array.isArray(ps.enum) && ps.enum.length) out[r] = ps.enum.includes('image') ? 'image' : ps.enum[0];
+      }
+      return out;
+    }
+
+    // Scalars: light type casts.
+    if (schema.type === 'integer') { const n = parseInt(value, 10); return Number.isNaN(n) ? value : n; }
+    if (schema.type === 'number') { const n = parseFloat(value); return Number.isNaN(n) ? value : n; }
+    if (schema.type === 'string' && typeof value !== 'string') return String(value);
+    if (schema.type === 'boolean') return value === true || value === 'true';
+    return value;
   }
 
   /**
@@ -482,6 +712,40 @@ export class McpMediaProvider {
   _pathFirst(res, path) { return this._pathStrings(res, path)[0] || null; }
 
   /** Upload a local image/audio (Buffer / data-URI / base64 / {data,mimeType}) → creation id. */
+  /**
+   * Upload a local reference and return the value the CURRENT tool's reference
+   * fields expect. Image tools accept the bare creation identifier; VIDEO tools
+   * validate their reference / keyframe `url` fields as real URLs and reject a
+   * bare id ("…url should be a valid URL"), so for video we resolve the id to
+   * its asset URL via the map's fetch tool (`creations_get`). Already-URL refs
+   * pass straight through.
+   */
+  async _uploadAsset(ref, opts = {}) {
+    const id = await this._uploadOne(ref, opts);
+    if (this.kind === 'video') return this._resolveAssetUrl(id);
+    return id;
+  }
+
+  /** Resolve a creation identifier to its asset URL via the map's async.fetch
+   *  tool (e.g. creations_get → url). Returns the input unchanged if it's
+   *  already a URL or can't be resolved. */
+  async _resolveAssetUrl(idOrUrl) {
+    if (typeof idOrUrl === 'string' && /^https?:\/\//i.test(idOrUrl)) return idOrUrl;
+    const a = this.media.async || {};
+    const fetchTool = this._resolveToolName(a.fetch, true);
+    if (!fetchTool) return idOrUrl;
+    try {
+      const idParam = this._param(fetchTool, ['creationIdentifier', 'identifier', 'id'], a.fetchIdParam);
+      const res = await this._call(fetchTool, { [idParam]: idOrUrl });
+      // Prefer the mapped DIRECT asset url (`async.urlPath`, the same field used
+      // to download outputs) over a generic resolve — references reject `webUrl`.
+      const url = (a.urlPath ? this._pathFirst(res, a.urlPath) : null) || this._resolveUrl(res);
+      return url || idOrUrl;
+    } catch {
+      return idOrUrl;
+    }
+  }
+
   async _uploadOne(ref, opts = {}) {
     const up = this.media.uploadRef || {};
 

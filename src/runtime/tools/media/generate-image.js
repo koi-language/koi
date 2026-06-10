@@ -28,6 +28,7 @@ import {
   recoverImageFile,
 } from './_pad-and-recover.js';
 import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
+import { wasRead, isGatedLocalPath, markRead } from '../../state/read-tracker.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -229,6 +230,30 @@ const generateImageAction = {
       const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
       const _guard = await requireToolInfoFirst('generate_image', agent);
       if (_guard) return _guard;
+    }
+
+    // ── Read-before-use guard ────────────────────────────────────────
+    // You may NOT use a LOCAL image as a reference unless you've `read_file`'d
+    // it this session OR generated it yourself this session (generated outputs
+    // are marked read). Forces the agent to actually LOOK at a reference it
+    // grabbed off disk instead of using it blind. @mention handles, att-N
+    // attachments and URLs are exempt; internal tool delegations bypass this
+    // (their refs are pre-validated by the delegating tool).
+    if (action._internalDelegate !== true && Array.isArray(action.referenceImages)) {
+      const refPath = (r) => (typeof r === 'string' ? r : (r && typeof r === 'object' ? (r.path || r.url || '') : ''));
+      const unread = action.referenceImages
+        .map((r, i) => [`referenceImages[${i}]`, refPath(r)])
+        .filter(([, v]) => isGatedLocalPath(v) && !wasRead(v));
+      if (unread.length) {
+        return {
+          success: false,
+          error:
+            'read_file required first — you cannot use a local image as a reference unless you have read it this session. ' +
+            'Call read_file on each of these BEFORE generate_image, then retry:\n  ' +
+            unread.map(([f, v]) => `${f}: ${v}`).join('\n  ') +
+            '\n(@mention handles, att-N attachments and http(s) URLs are exempt; images you generated this session are fine.)',
+        };
+      }
     }
 
     // Per-call warning bag. Populated below for soft-enforcement issues
@@ -1308,22 +1333,36 @@ const generateImageAction = {
 
       for (let i = 0; i < result.images.length; i++) {
         const img = result.images[i];
-        // Download from URL if no base64 data
+        // Download from URL if no base64 data. Retry with backoff + a timeout —
+        // provider CDNs (e.g. Magnific/pikaso) occasionally drop the first
+        // connection ("fetch failed"), and a 4K render is a large transfer. If
+        // every attempt fails, img.savedTo stays unset → reported as a FAILURE
+        // below (a URL we couldn't fetch is not a usable result).
         if (!img.b64 && img.url) {
-          try {
-            const resp = await fetch(img.url);
-            if (resp.ok) {
-              const contentType = resp.headers.get('content-type') || '';
-              const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'png';
-              const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
-              const filePath = path.join(saveDir, filename);
-              const buffer = Buffer.from(await resp.arrayBuffer());
-              fs.writeFileSync(filePath, buffer);
-              img.savedTo = filePath;
-              channel.log('image', `Downloaded and saved: ${filePath} (${(buffer.length / 1024).toFixed(0)}KB)`);
+          for (let attempt = 0; attempt < 3 && !img.savedTo; attempt++) {
+            if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), 30000);
+            try {
+              const resp = await fetch(img.url, { signal: ctrl.signal });
+              if (resp.ok) {
+                const contentType = resp.headers.get('content-type') || '';
+                const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'png';
+                const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
+                const filePath = path.join(saveDir, filename);
+                const buffer = Buffer.from(await resp.arrayBuffer());
+                fs.writeFileSync(filePath, buffer);
+                img.savedTo = filePath;
+                markRead(filePath); // the agent created it → it "knows" it (read-before-use)
+                channel.log('image', `Downloaded and saved: ${filePath} (${(buffer.length / 1024).toFixed(0)}KB)`);
+              } else {
+                channel.log('image', `Download HTTP ${resp.status} for ${img.url} (attempt ${attempt + 1}/3)`);
+              }
+            } catch (dlErr) {
+              channel.log('image', `Failed to download ${img.url} (attempt ${attempt + 1}/3): ${dlErr.message}`);
+            } finally {
+              clearTimeout(to);
             }
-          } catch (dlErr) {
-            channel.log('image', `Failed to download ${img.url}: ${dlErr.message}`);
           }
         }
         if (img.b64) {
@@ -1337,10 +1376,33 @@ const generateImageAction = {
       }
     }
 
-    // Verify images were actually generated
+    // Verify images were actually generated AND we have them locally. A bare
+    // `url` we couldn't download (img.savedTo never set) is NOT a usable result:
+    // the GUI has nothing to show and nothing got saved to the library. Treating
+    // it as success is exactly the "Image generated ✓ but nothing appears" bug —
+    // require a local asset (savedTo) or inline bytes (b64).
     const images = result.images || [];
-    const hasImages = images.length > 0 && images.some(img => img.url || img.b64 || img.savedTo);
+    const hasImages = images.length > 0 && images.some(img => img.savedTo || img.b64);
+    const onlyUndownloadableUrls = images.length > 0 && !hasImages
+      && images.every(img => img.url && !img.savedTo && !img.b64);
     if (!hasImages) {
+      // Distinct, honest failure: the provider DID return a result URL but every
+      // download attempt failed. This is NOT a content-policy rejection — say so
+      // precisely so the agent retries instead of telling the user it's done.
+      if (onlyUndownloadableUrls) {
+        const failedUrl = (images.find((im) => im.url) || {}).url || '';
+        channel.log('image', `Generation succeeded on ${result.provider || 'provider'} but the result URL could not be downloaded: ${failedUrl}`);
+        return {
+          success: false,
+          tool: 'generate_image',
+          provider: result.provider,
+          model: result.model,
+          error: `The image was generated by ${result.provider || 'the provider'} but Koi could not download the result after 3 attempts `
+            + '(network/CDN error fetching the asset URL). Nothing was saved or shown. Do NOT report this as completed — '
+            + 'do not store a "done" memory or look for a file; re-issue the SAME generate_image call to retry.',
+          images: result.images,
+        };
+      }
       // Mine the raw provider response for a real reason. Different providers
       // use different shapes; pull whatever's there without trusting any one.
       const raw = result.raw || result.providerRaw || {};

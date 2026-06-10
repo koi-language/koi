@@ -31,7 +31,8 @@ import { listNoteTitles, getVaultPaths, getAgentScopePaths } from './rmh/vault.j
 import { parseFrontmatter } from './rmh/frontmatter.js';
 import { buildNoteIndex } from './rmh/noteindex.js';
 import { buildGraph } from './rmh/graph.js';
-import { initDB, indexNote } from './rmh/engine.js';
+import { initDB } from './rmh/engine.js';
+import { initQValueTables, updateQ } from './rmh/qvalue.js';
 import { loadConfig } from './rmh/config.js';
 
 import { buildSnapshot, runRetrieve } from './_orchestrator.js';
@@ -48,6 +49,14 @@ let _state = {
   sessionId: null,
   snapshot: null,       // lazy
   snapshotMtime: null,  // for cache invalidation
+  // Titles surfaced by retrieve() this session. When a later write() cites
+  // one via a [[wiki-link]], that's a forward citation → RL reward. Map so
+  // each note is credited at most once per session.
+  retrievedThisSession: new Map(),
+  // Per-scope cached vault index (titles + frontmatter + link graph) for
+  // promote's link/area suggestions. Built once, patched incrementally per
+  // promoted note, so add_memory doesn't re-read the whole vault each time.
+  promoteCache: new Map(),
 };
 
 /**
@@ -88,6 +97,8 @@ export async function init({ projectRoot, sessionId, embeddingProvider, llmProvi
     sessionId,
     snapshot: null,
     snapshotMtime: null,
+    retrievedThisSession: new Map(),
+    promoteCache: new Map(),
   };
 
   return { vaultRoot, vaultSource: source, created };
@@ -203,6 +214,10 @@ export async function write(note) {
   // Invalidate snapshot cache so next retrieve picks up the new note
   _state.snapshot = null;
 
+  // RL reward: any note this new note cites via [[wiki-link]] that we
+  // surfaced earlier this session was clearly useful → reinforce it.
+  _rewardForwardCitations(note.body ?? '');
+
   // Emit event
   await eventLog.append(eventTypes.MemoryWritten, 'system', {
     title: final.title,
@@ -213,6 +228,41 @@ export async function write(note) {
   });
 
   return final;
+}
+
+/**
+ * Close the RL loop: scan a freshly written note's body for [[wiki-links]]
+ * to notes we retrieved earlier this session and reward each one (reward=1,
+ * the strongest signal in rmh/reward.js). Credit is one-shot per session —
+ * a cited note is removed from the tracking set so it isn't double-counted.
+ * Best-effort: a failure here must never break a memory write.
+ */
+function _rewardForwardCitations(body) {
+  try {
+    if (!body || _state.retrievedThisSession.size === 0) return;
+    const links = body.match(/\[\[([^\]]+)\]\]/g) || [];
+    if (links.length === 0) return;
+    const cited = [];
+    for (const raw of links) {
+      const title = raw.slice(2, -2).trim();
+      if (_state.retrievedThisSession.has(title)) cited.push(title);
+    }
+    if (cited.length === 0) return;
+
+    const dbPath = path.resolve(_state.vaultRoot, _state.config.engine.db_path);
+    const db = initDB(dbPath);
+    try {
+      initQValueTables(db);
+      for (const title of cited) {
+        updateQ(db, title, 1, _state.sessionId);
+        _state.retrievedThisSession.delete(title);
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Reward is non-critical — swallow and move on.
+  }
 }
 
 /**
@@ -269,8 +319,11 @@ function _matchFilter(fm, filter) {
 }
 
 /**
- * Retrieve relevant notes by query. Multi-signal: BM25 + composite vector
- * search + RRF fusion (v1 — warmth/PPR/RL come in subsequent phases).
+ * Retrieve relevant notes by query. Full multi-signal pipeline: composite
+ * vector (vitality-weighted) + BM25 + PPR graph expansion + warmth, fused
+ * via RRF, then re-ranked by learned Q-value + UCB exploration. Surfaced
+ * notes are logged for RL credit; forward citations in later write()s feed
+ * the reward back.
  *
  * @param {object} opts
  * @param {string} opts.query
@@ -295,7 +348,18 @@ export async function retrieve(opts = {}) {
   const results = await runRetrieve(snapshot, opts.query, {
     limit: opts.limit,
     filter: opts.filter,
+    sessionId: _state.sessionId,
+    agent: opts.agent,
   });
+
+  // Remember what we surfaced so a later write() that cites one of these
+  // notes can reward it (forward citation → RL credit). First-wins so the
+  // best (earliest) rank is what gets credited.
+  for (const r of results) {
+    if (!_state.retrievedThisSession.has(r.title)) {
+      _state.retrievedThisSession.set(r.title, true);
+    }
+  }
 
   // Emit retrieval event for RL reward + telemetry
   await eventLog.append(eventTypes.MemoryRetrieved, opts.agent || 'system', {
@@ -333,12 +397,16 @@ function _resolveScopePaths(scope) {
 }
 
 async function _autoPromote({ inboxPath, frontmatter, body, scope }) {
-  // Build vault index for promote (existing titles, frontmatter map, link graph)
   const scopePaths = _resolveScopePaths(scope);
-  const existingTitles = await listNoteTitles(scopePaths.notes);
-  const noteIndex = await buildNoteIndex(scopePaths.notes, existingTitles);
-  const linkGraph = await buildGraph(scopePaths.notes);
-  const vaultIndex = { titles: existingTitles, frontmatter: noteIndex.frontmatter, graph: linkGraph };
+  // Reuse a cached vault index instead of re-reading + re-parsing EVERY note
+  // on every save. The agent is the only writer within a session, so the
+  // cache is kept exact by patching in each promoted note incrementally
+  // (O(1)) rather than rebuilding it (O(N file reads)). This index only
+  // feeds promote's link/area suggestions; retrieval builds its own fresh
+  // snapshot, so a little staleness here never affects recall.
+  const vault = await _ensurePromoteVaultIndex(scope, scopePaths);
+  const existingTitles = [...vault.titles];
+  const vaultIndex = { titles: existingTitles, frontmatter: vault.frontmatter, graph: vault.graph };
 
   const promotionConfig = _state.config.promote || {};
   const promo = computePromotion({
@@ -374,29 +442,57 @@ async function _autoPromote({ inboxPath, frontmatter, body, scope }) {
   await fs.writeFile(destPath, `---\n${fmYaml}---\n${promo.updatedBody}`, 'utf8');
   await fs.rm(inboxPath, { force: true });
 
-  // Index it in SQLite for retrieval
-  try {
-    const dbPath = path.resolve(_state.vaultRoot, _state.config.engine.db_path);
-    const db = initDB(dbPath);
-    const fmFinal = promo.updatedFrontmatter;
-    const titleSlug = path.basename(promo.destinationFilename, '.md');
-    await indexNote(db, {
-      title: titleSlug,
-      frontmatter: fmFinal,
-      body: promo.updatedBody,
-      linkGraph: await buildGraph(scopePaths.notes),
-      config: _state.config.engine,
-      graphMetrics: null,
-    });
-  } catch (err) {
-    // Indexing failure is non-fatal — the note exists; reindex on next retrieve.
-  }
+  const promotedTitle = path.basename(promo.destinationFilename, '.md');
+  // Patch the cached index so the NEXT save sees this note without a re-read.
+  _addToPromoteVaultIndex(scope, promotedTitle, promo.updatedFrontmatter, promo.updatedBody);
 
-  return {
-    title: path.basename(promo.destinationFilename, '.md'),
-    status: 'active',
-    path: destPath,
+  // NOTE: semantic (embedding) indexing is deferred to retrieve()'s snapshot.
+  // The old inline indexNote call here was a no-op (wrong arg shape → always
+  // threw) plus a full extra vault read, so it's removed rather than fixed —
+  // fixing it would put an embedding round-trip on the save path (rejected:
+  // saves must stay network-free).
+  return { title: promotedTitle, status: 'active', path: destPath };
+}
+
+/**
+ * Lazily build (once per scope per session) the vault index that promote's
+ * link/area suggestions need — titles + frontmatter map + wiki-link graph —
+ * then keep it fresh via _addToPromoteVaultIndex. Replaces the O(N) full
+ * re-read that used to run on every add_memory.
+ */
+async function _ensurePromoteVaultIndex(scope, scopePaths) {
+  let cache = _state.promoteCache.get(scope);
+  if (cache) return cache;
+  const titles = await listNoteTitles(scopePaths.notes);
+  const noteIndex = await buildNoteIndex(scopePaths.notes, titles);
+  const linkGraph = await buildGraph(scopePaths.notes);
+  cache = {
+    titles: new Set(titles),
+    frontmatter: noteIndex.frontmatter,
+    graph: linkGraph,
   };
+  _state.promoteCache.set(scope, cache);
+  return cache;
+}
+
+/** Patch a freshly promoted note into the cached vault index (O(1)), so the
+ *  next save reflects it without re-reading the whole vault. */
+function _addToPromoteVaultIndex(scope, title, frontmatter, body) {
+  const cache = _state.promoteCache.get(scope);
+  if (!cache) return;
+  cache.titles.add(title);
+  cache.frontmatter.set(title, frontmatter);
+  const out = new Set();
+  for (const m of String(body || '').matchAll(/\[\[([^\]]+)\]\]/g)) {
+    const t = m[1]?.trim();
+    if (t) out.add(t);
+  }
+  cache.graph.outgoing.set(title, out);
+  for (const tgt of out) {
+    let inc = cache.graph.incoming.get(tgt);
+    if (!inc) { inc = new Set(); cache.graph.incoming.set(tgt, inc); }
+    inc.add(title);
+  }
 }
 
 function _toSlug(title) {

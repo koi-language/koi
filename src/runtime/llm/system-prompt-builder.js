@@ -550,6 +550,13 @@ batch:
   - actionType: direct
     intent: phase_done
 
+CRITICAL YAML INDENTATION (this is the #1 way a batch breaks): every "- actionType:" in a
+batch MUST sit at the SAME indent. When an action has a multi-line value ("message: |" /
+"prompt: |"), EVERY line of that block MUST be indented DEEPER than its key, and the NEXT
+"- actionType:" MUST dedent back to the sequence indent — otherwise the block silently
+swallows the following actions and they never run. If you are unsure about indentation for a
+long value, prefer a single-line double-quoted string with \\n escapes over a "|" block.
+
 ========================================
 EXECUTION FLOW
 ========================================

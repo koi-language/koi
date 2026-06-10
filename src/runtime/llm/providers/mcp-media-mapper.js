@@ -32,15 +32,15 @@ Target shape (omit any route you can't satisfy with a real tool — do NOT inven
 {
   "label": "<short provider name, e.g. Magnific>",
   "generate": {
-    "image": { "tool": "<text->image tool>", "promptParam": "<param>", "refsParam": "<param?>", "aspectRatioParam": "<param?>", "modelParam": "<the param that SELECTS which model/engine to use, e.g. one whose description says 'model slug from <list tool>' — like 'mode' or 'model'?>", "modelsListTool": "<the tool that ENUMERATES this route's available models, e.g. images_models_list?>", "idPath": "<path to the creation id(s) THIS tool returns, e.g. creations[].identifier>" },
-    "video": { "tool": "<text->video tool>", "promptParam": "<param>", "modelParam": "<the param that SELECTS the model, e.g. 'slug'?>", "modelsListTool": "<the tool that enumerates video models, e.g. video_models_list?>", "idPath": "<path to the job/creation id it returns>" },
+    "image": { "tool": "<text->image tool>", "promptParam": "<param>", "refsParam": "<param?>", "modelParam": "<the param that SELECTS which model/engine to use, e.g. one whose description says 'model slug from <list tool>' — like 'mode' or 'model'?>", "modelsListTool": "<the tool that ENUMERATES this route's available models, e.g. images_models_list?>", "inputs": "<see HOST INPUT KNOBS below — map each supported host knob to this tool's EXACT param>", "idPath": "<path to the creation id(s) THIS tool returns, e.g. creations[].identifier>" },
+    "video": { "tool": "<text->video tool>", "promptParam": "<param>", "modelParam": "<the param that SELECTS the model, e.g. 'slug'?>", "refsParam": "<param/path for VISUAL REFERENCE images (look/identity), e.g. references array?>", "startFrameParam": "<param/path for the LITERAL FIRST frame the video begins from (image-to-video), e.g. keyframes.start — an image keyframe, NOT a style reference; omit if the tool has none>", "endFrameParam": "<param/path for the LITERAL LAST frame, e.g. keyframes.end; omit if none>", "modelsListTool": "<the tool that enumerates video models, e.g. video_models_list?>", "inputs": "<see HOST INPUT KNOBS below>", "idPath": "<path to the job/creation id it returns>" },
     "audio": {
       "speech": { "tool": "<TTS tool>", "textParam": "<param>", "idPath": "<path to the id it returns>" },
       "music":  { "tool": "<music tool>", "promptParam": "<param>", "idPath": "<path to the id it returns>" }
     }
   },
   "operations": {
-    "upscale":            { "tool": "<upscaler>", "idParam": "<image-id param>", "scaleParam": "<param?>", "idPath": "<path to the id it returns>" },
+    "upscale":            { "tool": "<upscaler>", "idParam": "<image-id param>", "inputs": "<see HOST INPUT KNOBS — e.g. map host 'upscaleFactor' to the scale param>", "idPath": "<path to the id it returns>" },
     "background_removal": { "tool": "<bg remover>", "idParam": "<image-id param>", "idPath": "<path to the id it returns>" }
   },
   "cameraAngles": { "tool": "<reframe/camera tool>", "idParam": "<image-id param>", "map": { "horizontal": "<param>", "vertical": "<param>", "zoom": "<param>" }, "idPath": "<path to the id it returns>" },
@@ -49,7 +49,8 @@ Target shape (omit any route you can't satisfy with a real tool — do NOT inven
     "poll": "<long-poll status tool?>", "pollIdParam": "<param the poll tool takes the id(s) in?>",
     "status": "<single-snapshot status tool?>", "statusIdParam": "<param the status tool takes the id in?>",
     "pendingField": "<field present in the poll/status response ONLY while still running, e.g. poll_after_seconds>",
-    "statusPath": "<path to a status string in the response, e.g. creations[].status>", "doneValue": "<status value meaning finished, e.g. completed>", "failValue": "<status value meaning failed, e.g. failed>",
+    "statusPath": "<path to a status string in the response, e.g. creations[].status — the granular state like queued/processing the host shows in its progress badge>", "doneValue": "<status value meaning finished, e.g. completed>", "failValue": "<status value meaning failed, e.g. failed>",
+    "etaPath": "<path to a NUMBER of seconds-remaining / retry-after in the poll response, used to pace the progress bar, e.g. poll_after_seconds or expectTime; omit if none>",
     "timeoutParam": "<param?>", "timeoutSeconds": 25,
     "fetch": "<tool that returns the final asset URL?>", "fetchIdParam": "<param the fetch tool takes the id in?>", "urlPath": "<path to the final full-res asset URL in the fetch response, e.g. url>"
   },
@@ -57,7 +58,8 @@ Target shape (omit any route you can't satisfy with a real tool — do NOT inven
 }
 
 Rules:
-- Use EXACT tool names and EXACT param names from the provided tool list.
+- Use EXACT tool names and EXACT param names from the provided tool list. Param
+  names MAY be nested PATHS ("a.b[].c") — see NESTED PARAM PATHS below.
 - For the RESPONSE paths (idPath, urlPath, statusPath, pendingField, …), READ THE
   TOOL'S DESCRIPTION to find where each value lives. If a description says e.g.
   "returns creations[].identifier" or "creations_get → url (full-res)", encode
@@ -72,6 +74,32 @@ Rules:
   that list tool as the route's "modelsListTool" (and the selecting param as
   "modelParam") so the host can enumerate the provider's models. Read the model
   param's description to find which list tool it points to.
+
+- "inputs": for each ROUTE, map the HOST INPUT KNOBS the host can send to the EXACT
+  tool param that accepts them, as an array of objects:
+    [ { "koi": "<host knob name from the list below>", "param": "<EXACT tool param>",
+        "lowercase": <true ONLY if the param expects lowercase tokens like "4k" and
+        the host sends "4K">, "valueMap": { "<host value>": "<tool value>", … }? } ]
+  - Include a knob ONLY if THIS tool actually declares a param for it; omit the rest
+    (a missing knob is correctly dropped at call time).
+  - Use "valueMap" when the host's values differ from the tool's accepted set in a way
+    a simple lowercase can't fix (read the param's enum/description). Otherwise omit it.
+  - Do NOT put prompt / references / the model param here — those have their own fields
+    above. "inputs" is for the remaining generation knobs.
+  The HOST INPUT KNOBS available are listed AFTER the tool list below — they are
+  derived from the host's OWN generate_* schemas (the source of truth for what
+  the host can send). Map only the knobs THIS tool declares a param for.
+
+- NESTED PARAM PATHS — a tool param may live INSIDE an object/array. The tool
+  list gives flattened param PATHS: "a.b[].c" means property c inside the items
+  of array b inside object a. When a param is nested, write the PATH as the
+  value, not a bare name. This applies to EVERY param field: promptParam,
+  modelParam, refsParam, idParam, textParam, audioParam, imageParam, and each
+  inputs[].param. For a references array-of-objects, point refsParam at the
+  ARRAY (e.g. "video.clips[].references") — the host wraps each uploaded
+  reference id into the declared item shape ({type,url}) automatically. A flat
+  tool keeps bare names; only nest when the schema nests.
+
 - Output ONLY the JSON object, no prose.`;
 
 // Second-pass: bind the HOST media catalog (its slugs) to THIS provider's model
@@ -251,19 +279,103 @@ async function _buildModelCoverage(server, client, media, llm) {
   if (Object.keys(coverage).length) media.modelCoverage = coverage;
 }
 
+/**
+ * Flatten a JSON-Schema into LEAF param PATHS so the LLM can see params buried
+ * inside nested objects/arrays (e.g. a video tool's `video.clips[].prompt`) —
+ * not just the top-level keys, which is what hid the structure before and made
+ * the mapper produce a degenerate flat route. "[]" marks descent into array
+ * items. Capped in depth + count so a huge schema can't blow the prompt.
+ */
+function _flattenSchemaLeaves(schema, prefix, out, depth = 0) {
+  if (!schema || typeof schema !== 'object' || depth > 5 || out.length >= 60) return;
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const [k, v] of Object.entries(schema.properties)) {
+      _flattenSchemaLeaves(v, prefix ? `${prefix}.${k}` : k, out, depth + 1);
+    }
+    return;
+  }
+  if ((schema.type === 'array' || schema.items) && schema.items) {
+    const it = schema.items;
+    if (it && it.properties) { _flattenSchemaLeaves(it, `${prefix}[]`, out, depth + 1); return; }
+    const d = (it.description || schema.description || '').slice(0, 90);
+    const en = Array.isArray(it.enum) ? ` enum:[${it.enum.slice(0, 12).join(',')}]` : '';
+    out.push(`${prefix}[] — ${d}${en} (array<${(it && it.type) || 'any'}>)`);
+    return;
+  }
+  const d = (schema.description || '').slice(0, 90);
+  const en = Array.isArray(schema.enum) ? ` enum:[${schema.enum.slice(0, 12).join(',')}]` : '';
+  out.push(`${prefix} — ${d}${en} (${schema.type || 'any'})`);
+}
+
+// Host params that are NOT generation knobs — they have dedicated route fields
+// (prompt/refs/frames) or are routing/meta. Everything else in a generate_*
+// schema is a knob the mapper should offer the LLM. This denylist is the only
+// host-side static bit, and it's about KOI's OWN params (legitimate).
+const _NON_KNOB_PARAMS = new Set([
+  'prompt', 'text', 'title', 'summary', 'label', 'intent', 'actionType',
+  'referenceImages', 'referenceVideos', 'startFrame', 'endFrame',
+  'image', 'images', 'sourceImage', 'maskImage',
+  'shots', 'numShots', 'kind', 'preferQuality', 'characterOrientation',
+  'wait', 'saveTo', 'saveAs', 'background', 'mode',
+]);
+
+/**
+ * Derive the host's generation-knob vocabulary from Koi's OWN generate_* action
+ * schemas — the single source of truth. Adding a knob to generate_video flows
+ * here automatically; no hand-maintained list. Returns { image:[], video:[],
+ * audio:[] } of { koi, type, enum?, description }.
+ */
+async function _hostKnobs() {
+  const pick = async (mod) => {
+    try {
+      const m = await import(mod);
+      const props = (m && m.default && m.default.schema && m.default.schema.properties) || {};
+      const knobs = [];
+      for (const [name, def] of Object.entries(props)) {
+        if (_NON_KNOB_PARAMS.has(name)) continue;
+        const t = def && def.type;
+        if (t === 'string' || t === 'number' || t === 'integer' || t === 'boolean') {
+          knobs.push({
+            koi: name, type: t,
+            enum: Array.isArray(def.enum) ? def.enum : undefined,
+            description: (def.description || '').slice(0, 120),
+          });
+        }
+      }
+      return knobs;
+    } catch { return []; }
+  };
+  const [image, video] = await Promise.all([
+    pick('../../tools/media/generate-image.js'),
+    pick('../../tools/media/generate-video.js'),
+  ]);
+  return { image, video };
+}
+
+/** Render the derived host knobs as a prompt block for the mapper LLM. */
+function _renderHostKnobs(knobs) {
+  const line = (k) => {
+    const en = k.enum ? ` (one of: ${k.enum.join(', ')})` : '';
+    return `    - ${k.koi} [${k.type}]${en}${k.description ? ` — ${k.description}` : ''}`;
+  };
+  const sect = (name, arr) => arr && arr.length ? `  ${name} generate knobs:\n${arr.map(line).join('\n')}` : '';
+  return [
+    'HOST INPUT KNOBS — derived from the host\'s generate_* schemas. Map each to',
+    'the EXACT tool param (nested PATH when needed) only if the tool declares it:',
+    sect('image', knobs.image),
+    sect('video', knobs.video),
+    '  operations (e.g. upscale): upscaleFactor (scale), prompt, creativity, faceEnhancement, outputFormat.',
+  ].filter(Boolean).join('\n');
+}
+
 async function _mapServer(server, client, agent) {
   const hash = toolsetHash(client);
   const tools = (client.tools || []).map(t => {
-    const props = (t.inputSchema && t.inputSchema.properties) || {};
-    // Include each param's description + enum (truncated) so the LLM can spot the
-    // model-selector param (e.g. `mode` → "Model slug from images_models_list")
-    // and the list tool it points to. Plain names alone hid that signal.
-    const params = Object.entries(props).slice(0, 24).map(([k, v]) => {
-      const d = v && typeof v.description === 'string' ? v.description.slice(0, 110) : '';
-      const en = v && Array.isArray(v.enum) ? ` enum:[${v.enum.slice(0, 12).join(',')}]` : '';
-      return (d || en) ? `${k} — ${d}${en}` : k;
-    });
-    return { name: t.name, description: (t.description || '').slice(0, 240), params };
+    // Flatten the FULL schema to leaf paths (not just top-level keys) so the LLM
+    // can map params nested inside objects/arrays.
+    const leaves = [];
+    _flattenSchemaLeaves(t.inputSchema, '', leaves, 0);
+    return { name: t.name, description: (t.description || '').slice(0, 240), params: leaves.slice(0, 60) };
   });
   const validNames = new Set(tools.map(t => t.name));
 
@@ -275,8 +387,9 @@ async function _mapServer(server, client, agent) {
     return null;
   }
 
+  const hostKnobs = _renderHostKnobs(await _hostKnobs());
   const prompt =
-    `${MAP_SPEC}\n\nServer: ${server}\nTools (use these EXACT names and param names):\n${JSON.stringify(tools, null, 2)}`;
+    `${MAP_SPEC}\n\nServer: ${server}\nTools (use these EXACT names and param paths):\n${JSON.stringify(tools, null, 2)}\n\n${hostKnobs}`;
 
   let media = null;
   let rawText = '';

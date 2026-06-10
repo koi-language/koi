@@ -328,7 +328,13 @@ async function searchComposite(params) {
     limit,
     config
   } = params;
-  const queryVec = await embedText(queryText, config);
+  // koi-fork: accept a pre-computed query embedding so the caller can share
+  // ONE embedding across intent classification + composite search instead of
+  // re-embedding here. Falls back to embedding when not supplied (and if a
+  // future re-vendor drops this line, behaviour stays correct, just 1 extra
+  // embed). queryVec dim must match stored vectors; cosine() returns 0 on a
+  // mismatch, so a stale/foreign vector degrades safely rather than throwing.
+  const queryVec = params.queryVec ?? await embedText(queryText, config);
   const sw = intent.spaceWeights;
   const splitW = intent.splitWeights;
   const bins = config.piecewise_bins;

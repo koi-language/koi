@@ -19,6 +19,24 @@ function _looksLikeAction(obj) {
   return Object.keys(obj).some(k => _ACTION_KEYS.has(k));
 }
 
+// Text that is a (malformed) YAML *action* attempt, not genuine prose. When a
+// response fails to parse, we must NOT dump it into the chat as a print — that
+// "vomits the raw YAML". If it carries action structure, throw to force a retry.
+const _YAML_ACTION_LINE = /(?:^|\n)[ \t]*-?[ \t]*(?:actionType|intent|batch|parallel)[ \t]*:/;
+function _looksLikeYamlAction(t) {
+  return typeof t === 'string' && _YAML_ACTION_LINE.test(t);
+}
+
+// A `message` value that itself contains action YAML means a block scalar
+// (`message: |`) swallowed the batch's sibling actions — a model indentation
+// bug that, left alone, prints the whole batch as one giant message and never
+// runs the swallowed actions. Detect it so we can retry instead.
+function _messageSwallowedActions(s) {
+  if (typeof s !== 'string' || s.length < 24) return false;
+  return /\n[ \t]*-?[ \t]*actionType[ \t]*:[ \t]*(?:direct|delegate)\b/.test(s)
+      && /\n[ \t]*-?[ \t]*intent[ \t]*:[ \t]*[A-Za-z]/.test(s);
+}
+
 /**
  * Log a debug message (only when KOI_DEBUG_LLM=1).
  * @private
@@ -113,7 +131,17 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     // YAML coerced prose-with-a-colon ("Note: done.") into a 1-key map. If
     // NONE of the keys look like a real action, it was prose, not a tool
     // call — print the original text instead of throwing on a bogus action.
+    // BUT if the raw text carries action structure (batch:/actionType:/intent:)
+    // it's a MALFORMED action, not prose — throw so the agent retries rather
+    // than vomiting the raw YAML into the chat.
     if (!_looksLikeAction(parsed)) {
+      if (_looksLikeYamlAction(_rawCleaned)) {
+        throw new Error(
+          `Your YAML parsed but isn't a valid action (likely a block-scalar/indentation slip). ` +
+          `Re-emit a clean action — every action key (actionType/intent) at the same indent, and ` +
+          `multi-line values under "message: |" / "prompt: |" indented DEEPER than the key.`
+        );
+      }
       return normalizeReactiveAction({
         actionType: 'direct', intent: 'print', message: _rawCleaned.trim(),
       });
@@ -186,7 +214,8 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
       // action — that still throws to retry, so we never silently swallow a
       // half-formed tool call (the exact anti-pattern the user banned).
       const _trimmed = cleaned.trim();
-      if (_trimmed.length > 0 && !_trimmed.startsWith('{') && !_trimmed.startsWith('[')) {
+      if (_trimmed.length > 0 && !_trimmed.startsWith('{') && !_trimmed.startsWith('[')
+          && !_looksLikeYamlAction(_trimmed)) {
         return normalizeReactiveAction({
           actionType: 'direct',
           intent: 'print',
@@ -309,6 +338,18 @@ export function normalizeBatchItem(item) {
  * @returns {object}
  */
 export function normalizeReactiveAction(parsed) {
+  // Guard: a `message`/`text` that itself contains action YAML means a block
+  // scalar swallowed the batch's sibling actions (model indentation bug).
+  // Throw so the agent retries instead of printing the whole batch as one
+  // giant message (and never running the swallowed actions).
+  if (parsed && typeof parsed === 'object'
+      && (_messageSwallowedActions(parsed.message) || _messageSwallowedActions(parsed.text))) {
+    throw new Error(
+      `A multi-line value swallowed sibling actions — your "message: |" block was indented so the ` +
+      `next action fell inside it. Re-emit the batch with each "- actionType:" at the SAME indent and ` +
+      `every block-scalar line indented DEEPER than its key.`
+    );
+  }
   // Strip compliance fields (batch-level or legacy inline)
   if (parsed.user_request_compliance) {
     if (parsed.user_request_compliance !== 'will_do') parsed._refused = true;

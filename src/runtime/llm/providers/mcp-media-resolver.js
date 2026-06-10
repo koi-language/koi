@@ -77,3 +77,109 @@ export function activeFor(kind) {
   } catch { /* registry not ready / any error → treat as "no MCP" → backend */ }
   return null;
 }
+
+// ── Dynamic tool-param descriptors (so the GUI composes panels from the ACTIVE
+//    provider instead of a hardcoded set) ───────────────────────────────────
+
+// Native (gateway/Fal) upscaler knobs — Braxil's default set. Names match the
+// `upscale_image` tool params the GUI emits; the GUI localises by name.
+const NATIVE_UPSCALE_FIELDS = [
+  { name: 'upscaleFactor', type: 'enum', options: [2, 3, 4], unit: 'x', default: 2 },
+  { name: 'prompt', type: 'string', default: '' },
+  { name: 'creativity', type: 'number', min: 0, max: 1, step: 0.05, default: 0.3 },
+  { name: 'faceEnhancement', type: 'bool', default: true },
+];
+
+/** Scale options (as numbers) from an MCP upscale tool's scale param schema. */
+function _scaleOptionsFromSchema(client, route) {
+  const tool = client && (client.tools || []).find((t) => t.name === route.tool);
+  const props = tool && tool.inputSchema && tool.inputSchema.properties;
+  const spec = props && props[route.scaleParam || 'scale'];
+  if (spec && Array.isArray(spec.enum) && spec.enum.length) {
+    const nums = spec.enum
+      .map((e) => parseInt(String(e).replace(/[^\d]/g, ''), 10))
+      .filter((n) => !Number.isNaN(n) && n > 0);
+    if (nums.length) return [...new Set(nums)].sort((a, b) => a - b);
+  }
+  if (spec && (spec.type === 'number' || spec.type === 'integer')) {
+    const lo = Math.max(1, Math.floor(spec.minimum ?? 2));
+    const hi = Math.min(8, Math.floor(spec.maximum ?? 4));
+    const out = [];
+    for (let n = lo; n <= hi; n++) out.push(n);
+    if (out.length) return out;
+  }
+  return [2, 4]; // couldn't introspect → safe default for an MCP upscaler
+}
+
+/**
+ * Describe the upscale panel's controls for the ACTIVE image-upscaling provider,
+ * so the GUI composes the popover dynamically instead of showing Braxil's fixed
+ * knobs. When a media MCP owns upscaling, only the knobs IT supports are returned
+ * — scale with its REAL options (e.g. Magnific → [2,4], no phantom 3x), plus
+ * prompt/creativity/face ONLY if the map wires them. No MCP → the native set.
+ * Field `name`s match the `upscale_image` params the GUI emits; the GUI localises.
+ * @returns {{ provider: string, label?: string, fields: Array<object> }}
+ */
+/**
+ * Status of the media MCP that's replacing native generation, for the GUI's
+ * footer indicator. Returns:
+ *   - { server, label, kinds, state: 'active' }     — a media MCP is live and
+ *     replacing generation for `kinds` (image/video/audio).
+ *   - { server, label, kinds: [], state: 'connecting' } — a server the user
+ *     enabled for media is registered but its tools aren't loaded yet.
+ *   - null — no media MCP in play (native generation).
+ */
+export function mediaMcpStatus() {
+  try {
+    let server = null;
+    let label = null;
+    const kinds = [];
+    for (const kind of ['image', 'video', 'audio']) {
+      const a = activeFor(kind);
+      if (!a) continue;
+      if (!server) { server = a.server; label = a.label; }
+      if (a.server === server) kinds.push(kind);
+    }
+    if (server) return { server, label, kinds, state: 'active' };
+
+    // Not active yet — is a media-enabled server still COMING UP? That means
+    // either its tools aren't loaded (reconnecting) OR they are but the media
+    // map needs (re)generating (e.g. after a map-version bump, or right after
+    // connect before the first generation triggers the LLM mapper). Both are
+    // transient "connecting" states, not "active".
+    for (const [name, client] of mcpRegistry.entries()) {
+      if (!client) continue;
+      const enabledMedia = (client.media && typeof client.media === 'object') || getDecision(name) === 'enabled';
+      if (!enabledMedia) continue;
+      const ready = (Array.isArray(client.tools) && client.tools.length > 0) || client.initialized;
+      const hasMap = (client.media && typeof client.media === 'object') || !!currentMap(name, client);
+      if (!ready || !hasMap) {
+        const label = (client.media && client.media.label) || name;
+        return { server: name, label, kinds: [], state: 'connecting' };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function describeUpscaleParams() {
+  try {
+    const mcp = activeFor('image');
+    const route = mcp && mcp.media && mcp.media.operations && mcp.media.operations.upscale;
+    if (!mcp || !route) return { provider: 'native', fields: NATIVE_UPSCALE_FIELDS };
+
+    const client = mcpRegistry.get(mcp.server);
+    const options = _scaleOptionsFromSchema(client, route);
+    const fields = [{ name: 'upscaleFactor', type: 'enum', options, unit: 'x', default: options[0] }];
+    // Extra knobs only if the MCP map actually wires them for upscale (Magnific
+    // wires none → they stay hidden instead of being sent and ignored).
+    if (route.promptParam) fields.push({ name: 'prompt', type: 'string', default: '' });
+    if (route.creativityParam) fields.push({ name: 'creativity', type: 'number', min: 0, max: 1, step: 0.05, default: 0.3 });
+    if (route.faceParam) fields.push({ name: 'faceEnhancement', type: 'bool', default: true });
+    return { provider: `mcp:${mcp.server}`, label: mcp.label, fields };
+  } catch {
+    return { provider: 'native', fields: NATIVE_UPSCALE_FIELDS };
+  }
+}

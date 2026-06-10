@@ -21,7 +21,12 @@ import os from 'os';
 // so previously-cached maps are invalidated and re-generated with the new spec.
 // v3: added per-route `modelParam`/`modelsListTool` + top-level `modelCoverage`
 // (catalog-slug → external model id) for picker→MCP routing.
-const MAP_VERSION = 3;
+// v4: added per-route `inputs` (host knob → tool param + value transform), so the
+// input mapping is data-driven from the map, not hand-listed in mcp-media.js.
+// v5: param fields may be NESTED PATHS ("video.clips[].prompt") so structured
+// tools (e.g. Magnific video_generate) map correctly; host-knob vocabulary is
+// now derived from Koi's generate_* schemas and the static fallback was removed.
+const MAP_VERSION = 5;
 
 function _dir() {
   return path.join(os.homedir(), '.koi', 'mcp-media-maps');

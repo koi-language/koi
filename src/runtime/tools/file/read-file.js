@@ -17,6 +17,7 @@ import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
 import { creationDirHit, creationDirBlockedError } from '../_creation-dir-guard.js';
 import { channel } from '../../io/channel.js';
+import { markRead } from '../../state/read-tracker.js';
 
 async function extractPdfPageImages(page, pdfjsLib) {
   const opList = await page.getOperatorList();
@@ -775,6 +776,10 @@ export default {
     }
 
     const stat = fs.statSync(resolvedPath);
+    // Record that the agent has actually LOOKED at this file, so media tools can
+    // enforce read-before-use (you can't animate / reference an image you never
+    // opened). Files only — listing a directory isn't "reading" an image.
+    if (!stat.isDirectory()) markRead(resolvedPath);
     if (stat.isDirectory()) {
       // Creation-dir guard: LISTING a shared `.koi` creation dir
       // (timelines/storyboards/images/videos/renders) is forbidden — it

@@ -27,6 +27,7 @@ import path from 'path';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { channel } from '../../io/channel.js';
+import { markRead } from '../../state/read-tracker.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
 import { slugifyDescription, buildDescribedFilename } from './util/slugify-description.js';
@@ -440,6 +441,35 @@ const generateVideoAction = {
     const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
     const _guard = await requireToolInfoFirst('generate_video', agent);
     if (_guard) return _guard;
+
+    // ── Read-before-use guard ────────────────────────────────────────
+    // You may NOT animate / reference a LOCAL image you haven't `read_file`'d
+    // first this session — read_file is how you actually LOOK at the image
+    // before committing it to a (costly) generation. Blind use of a path
+    // grabbed off the working area is the reported bug (the agent fired
+    // generate_video on a storyboard sheet it never opened and hallucinated
+    // the scene). @mention handles, att-N attachments and URLs are exempt
+    // (deliberate named references, not a guessed path).
+    {
+      const { wasRead, isGatedLocalPath } = await import('../../state/read-tracker.js');
+      const imgInputs = [
+        ['startFrame', action.startFrame],
+        ['endFrame', action.endFrame],
+        ...(Array.isArray(action.referenceImages)
+          ? action.referenceImages.map((r, i) => [`referenceImages[${i}]`, r]) : []),
+      ];
+      const unread = imgInputs.filter(([, v]) => isGatedLocalPath(v) && !wasRead(v));
+      if (unread.length) {
+        return {
+          success: false,
+          error:
+            'read_file required first — you cannot animate or reference an image you have not read this session. ' +
+            'Call read_file on each of these BEFORE generate_video, then retry:\n  ' +
+            unread.map(([f, v]) => `${f}: ${v}`).join('\n  ') +
+            '\n(@mention handles, att-N attachments and http(s) URLs are exempt.)',
+        };
+      }
+    }
 
     // ── Strip agent-supplied `model` ─────────────────────────────────
     // The auto-picker (pickVideoModel + the live catalog) is the SOLE
@@ -1816,6 +1846,7 @@ const generateVideoAction = {
     }
 
     reportProgress?.(1, 'Done');
+    if (savedTo) markRead(savedTo); // the agent created it → it "knows" it (read-before-use)
     return {
       success: true,
       provider: resolved.provider,
@@ -1945,14 +1976,24 @@ export async function _pollUntilTerminal(instance, submitted, { abortSignal, rep
     // Time-elapsed driven progress: 0.05..0.92 reserved for polling.
     if (reportProgress) {
       const elapsed = Date.now() - t0;
-      // With a finite deadline, scale linearly to it. With no deadline,
-      // ease toward (but never reach) 0.92 on a half-life curve so the
-      // bar still advances on long, open-ended waits.
-      const frac = hasDeadline
-        ? Math.min(1, elapsed / Math.max(1, timeoutMs))
-        : 1 - Math.pow(0.5, elapsed / (5 * 60 * 1000));
+      const elapsedS = elapsed / 1000;
+      // Pace the bar by the provider's own ETA when it reports one
+      // (`etaSeconds`, surfaced by the MCP getStatus from the map's etaPath) —
+      // far more accurate than a guessed curve. Else: linear to the deadline,
+      // or a half-life ease on open-ended waits.
+      const eta = Number(result.etaSeconds);
+      const frac = (Number.isFinite(eta) && eta > 0)
+        ? elapsedS / (elapsedS + eta)
+        : (hasDeadline
+          ? Math.min(1, elapsed / Math.max(1, timeoutMs))
+          : 1 - Math.pow(0.5, elapsed / (5 * 60 * 1000)));
       const pct = Math.min(0.92, 0.05 + 0.87 * frac);
-      reportProgress(pct, `Waiting for provider… ${Math.round(elapsed / 1000)}s`);
+      // Show the provider's real status ("queued" → "processing") when it gives
+      // one, instead of a flat "Waiting…", so the badge updates.
+      const rs = typeof result.rawStatus === 'string' && result.rawStatus
+        ? result.rawStatus.charAt(0).toUpperCase() + result.rawStatus.slice(1)
+        : 'Waiting for provider…';
+      reportProgress(pct, `${rs} ${Math.round(elapsedS)}s`);
     }
 
     if (hasDeadline && Date.now() + pollMs > deadline) {
