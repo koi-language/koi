@@ -29,6 +29,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { sweepSessionIntoPalace } from './palace.js';
 
 const DB_DIR = path.join(os.homedir(), '.koi', 'media-library', 'vector-cache');
 const TABLE = 'conversations';
@@ -355,6 +356,22 @@ async function _runIndex(sessionId) {
   entry.inflight = true;
   try {
     const turns = _readDialogueTurns(entry.sessionDir);
+    // Palace sweep FIRST — before the summary guards below. The palace has
+    // its own watermark-based idempotency, and gating it behind the
+    // MIN_TURNS_BETWEEN_EMBEDS guard would starve drawer ingestion whenever
+    // the session summary is fresh. Awaited inside this inflight window so
+    // flushConversationIndex() at session close also flushes the palace.
+    try {
+      await sweepSessionIntoPalace({
+        sessionId,
+        sessionDir: entry.sessionDir,
+        projectRoot: entry.projectRoot || '',
+        llmProvider: entry.llmProvider,
+        turns,
+      });
+    } catch (err) {
+      process.stderr.write(`[palace] sweep ${sessionId} failed: ${err.message}\n`);
+    }
     if (turns.length < 2) return; // Nothing meaningful to summarise yet.
     const turnCount = turns.length;
     if (turnCount - entry.lastEmbeddedCount < MIN_TURNS_BETWEEN_EMBEDS) {

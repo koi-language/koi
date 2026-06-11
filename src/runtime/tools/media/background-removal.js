@@ -18,6 +18,8 @@ import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import asyncCapable from '../_async-capable.js';
 import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
+import { exportMediaCopy } from './util/export-copy.js';
+import { downloadAssetToFile, undownloadableResult } from '../../io/download-asset.js';
 
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
@@ -47,7 +49,7 @@ const backgroundRemovalAction = {
       },
       saveTo: {
         type: 'string',
-        description: 'Directory path where the result should be saved. Mirrors generate_image. If omitted, the image lands in ~/.koi/images/ (shared with generate_image). Filename is auto-generated (bgremove_<timestamp>_<i>.<ext>).',
+        description: 'Where to place a COPY of the result (a directory, or a full .png/.webp file path). The original always stays in ~/.koi/images/ so the creations drawer finds it. Mirrors generate_image. images[].savedTo is the original; images[].exportedTo is the copy at your saveTo.',
       },
     },
     required: ['image'],
@@ -170,9 +172,9 @@ const backgroundRemovalAction = {
       return { success: false, provider: resolved.provider, model: result.model, error: 'Background removal returned no images.' };
     }
 
-    const saveDir = typeof action.saveTo === 'string' && action.saveTo.trim()
-      ? path.resolve(action.saveTo.trim())
-      : path.join(os.homedir(), '.koi', 'images');
+    // ORIGINAL always in ~/.koi/images (media library / creations drawer
+    // indexes it); a caller saveTo gets a COPY before the return.
+    const saveDir = path.join(os.homedir(), '.koi', 'images');
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = action.outputFormat === 'webp' ? 'webp' : 'png';
@@ -181,6 +183,7 @@ const backgroundRemovalAction = {
     // the gallery / Finder ordering (e.g. `mouse-with-cheese-bgremoved-<ts>_0.png`).
     const slug = slugFromSourcePath(action.image, 'bgremoved');
     const saved = [];
+    let lastDl = null; // classified download failure (network|http) for the no-asset path
     for (let i = 0; i < result.images.length; i++) {
       const img = result.images[i];
       const filename = buildDescribedFilename({ slug, fallback: 'bgremoved', index: i, ext: outExt });
@@ -191,23 +194,23 @@ const backgroundRemovalAction = {
         saved.push({ savedTo: filePath });
         channel.log('image', `Saved: ${filePath}`);
       } else if (img.url) {
-        try {
-          const resp = await fetch(img.url);
-          if (resp.ok) {
-            const buffer = Buffer.from(await resp.arrayBuffer());
-            fs.writeFileSync(filePath, buffer);
-            saved.push({ savedTo: filePath, url: img.url });
-            channel.log('image', `Downloaded and saved: ${filePath} (${(buffer.length / 1024).toFixed(0)}KB)`);
-          } else {
-            channel.log('image', `Failed to download ${img.url}: HTTP ${resp.status}`);
-          }
-        } catch (dlErr) {
-          channel.log('image', `Failed to download ${img.url}: ${dlErr.message}`);
+        const dl = await downloadAssetToFile(img.url, filePath, { kind: 'image' });
+        if (dl.ok) {
+          saved.push({ savedTo: filePath, url: img.url });
+        } else {
+          lastDl = dl;
         }
       }
     }
 
     if (saved.length === 0) {
+      // Transport/DNS failure (the asset exists, retry the download) vs. no data.
+      if (lastDl) {
+        return undownloadableResult({
+          tool: 'remove_background', provider: resolved.provider, model: result.model,
+          url: (result.images.find((im) => im.url) || {}).url || '', dl: lastDl, noun: 'image',
+        });
+      }
       return { success: false, provider: resolved.provider, model: result.model, error: 'Background removal result had no usable image data (no b64 or downloadable url).' };
     }
 
@@ -243,6 +246,16 @@ const backgroundRemovalAction = {
         });
       }
     } catch { /* lineage is best-effort */ }
+
+    // Export a COPY to the caller's saveTo (canonical original already
+    // registered above). `savedTo` stays the original; `exportedTo` is the copy.
+    if (action.saveTo) {
+      saved.forEach((img, i) => {
+        if (!img.savedTo) return;
+        const copy = exportMediaCopy(img.savedTo, action.saveTo, { index: i, logTag: 'image' });
+        if (copy) img.exportedTo = copy;
+      });
+    }
 
     return {
       success: true,

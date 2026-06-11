@@ -49,7 +49,7 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
       },
       options: {
         type: 'array',
-        description: 'Optional array of choices for interactive menu. Each item is either a string (e.g. "Yes") or an object { title, value?, description?, freeText? }. Set freeText:true on a choice to show an inline text input when selected (e.g. { title: "Other", freeText: true }).'
+        description: 'Optional array of choices for interactive menu. Each item is either a string (e.g. "Yes") or an object { title (or label), value?, description?, freeText? } — `title` and `label` are interchangeable for the display text. Set freeText:true on a choice to show an inline text input when selected (e.g. { title: "Other", freeText: true }).'
       },
       prompt: {
         type: 'string',
@@ -179,7 +179,16 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
       const _multiSelect = action.meta?.multiSelect === true;
       const value = await channel.select(cleanQuestion || question, options.map((opt) => {
         if (typeof opt === 'string') return { title: opt, value: opt };
-        return { title: opt.title || opt.value || '', value: opt.value || opt.title || '', description: opt.description || null, freeText: opt.freeText || false };
+        // Accept BOTH `title` and `label` for the display text — the model very
+        // often emits { label, value } (the common UI convention). Without
+        // `label` in the chain, title fell back to `value`, so the user saw the
+        // raw value ("baoyu") instead of the human label. Prefer title→label→value.
+        return {
+          title: opt.title || opt.label || opt.value || '',
+          value: opt.value || opt.title || opt.label || '',
+          description: opt.description || null,
+          freeText: opt.freeText || false,
+        };
       }), 0, { meta: { allowFreeText: true, multiSelect: _multiSelect } });
       return { answer: value || options[0] };
     }

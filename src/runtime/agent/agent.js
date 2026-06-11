@@ -2448,7 +2448,7 @@ export class Agent {
           if (session._consecutiveNetworkErrors >= 3) {
             channel.log('agent', `${this.name}: Gateway unreachable (${session._consecutiveNetworkErrors} consecutive network failures) — asking user instead of retrying`);
             const _s = globalThis.__koiStrings || {};
-            channel.print(`\x1b[33m⚠ ${_s.networkDown || 'Network or gateway appears to be down. Check your connection or try again later.'}\x1b[0m`);
+            channel.print(`\x1b[31m⚠ ${_s.networkDown || 'Network or gateway appears to be down. Check your connection or try again later.'}\x1b[0m`);
             const _hasPromptUser = typeof Agent._cliHooks?.onBusy === 'function';
             if (_hasPromptUser) {
               Agent._cliHooks?.onBusy?.(false);

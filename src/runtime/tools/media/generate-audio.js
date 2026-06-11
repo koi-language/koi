@@ -20,40 +20,12 @@ import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { findVoiceByName } from '../../state/voice-registry.js';
 import { _uploadVideoRef } from './generate-video.js';
+import { exportMediaCopy } from './util/export-copy.js';
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
-
-/**
- * Redirect a per-file `saveTo` that points INSIDE a workflow workspace
- * (`<root>/.koi/workflows/<run_id>/...`) to the canonical home for
- * audio (`~/.koi/audio/<basename>`). Workflow workspaces are
- * ephemeral; anything persisted there silently disappears on cleanup,
- * and timeline / chat references break days later. Mirrors the same
- * guard in generate-video.js's `_canonicalKoiSaveDir`. Returns the
- * input unchanged when not inside a workspace.
- */
-function _canonicalAudioSavePath(resolvedFilePath) {
-  if (typeof resolvedFilePath !== 'string' || !resolvedFilePath) return resolvedFilePath;
-  const segs = resolvedFilePath.split(path.sep);
-  let inWorkflowWorkspace = false;
-  for (let i = 0; i + 1 < segs.length; i++) {
-    if (segs[i] === '.koi' && segs[i + 1] === 'workflows') {
-      inWorkflowWorkspace = true;
-      break;
-    }
-  }
-  if (!inWorkflowWorkspace) return resolvedFilePath;
-  const canonical = path.join(os.homedir(), '.koi', 'audio', path.basename(resolvedFilePath));
-  channel.log(
-    'audio',
-    `saveTo "${resolvedFilePath}" is inside a workflow workspace (ephemeral); ` +
-    `redirecting to "${canonical}" so the audio survives workspace cleanup.`,
-  );
-  return canonical;
-}
 
 const generateAudioAction = {
   type: 'generate_audio',
@@ -79,7 +51,7 @@ const generateAudioAction = {
       voice:        { type: 'string', description: 'Voice: preset name (alloy, echo, fable, onyx, nova, shimmer for OpenAI; provider-specific names for ElevenLabs / MiniMax) OR a cloned-voice name registered via create_voice. Default: alloy.' },
       outputFormat: { type: 'string', description: 'Audio format: mp3, opus, aac, flac, wav, pcm (default: mp3)' },
       speed:        { type: 'number', description: 'Speed multiplier: 0.25 to 4.0 (default: 1.0)' },
-      saveTo:       { type: 'string', description: 'File path to save the generated audio (required for speech and sfx modes)' },
+      saveTo:       { type: 'string', description: 'File path where a COPY of the generated audio is placed (required for speech, sfx and music modes). The ORIGINAL is always kept in ~/.koi/audio/ so the creations drawer finds it: the response `savedTo` is that original and `exportedTo` is the copy at your path.' },
       emotion:      { type: 'string', description: 'Voice emotion (MiniMax / ElevenLabs only): happy, sad, angry, calm, surprised, disgusted, fearful, neutral.' },
       pitch:        { type: 'number', description: 'Pitch offset in semitones (MiniMax: -12..12). Ignored by OpenAI.' },
       volume:       { type: 'number', description: 'Volume multiplier (MiniMax: 0..10, default 1.0). Ignored by OpenAI.' },
@@ -217,10 +189,13 @@ const generateAudioAction = {
       });
 
       // Save to disk
-      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
-      const dir = path.dirname(savePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
+      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
+      const requestedSaveTo = path.resolve(action.saveTo);
+      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
+      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
 
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
@@ -255,6 +230,7 @@ const generateAudioAction = {
         model: resolved.model,
         mode: 'speech',
         savedTo: savePath,
+        ...(exportedTo ? { exportedTo } : {}),
         format: result.format,
         fileSize: result.audio.length,
         usage: result.usage,
@@ -325,10 +301,13 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
-      const dir = path.dirname(savePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
+      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
+      const requestedSaveTo = path.resolve(action.saveTo);
+      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
+      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
       try {
@@ -361,6 +340,7 @@ const generateAudioAction = {
         model: resolved.model,
         mode: 'sfx',
         savedTo: savePath,
+        ...(exportedTo ? { exportedTo } : {}),
         format: result.format,
         fileSize: result.audio.length,
         usage: result.usage,
@@ -399,10 +379,13 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      const savePath = _canonicalAudioSavePath(path.resolve(action.saveTo));
-      const dir = path.dirname(savePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
+      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
+      const requestedSaveTo = path.resolve(action.saveTo);
+      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
+      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
       try {
@@ -431,6 +414,7 @@ const generateAudioAction = {
         model: resolved.model,
         mode: 'music',
         savedTo: savePath,
+        ...(exportedTo ? { exportedTo } : {}),
         format: result.format,
         fileSize: result.audio.length,
         usage: result.usage,

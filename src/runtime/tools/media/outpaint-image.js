@@ -117,7 +117,7 @@ const outpaintImageAction = {
       },
       saveTo: {
         type: 'string',
-        description: 'Directory path where the result should be saved. If omitted, the image lands in ~/.koi/images/.',
+        description: 'Where to place a COPY of the result (a directory, or a full image file path). The original always stays in ~/.koi/images/ (images[].savedTo); the copy at your saveTo is images[].exportedTo.',
       },
     },
     required: ['image'],

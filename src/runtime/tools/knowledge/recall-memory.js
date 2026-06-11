@@ -26,6 +26,7 @@ import path from 'path';
 import os from 'os';
 import * as memory from '../../memory/index.js';
 import { searchConversations } from '../../state/conversations.js';
+import { searchPalace, countPalaceDrawers } from '../../state/palace.js';
 
 /** Resolve a conversation row to its verbatim transcript path. */
 function _dialoguePath(row) {
@@ -196,25 +197,63 @@ export default {
     // index (not the vault — dumping raw transcripts there would drown the
     // curated notes), but recall_memory is the SINGLE recall surface, so we
     // search it here too. Each match carries a `dialoguePath` the agent can
-    // `read_file` for the VERBATIM transcript. ──
+    // `read_file` for the VERBATIM transcript.
+    //
+    // Primary engine: the conversation PALACE — per-exchange verbatim
+    // drawers (vector + BM25 + RRF), so the agent gets the literal text of
+    // the matching exchange, not a lossy session summary. Falls back to the
+    // legacy session-summary search when the palace has no rows yet (fresh
+    // install, backfill still running) or no verbatim hit. ──
     let conversations = [];
     if (action.includeConversations !== false) {
+      const projectRoot = action.allProjects ? null : (process.env.KOI_PROJECT_ROOT || null);
+      let drawerCount = 0;
       try {
-        const rows = await searchConversations({
-          query,
-          projectRoot: action.allProjects ? null : (process.env.KOI_PROJECT_ROOT || null),
-          k: Math.min(_limit, 5),
-          llmProvider: agent?.llmProvider,
-        });
-        conversations = (rows || [])
-          .map((r) => ({
-            sessionId: r.sessionId,
-            title: r.title || '',
-            summary: r.summary || '',
-            dialoguePath: _dialoguePath(r),
-          }))
-          .filter((c) => c.dialoguePath);
-      } catch { /* conversation index unavailable — best-effort */ }
+        drawerCount = agent?.llmProvider ? await countPalaceDrawers(projectRoot) : 0;
+        if (drawerCount > 0) {
+          const hits = await searchPalace({
+            query,
+            projectRoot,
+            k: Math.min(_limit, 5),
+            llmProvider: agent.llmProvider,
+          });
+          conversations = (hits || [])
+            .map((h) => ({
+              sessionId: h.sessionId,
+              title: h.title || '',
+              summary: h.snippet || '', // verbatim excerpt of the matching exchange
+              room: h.room || '',
+              ts: h.ts || 0,
+              dialoguePath: h.dialoguePath || null,
+            }))
+            .filter((c) => c.dialoguePath);
+        }
+      } catch { /* palace unavailable — fall through to legacy */ }
+      if (conversations.length === 0) {
+        try {
+          const rows = await searchConversations({
+            query,
+            projectRoot,
+            k: Math.min(_limit, 5),
+            llmProvider: agent?.llmProvider,
+          });
+          conversations = (rows || [])
+            .map((r) => ({
+              sessionId: r.sessionId,
+              title: r.title || '',
+              summary: r.summary || '',
+              dialoguePath: _dialoguePath(r),
+            }))
+            .filter((c) => c.dialoguePath);
+          process.stderr.write(
+            `[recall_memory] conversations via LEGACY summary search (palace: ${drawerCount} drawer(s), 0 hits) → ${conversations.length} result(s)\n`,
+          );
+        } catch { /* conversation index unavailable — best-effort */ }
+      } else {
+        process.stderr.write(
+          `[recall_memory] conversations via PALACE (${drawerCount} drawer(s) in wing) → ${conversations.length} verbatim hit(s)\n`,
+        );
+      }
     }
 
     // ── 3. One response: notes + conversations. ──
@@ -228,7 +267,7 @@ export default {
     if (vaultResults.length === 0 && conversations.length === 0) {
       out.message = 'Nothing matched — no vault note and no past conversation for this query. Do NOT disk-search blindly; ask the user or proceed.';
     } else if (conversations.length > 0) {
-      out.note = 'Past conversations matched — `read_file` a `dialoguePath` to read that conversation VERBATIM and work from the raw transcript.';
+      out.note = 'Past conversations matched — each `summary` is a VERBATIM excerpt of the matching exchange (with its topic `room` when available); `read_file` the `dialoguePath` for the full raw transcript.';
     }
     return out;
   },

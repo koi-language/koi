@@ -12,17 +12,19 @@ import path from 'path';
 export default {
   type: 'show_result',
   intent: 'show_result',
-  description: 'Present a result to the user — a file, image, video, URL, or timeline. The UI opens it in the most appropriate way (new tab, preview, editor, etc). Use when you want to proactively surface a result instead of waiting for the user to click.',
-  instructions: `Use show_result when the main output of a task is a file, image, video, URL, or timeline that the user should see immediately.
+  description: 'Open something in the user\'s work area (the panel beside the chat) — a file (.md/.txt/.pdf/.docx/.html/code), image, video, URL, or timeline. The UI picks the right viewer/editor by extension. THIS is how you let the user SEE a file: reading a file loads it into YOUR context only, it does NOT show it to the user. You can pass just a `path` (or `url`) — the type is inferred.',
+  instructions: `Use show_result whenever the user should SEE something on disk or on the web — both when YOU produced it and when the user asks to view it.
 
-Examples:
-- After generating an image: show_result with resourceType=image and the path
-- After generating a video: show_result with resourceType=video and the path
-- After creating/modifying a file: show_result with resourceType=file and the path
-- When presenting a webpage as a result: show_result with resourceType=url
-- After assembling a timeline (create_timeline + add_clip_to_timeline calls) and BEFORE rendering: show_result with resourceType=timeline and timelineId — opens the timeline editor so the user can preview the cut, scrub, mute tracks, etc.
+ALWAYS call it (don't paste content into chat instead) when:
+- The user asks to SEE / SHOW / OPEN / VIEW / "muéstrame" / "enséñame" / "ábreme" a file that exists (a .md report, a document, "el guion", "la secuencia", "los correos"…) → show_result resourceType=file + absolute path. read_file does NOT show it to the user.
+- You created or modified a file the user wants to read → show_result resourceType=file + path.
+- After generating an image / video → show_result with the path (type is auto-detected).
+- Presenting a webpage as a result → show_result resourceType=url.
+- After assembling a timeline (create_timeline + add_clip_to_timeline) and BEFORE rendering → show_result resourceType=timeline + timelineId (opens the editor to preview/scrub/mute).
 
-Do NOT use for every file path mentioned in a response — only for the primary result(s) the user is expected to see.`,
+You usually don't need read_file first — if you have the path, call show_result directly. Passing just \`path\` works; resourceType is optional.
+
+Do NOT use for every file path mentioned in passing — only the primary result(s) the user is expected to see.`,
   thinkingHint: 'Presenting result',
   permission: null,
   hidden: () => process.env.KOI_EXIT_ON_COMPLETE === '1',
@@ -65,10 +67,26 @@ Do NOT use for every file path mentioned in a response — only for the primary 
 
   async execute(action) {
     // Accept several field names the LLM might use.
-    const resourceType = action.resourceType || action.kind || action.mediaType;
-    let resolvedPath = action.path;
+    let resourceType = action.resourceType || action.kind || action.mediaType;
+    let resolvedPath = action.path || action.file || action.filePath;
     const url = action.url;
     const title = action.title;
+
+    // Be forgiving: when the agent passes just a path (or url) without a
+    // resourceType, infer it. The GUI routes any 'file' by extension anyway —
+    // .md/.pdf/.txt/.html/.docx all open in their proper viewer — so the only
+    // thing inference buys is not failing the call. Image/video get their
+    // dedicated types so the inline chat preview is right.
+    if (!resourceType) {
+      if (resolvedPath) {
+        const ext = path.extname(resolvedPath).toLowerCase();
+        if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif', '.heic'].includes(ext)) resourceType = 'image';
+        else if (['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'].includes(ext)) resourceType = 'video';
+        else resourceType = 'file';
+      } else if (url) {
+        resourceType = 'url';
+      }
+    }
 
     if (!resourceType) {
       return { success: false, error: 'Missing "resourceType" field (file|image|video|url|timeline)' };

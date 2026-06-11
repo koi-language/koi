@@ -22,6 +22,7 @@ import { channel } from '../../io/channel.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { absolutizeMediaRefs } from './_absolutize-media-ref.js';
 import { slugifyDescription, buildDescribedFilename } from './util/slugify-description.js';
+import { exportMediaCopy } from './util/export-copy.js';
 import {
   computeAspectCapGeometry,
   padImageBuffer,
@@ -29,6 +30,7 @@ import {
 } from './_pad-and-recover.js';
 import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
 import { wasRead, isGatedLocalPath, markRead } from '../../state/read-tracker.js';
+import { fetchAssetBuffer, undownloadableResult } from '../../io/download-asset.js';
 
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
@@ -155,7 +157,7 @@ const generateImageAction = {
         }
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
-      saveTo:          { type: 'string', description: 'Directory path to save generated images. If omitted, images are returned as base64.' },
+      saveTo:          { type: 'string', description: 'Where to place a COPY of the generated image(s). Either a DIRECTORY (a filename is minted inside it) OR a full FILE path ending in an image extension (.png/.jpg/.webp) — in that case the first image is copied to exactly that path. The ORIGINAL is always kept in ~/.koi/images (so the creations drawer always finds it): images[].savedTo is that original and images[].exportedTo is the copy at your saveTo. Prefer an absolute path; relative paths resolve against cwd. If omitted, only the ~/.koi/images original is produced.' },
       summary:         { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari hero shot for video ad opening", "Burrow front view, 9:16, used in storyboard sheet 2". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
       metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover — for example, when an image is part of a multi-step pipeline that another tool / skill later consumes, the upstream call records the source artefact path here so the downstream stage can re-attach context. **The skill / workflow you are operating under is the source of truth for which metadata keys are required for each call shape** — read its instructions. If a contract is violated (a required key is missing), the tool returns a soft warning in the result alongside `success: true`. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
       cameraAngles: {
@@ -1339,42 +1341,38 @@ const generateImageAction = {
     }
 
     // Always save images to disk — persistent dir so they survive across sessions
+    // Track the last DOWNLOAD failure (classified by `fetchAssetBuffer`) so we
+    // can tell a local connectivity/DNS problem (the asset exists on the
+    // provider, WE couldn't reach it) apart from a real failure (HTTP 4xx/5xx).
+    // They need opposite recoveries: a network error → retry the DOWNLOAD, never
+    // regenerate; an HTTP error → the result is genuinely unusable.
+    let lastDl = null; // classified failure from fetchAssetBuffer (network|http)
     if (result.images?.length) {
+      // The ORIGINAL always lands in the persistent ~/.koi/images repo so it
+      // survives across sessions AND the media library / creations drawer
+      // always indexes it. A caller-supplied saveTo gets a COPY further down
+      // (see exportMediaCopy) — the user's path is never the sole home.
       const saveDir = path.join(os.homedir(), '.koi', 'images');
       if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
       for (let i = 0; i < result.images.length; i++) {
         const img = result.images[i];
-        // Download from URL if no base64 data. Retry with backoff + a timeout —
-        // provider CDNs (e.g. Magnific/pikaso) occasionally drop the first
-        // connection ("fetch failed"), and a 4K render is a large transfer. If
-        // every attempt fails, img.savedTo stays unset → reported as a FAILURE
-        // below (a URL we couldn't fetch is not a usable result).
+        // Download from URL if no base64 data, via the shared asset downloader
+        // (retry + backoff + transport-vs-HTTP classification). If it fails,
+        // img.savedTo stays unset → reported as a FAILURE below, with the
+        // classification driving whether the agent should retry or give up.
         if (!img.b64 && img.url) {
-          for (let attempt = 0; attempt < 3 && !img.savedTo; attempt++) {
-            if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
-            const ctrl = new AbortController();
-            const to = setTimeout(() => ctrl.abort(), 30000);
-            try {
-              const resp = await fetch(img.url, { signal: ctrl.signal });
-              if (resp.ok) {
-                const contentType = resp.headers.get('content-type') || '';
-                const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'png';
-                const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
-                const filePath = path.join(saveDir, filename);
-                const buffer = Buffer.from(await resp.arrayBuffer());
-                fs.writeFileSync(filePath, buffer);
-                img.savedTo = filePath;
-                markRead(filePath); // the agent created it → it "knows" it (read-before-use)
-                channel.log('image', `Downloaded and saved: ${filePath} (${(buffer.length / 1024).toFixed(0)}KB)`);
-              } else {
-                channel.log('image', `Download HTTP ${resp.status} for ${img.url} (attempt ${attempt + 1}/3)`);
-              }
-            } catch (dlErr) {
-              channel.log('image', `Failed to download ${img.url} (attempt ${attempt + 1}/3): ${dlErr.message}`);
-            } finally {
-              clearTimeout(to);
-            }
+          const dl = await fetchAssetBuffer(img.url, { kind: 'image' });
+          if (dl.ok) {
+            const ext = dl.contentType.includes('png') ? 'png' : dl.contentType.includes('webp') ? 'webp' : 'png';
+            const filename = buildDescribedFilename({ slug, fallback: 'image', index: i, ext });
+            const filePath = path.join(saveDir, filename);
+            fs.writeFileSync(filePath, dl.buffer);
+            img.savedTo = filePath;
+            markRead(filePath); // the agent created it → it "knows" it (read-before-use)
+            channel.log('image', `Downloaded and saved: ${filePath} (${(dl.buffer.length / 1024).toFixed(0)}KB)`);
+          } else {
+            lastDl = dl;
           }
         }
         if (img.b64) {
@@ -1383,6 +1381,7 @@ const generateImageAction = {
           const filePath = path.join(saveDir, filename);
           fs.writeFileSync(filePath, Buffer.from(img.b64, 'base64'));
           img.savedTo = filePath;
+          markRead(filePath); // the agent created it → it "knows" it (read-before-use)
           channel.log('image', `Saved: ${filePath}`);
         }
       }
@@ -1403,15 +1402,17 @@ const generateImageAction = {
       // precisely so the agent retries instead of telling the user it's done.
       if (onlyUndownloadableUrls) {
         const failedUrl = (images.find((im) => im.url) || {}).url || '';
-        channel.log('image', `Generation succeeded on ${result.provider || 'provider'} but the result URL could not be downloaded: ${failedUrl}`);
+        const dl = lastDl || { errorClass: 'network', message: 'connectivity error' };
+        channel.log('image', `Generation succeeded on ${result.provider || 'provider'} but the result URL could not be downloaded (${dl.errorClass}): ${failedUrl}`);
         return {
-          success: false,
-          tool: 'generate_image',
-          provider: result.provider,
-          model: result.model,
-          error: `The image was generated by ${result.provider || 'the provider'} but Koi could not download the result after 3 attempts `
-            + '(network/CDN error fetching the asset URL). Nothing was saved or shown. Do NOT report this as completed — '
-            + 'do not store a "done" memory or look for a file; re-issue the SAME generate_image call to retry.',
+          ...undownloadableResult({
+            tool: 'generate_image',
+            provider: result.provider,
+            model: result.model,
+            url: failedUrl,
+            dl,
+            noun: 'image',
+          }),
           images: result.images,
         };
       }
@@ -1486,6 +1487,18 @@ const generateImageAction = {
           channel.log('image', `Aspect-cap recovery failed on ${path.basename(img.savedTo)} (keeping padded): ${recErr.message}`);
         }
       }
+    }
+
+    // Export a COPY to the caller's saveTo (if any) now that the canonical
+    // original is final (post aspect-cap recovery). The original stays in
+    // ~/.koi/images and is what the media library / lineage below register, so
+    // the creations drawer always finds it; `exportedTo` is the user's copy.
+    if (action.saveTo) {
+      savedImages.forEach((img, i) => {
+        if (!img.savedTo) return;
+        const copy = exportMediaCopy(img.savedTo, action.saveTo, { index: i, logTag: 'image' });
+        if (copy) img.exportedTo = copy;
+      });
     }
 
     // Auto-save generated images to media library (non-blocking).
@@ -1607,6 +1620,9 @@ const generateImageAction = {
       }
     } catch { /* lineage is best-effort — never fail the tool on it */ }
 
+    // Response contract (uniform across media tools): `savedTo` is the
+    // canonical original in ~/.koi/images (stable, indexed by the creations
+    // drawer); `exportedTo`, when present, is the COPY at the caller's saveTo.
     return {
       success: true,
       provider: resolved.provider,
@@ -1727,7 +1743,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
     }).join('\n');
     fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved reference image, look at it — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
   }
-  fields.push('optional "saveTo" — absolute directory path where the tool will save the generated image(s). The real path is returned in images[].savedTo — use THAT in any downstream step, never fabricate paths.');
+  fields.push('optional "saveTo" — where to place a COPY: an absolute DIRECTORY (a filename is minted inside it) OR a full FILE path ending in .png/.jpg/.webp (the first image is copied to exactly that path). The original always stays in ~/.koi/images and is returned in images[].savedTo (use THAT for downstream chaining, never fabricate paths); the copy at your saveTo is images[].exportedTo.');
 
   const header = 'Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). The router auto-picks one model from the active catalog based on your params — see the per-model breakdown at the end of this description for what each option supports. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const refNote = refsEnabled

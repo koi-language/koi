@@ -31,6 +31,8 @@ import { markRead } from '../../state/read-tracker.js';
 import { normalizeImageForProvider } from './_normalize-image-for-provider.js';
 import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } from './_auto-attach-mentions.js';
 import { slugifyDescription, buildDescribedFilename } from './util/slugify-description.js';
+import { exportMediaCopy } from './util/export-copy.js';
+import { classifyDownloadFailure } from '../../io/download-asset.js';
 import {
   padIfNeeded,
   recoverFromPadded,
@@ -279,14 +281,14 @@ function _canonicalKoiSaveDir(resolvedDir, kind) {
   return canonical;
 }
 
-export async function saveVideoFromUrl(url, { saveTo, provider, model, id, prompt } = {}) {
+export async function saveVideoFromUrl(url, { provider, model, id, prompt } = {}) {
   if (!url) return { path: null, error: 'No video URL returned by provider.' };
-  const saveDir = _canonicalKoiSaveDir(
-    typeof saveTo === 'string' && saveTo.trim()
-      ? path.resolve(saveTo.trim())
-      : path.join(os.homedir(), '.koi', 'videos'),
-    'videos',
-  );
+  // The ORIGINAL always streams to the canonical ~/.koi/videos home so the
+  // media library / creations drawer indexes it and timelines reference stable
+  // storage (never an ephemeral workspace path). A caller-supplied saveTo gets
+  // a COPY at the FINALIZED path (after recovery / edit-list stripping) — that
+  // happens at the call sites via exportMediaCopy, not here.
+  const saveDir = _canonicalKoiSaveDir(path.join(os.homedir(), '.koi', 'videos'), 'videos');
 
   try {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
@@ -296,17 +298,26 @@ export async function saveVideoFromUrl(url, { saveTo, provider, model, id, promp
     return { path: null, error: msg };
   }
 
-  const MAX_ATTEMPTS = 3;
-  let lastErr = null;
+  // Video streams straight to disk (don't buffer a 100MB asset in memory), so
+  // it keeps its own loop, but shares the retry shape (exp backoff + jitter)
+  // and the network-vs-HTTP classification with the buffered downloader via
+  // `classifyDownloadFailure` — a transport/DNS drop is NOT a generation
+  // failure, the caller must retry the download, not regenerate.
+  const MAX_ATTEMPTS = 5;
+  let lastErrObj = null;   // thrown transport error (for classification)
+  let lastHttpStatus = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let filePath = null;
+    if (attempt > 1) {
+      const backoff = Math.min(8000, 1000 * 2 ** (attempt - 2)) + Math.floor(Math.random() * 400);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
     try {
       const resp = await fetch(url);
       if (!resp.ok) {
-        const msg = `HTTP ${resp.status} ${resp.statusText}`;
-        channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg}`);
-        lastErr = msg;
+        lastHttpStatus = resp.status;
+        channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): HTTP ${resp.status} ${resp.statusText}`);
         if (resp.status >= 400 && resp.status < 500) break; // 4xx won't recover
         continue;
       }
@@ -335,15 +346,18 @@ export async function saveVideoFromUrl(url, { saveTo, provider, model, id, promp
       channel.log('video', `Saved: ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)${provider ? ` from ${provider}/${model}` : ''}`);
       return { path: filePath, error: null };
     } catch (err) {
-      lastErr = err.message || String(err);
-      channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${lastErr}`);
+      // Surface the real transport cause (DNS/ECONNRESET/timeout), hidden on
+      // `.cause` by Node's "fetch failed" wrapper, and keep the error OBJECT
+      // so the failure can be classified.
+      lastErrObj = err;
+      const c = err?.cause;
+      channel.log('video', `Download failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${err.message || err}${c ? ` (cause: ${c.code || c.message || c})` : ''}`);
       if (filePath) { try { fs.unlinkSync(filePath); } catch { /* ignore */ } }
-      // Brief backoff before retry; common cause is mid-stream socket reset.
-      if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, 500 * attempt));
     }
   }
 
-  return { path: null, error: `Could not download video after ${MAX_ATTEMPTS} attempts: ${lastErr || 'unknown'}` };
+  const dl = classifyDownloadFailure({ error: lastErrObj, httpStatus: lastHttpStatus });
+  return { path: null, error: `Could not download video after ${MAX_ATTEMPTS} attempts: ${dl.message}`, dl };
 }
 
 const generateVideoAction = {
@@ -395,7 +409,7 @@ const generateVideoAction = {
           },
         },
       },
-      saveTo:          { type: 'string',  description: 'Directory to save the final video file in. Defaults to ~/.koi/videos/ when omitted.' },
+      saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in ~/.koi/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
@@ -1616,7 +1630,9 @@ const generateVideoAction = {
 
     // ── status === 'completed' from here ────────────────────────────
     let savedTo = null;
+    let exportedTo = null; // copy at the caller's saveTo (original stays in ~/.koi/videos)
     let saveError = null;
+    let saveDl = null; // classified download failure (network|http) when savedTo stays null
     let chainedExtend = false;
     if (final.url) {
       reportProgress?.(0.95, 'Downloading video…');
@@ -1632,6 +1648,7 @@ const generateVideoAction = {
       });
       savedTo = saveResult.path;
       saveError = saveResult.error;
+      saveDl = saveResult.dl || null;
       // Strip the black borders we padded on at submit time (transparent
       // to the agent — only fires when an input was actually padded). The
       // model's output preserves the input envelope (diffusion video
@@ -1793,6 +1810,11 @@ const generateVideoAction = {
           channel.log('video', `Media library save failed (continuing): ${err.message}`);
         }
       }
+      // Export a COPY to the caller's saveTo now the path is final & canonical
+      // (the original in ~/.koi/videos is what the library + timeline reference).
+      if (savedTo && action.saveTo) {
+        exportedTo = exportMediaCopy(savedTo, action.saveTo, { logTag: 'video' });
+      }
     }
 
     // Per-shot downloads for multishot completions. Each shot is also
@@ -1846,12 +1868,18 @@ const generateVideoAction = {
             }
           }
         }
+        // Export a COPY of the finalized shot to the caller's saveTo (original
+        // stays in ~/.koi/videos). Each shot gets a distinct copy via index.
+        const shotExportedTo = (shotSavedTo && action.saveTo)
+          ? exportMediaCopy(shotSavedTo, action.saveTo, { index: shot.index, logTag: 'video' })
+          : null;
         savedShots.push({
           index: shot.index,
           id: shot.id,
           status: shot.status,
           url: shot.url,
           ...(shotSavedTo ? { savedTo: shotSavedTo } : {}),
+          ...(shotExportedTo ? { exportedTo: shotExportedTo } : {}),
           ...(shotSaveError ? { saveError: shotSaveError } : {}),
           error: shot.error,
         });
@@ -1882,7 +1910,12 @@ const generateVideoAction = {
       status: 'completed',
       url: final.url,
       ...(savedTo ? { savedTo } : {}),
+      ...(exportedTo ? { exportedTo } : {}),
       ...(saveError ? { saveError } : {}),
+      // A transport/DNS drop while downloading is NOT a generation failure —
+      // the video exists at `url`. Flag it so the agent retries the download
+      // (re-issue the same call) instead of regenerating.
+      ...(!savedTo && saveDl?.errorClass === 'network' ? { networkError: true, retryable: true } : {}),
       ...(savedShots ? { shots: savedShots } : {}),
       // Surface duration clamping when it happened, so the caller
       // (agent → user-facing report; or the timeline GUI later) can
@@ -2176,7 +2209,8 @@ async function _runHybridExtendChain({
   // 5. Download the extend output to a temp path (no gallery — only
   //    the final concat goes there). Recover any padding we applied.
   const sr = await saveVideoFromUrl(final.url, {
-    saveTo: null, // → default tmp landing
+    // Intermediate extend output — lands in ~/.koi/videos; only the final
+    // concat is registered/exported, so no saveTo handling here.
     provider: resolved.provider,
     model: submitted.model || final.model,
     id: `${final.id || submitted.id}-extend`,

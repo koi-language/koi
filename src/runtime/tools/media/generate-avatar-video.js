@@ -22,6 +22,7 @@ import sharp from 'sharp';
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { _stashJobMetadata, getJobMetadata, clearJobMetadata, saveVideoFromUrl, _pollUntilTerminal, _resolveTimeoutMs } from './generate-video.js';
+import { exportMediaCopy } from './util/export-copy.js';
 import { channel } from '../../io/channel.js';
 
 // Fal's hard cap for file_too_large is 10 MB / 10485760 bytes (see
@@ -76,7 +77,7 @@ const generateAvatarVideoAction = {
       prompt:       { type: 'string', description: 'Optional scene / style hint (most avatar models ignore this). MANDATORY when set: write it in English regardless of the user\'s language — avatar models that DO read this field are trained on English. The spoken content is driven by `audioFile`, not by this prompt; this field is for visual scene direction only.' },
       aspectRatio:  { type: 'string', description: 'Aspect ratio: "1:1", "16:9", "9:16" (provider-dependent).' },
       seed:         { type: 'number', description: 'Optional seed for reproducible output.' },
-      saveTo:       { type: 'string', description: 'Directory to save the final video. Defaults to ~/.koi/videos/.' },
+      saveTo:       { type: 'string', description: 'Where to place a COPY of the final video (a directory, or a full video file path). The original always stays in ~/.koi/videos/ (returned as `savedTo`); the copy is returned as `exportedTo`.' },
       timeoutMs:    { type: 'number', description: 'Max wall-clock to wait for the provider in ms (default 1200000 = 20 min).' },
       pollIntervalMs: { type: 'number', description: 'Poll cadence in ms (default 8000, clamped to [2000, 30000]).' },
     },
@@ -337,11 +338,11 @@ const generateAvatarVideoAction = {
     }
 
     let savedTo = null;
+    let exportedTo = null; // copy at the caller's saveTo (original stays in ~/.koi/videos)
     let saveError = null;
     if (final.url) {
       reportProgress?.(0.95, 'Downloading video…');
       const sr = await saveVideoFromUrl(final.url, {
-        saveTo: action.saveTo,
         provider: resolved.provider,
         model: final.model || submitted.model || resolved.model,
         id: final.id || submitted.id,
@@ -361,6 +362,10 @@ const generateAvatarVideoAction = {
         } catch (err) {
           channel.log('video', `Media library save failed (continuing): ${err.message}`);
         }
+        // Export a COPY to the caller's saveTo (original stays in ~/.koi/videos).
+        if (action.saveTo) {
+          exportedTo = exportMediaCopy(savedTo, action.saveTo, { logTag: 'video' });
+        }
       }
     }
     if (submitted.id) clearJobMetadata(submitted.id);
@@ -374,6 +379,7 @@ const generateAvatarVideoAction = {
       status: 'completed',
       url: final.url,
       ...(savedTo ? { savedTo } : {}),
+      ...(exportedTo ? { exportedTo } : {}),
       ...(saveError ? { saveError } : {}),
     };
   },

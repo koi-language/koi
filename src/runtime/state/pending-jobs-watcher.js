@@ -147,6 +147,7 @@ async function _resumeVideoJob(job) {
     saveVideoFromUrl,
     _reconcileExtendOutput,
   } = await import('../tools/media/generate-video.js');
+  const { exportMediaCopy } = await import('../tools/media/util/export-copy.js');
 
   // Heartbeat the lock so other watchers see we're alive. Cleared in
   // the finally block — even on throw — so the lock doesn't stick on
@@ -217,7 +218,6 @@ async function _resumeVideoJob(job) {
 
     // ── Completed. Download + assign + mark done ─────────────────
     const saved = await saveVideoFromUrl(final.url, {
-      saveTo: job.savePath,
       provider: job.provider,
       model: final.model || job.slug,
       id: job.jobId,
@@ -254,6 +254,12 @@ async function _resumeVideoJob(job) {
         return;
       }
       mediaPath = reconciled.path;
+    }
+
+    // Export a COPY to the user's requested savePath now the path is final
+    // (the original stays in ~/.koi/videos and is what the timeline references).
+    if (job.savePath) {
+      exportMediaCopy(mediaPath, job.savePath, { logTag: 'jobs' });
     }
 
     // Assign to the clip if the job carried clipContext (i.e. it was

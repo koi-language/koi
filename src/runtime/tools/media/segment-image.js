@@ -14,6 +14,7 @@ import os from 'os';
 import { channel } from '../../io/channel.js';
 import asyncCapable from '../_async-capable.js';
 import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
+import { downloadAssetToFile } from '../../io/download-asset.js';
 
 // SAM 3 — text-prompted for precompute, point+text for fallback clicks.
 const SAM3_MODEL = 'fal-ai/sam-3/image';
@@ -270,20 +271,16 @@ const segmentImageAction = {
             const maskUrl = r.maskUrls[i];
             const fileName = buildDescribedFilename({ slug, fallback: 'mask', index: localMasks.length, ext: 'png' });
             const localPath = path.join(masksDir, fileName);
-            try {
-              const maskRes = await fetch(maskUrl);
-              if (maskRes.ok) {
-                const buffer = Buffer.from(await maskRes.arrayBuffer());
-                fs.writeFileSync(localPath, buffer);
-                localMasks.push({
-                  localPath,
-                  maskUrl,
-                  score: r.scores?.[i] ?? 0.9,
-                  bbox: null,
-                  concept: r.concept,
-                });
-              }
-            } catch {}
+            const dl = await downloadAssetToFile(maskUrl, localPath, { kind: 'image' });
+            if (dl.ok) {
+              localMasks.push({
+                localPath,
+                maskUrl,
+                score: r.scores?.[i] ?? 0.9,
+                bbox: null,
+                concept: r.concept,
+              });
+            }
           }
         }
       }
@@ -343,10 +340,8 @@ const segmentImageAction = {
           const slug = slugFromSourcePath(params.path, 'mask-point');
           const fileName = buildDescribedFilename({ slug, fallback: 'mask', index: 0, ext: 'png' });
           const localPath = path.join(masksDir, fileName);
-          const maskRes = await fetch(maskUrl);
-          if (maskRes.ok) {
-            const buffer = Buffer.from(await maskRes.arrayBuffer());
-            fs.writeFileSync(localPath, buffer);
+          const dl = await downloadAssetToFile(maskUrl, localPath, { kind: 'image' });
+          if (dl.ok) {
             localMasks.push({ localPath, maskUrl, score: 0.8, bbox: null });
             channel.log('image', `segment_image: fallback returned a mask`);
           }

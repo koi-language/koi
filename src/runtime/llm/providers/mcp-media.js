@@ -28,6 +28,7 @@
 
 import { mcpRegistry } from '../../mcp/mcp-registry.js';
 import { channel } from '../../io/channel.js';
+import { fetchAssetBuffer } from '../../io/download-asset.js';
 import yaml from 'yaml';
 
 const MAX_POLL_ATTEMPTS = 40; // ~40 × up-to-25s long-polls = generous ceiling
@@ -828,9 +829,20 @@ export class McpMediaProvider {
   }
 
   async _downloadBuffer(url, opts = {}) {
-    const res = await fetch(url, { signal: opts.abortSignal });
-    if (!res.ok) throw new Error(`MCP ${this.server}: asset download failed (HTTP ${res.status})`);
-    return Buffer.from(await res.arrayBuffer());
+    // Shared downloader: retry + backoff + transport-vs-HTTP classification, so
+    // a transient CDN/DNS drop on an audio/video asset recovers instead of
+    // hard-failing the generation. The thrown error carries the classification
+    // (`networkError`) so callers can tell "couldn't reach it" from "not there".
+    const dl = await fetchAssetBuffer(url, { kind: this.kind || 'media', signal: opts.abortSignal });
+    if (dl.ok) return dl.buffer;
+    const err = new Error(`MCP ${this.server}: asset download failed (${dl.message})`);
+    err.errorClass = dl.errorClass;
+    err.networkError = dl.errorClass === 'network';
+    // Preserve the original transport cause so the runtime's network-aware
+    // handling (isNetworkError → retry, no model-profile escalation) recognises
+    // a DNS/socket/CDN drop instead of treating it as a provider failure.
+    if (dl.error) err.cause = dl.error.cause || dl.error;
+    throw err;
   }
 
   async _call(tool, args) {

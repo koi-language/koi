@@ -106,13 +106,25 @@ const _SYSTEM = {
   ],
 };
 
+/** Leaner previous-sessions variant for Workers. Historically the
+ *  Worker skipped this slot entirely — the old source only surfaced
+ *  lossy session SUMMARIES, low value for a task-bound agent. Now the
+ *  conversations source injects VERBATIM exchanges from the palace
+ *  ("we already fixed this exact error like this"), which IS useful
+ *  mid-task — so the Worker gets it too, just smaller (k=3, 800
+ *  tokens) to keep most of the budget for code context. */
+const WORKER_PREVIOUS_SESSIONS_SLOT = {
+  ...PREVIOUS_SESSIONS_SLOT,
+  query: { ...PREVIOUS_SESSIONS_SLOT.query, k: 3 },
+  budget: 800,
+};
+
 const _WORKER = {
   template: null,
   slots: [
     NOTES_SLOT,
     BLOCKERS_SLOT,
-    // Workers care less about previous-session continuity (they're
-    // task-bound) — skip that slot to save tokens for code context.
+    WORKER_PREVIOUS_SESSIONS_SLOT,
   ],
 };
 

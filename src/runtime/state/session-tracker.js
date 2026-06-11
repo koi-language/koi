@@ -20,6 +20,7 @@ import path from 'path';
 import fs from 'fs';
 import { channel } from '../io/channel.js';
 import { scheduleConversationIndex, flushConversationIndex, backfillConversationIndex } from './conversations.js';
+import { backfillPalace, migratePalaceGlobal } from './palace.js';
 
 // Slot for the LLM provider used by the conversations index pipeline
 // (title + summary + embedding for the "Recent Sessions" sidebar /
@@ -645,6 +646,27 @@ export class SessionTracker {
         }).catch((err) => {
           process.stderr.write(`[session-tracker] backfill ${this.projectRoot} failed: ${err.message}\n`);
         });
+        // Palace backfill runs SEPARATELY from the conversations one —
+        // that pipeline skips sessions whose summary row is fresh, which
+        // would starve drawer ingestion for history indexed before the
+        // palace existed. Opt-out: KOI_PALACE_BACKFILL=0.
+        if (process.env.KOI_PALACE_BACKFILL !== '0') {
+          backfillPalace({
+            projectRoot: this.projectRoot,
+            llmProvider: _conversationIndexProvider,
+            maxConcurrency: 1,
+          }).catch((err) => {
+            process.stderr.write(`[palace] backfill ${this.projectRoot} failed: ${err.message}\n`);
+          });
+          // GLOBAL one-shot migration of ALL historical conversations
+          // (every project in the conversations index + ~/.koi/sessions),
+          // not just this project. Guarded by a persistent marker in
+          // palace_meta — after the first completion it's a no-op.
+          migratePalaceGlobal({ llmProvider: _conversationIndexProvider })
+            .catch((err) => {
+              process.stderr.write(`[palace] global migration failed: ${err.message}\n`);
+            });
+        }
       }
     }
   }
