@@ -68,14 +68,22 @@ export class SessionTracker {
    * so the lazy `_ensureInit()` re-runs against the resumed git repo
    * and recovers the resumed session's tracked files from history.
    */
-  repointToSession(newSessionId) {
-    if (!newSessionId || newSessionId === this.sessionId) return;
-    this.sessionId = newSessionId;
-    this.gitDir = path.join(this.projectRoot, '.koi', 'sessions', newSessionId);
+  repointToSession(newSessionId, newProjectRoot = null) {
+    // `newProjectRoot` heals the root-mismatch case: the resumed session's
+    // files may live under a DIFFERENT project root than this writer was
+    // constructed with (e.g. the writing engine ran with KOI_PROJECT_ROOT=
+    // <agents>/.build while this one got the repo root). Without re-rooting,
+    // history is read from one tree and new messages are appended to the
+    // other — the next resume then only finds half the conversation.
+    const rootChanged = !!newProjectRoot && newProjectRoot !== this.projectRoot;
+    if ((!newSessionId || newSessionId === this.sessionId) && !rootChanged) return;
+    if (rootChanged) this.projectRoot = newProjectRoot;
+    if (newSessionId) this.sessionId = newSessionId;
+    this.gitDir = path.join(this.projectRoot, '.koi', 'sessions', this.sessionId);
     this.initialized = false;
     this.trackedFiles = new Set();
     this.pendingFiles = new Set();
-    channel.log('session', `Re-pointed session tracker to: ${newSessionId}`);
+    channel.log('session', `Re-pointed session tracker to: ${this.sessionId} (root=${this.projectRoot})`);
   }
 
   /** Run git with GIT_DIR/GIT_WORK_TREE pointing to our session repo.
