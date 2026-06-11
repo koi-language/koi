@@ -234,7 +234,11 @@ ${taskDescription}`;
       E: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
       F: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: EFFORT_LOW },
       G: { code: 70,  reasoning: 70,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
-      G2: { code: 50,  reasoning: 70,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      // G2 runs the media-production skills (infographic, slide-deck, poster…):
+      // multi-step flows that read reference specs and assemble long prompts.
+      // reasoning 80 + high effort keeps small models out — a nano-class model
+      // skips the skill's read steps and improvises vague prompts (seen live).
+      G2: { code: 50,  reasoning: 80,  risk: 10, reasoningEffort: EFFORT_HIGH },
       H: { code: 50,  reasoning: 40,  risk: 10, reasoningEffort: EFFORT_LOW },
       I: { code: 60,  reasoning: 50,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
       J: { code: 60,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },

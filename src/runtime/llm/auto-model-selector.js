@@ -45,7 +45,7 @@ function _useLocalFallback(reason) {
   if (Object.keys(fallback).length > 0) {
     modelsData = fallback;
     if (process.env.KOI_LOG_FILE) {
-      try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend ${reason}, using local models.json fallback\n`); } catch {}
+      try { _require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Backend ${reason}, using local models.json fallback\n`); } catch {}
     }
   }
 }
@@ -102,7 +102,7 @@ async function _doLoadRemoteModels() {
         _remoteEtag = res.headers.get('etag') || '';
         if (process.env.KOI_LOG_FILE) {
           const count = Object.values(data).reduce((n, p) => n + Object.keys(p).length, 0);
-          try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Loaded ${count} models from backend\n`); } catch {}
+          try { _require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] Loaded ${count} models from backend\n`); } catch {}
         }
       }
     } else if (!_remoteLoaded) {
@@ -187,7 +187,7 @@ function _applyCooldown(map, key, label) {
   const secs = COOLDOWN_STEPS_MS[step] / 1000;
   // Log to file only — not visible to the user
   if (process.env.KOI_LOG_FILE) {
-    try { require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[circuit-breaker] ${label} on cooldown for ${secs}s (failure #${entry.failures})\n`); } catch {}
+    try { _require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[circuit-breaker] ${label} on cooldown for ${secs}s (failure #${entry.failures})\n`); } catch {}
   }
 }
 
@@ -383,7 +383,7 @@ function _maybeDegradeForLatency(winner) {
       if (winner.useThinking && !altCaps.thinking) continue;
       if (process.env.KOI_LOG_FILE) {
         try {
-          require('fs').appendFileSync(process.env.KOI_LOG_FILE,
+          _require('fs').appendFileSync(process.env.KOI_LOG_FILE,
             `[auto-model] degrading ${winner.provider}/${winner.model} (p50=${myP50}ms) → ${altProvider}/${altSlug}\n`);
         } catch {}
       }
@@ -432,9 +432,20 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   // loop (see logs around the no-content/gemini-3.5-flash case).
   // Honour the cooldown first; only break it when literally nothing
   // else is available.
+  // `relaxedProfile` marks that the surviving candidates do NOT meet the
+  // requested code/reasoning thresholds. In that case the final sort must
+  // pick the MOST CAPABLE model, not the cheapest: the original cost-first
+  // sort handed a reasoning:90 task to the cheapest model in the catalog
+  // (gpt-5.4-nano, reasoning:29) whenever the only qualifying provider was
+  // on cooldown — the exact opposite of what the escalated profile asked for.
+  let relaxedProfile = false;
   if (candidates.length === 0) {
     candidates = _buildAllCandidates(availableProviders, taskType, requiresImage, minContextK, requiresVideo, requiresAudio, requiresFile)
       .filter(c => !_isProviderOnCooldown(c.provider) && !_isModelOnCooldown(c.provider, c.model));
+    relaxedProfile = true;
+    if (candidates.length > 0 && process.env.KOI_LOG_FILE) {
+      try { _require('fs').appendFileSync(process.env.KOI_LOG_FILE, `[auto-model] No healthy model meets profile (code≥${profile?.code ?? difficulty}, reasoning≥${profile?.reasoning ?? 0}) — relaxed pool, capability-first sort\n`); } catch {}
+    }
   }
 
   // Last resort — every candidate is on cooldown. Bypass cooldowns so
@@ -442,6 +453,7 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   // now correctly gated behind "tried relaxed profile first".
   if (candidates.length === 0) {
     candidates = _buildCandidates(availableProviders, taskType, difficulty, requiresImage, true, minContextK, profile, requiresVideo, requiresAudio, requiresFile);
+    relaxedProfile = false; // these DO meet the profile — cheapest-capable applies again
   }
 
   // No model meets the difficulty threshold — pick the one with the highest score
@@ -462,14 +474,24 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
   }
 
   candidates.sort((a, b) => {
-    const costDiff = a.totalCost - b.totalCost;
-    if (Math.abs(costDiff) > 0.0001) return costDiff;
-    // At equal cost, prefer the more capable model (sum of code + reasoning), not the faster one.
-    // Use thinking scores if the candidate was selected with thinking enabled.
     const aCode = a.useThinking ? (a.caps?.codeThinking ?? a.caps?.code ?? 0) : (a.caps?.code ?? 0);
     const aReas = a.useThinking ? (a.caps?.reasoningThinking ?? a.caps?.reasoning ?? 0) : (a.caps?.reasoning ?? 0);
     const bCode = b.useThinking ? (b.caps?.codeThinking ?? b.caps?.code ?? 0) : (b.caps?.code ?? 0);
     const bReas = b.useThinking ? (b.caps?.reasoningThinking ?? b.caps?.reasoning ?? 0) : (b.caps?.reasoning ?? 0);
+    // Relaxed-profile pool: nobody meets the requested thresholds, so the
+    // closest approximation is the MOST capable model (capability-first,
+    // cost as tiebreak). Cost-first here would hand an escalated task to
+    // the cheapest/weakest model in the catalog.
+    if (relaxedProfile) {
+      const capDiff = (bCode + bReas) - (aCode + aReas);
+      if (capDiff !== 0) return capDiff;
+      return a.totalCost - b.totalCost;
+    }
+    // Qualifying pool: cheapest capable model wins.
+    const costDiff = a.totalCost - b.totalCost;
+    if (Math.abs(costDiff) > 0.0001) return costDiff;
+    // At equal cost, prefer the more capable model (sum of code + reasoning), not the faster one.
+    // Use thinking scores if the candidate was selected with thinking enabled.
     return (bCode + bReas) - (aCode + aReas);
   });
 
