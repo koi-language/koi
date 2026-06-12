@@ -32,8 +32,8 @@ Target shape (omit any route you can't satisfy with a real tool — do NOT inven
 {
   "label": "<short provider name, e.g. Magnific>",
   "generate": {
-    "image": { "tool": "<text->image tool>", "promptParam": "<param>", "refsParam": "<param?>", "modelParam": "<the param that SELECTS which model/engine to use, e.g. one whose description says 'model slug from <list tool>' — like 'mode' or 'model'?>", "modelsListTool": "<the tool that ENUMERATES this route's available models, e.g. images_models_list?>", "inputs": "<see HOST INPUT KNOBS below — map each supported host knob to this tool's EXACT param>", "idPath": "<path to the creation id(s) THIS tool returns, e.g. creations[].identifier>" },
-    "video": { "tool": "<text->video tool>", "promptParam": "<param>", "modelParam": "<the param that SELECTS the model, e.g. 'slug'?>", "refsParam": "<param/path for VISUAL REFERENCE images (look/identity), e.g. references array?>", "startFrameParam": "<param/path for the LITERAL FIRST frame the video begins from (image-to-video), e.g. keyframes.start — an image keyframe, NOT a style reference; omit if the tool has none>", "endFrameParam": "<param/path for the LITERAL LAST frame, e.g. keyframes.end; omit if none>", "modelsListTool": "<the tool that enumerates video models, e.g. video_models_list?>", "inputs": "<see HOST INPUT KNOBS below>", "idPath": "<path to the job/creation id it returns>" },
+    "image": { "tool": "<text->image tool>", "promptParam": "<param>", "refsParam": "<param?>", "modelParam": "<the param that SELECTS which model/engine to use, e.g. one whose description says 'model slug from <list tool>' — like 'mode' or 'model'?>", "modelsListTool": "<the tool that ENUMERATES this route's available models, e.g. images_models_list?>", "inputs": "<see HOST INPUT KNOBS below — map each supported host knob to this tool's EXACT param>", "unmappedInputs": "<host knobs this tool declares NO param for, each { koi, reason }>", "idPath": "<path to the creation id(s) THIS tool returns, e.g. creations[].identifier>" },
+    "video": { "tool": "<text->video tool>", "promptParam": "<param>", "modelParam": "<the param that SELECTS the model, e.g. 'slug'?>", "refsParam": "<param/path for VISUAL REFERENCE images (look/identity), e.g. references array?>", "startFrameParam": "<param/path for the LITERAL FIRST frame the video begins from (image-to-video), e.g. keyframes.start — an image keyframe, NOT a style reference; omit if the tool has none>", "endFrameParam": "<param/path for the LITERAL LAST frame, e.g. keyframes.end; omit if none>", "modelsListTool": "<the tool that enumerates video models, e.g. video_models_list?>", "inputs": "<see HOST INPUT KNOBS below>", "unmappedInputs": "<host knobs this tool declares NO param for, each { koi, reason }>", "idPath": "<path to the job/creation id it returns>" },
     "audio": {
       "speech": { "tool": "<TTS tool>", "textParam": "<param>", "idPath": "<path to the id it returns>" },
       "music":  { "tool": "<music tool>", "promptParam": "<param>", "idPath": "<path to the id it returns>" }
@@ -80,15 +80,21 @@ Rules:
     [ { "koi": "<host knob name from the list below>", "param": "<EXACT tool param>",
         "lowercase": <true ONLY if the param expects lowercase tokens like "4k" and
         the host sends "4K">, "valueMap": { "<host value>": "<tool value>", … }? } ]
-  - Include a knob ONLY if THIS tool actually declares a param for it; omit the rest
-    (a missing knob is correctly dropped at call time).
+  - ACCOUNT FOR EVERY HOST KNOB of the route's kind — none may be silently dropped.
+    For each knob, scan the tool's FULL param path list for a param that accepts it
+    (it may be NESTED, e.g. host "resolution" → "video.clips[].resolution"). If the
+    tool declares one, the knob MUST appear in "inputs". If the tool truly has no
+    param for it (or it's handled by a dedicated field like modelParam), declare it
+    in the route's "unmappedInputs": [ { "koi": "<knob>", "reason": "<short why>" } ].
+    Every host knob must land in exactly one of "inputs"/"unmappedInputs" — the host
+    verifies this and will re-ask you about any knob left unaccounted.
   - Use "valueMap" when the host's values differ from the tool's accepted set in a way
     a simple lowercase can't fix (read the param's enum/description). Otherwise omit it.
   - Do NOT put prompt / references / the model param here — those have their own fields
     above. "inputs" is for the remaining generation knobs.
   The HOST INPUT KNOBS available are listed AFTER the tool list below — they are
   derived from the host's OWN generate_* schemas (the source of truth for what
-  the host can send). Map only the knobs THIS tool declares a param for.
+  the host can send).
 
 - NESTED PARAM PATHS — a tool param may live INSIDE an object/array. The tool
   list gives flattened param PATHS: "a.b[].c" means property c inside the items
@@ -287,7 +293,16 @@ async function _buildModelCoverage(server, client, media, llm) {
  * items. Capped in depth + count so a huge schema can't blow the prompt.
  */
 function _flattenSchemaLeaves(schema, prefix, out, depth = 0) {
-  if (!schema || typeof schema !== 'object' || depth > 5 || out.length >= 60) return;
+  if (!schema || typeof schema !== 'object' || out.length >= 60) return;
+  if (depth > 8) {
+    // Past the depth cap, emit the param itself instead of dropping it: a
+    // param the LLM never sees can never be mapped (Magnific's
+    // video.clips[].references[].url sat below the old cap of 5 and the whole
+    // `references` array silently vanished from the mapper prompt — so the
+    // map shipped without refsParam and reference images were never sent).
+    out.push(`${prefix} — ${(schema.description || '').slice(0, 90)} (${schema.type || 'object'}, deeper structure omitted)`);
+    return;
+  }
   if (schema.properties && typeof schema.properties === 'object') {
     for (const [k, v] of Object.entries(schema.properties)) {
       _flattenSchemaLeaves(v, prefix ? `${prefix}.${k}` : k, out, depth + 1);
@@ -317,6 +332,9 @@ const _NON_KNOB_PARAMS = new Set([
   'image', 'images', 'sourceImage', 'maskImage',
   'shots', 'numShots', 'kind', 'preferQuality', 'characterOrientation',
   'wait', 'saveTo', 'saveAs', 'background', 'mode',
+  // routing/meta, not generation knobs: 'model' is the dedicated modelParam
+  // field; the timeouts pace the HOST's own polling; suppressPresent is UI meta.
+  'model', 'timeoutMs', 'pollIntervalMs', 'suppressPresent',
 ]);
 
 /**
@@ -350,6 +368,33 @@ async function _hostKnobs() {
     pick('../../tools/media/generate-video.js'),
   ]);
   return { image, video };
+}
+
+/**
+ * Deterministic completeness check: every host knob of a mapped generate route
+ * must appear either in the route's "inputs" (mapped) or in "unmappedInputs"
+ * (explicitly declared unmappable). The check is purely structural — a set
+ * difference on knob names; the mapping DECISION stays 100% with the LLM (see
+ * the no-hardcoded-literal-matching rule). Returns { image:[...], video:[...] }
+ * with the unaccounted knob names, empty object when complete.
+ */
+function _unaccountedKnobs(media, knobs) {
+  const missing = {};
+  for (const kind of ['image', 'video']) {
+    const route = media && media.generate && media.generate[kind];
+    if (!route) continue;
+    const accounted = new Set();
+    for (const i of Array.isArray(route.inputs) ? route.inputs : []) {
+      if (i && typeof i.koi === 'string') accounted.add(i.koi);
+    }
+    for (const u of Array.isArray(route.unmappedInputs) ? route.unmappedInputs : []) {
+      if (typeof u === 'string') accounted.add(u);
+      else if (u && typeof u.koi === 'string') accounted.add(u.koi);
+    }
+    const miss = (knobs[kind] || []).map(k => k.koi).filter(k => !accounted.has(k));
+    if (miss.length) missing[kind] = miss;
+  }
+  return missing;
 }
 
 /** Render the derived host knobs as a prompt block for the mapper LLM. */
@@ -387,7 +432,8 @@ async function _mapServer(server, client, agent) {
     return null;
   }
 
-  const hostKnobs = _renderHostKnobs(await _hostKnobs());
+  const knobs = await _hostKnobs();
+  const hostKnobs = _renderHostKnobs(knobs);
   const prompt =
     `${MAP_SPEC}\n\nServer: ${server}\nTools (use these EXACT names and param paths):\n${JSON.stringify(tools, null, 2)}\n\n${hostKnobs}`;
 
@@ -418,6 +464,51 @@ async function _mapServer(server, client, agent) {
     // the prompt can be tuned, and don't cache it so we retry.
     channel.log('mcp', `[media-mapper] ${server}: LLM produced NO routes. Raw output: ${rawText.slice(0, 600)}`);
     return null;
+  }
+
+  // Completeness loop: a knob the LLM silently dropped (e.g. video resolution)
+  // only surfaces much later as a broken generation, so we verify structurally
+  // and re-ask — with the conversation so far plus the exact misses — until
+  // every host knob is accounted for (bounded; on give-up we keep the partial
+  // map and log loudly rather than lose the whole mapping).
+  const convo = [
+    { role: 'user', content: prompt },
+    { role: 'assistant', content: rawText },
+  ];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const missing = _unaccountedKnobs(media, knobs);
+    if (!Object.keys(missing).length) break;
+    channel.log('mcp', `[media-mapper] ${server}: unaccounted host knobs ${JSON.stringify(missing)} — re-asking (attempt ${attempt}/2)`);
+    const feedback =
+      `Your "media" object left these HOST INPUT KNOBS unaccounted for: ${JSON.stringify(missing)}.\n` +
+      `For EACH one, scan that route's tool param paths again: if a param accepts it ` +
+      `(possibly nested, e.g. "video.clips[].resolution"), add it to the route's "inputs"; ` +
+      `if the tool truly declares no param for it, add { "koi", "reason" } to the route's ` +
+      `"unmappedInputs". Re-output the FULL corrected "media" JSON object, no prose.`;
+    try {
+      const { text } = await llm.complete(
+        [...convo, { role: 'user', content: feedback }],
+        { responseFormat: 'json_object', timeoutMs: 60000 },
+      );
+      const stripped = (text || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const parsed = JSON.parse(stripped);
+      const mediaObj = (parsed && typeof parsed.media === 'object' && parsed.media) ? parsed.media : parsed;
+      const repaired = _prune(mediaObj, validNames);
+      // Accept the repair only if it still has routes — never trade a working
+      // map for an empty one.
+      if (Object.keys(repaired.generate || {}).length || Object.keys(repaired.operations || {}).length) {
+        if (!repaired.label) repaired.label = media.label;
+        media = repaired;
+        convo.push({ role: 'user', content: feedback }, { role: 'assistant', content: stripped });
+      }
+    } catch (err) {
+      channel.log('mcp', `[media-mapper] ${server}: knob-repair pass failed (${err.message})`);
+      break;
+    }
+  }
+  const stillMissing = _unaccountedKnobs(media, knobs);
+  if (Object.keys(stillMissing).length) {
+    channel.log('mcp', `[media-mapper] ${server}: WARNING — host knobs still unaccounted after repair: ${JSON.stringify(stillMissing)}`);
   }
 
   // Second pass: bind host catalog slugs → this provider's model ids (best-effort,

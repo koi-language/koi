@@ -7,6 +7,21 @@ import { BaseLLM, BaseEmbedding, BaseSearch, BaseAudioGen, ProviderBlockedError 
 import { getModelCaps } from '../cost-center.js';
 import { channel } from '../../io/channel.js';
 
+// Per-request options for STREAMING calls. The SDK's `timeout` only covers
+// until the response HEADERS arrive (the timer is cleared once fetch
+// resolves), so for a stream it can be far below the 10-minute default
+// without touching reasoning/generation time: headers arrive in seconds on a
+// healthy connection regardless of thinking effort — minutes of pre-header
+// silence means a hung connection or load balancer, not a slow model. The
+// budget still has to cover UPLOADING the request body (multi-MB base64
+// vision payloads on a slow uplink), hence 120s rather than 30s.
+// `maxRetries` here overrides the client-level `maxRetries: 0`: the SDK
+// auto-retries connect failures/timeouts ONLY before any response is
+// received, which is safe for streams — a hung connection becomes a
+// transparent retry instead of a 10-minute wait that fails the call and
+// puts the whole provider on circuit-breaker cooldown.
+const STREAM_CONNECT_OPTS = { timeout: 120_000, maxRetries: 2 };
+
 /**
  * Classify an OpenAI SDK error as a ProviderBlockedError when it maps to a
  * known block condition (policy refusal, rate limit, quota, auth). Returns
@@ -200,7 +215,7 @@ export class OpenAIChatLLM extends BaseLLM {
       }
 
       channel.log('llm', `[request] model=${params.model} max_tokens=${params.max_completion_tokens} reasoning_effort=${params.reasoning_effort ?? params.reasoning?.effort ?? '(none)'} thinking=${this.useThinking} temp=${params.temperature ?? '(default)'}`);
-      const options = abortSignal ? { signal: abortSignal } : {};
+      const options = { ...STREAM_CONNECT_OPTS, ...(abortSignal ? { signal: abortSignal } : {}) };
       const stream = await this.client.chat.completions.create(params, options);
 
       const race = this._abortRace(abortSignal);
@@ -541,7 +556,7 @@ export class OpenAIResponsesLLM extends BaseLLM {
         params.reasoning = { effort: this.reasoningEffort, summary: 'auto' };
       }
 
-      const options = abortSignal ? { signal: abortSignal } : {};
+      const options = { ...STREAM_CONNECT_OPTS, ...(abortSignal ? { signal: abortSignal } : {}) };
       const stream = await this.client.responses.create(params, options);
       const race = this._abortRace(abortSignal);
       const _iterate = async () => {

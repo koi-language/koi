@@ -134,7 +134,24 @@ export class McpMediaProvider {
     // version change).
     this._applyInputs(tool, args, route.inputs, opts);
 
-    if (Array.isArray(opts.referenceImages) && opts.referenceImages.length) {
+    // Image inputs (references / start / end frame) must NEVER be silently
+    // dropped: a generation that "succeeds" without them ignores the user's
+    // identity/look constraints, which is worse than not generating. If the
+    // map has no slot for an input the caller actually sent (and the live
+    // schema offers no flat candidate either), delegate to the gateway —
+    // checked BEFORE uploading so we don't pay for uploads we'd discard.
+    const hasRefs = Array.isArray(opts.referenceImages) && opts.referenceImages.length;
+    if (hasRefs && !route.refsParam
+        && !this._param(tool, ['references', 'reference_images', 'referenceImages', 'images'], null, true)) {
+      channel.log('media-router', `[mcp:${this.server}] ${tool} has no mapped param for reference images → gateway`);
+      return this._fallback('generate', [prompt, opts], `${tool} has no param for reference images`);
+    }
+    if ((opts.startFrame && !route.startFrameParam) || (opts.endFrame && !route.endFrameParam)) {
+      channel.log('media-router', `[mcp:${this.server}] ${tool} has no mapped start/end frame param → gateway`);
+      return this._fallback('generate', [prompt, opts], `${tool} has no start/end frame param`);
+    }
+
+    if (hasRefs) {
       const ids = [];
       for (const ref of opts.referenceImages) ids.push(await this._uploadAsset(ref, opts));
       this._setArg(tool, args, ['references', 'reference_images', 'referenceImages', 'images'], route.refsParam, ids);
@@ -567,7 +584,7 @@ export class McpMediaProvider {
     const direct = this._extractAssets(res);
     if (direct.length && direct[0].url) return `__sync__:${direct[0].url}`;
     this._logRaw(tool, res);
-    throw new Error(`MCP ${this.server}.${tool}: no creation identifier in result`);
+    throw new Error(`MCP ${this.server}.${tool}: no creation identifier in result${this._resultHint(res)}`);
   }
 
   /** Inline: submit, long-poll until terminal, fetch the asset URL(s). */
@@ -583,7 +600,7 @@ export class McpMediaProvider {
     const ids = this._resolveIds(submitRes, route);
     if (!ids.length) {
       this._logRaw(tool, submitRes);
-      throw new Error(`MCP ${this.server}.${tool}: no creation identifier or asset in result`);
+      throw new Error(`MCP ${this.server}.${tool}: no creation identifier or asset in result${this._resultHint(submitRes)}`);
     }
 
     const async_ = this.media.async || {};
@@ -689,6 +706,20 @@ export class McpMediaProvider {
 
   _logRaw(tool, res) {
     try { channel.log('mcp', `[mcp-media] ${this.server}.${tool} raw result: ${JSON.stringify(res).slice(0, 2000)}`); } catch { /* */ }
+  }
+
+  /** " — <provider text>" suffix for unrecognised-result errors. MCPs report
+   *  failures as plain text in `result` (e.g. "Invalid resolution ''..."); the
+   *  generic "no creation identifier" error used to swallow that, leaving the
+   *  agent and the logs with no actionable cause. */
+  _resultHint(res) {
+    try {
+      const s = typeof res === 'string' ? res
+        : (res && typeof res.result === 'string') ? res.result
+          : JSON.stringify(res);
+      const t = (s || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+      return t ? ` — ${t}` : '';
+    } catch { return ''; }
   }
 
   /** Generic JSON path getter: supports "a.b" and "a[].b" (descend arrays). */

@@ -26,7 +26,15 @@ import os from 'os';
 // v5: param fields may be NESTED PATHS ("video.clips[].prompt") so structured
 // tools (e.g. Magnific video_generate) map correctly; host-knob vocabulary is
 // now derived from Koi's generate_* schemas and the static fallback was removed.
-const MAP_VERSION = 5;
+// v6: mapper schema-flatten depth raised 5→8 with an explicit marker on cut
+// (deep params like video.clips[].references[].url used to vanish from the
+// mapper prompt, so video refsParam/startFrameParam were never mapped), and
+// toolsetHash now fingerprints the FULL inputSchema, not just top-level keys.
+// v7: the mapper must ACCOUNT for every host knob per generate route ("inputs"
+// or "unmappedInputs") and a deterministic verify+re-ask loop enforces it —
+// pre-v7 maps could silently drop knobs the tool does declare (Magnific video
+// lost resolution/aspectRatio/quality → "Invalid resolution ''" at generate).
+const MAP_VERSION = 7;
 
 function _dir() {
   return path.join(os.homedir(), '.koi', 'mcp-media-maps');
@@ -45,17 +53,17 @@ function _hash(str) {
 }
 
 /**
- * Stable fingerprint of a client's toolset (names + each tool's param keys).
- * Changes whenever the server adds/removes/renames a tool or its params, which
- * is exactly when the cached map should be regenerated.
+ * Stable fingerprint of a client's toolset (names + each tool's FULL
+ * inputSchema). Changes whenever the server adds/removes/renames a tool or
+ * reshapes any param — including NESTED ones — which is exactly when the
+ * cached map should be regenerated. (Top-level keys alone were blind to
+ * structured tools: Magnific's video_generate exposes only `video`/`folderReference`
+ * at the top, so its entire clip schema could change without invalidating.)
  */
 export function toolsetHash(client) {
   const tools = (client && Array.isArray(client.tools)) ? client.tools : [];
   const sig = tools
-    .map(t => {
-      const props = t.inputSchema && t.inputSchema.properties ? Object.keys(t.inputSchema.properties).sort() : [];
-      return `${t.name}(${props.join(',')})`;
-    })
+    .map(t => `${t.name}(${JSON.stringify(t.inputSchema || {})})`)
     .sort()
     .join('|');
   return _hash(sig);
