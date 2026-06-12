@@ -834,6 +834,10 @@ export default {
         resolvedPath = tlBranch.redirectPath;
         filePath = tlBranch.redirectPath;
         _fromTimelineRedirect = true;
+      } else if (tlBranch?.rawJsonFallback) {
+        // Render not possible → serve the timeline's raw JSON below (the
+        // normal text-read path). The structure is what edit intents need.
+        channel.log('read_file', `[timeline] ${tlBranch.note}`);
       } else {
         channel.log('read_file', `[timeline] no redirect produced — falling through to raw-text read (likely a bug)`);
       }
@@ -1742,11 +1746,20 @@ async function _resolveTimelineForRead(timelinePath, agent) {
   }
 
   // Branch (c): multi-clip → render and cache by sha1 of the JSON.
-  const renderedPath = await _ensureCachedTimelineRender(tl, raw, agent);
-  if (!renderedPath) {
-    return { _error: `Timeline render failed for ${tl.id || path.basename(timelinePath)}.` };
+  const rendered = await _ensureCachedTimelineRender(tl, raw, agent);
+  if (rendered?.path) {
+    return { redirectPath: rendered.path, reason: 'rendered timeline' };
   }
-  return { redirectPath: renderedPath, reason: 'rendered timeline' };
+  // Render failed (e.g. the ffmpeg path can't draw title overlays yet).
+  // Fall back to the timeline's RAW JSON: for inspect/edit intents the
+  // structure (clip ids, tracks, scale, offsets) is exactly what the agent
+  // needs — an outright error here used to send agents on a
+  // list_timelines/shell/recall goose chase that never converged.
+  return {
+    rawJsonFallback: true,
+    note: `Timeline could not be rendered to video (${rendered?.error || 'unknown error'}). ` +
+      `Falling back to the timeline's raw JSON — to edit it use get_timeline / the timeline update tools.`,
+  };
 }
 
 /** Snapshot helper: read selectedClipId from the active doc when it
@@ -1775,7 +1788,7 @@ async function _ensureCachedTimelineRender(timelineJson, rawJsonStr, agent) {
 
   if (fs.existsSync(cachedPath)) {
     channel.log('read_file', `[timeline] cache hit ${path.basename(cachedPath)}`);
-    return cachedPath;
+    return { path: cachedPath };
   }
 
   channel.log('read_file', `[timeline] rendering ${tlId} → ${path.basename(cachedPath)} (this may take a few seconds)`);
@@ -1784,7 +1797,7 @@ async function _ensureCachedTimelineRender(timelineJson, rawJsonStr, agent) {
     renderTool = (await import('../timeline/render-timeline.js')).default;
   } catch (err) {
     channel.log('read_file', `[timeline] render-timeline tool unavailable: ${err.message}`);
-    return null;
+    return { error: `render-timeline tool unavailable: ${err.message}` };
   }
   try {
     const result = await renderTool.execute(
@@ -1793,16 +1806,16 @@ async function _ensureCachedTimelineRender(timelineJson, rawJsonStr, agent) {
     );
     if (!result?.success) {
       channel.log('read_file', `[timeline] render failed: ${result?.error || 'unknown'}`);
-      return null;
+      return { error: result?.error || 'unknown render failure' };
     }
     if (!fs.existsSync(cachedPath)) {
       channel.log('read_file', `[timeline] render returned success but file missing: ${cachedPath}`);
-      return null;
+      return { error: 'render reported success but the output file is missing' };
     }
-    return cachedPath;
+    return { path: cachedPath };
   } catch (err) {
     channel.log('read_file', `[timeline] render threw: ${err.message}`);
-    return null;
+    return { error: err.message };
   }
 }
 

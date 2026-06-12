@@ -105,6 +105,27 @@ export function compileTimeline(timeline, params = {}) {
   // xfade output.
   _rejectCrossClipTransitions(clips);
 
+  // Pseudo-clips (titles, placeholders, nested-timeline refs) have no file
+  // behind their path — ffmpeg would try to open "title:1" as a protocol and
+  // die with the cryptic "Protocol not found". This renderer cannot rasterize
+  // them yet (the GUI's native compositor draws them at export), so fail fast
+  // with a message the agent can act on instead of a raw ffmpeg crash.
+  const pseudoClips = clips.filter((c) => {
+    const p = typeof c?.path === 'string' ? c.path : '';
+    return p.startsWith('title:') || p.startsWith('placeholder-') || p.startsWith('timeline:');
+  });
+  if (pseudoClips.length > 0) {
+    const what = pseudoClips
+      .map((c) => `${c.track}: ${c.titleProps?.text ? `title "${c.titleProps.text}"` : c.path}`)
+      .join(', ');
+    throw new Error(
+      `This timeline has ${pseudoClips.length} overlay clip(s) the ffmpeg renderer cannot draw yet (${what}). ` +
+      `Rendering/previewing a timeline with titles must go through the GUI's native export. ` +
+      `If you need to INSPECT or EDIT the timeline, do NOT render it — call get_timeline (full JSON state) ` +
+      `and the timeline update tools instead.`
+    );
+  }
+
   // Build inputs — one ffmpeg `-i` per clip, trimmed to its source window.
   const inputArgs = [];
   const clipInputIndex = new Map(); // clipId → input index (0-based)

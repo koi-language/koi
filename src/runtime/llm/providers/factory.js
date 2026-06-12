@@ -122,8 +122,14 @@ function _resolveLLM(req) {
       client = clients[provider];
     }
     if (!client) throw new Error(`No SDK client for forced provider: ${provider}. Is the API key set?`);
-    const instance = createLLM(provider, client, model, { temperature, maxTokens, useThinking: false });
-    return { instance, provider, effectiveProvider: provider, model, useThinking: false, effectiveDifficulty: baseDifficulty };
+    // Signed-in: the gateway client is OpenAI-compatible for EVERY provider
+    // (_gatewayClients maps all names to the same client), so the wrapper must
+    // be the OpenAI one — wrapping it in AnthropicLLM/GeminiLLM crashes on
+    // `this.client.messages.create` (no `.messages` on an OpenAI client).
+    // Same rule as the auto path below (effectiveProvider = 'openai').
+    const _forcedEffective = _isSignedIn ? 'openai' : provider;
+    const instance = createLLM(_forcedEffective, client, model, { temperature, maxTokens, useThinking: false });
+    return { instance, provider, effectiveProvider: _forcedEffective, model, useThinking: false, effectiveDifficulty: baseDifficulty };
   }
 
   if (!availableProviders?.length) {

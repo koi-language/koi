@@ -27,6 +27,30 @@ function _looksLikeYamlAction(t) {
   return typeof t === 'string' && _YAML_ACTION_LINE.test(t);
 }
 
+// Prose head + YAML action tail ("He revisado las imágenes…\n\nbatch:\n  - …").
+// The WHOLE text isn't valid YAML — the prose's own colons make the parser
+// throw ("Nested mappings are not allowed in compact mappings") — which used
+// to discard a perfectly good action AND the analysis, forcing a retry. Slice
+// at the first action-looking line: if that tail parses to a real action,
+// execute it and surface the head as a print (the prose→print rule).
+function _recoverProseThenAction(text) {
+  if (typeof text !== 'string') return null;
+  const m = _YAML_ACTION_LINE.exec(text);
+  if (!m) return null;
+  const start = m.index + (m[0][0] === '\n' ? 1 : 0);
+  if (start === 0) return null; // no prose head — genuinely malformed action
+  const head = text.slice(0, start).trim();
+  const tail = text.slice(start).trim();
+  if (!head || !tail) return null;
+  try {
+    const parsed = parseYaml(tail, { uniqueKeys: false });
+    if (parsed && typeof parsed === 'object' && _looksLikeAction(parsed)) {
+      return { prose: head, parsed };
+    }
+  } catch { /* tail not valid YAML either → let the caller throw/retry */ }
+  return null;
+}
+
 // A `message` value that itself contains action YAML means a block scalar
 // (`message: |`) swallowed the batch's sibling actions — a model indentation
 // bug that, left alone, prints the whole batch as one giant message and never
@@ -63,6 +87,7 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     cleaned = cleaned.replace(/^```(?:ya?ml|json)?\n?/i, '').replace(/\n?```$/, '').trim();
   }
   const _rawCleaned = cleaned; // pre-strip copy, used for the prose fallback
+  let _proseHead = ''; // prose recovered ahead of a YAML action tail → printed first
 
   // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
   // Find the first { or [ that starts valid JSON and discard everything before it.
@@ -144,15 +169,22 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     // than vomiting the raw YAML into the chat.
     if (!_looksLikeAction(parsed)) {
       if (_looksLikeYamlAction(_rawCleaned)) {
-        throw new Error(
-          `Your YAML parsed but isn't a valid action (likely a block-scalar/indentation slip). ` +
-          `Re-emit a clean action — every action key (actionType/intent) at the same indent, and ` +
-          `multi-line values under "message: |" / "prompt: |" indented DEEPER than the key.`
-        );
+        const _rec = _recoverProseThenAction(_rawCleaned);
+        if (_rec) {
+          parsed = _rec.parsed;
+          _proseHead = _rec.prose;
+        } else {
+          throw new Error(
+            `Your YAML parsed but isn't a valid action (likely a block-scalar/indentation slip). ` +
+            `Re-emit a clean action — every action key (actionType/intent) at the same indent, and ` +
+            `multi-line values under "message: |" / "prompt: |" indented DEEPER than the key.`
+          );
+        }
+      } else {
+        return normalizeReactiveAction({
+          actionType: 'direct', intent: 'print', message: _rawCleaned.trim(),
+        });
       }
-      return normalizeReactiveAction({
-        actionType: 'direct', intent: 'print', message: _rawCleaned.trim(),
-      });
     }
   } catch (firstErr) {
     // YAML parse failed (genuinely malformed / truncated). Fall through to
@@ -231,17 +263,39 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
         });
       }
 
-      // No recovery via a secondary LLM: we must NEVER invent actions the
-      // agent did not explicitly emit. A second model "fixing" a malformed
-      // response is guessing intent on behalf of the real agent — the same
-      // anti-pattern the user has banned. Surface the parse failure instead
-      // so the real agent retries with a valid JSON action.
-      throw new Error(
-        `Your response was not valid YAML (or JSON) and could not be parsed. ${firstErr.message}. ` +
-        `Response received: ${cleaned.substring(0, 300)}. ` +
-        `Retry with a valid YAML action, e.g.:\nactionType: direct\nintent: print\nmessage: "..."`
-      );
+      // Prose head + action tail (the response DOES carry action lines, the
+      // prose ahead of them is what broke the YAML parse). Recover the action,
+      // surface the prose as a print — this is mechanical slicing of what the
+      // model literally emitted, NOT a second model guessing intent.
+      const _rec = _recoverProseThenAction(_rawCleaned);
+      if (_rec) {
+        parsed = _rec.parsed;
+        _proseHead = _rec.prose;
+      } else {
+        // No recovery via a secondary LLM: we must NEVER invent actions the
+        // agent did not explicitly emit. A second model "fixing" a malformed
+        // response is guessing intent on behalf of the real agent — the same
+        // anti-pattern the user has banned. Surface the parse failure instead
+        // so the real agent retries with a valid JSON action.
+        throw new Error(
+          `Your response was not valid YAML (or JSON) and could not be parsed. ${firstErr.message}. ` +
+          `Response received: ${cleaned.substring(0, 300)}. ` +
+          `Retry with a valid YAML action, e.g.:\nactionType: direct\nintent: print\nmessage: "..."`
+        );
+      }
     }
+  }
+
+  // Surface the prose head recovered by _recoverProseThenAction as a print
+  // that runs BEFORE the action(s) — the narration is part of the answer
+  // (prose→print rule); only the action tail is executable YAML.
+  if (_proseHead) {
+    const _printHead = { actionType: 'direct', intent: 'print', message: _proseHead };
+    if (Array.isArray(parsed)) parsed.unshift(_printHead);
+    else if (parsed.batch && Array.isArray(parsed.batch)) parsed.batch.unshift(_printHead);
+    else if (parsed.actions && Array.isArray(parsed.actions)) parsed.actions.unshift(_printHead);
+    else if (parsed.parallel && Array.isArray(parsed.parallel)) parsed = { batch: [_printHead, { parallel: parsed.parallel }] };
+    else parsed = { batch: [_printHead, parsed] };
   }
 
   // Helper: inject preamble text into the last prompt_user in an action list

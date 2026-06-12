@@ -509,6 +509,13 @@ function _write(state) {
   // the canonical home dir.
   const existing = _findExistingFile(state.id);
   const fp = existing ?? _filePath(state.id);
+  // Rolling one-deep backup: keep the previous version next to the file so a
+  // destructive replace (agent bug, malformed bulk update) is always
+  // recoverable by copying the .bak back — learned the hard way when an
+  // empty-state update_timeline wiped a 13-clip timeline with no way back.
+  try {
+    if (fs.existsSync(fp)) fs.copyFileSync(fp, `${fp}.bak`);
+  } catch { /* backup is best-effort — never block the write */ }
   // Atomic replace: write to .tmp then rename so a crashed write
   // never leaves a half-flushed JSON file behind.
   const tmp = `${fp}.tmp`;
