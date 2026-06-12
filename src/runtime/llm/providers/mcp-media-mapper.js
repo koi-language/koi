@@ -347,7 +347,12 @@ async function _hostKnobs() {
   const pick = async (mod) => {
     try {
       const m = await import(mod);
-      const props = (m && m.default && m.default.schema && m.default.schema.properties) || {};
+      // _pristineProperties is the schema BEFORE the live capability rewrite
+      // trims provider-unsupported props — reading the live schema here is
+      // circular (a knob missing from the active map gets deleted from the
+      // schema, so the remap could never offer it again).
+      const props = (m && m.default && (m.default._pristineProperties
+        || (m.default.schema && m.default.schema.properties))) || {};
       const knobs = [];
       for (const [name, def] of Object.entries(props)) {
         if (_NON_KNOB_PARAMS.has(name)) continue;

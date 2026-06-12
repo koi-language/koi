@@ -2726,6 +2726,13 @@ import { formatModelCatalog } from './_format-model-catalog.js';
 // the source `generateVideoAction` would land on a copy nobody reads.
 const wrappedAction = asyncCapable(generateVideoAction);
 
+// Pristine knob vocabulary, snapshotted BEFORE the capability rewrite below
+// deletes props the ACTIVE provider lacks (aspectRatio/resolution/withAudio…).
+// The MCP media mapper reads this: deriving knobs from the live (trimmed)
+// schema is circular — a provider whose map is missing a knob trims the
+// schema, so the remap can never recover it (Magnific resolution bug).
+wrappedAction._pristineProperties = JSON.parse(JSON.stringify(wrappedAction.schema.properties));
+
 // Fire-and-forget: rewrite the tool schema + description from the backend's
 // active video model set so the agent only ever sees values the catalog can
 // actually serve. Mirrors the pattern in generate-image.js — the description

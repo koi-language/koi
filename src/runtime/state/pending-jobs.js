@@ -186,8 +186,9 @@ export function listPending() {
 //
 // Lock primitive:
 //   • acquireLock(jobId, pid)   — sets pollerPid + heartbeat; refuses if
-//                                  there's a non-stale lock from a
-//                                  different pid.
+//                                  there's ANY non-stale lock (same-pid
+//                                  included: the watcher shares the live
+//                                  poller's process).
 //   • refreshLock(jobId, pid)   — bumps the heartbeat; call this every
 //                                  ≤10 s while polling so other engines
 //                                  see the lock is alive.
@@ -196,10 +197,12 @@ export function listPending() {
 //                                  normally we finish with mark*).
 //
 // Staleness: a lock older than `LOCK_STALE_MS` is treated as abandoned.
-// 30 s is comfortable above any reasonable poll-iteration time (we poll
-// every 3–5 s and `getStatus` is sub-second on the happy path).
+// 90 s: comfortably above the slowest legitimate heartbeat gap — gateway
+// polls tick every 3–5 s, but an MCP long-poll iteration (creations_wait
+// with timeoutSeconds ≈ 25–30 s) only heartbeats when the call returns,
+// so 30 s used to race the live poller and let the watcher steal its job.
 
-const LOCK_STALE_MS = 30_000;
+const LOCK_STALE_MS = 90_000;
 
 export function acquireLock(jobId, pid) {
   const cur = readJob(jobId);
@@ -207,11 +210,16 @@ export function acquireLock(jobId, pid) {
   const now = Date.now();
   if (cur.pollerPid && cur.pollerHeartbeat) {
     const age = now - cur.pollerHeartbeat;
-    if (age < LOCK_STALE_MS && cur.pollerPid !== pid) {
-      // Another live owner — back off.
+    if (age < LOCK_STALE_MS) {
+      // A FRESH lock is owned, even when pollerPid === pid: the recovery
+      // watcher runs in the SAME process as the live poller, so a same-pid
+      // bypass let it steal every active job seconds after submission and
+      // double-poll it (fatally, for MCP jobs resumed through the gateway).
+      // A crashed owner can't renew its heartbeat — staleness alone is the
+      // correct (and only) re-acquire signal.
       return false;
     }
-    // Same pid (we're re-acquiring after a crash) OR stale lock → take it.
+    // Stale lock → abandoned → take it.
   }
   const updated = updateJob(jobId, { pollerPid: pid, pollerHeartbeat: now });
   return !!updated;

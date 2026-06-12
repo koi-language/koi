@@ -72,6 +72,14 @@ export class McpMediaProvider {
     // provider). The MCP provider doesn't have the backend catalog, so expose a
     // permissive default: refs allowed, dimensions/labels left to the MCP. The
     // tool's CANONICAL_* fallbacks cover the empty enums.
+    // Knob-shaped capabilities derive from the connect-time map: a knob the
+    // map routed to a tool param IS supported. A static `withAudio:false`
+    // here made generate_video drop the flag ("does not support audio
+    // generation") even though the map wired it to withSoundEffects.
+    const route = (this.media.generate && this.media.generate[kind]) || {};
+    const mappedKnobs = new Set(
+      (Array.isArray(route.inputs) ? route.inputs : []).map(i => i && i.koi).filter(Boolean),
+    );
     this.capabilities = {
       referenceImages: true,
       hasRefImageSupport: true,
@@ -83,6 +91,7 @@ export class McpMediaProvider {
       labels: [],
       labelDetails: [],
       models: [],
+      withAudio: mappedKnobs.has('withAudio'),
     };
   }
 

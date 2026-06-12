@@ -161,11 +161,36 @@ async function _resumeVideoJob(job) {
   if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
 
   try {
-    const instance = new GatewayVideoGen(job.slug || 'auto');
-    // Synthetic `submitted` shape — what GatewayVideoGen.generate()
+    // Resume through the provider that OWNS the job. An MCP job's id is a
+    // provider creation id (e.g. Magnific "CHVW36HEEy") — polling the gateway
+    // with it 400s ("expected model|requestId") and used to mark the job
+    // failed while the real generation was still running fine.
+    let instance;
+    const mcpServer = (typeof job.provider === 'string' && job.provider.startsWith('mcp:'))
+      ? job.provider.slice('mcp:'.length)
+      : null;
+    if (mcpServer) {
+      const { mcpRegistry } = await import('../mcp/mcp-registry.js');
+      const { currentMap } = await import('../llm/providers/mcp-media-store.js');
+      const client = mcpRegistry.get(mcpServer);
+      const media = client ? currentMap(mcpServer, client) : null;
+      if (!media) {
+        // Server not connected / map not current yet (e.g. right after boot).
+        // The provider may still be generating server-side — release and let
+        // a later scan retry instead of failing the job.
+        releaseLock(job.jobId, process.pid);
+        channel.log('jobs', `job ${job.jobId} belongs to MCP "${mcpServer}" which isn't ready — will retry on next scan`);
+        return;
+      }
+      const { McpMediaProvider } = await import('../llm/providers/mcp-media.js');
+      instance = new McpMediaProvider({ kind: 'video', server: mcpServer, media });
+    } else {
+      instance = new GatewayVideoGen(job.slug || 'auto');
+    }
+    // Synthetic `submitted` shape — what the provider's generate()
     // returns. `id` is the composite jobId (e.g.
     // `bytedance/seedance-2.0/image-to-video|019e17...`) and
-    // `_pollUntilTerminal` polls fal's status endpoint with it.
+    // `_pollUntilTerminal` polls the owning provider's status with it.
     const submitted = {
       id: job.jobId,
       status: 'pending',

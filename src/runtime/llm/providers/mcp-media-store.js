@@ -34,7 +34,11 @@ import os from 'os';
 // or "unmappedInputs") and a deterministic verify+re-ask loop enforces it —
 // pre-v7 maps could silently drop knobs the tool does declare (Magnific video
 // lost resolution/aspectRatio/quality → "Invalid resolution ''" at generate).
-const MAP_VERSION = 7;
+// v8: host knobs now derive from the generate_* PRISTINE schema snapshot — v7
+// read the live schema AFTER the capability rewrite deleted the very props the
+// active provider's map was missing, so the v7 remap regenerated the same
+// incomplete map (circular trim) and the completeness loop saw nothing wrong.
+const MAP_VERSION = 8;
 
 function _dir() {
   return path.join(os.homedir(), '.koi', 'mcp-media-maps');

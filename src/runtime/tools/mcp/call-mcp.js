@@ -3,6 +3,8 @@
  *
  * Used by the LLM to invoke external tools exposed via MCP stdio servers.
  */
+import { getDecision, currentMap } from '../../llm/providers/mcp-media-store.js';
+
 export default {
   type: 'call_mcp',
   intent: 'call_mcp',
@@ -70,6 +72,37 @@ export default {
         console.error(`[call_mcp] MCP "${mcp}" is down, reconnecting...`);
       }
       await client.connect();
+    }
+
+    // Media-enabled servers: their mapped GENERATION tools must go through the
+    // host media pipeline (generate_image/generate_video/…), never raw — a raw
+    // call produces an untracked result (nothing saved locally, no gallery/
+    // drawer indexing, no progress UI) while looking like a success to the
+    // agent, which then falsely reports the task as done. Data-driven from the
+    // server's media map; all other tools on the server stay callable.
+    try {
+      if (getDecision(mcp) === 'enabled') {
+        const media = currentMap(mcp, client);
+        const gen = (media && media.generate) || {};
+        const blocked = new Set([
+          gen.image && gen.image.tool,
+          gen.video && gen.video.tool,
+          gen.audio && gen.audio.speech && gen.audio.speech.tool,
+          gen.audio && gen.audio.music && gen.audio.music.tool,
+          ...Object.values((media && media.operations) || {}).map(r => r && r.tool),
+        ].filter(Boolean));
+        if (blocked.has(tool)) {
+          throw new Error(
+            `call_mcp: "${mcp}.${tool}" is the media GENERATION route of this server and must not be called raw — `
+            + `use the host action (generate_image / generate_video / generate_audio or the matching operation) so the `
+            + `result is saved and tracked. If that action failed, report the failure to the user instead of working around it.`
+          );
+        }
+      }
+    } catch (guardErr) {
+      // Only re-throw the guard's own rejection; a store hiccup must not
+      // break unrelated call_mcp usage.
+      if (String(guardErr.message || '').startsWith('call_mcp:')) throw guardErr;
     }
 
     if (process.env.KOI_DEBUG_LLM) {

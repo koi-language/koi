@@ -1650,6 +1650,12 @@ import { formatModelCatalog } from './_format-model-catalog.js';
 // to the source `generateImageAction` would land on a copy nobody reads.
 const wrappedAction = asyncCapable(generateImageAction);
 
+// Pristine knob vocabulary, snapshotted BEFORE the capability rewrite below
+// deletes props the ACTIVE provider lacks. The MCP media mapper reads this:
+// deriving knobs from the live (trimmed) schema is circular — a provider whose
+// map is missing a knob trims the schema, so the remap can never recover it.
+wrappedAction._pristineProperties = JSON.parse(JSON.stringify(wrappedAction.schema.properties));
+
 // Fire-and-forget: build the tool schema dynamically from the backend's
 // /gateway/models/image.json. The rule: the agent must only ever see values
 // the backend can actually serve. If the backend advertises no aspect ratios
