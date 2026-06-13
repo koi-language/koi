@@ -1304,13 +1304,21 @@ CRITICAL RULES:
         const _newProfile = { ...profile };
 
         if (_phaseProfile.reasoning && _phaseProfile.reasoning !== 'auto') {
-          const score = _levelToScore[_phaseProfile.reasoning];
-          if (score !== undefined) {
-            _newProfile.reasoning = score;
-            _newProfile.reasoningEffort = _levelToEffort[_phaseProfile.reasoning];
-            // Thinking is only justified for medium+ effort. If the
-            // phase caps reasoning at none/low, disable thinking even
-            // if the classifier originally enabled it.
+          // DECOUPLED (per product decision): a phase's reasoning level sets
+          // ONLY the thinking EFFORT/budget of the chosen model — it no longer
+          // overrides `reasoning`, the capability score the auto-model-selector
+          // uses to PICK a model. Model choice stays driven by the classifier's
+          // capability assessment, so a "low" phase runs a CAPABLE model that
+          // simply thinks less, instead of being downgraded to a weak model
+          // (e.g. Gemini 3 Flash) just because the phase is cheap. Previously
+          // this also set `_newProfile.reasoning = score`, which conflated
+          // "how hard to think" with "which model" — the bug we're fixing.
+          const effort = _levelToEffort[_phaseProfile.reasoning];
+          if (effort !== undefined) {
+            _newProfile.reasoningEffort = effort;
+            // Thinking is only justified for medium+ effort. If the phase
+            // sets none/low effort, disable thinking even if the classifier
+            // originally enabled it.
             _newProfile.thinking = _phaseProfile.reasoning !== EFFORT_NONE && _phaseProfile.reasoning !== EFFORT_LOW ? _newProfile.thinking : false;
             _changed = true;
           }
@@ -1324,7 +1332,7 @@ CRITICAL RULES:
         }
         if (_changed) {
           _newProfile.difficulty = Math.max(_newProfile.code || 0, _newProfile.reasoning || 0);
-          channel.log('llm', `[classify] Phase profile override: code=${_newProfile.code} reasoning=${_newProfile.reasoning} effort=${_newProfile.reasoningEffort}`);
+          channel.log('llm', `[classify] Phase override: effort=${_newProfile.reasoningEffort} thinking=${_newProfile.thinking} (model still chosen by classifier capability — code=${_newProfile.code} reasoning=${_newProfile.reasoning})`);
           profile = _newProfile;
         }
       }

@@ -123,8 +123,11 @@ ${taskDescription}`;
       A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: EFFORT_NONE },
       B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: EFFORT_NONE },
       C: { code: 30,  reasoning: 25,  risk: 10, reasoningEffort: EFFORT_LOW },
-      D: { code: 45,  reasoning: 40,  risk: 15, reasoningEffort: EFFORT_LOW },
-      E: { code: 60,  reasoning: 55,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
+      // Media production (image/poster/infographic) and complex tasks need a
+      // capable model: reasoning 65 keeps low-reasoning models (e.g. Gemini 3
+      // Flash @39) out, which otherwise botch detailed prompt assembly.
+      D: { code: 45,  reasoning: 65,  risk: 15, reasoningEffort: EFFORT_MEDIUM },
+      E: { code: 60,  reasoning: 65,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
       F: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: EFFORT_LOW },
       G: { code: 40,  reasoning: 45,  risk: 50, reasoningEffort: EFFORT_LOW },
     };
