@@ -4094,6 +4094,21 @@ export class Agent {
           }
         }
 
+        // ── User-stop abort (Ctrl+C / Stop): DISCARD queued input ───────
+        // If the user pressed stop, any message they typed while the
+        // agent was busy is dropped — NOT replayed. Without this, the
+        // drain below re-delivers that message into the input queue and
+        // the prompt_user call consumes it, so it resurfaces as the
+        // user's "last message" on the next turn, again and again — the
+        // exact bug being fixed. We gate on reason !== 'cancel' so the
+        // cancel_task / cancel_plan ACK path below still works (those
+        // aborts WANT their note drained and acknowledged).
+        if (this._abortReason !== 'cancel') {
+          try { this._inbox?.clear?.(); } catch { /* non-fatal */ }
+          try { Agent._cliHooks?.getUiBridge?.()?.clearInputQueue?.(); } catch { /* non-fatal */ }
+          channel.log('inbox', `${this.name}: user-stop abort — discarded queued input (reason=${this._abortReason ?? 'user-stop'})`);
+        }
+
         // If the loop exited while a classified inbox message is still
         // undrained (classic case: cancel_task / cancel_plan aborted
         // the loop mid-batch, before the next top-of-loop drain could
@@ -4102,6 +4117,8 @@ export class Agent {
         //   2. `deliverClassifiedInput` queues the user's text for
         //      the prompt_user below, so the agent doesn't wait
         //      silently with no visible ACK.
+        // After a user-stop discard above, hasWork() is false, so this
+        // is naturally skipped.
         if (this._inbox?.hasWork?.()) {
           try {
             const processed = this._inbox.drainProcessed();

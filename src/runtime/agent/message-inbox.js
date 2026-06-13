@@ -147,6 +147,19 @@ export class MessageInbox {
     return this._pending.length > 0 || this._processed.length > 0;
   }
 
+  /**
+   * Discard every pending and processed message. Called when the user
+   * aborts (Ctrl+C): input typed while the agent was busy must NOT be
+   * replayed into the next turn. A classification already running inside
+   * `_processChain` may still finish and push one residual entry — the
+   * ui-bridge queue clear on the abort side plus the user-stop gate in
+   * the reactive loop's recovery path absorb that tail.
+   */
+  clear() {
+    this._pending = [];
+    this._processed = [];
+  }
+
   /** ─────────────────────── Internal ─────────────────────── */
 
   async _processNext() {
@@ -178,7 +191,6 @@ export class MessageInbox {
       result = { kind: 'noop', reasoning: `classifier error: ${err?.message || err}` };
     }
 
-    this._processed.push({ message: entry, result });
     channel.log('inbox', `${this._agent.name}: classified "${entry.text.substring(0, 60)}" → ${result.kind}${result.targetTaskId ? ` (task #${result.targetTaskId})` : ''}${result.target?.source ? ` [${result.target.source}]` : ''}`);
 
     // Cross-agent modifications can't wait for the classifier agent's
@@ -239,6 +251,16 @@ export class MessageInbox {
       channel.log('inbox', `${this._agent.name}: pre-deliver failed: ${err?.message || err}`);
     }
 
+    // Publish to the drainable buffer LAST — only after the cross-agent
+    // apply and pre-deliver steps above have stamped their guard flags
+    // (`_crossAgentApplied`, `_preDelivered`) on the result/entry. If we
+    // pushed earlier (the old order), the main loop could drain this
+    // entry during one of the awaits above, see the guard flags still
+    // unset, and re-run the same work: re-applying a cross-agent modify,
+    // or — the bug the user hit — calling deliverClassifiedInput() a
+    // SECOND time so the same message re-enters the input queue and
+    // resurfaces as their "last message" again.
+    this._processed.push({ message: entry, result });
     this._wakeAgent();
   }
 
