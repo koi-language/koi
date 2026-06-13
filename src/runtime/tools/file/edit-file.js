@@ -289,7 +289,7 @@ export default {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path to edit. Accepts an absolute or relative path, or a `@mention` handle (e.g. "@hero_script") resolved via the cross-project MediaLibrary to the most recent file tagged with that handle.' },
-      diff: { type: 'string', description: 'Unified diff with @@ hunks. Lines: " " context, "-" remove, "+" add.' },
+      diff: { type: 'string', description: 'Unified diff with @@ hunks. Lines: " " context, "-" remove, "+" add. For diffs containing HTML/CSS/code or punctuation-heavy lines, do NOT inline the diff — set diff to a heredoc reference "KOI_HEREDOC_<n>" and place the verbatim diff between ###KOI_HEREDOC_<n>_START### / ###KOI_HEREDOC_<n>_END### marker lines AFTER the YAML document. The body is taken literally, so colons, braces, quotes and # are all safe.' },
       internal: { type: 'boolean', description: 'Optional. When true, the edit is silent: no diff card and no permission dialog. Use for agent-only files (workflow state, scratch JSON). Paths under `.koi/` default to true automatically — pass false to force-show.' }
     },
     required: ['path', 'diff']

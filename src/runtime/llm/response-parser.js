@@ -61,6 +61,107 @@ function _messageSwallowedActions(s) {
       && /\n[ \t]*-?[ \t]*intent[ \t]*:[ \t]*[A-Za-z]/.test(s);
 }
 
+// ---------------------------------------------------------------------------
+// HEREDOC content blocks.
+//
+// Problem: file payloads (write_file `content`, edit_file `diff`) are arbitrary
+// HTML/CSS/code. Inlined as a YAML value they routinely break the parser —
+// `line-height: 1.6;` reads as a nested mapping, `{ margin: 0; }` as a flow
+// map ("Nested mappings are not allowed in compact mappings"). Block scalars
+// (`|`) "work" but the #1 batch-breaker is mis-indenting their body.
+//
+// Fix: let the model put that payload OUTSIDE the YAML, between sentinel lines,
+// and reference it by id from the field. We pull the blocks out of the raw text
+// BEFORE YAML parsing (so their contents never reach the parser), then splice
+// each captured body back into any field whose value is the matching reference.
+// No escaping, no indentation to maintain — the body is verbatim.
+//
+//   intent: write_file
+//   path: page.html
+//   content: KOI_HEREDOC_1
+//   ###KOI_HEREDOC_1_START###
+//   <!doctype html><style>body{ margin:0; line-height:1.6; }</style>...
+//   ###KOI_HEREDOC_1_END###
+//
+// The reference token (`KOI_HEREDOC_<id>`) is a plain alnum scalar, so it is
+// ALWAYS valid YAML regardless of what the body contains.
+const _HEREDOC_MARKER = '###KOI_HEREDOC_';
+const _HEREDOC_BLOCK_RE =
+  /^[ \t]*###KOI_HEREDOC_(\w+)_START###[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*###KOI_HEREDOC_\1_END###[ \t]*$/gm;
+const _HEREDOC_REF_RE = /^KOI_HEREDOC_(\w+)$/;
+
+// Strip every heredoc block out of the raw response and return the cleaned text
+// plus an id→body map. Cleaned text is what gets YAML-parsed; the bodies are
+// spliced back afterwards via _applyHeredocs.
+function _extractHeredocs(text) {
+  const blocks = new Map();
+  if (typeof text !== 'string' || !text.includes(_HEREDOC_MARKER)) {
+    return { text, blocks };
+  }
+  // Reset lastIndex — module-level /g regex is reused across calls.
+  _HEREDOC_BLOCK_RE.lastIndex = 0;
+  const stripped = text.replace(_HEREDOC_BLOCK_RE, (_m, id, body) => {
+    blocks.set(id, body);
+    return ''; // remove the block entirely so the remaining text is clean YAML
+  });
+  return { text: stripped, blocks };
+}
+
+// Last-ditch deterministic recovery for the case the model SKIPPED the heredoc
+// convention and inlined HTML/CSS/code straight into `content:` / `diff:`,
+// breaking the YAML parse. We can recover SAFELY only when the payload is the
+// tail of the document — i.e. there is exactly ONE inline content/diff field
+// and everything after it runs to EOF. That's how models actually emit file
+// writes (the big blob goes last), and taking value-to-EOF removes the
+// where-does-the-value-end ambiguity entirely: whatever it looks like, it's
+// content. Anything more ambiguous (2+ inline fields, junk before the action)
+// → return null so the caller throws a heredoc-guided retry instead of
+// guessing and silently corrupting the file. Returns { parsedHead, blocks }.
+function _recoverInlineFileContent(text) {
+  if (typeof text !== 'string') return null;
+  if (!/\bintent[ \t]*:[ \t]*(?:write_file|edit_file)\b/.test(text)) return null;
+  const fieldRe = /^([ \t]*)(content|diff)[ \t]*:[ \t]*(.*)$/gm;
+  const hits = [];
+  let m;
+  while ((m = fieldRe.exec(text)) !== null) {
+    const v = m[3].trim();
+    // Skip block scalars (handled by YAML), empties, and already-heredoc refs.
+    if (!v || v.startsWith('|') || v.startsWith('>') || _HEREDOC_REF_RE.test(v)) continue;
+    hits.push({ valueStart: m.index + m[0].length - m[3].length });
+  }
+  if (hits.length !== 1) return null; // 0 → not this case; 2+ → ambiguous, bail
+  const value = text.slice(hits[0].valueStart); // value runs verbatim to EOF
+  const head = text.slice(0, hits[0].valueStart) + 'KOI_HEREDOC_R';
+  let parsedHead;
+  try { parsedHead = parseYaml(head, { uniqueKeys: false }); }
+  catch { return null; } // head still broken → not a clean tail, don't guess
+  if (!parsedHead || typeof parsedHead !== 'object') return null;
+  _applyHeredocs(parsedHead, new Map([['R', value]]));
+  channel.log('llm',
+    '[parser] recovered inlined file content (model skipped the KOI_HEREDOC convention) — ' +
+    'lifted the value-to-EOF payload into the action');
+  return parsedHead;
+}
+
+// Walk a parsed action tree and replace any string value that is exactly a
+// `KOI_HEREDOC_<id>` reference with its captured body. Mutates in place.
+function _applyHeredocs(node, blocks) {
+  if (!blocks || blocks.size === 0 || node == null) return node;
+  if (typeof node === 'string') {
+    const m = _HEREDOC_REF_RE.exec(node.trim());
+    return m && blocks.has(m[1]) ? blocks.get(m[1]) : node;
+  }
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) node[i] = _applyHeredocs(node[i], blocks);
+    return node;
+  }
+  if (typeof node === 'object') {
+    for (const k of Object.keys(node)) node[k] = _applyHeredocs(node[k], blocks);
+    return node;
+  }
+  return node;
+}
+
 /**
  * Log a debug message (only when KOI_DEBUG_LLM=1).
  * @private
@@ -81,6 +182,14 @@ function logDebug(message) {
  * @returns {Promise<object|object[]>}
  */
 export async function parseReactiveResponse(responseText, agent = null, callUtilityFn = null) {
+  // Pull heredoc content blocks (write_file `content`, edit_file `diff`, etc.)
+  // OUT of the text before anything else touches it — their arbitrary HTML/CSS/
+  // code must never reach the YAML parser. The reference tokens left behind are
+  // plain scalars, so the remaining document always parses. Bodies are spliced
+  // back into the matching fields once we have a valid action tree.
+  const { text: _deheredoced, blocks: _heredocs } = _extractHeredocs(responseText);
+  responseText = _deheredoced;
+
   // Clean markdown code blocks
   let cleaned = responseText.trim();
   if (cleaned.startsWith('```')) {
@@ -89,14 +198,21 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
   const _rawCleaned = cleaned; // pre-strip copy, used for the prose fallback
   let _proseHead = ''; // prose recovered ahead of a YAML action tail → printed first
 
+  // The brace/bracket preamble+trailing stripping below is for JSON-mode
+  // responses (prose then `{...}`). It MUST NOT run when the response is
+  // already a YAML action — a `{` then belongs to file content (CSS
+  // `{ margin: 0 }`, a JS snippet) and chopping to it shreds the action and
+  // turns the CSS into a bogus flow-map. Detect a YAML-action head and skip.
+  const _yamlActionHead = /^[ \t]*(?:-[ \t]+)?(?:batch|parallel|actions|actionType|intent|type)[ \t]*:/.test(cleaned);
+
   // Strip preamble: some models (e.g. Anthropic) write reasoning text before the JSON.
   // Find the first { or [ that starts valid JSON and discard everything before it.
   // Capture preamble text — if the action is prompt_user, inject it as "message".
   // Prefer { over [ — arrays at the top level are rare and often false positives
   // (e.g. the LLM writes "[0, range)" as math notation, not a JSON array).
   let preambleText = '';
-  const braceIdx = cleaned.indexOf('{');
-  let bracketIdx = cleaned.indexOf('[');
+  const braceIdx = _yamlActionHead ? -1 : cleaned.indexOf('{');
+  let bracketIdx = _yamlActionHead ? -1 : cleaned.indexOf('[');
   // Only trust [ if it looks like a JSON array of objects (reactive actions are always objects)
   if (bracketIdx >= 0) {
     const afterBracket = cleaned.substring(bracketIdx + 1).trimStart();
@@ -271,12 +387,34 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
       if (_rec) {
         parsed = _rec.parsed;
         _proseHead = _rec.prose;
+      } else if ((parsed = _recoverInlineFileContent(_rawCleaned))) {
+        // Deterministically lifted inlined file content (model skipped the
+        // heredoc) into the action — `parsed` is now valid; fall through.
       } else {
         // No recovery via a secondary LLM: we must NEVER invent actions the
         // agent did not explicitly emit. A second model "fixing" a malformed
         // response is guessing intent on behalf of the real agent — the same
         // anti-pattern the user has banned. Surface the parse failure instead
         // so the real agent retries with a valid JSON action.
+        //
+        // When the break is almost certainly inlined file content (a
+        // write_file/edit_file action whose HTML/CSS/code value tripped the
+        // mapping parser) AND the safe value-to-EOF recovery above could not
+        // apply (e.g. 2+ inline fields, payload not at the tail), steer the
+        // retry straight to the HEREDOC instead of the generic hint.
+        const _looksLikeInlineFileContent =
+          /\bintent[ \t]*:[ \t]*(?:write_file|edit_file)\b/.test(_rawCleaned)
+          && /compact mappings|implicit key|nested mapping|mapping values are not allowed|flow collection|block collection/i.test(firstErr.message);
+        if (_looksLikeInlineFileContent) {
+          throw new Error(
+            `Your file content broke the YAML parser (${firstErr.message}). ` +
+            `Do NOT inline HTML/CSS/code into "content"/"diff" and do NOT use a "|" block for it. ` +
+            `Re-emit using a HEREDOC: set the field to "KOI_HEREDOC_1", then put the verbatim payload ` +
+            `between marker lines AFTER the YAML, e.g.:\n` +
+            `actionType: direct\nintent: write_file\npath: page.html\ncontent: KOI_HEREDOC_1\n` +
+            `###KOI_HEREDOC_1_START###\n<your file content, any characters, taken literally>\n###KOI_HEREDOC_1_END###`
+          );
+        }
         throw new Error(
           `Your response was not valid YAML (or JSON) and could not be parsed. ${firstErr.message}. ` +
           `Response received: ${cleaned.substring(0, 300)}. ` +
@@ -297,6 +435,11 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     else if (parsed.parallel && Array.isArray(parsed.parallel)) parsed = { batch: [_printHead, { parallel: parsed.parallel }] };
     else parsed = { batch: [_printHead, parsed] };
   }
+
+  // Splice captured heredoc bodies back into the parsed action tree, replacing
+  // every `KOI_HEREDOC_<id>` reference with its verbatim content. Runs before
+  // batch/array dispatch so each action carries its real payload downstream.
+  _applyHeredocs(parsed, _heredocs);
 
   // Helper: inject preamble text into the last prompt_user in an action list
   const _injectPreamble = (actions) => {

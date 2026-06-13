@@ -529,6 +529,21 @@ message: |
   Multi-line text goes here.
   Colons (a: b), "quotes", and # are all safe inside a | block.
 
+FILE CONTENT (write_file "content", edit_file "diff"): do NOT inline HTML/CSS/code as a YAML value and do NOT use a "|" block for it — punctuation like "line-height: 1.6;" or "{ margin: 0; }" breaks the parser, and block-scalar indentation is the #1 batch-breaker. Instead pass it as a HEREDOC: set the field to a reference token "KOI_HEREDOC_<n>", then place the verbatim payload between sentinel lines AFTER the YAML document. The body is taken literally — no escaping, no indentation, any characters are safe:
+
+batch:
+  - actionType: direct
+    intent: write_file
+    path: page.html
+    content: KOI_HEREDOC_1
+###KOI_HEREDOC_1_START###
+<!doctype html>
+<style>body { margin: 0; line-height: 1.6; }</style>
+<h1>Hi: there # really</h1>
+###KOI_HEREDOC_1_END###
+
+Use a distinct number per file (KOI_HEREDOC_1, KOI_HEREDOC_2, …) and one START/END pair per token. Put all heredoc blocks after the YAML. The START/END marker lines must each be on their own line.
+
 Never output invalid YAML. Invalid YAML crashes the system.
 
 ========================================

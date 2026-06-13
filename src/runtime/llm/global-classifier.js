@@ -106,6 +106,10 @@ export async function classifyGlobalMessage(agent, message) {
   const validTargets = snapshot.tasks
     .filter((t) => t.status === 'pending' || t.status === 'in_progress')
     .map((t) => `${t.source}#${t.id}`);
+  // Root's in-flight direct work (no task object yet) is targetable too,
+  // so a correction of what the assistant is doing RIGHT NOW can be a
+  // modify_task instead of a phantom new_task. See global-snapshot.js.
+  if (snapshot.rootIntent) validTargets.push('root#current');
 
   const prompt = `You are the GLOBAL message router for an AI agent runtime. A user message just arrived. You see the complete runtime state: all pending/in-progress tasks (across the root's workqueue AND the global task plan), any delegate currently executing one of them, and the recent dialogue.
 
@@ -119,6 +123,7 @@ Decide ONE of:
 
 STRICT RULES:
 - "modify_task" / "cancel_task" require a concrete target. If no existing task clearly matches, downgrade to "new_task" (for modify) or "noop" (for cancel).
+- "root#current" (only present when shown above as "ASSISTANT IS HANDLING THIS DIRECTLY") represents what the assistant is doing RIGHT NOW in conversation, BEFORE any task or delegate exists. If the user corrects, refines, redirects, or replaces THAT in-flight request — e.g. "mejor sobre coches" (better about cars) right after "haz un articulo sobre motos de agua" — use modify_task targeting root#current. This is the common "no, actually…" case: do NOT make it a new_task, that creates an ignored parallel task. The rewrite MUST state the corrected intent (e.g. an article about cars, not jet skis).
 - Thematic overlap alone is NOT enough for "modify_task" — the user must be refining or altering the SAME work. "Research X, now also look up Y" → modify. "Research X. Now tell me about Z" → new_task.
 - DISTINGUISH modify vs cancel: "better do lentils instead" = modify (replace subject of same task). "forget the recipe, never mind" = cancel_task. "do lentils in a new file" (while old task continues) = new_task.
 - DISTINGUISH cancel_task vs cancel_plan: "cancel the lentil search" (one specific task) = cancel_task. "cancel everything" / "stop all work" = cancel_plan. When in doubt and there's only ONE active task, prefer cancel_task.
@@ -127,6 +132,7 @@ STRICT RULES:
 - Never invent a target id. ONLY pick from the list of VALID TARGETS provided.
 
 ABORT-IN-FLIGHT:
+- For modify_task targeting \`root#current\`, set \`abortInFlight: true\` — the assistant is actively working on the old intent, so it must be interrupted to re-plan with the correction.
 - For modify_task / cancel_task where the task is currently \`in_progress\` AND there's a delegate listed as working on it, set \`abortInFlight: true\` — the runtime interrupts the delegate's current LLM / tool call so the change is seen immediately.
 - For cancel_plan, \`abortInFlight\` is always true (implicit) and targetDelegateAgent does not apply.
 - If the task is still \`pending\` or no delegate is running it, set \`abortInFlight: false\`.
@@ -175,11 +181,37 @@ Return ONLY a single JSON object (no prose, no markdown fences):
     return _defaultNewTask(message);
   }
 
-  const kind = json.kind;
+  let kind = json.kind;
   const validKinds = ['new_task', 'modify_task', 'cancel_task', 'cancel_plan', 'noop'];
   if (!validKinds.includes(kind)) {
     channel.log('inbox', `${agent.name}: global classifier invalid kind "${kind}" — defaulting to new_task`);
     return _defaultNewTask(message, json.language);
+  }
+
+  // ── Deterministic correction override ───────────────────────────────
+  // Cheap classifiers reliably MISCLASSIFY terse topic-swaps ("mejor de
+  // coches" right after "artículo sobre motos de agua") as new_task, even
+  // though the prompt rule says it's a modification. The model usually
+  // parses the CONTENT correctly ("coches") but picks the wrong ACTION.
+  // So when the message clearly redirects the topic AND there is a single
+  // unambiguous active target (root's in-flight intent, or the one
+  // in-progress/pending task), force modify_task onto that target and
+  // keep the model's rewrite. This is the deterministic safety net the
+  // prompt alone can't guarantee.
+  if ((kind === 'new_task' || kind === 'noop') && _looksLikeTopicRedirect(message.text)) {
+    const ct = _pickCorrectionTarget(snapshot);
+    if (ct) {
+      channel.log('inbox', `${agent.name}: correction override — "${message.text.substring(0, 40)}" → modify_task ${ct.source}#${ct.id}${ct.delegate ? ` (delegate ${ct.delegate})` : ''}`);
+      json.kind = 'modify_task';
+      kind = 'modify_task';
+      json.target = { id: ct.id, source: ct.source, owner: ct.owner };
+      json.abortInFlight = ct.abortInFlight;
+      if (ct.delegate) json.targetDelegateAgent = ct.delegate;
+      if (!json.rewrite || !json.rewrite.subject) {
+        const _subj = message.text.length > 80 ? message.text.substring(0, 77) + '...' : message.text;
+        json.rewrite = { subject: _subj, description: message.text, activeForm: 'Applying the correction' };
+      }
+    }
   }
 
   // modify_task AND cancel_task both need a valid target. Share the
@@ -291,4 +323,71 @@ function _normalizeLanguage(lang) {
   const trimmed = lang.trim();
   if (!trimmed || trimmed.toLowerCase() === 'null' || trimmed.toLowerCase() === 'unknown') return null;
   return trimmed;
+}
+
+/**
+ * Heuristic: does this short message read as "redirect the current work to
+ * a different subject"? Tuned to be SPECIFIC (names a new topic) so it
+ * doesn't fire on additive follow-ups or unrelated requests. Spanish-first
+ * because that's the primary user language, plus common English forms.
+ */
+function _looksLikeTopicRedirect(text) {
+  if (typeof text !== 'string') return false;
+  const t = text.trim().toLowerCase();
+  if (!t || t.length > 80) return false; // corrections are short
+  return (
+    // "mejor de coches", "mejor sobre coches", "mejor el de…", "mejor un…"
+    /^mejor\s+(de|del|sobre|el|la|los|las|un|una|lo)\b/.test(t) ||
+    // "que sea de X", "que trate de X", "cámbialo a X", "cambia a X",
+    // "en vez de X", "en lugar de X", "hazlo de X", "ponlo de X"
+    /^(que sea|que trate|c[áa]mbialo|cambia(lo)?\s+(a|por)|en vez de|en lugar de|haz(lo)?\s+(de|sobre)|ponlo\s+(de|sobre))\b/.test(t) ||
+    // English equivalents
+    /^(make it about|change it to|instead of|rather make it|better make it|actually,?\s+(make it|about))\b/.test(t)
+  );
+}
+
+/**
+ * Pick the single unambiguous target a topic-redirect should modify.
+ * Returns { source, id, owner, abortInFlight, delegate } or null when
+ * there's nothing active or it's ambiguous (we refuse to guess then).
+ */
+function _pickCorrectionTarget(snapshot) {
+  // Root's own in-flight direct work wins — it's the most immediate.
+  if (snapshot.rootIntent) {
+    return { source: 'root', id: 'current', owner: snapshot.rootIntent.owner || null, abortInFlight: true, delegate: null };
+  }
+
+  const tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+  const delegates = Array.isArray(snapshot.runningDelegates) ? snapshot.runningDelegates : [];
+
+  // Exactly one delegate running → redirect ITS own work item. The plan
+  // can carry several in_progress rows (System's task + the delegate's),
+  // so don't bail on count: the running delegate disambiguates which one
+  // the correction is about.
+  if (delegates.length === 1) {
+    const name = String(delegates[0].name || '');
+    const own = tasks.filter(
+      (t) => String(t.source) === `workqueue:${name}` &&
+        (t.status === 'in_progress' || t.status === 'pending')
+    );
+    if (own.length >= 1) {
+      const ip = own.filter((t) => t.status === 'in_progress');
+      const pick = (ip.length > 0 ? ip : own).sort((a, b) => Number(b.id) - Number(a.id))[0];
+      return { source: pick.source, id: String(pick.id), owner: pick.owner || name, abortInFlight: true, delegate: name };
+    }
+  }
+
+  // Otherwise a SINGLE active task overall. Prefer in_progress; fall back
+  // to a lone pending one. More than one (and no single delegate) →
+  // ambiguous, refuse to guess.
+  const inProgress = tasks.filter((t) => t.status === 'in_progress');
+  const pool = inProgress.length > 0 ? inProgress : tasks.filter((t) => t.status === 'pending');
+  if (pool.length !== 1) return null;
+  const t = pool[0];
+  let delegate = null;
+  const m = /^workqueue:(.+)$/.exec(String(t.source || ''));
+  if (m && delegates.some((d) => String(d.name || '').toLowerCase() === m[1].toLowerCase())) {
+    delegate = m[1];
+  }
+  return { source: String(t.source), id: String(t.id), owner: t.owner || null, abortInFlight: !!delegate, delegate };
 }

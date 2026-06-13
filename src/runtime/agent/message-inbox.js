@@ -41,6 +41,13 @@ export class MessageInbox {
     this._processChain = Promise.resolve();
     /** Counter for inbox message ids */
     this._nextId = 1;
+    /**
+     * Bumped every time clear() runs (user pressed Stop). A message whose
+     * classification started before the bump but finishes after it belongs
+     * to the discarded pre-Stop batch and must NOT be published. See the
+     * generation check in _processNext.
+     */
+    this._clearGen = 0;
   }
 
   /**
@@ -90,11 +97,26 @@ export class MessageInbox {
     // context — exactly the "memoria no disponible" complaint.
     //
     // Heuristic: only fire when (a) the message is from a user (not an
-    // agent broadcast), (b) the buffer is non-empty, and (c) the buffer's
-    // last entry is from the assistant — meaning the previous exchange
-    // already concluded. Mid-task user follow-ups (where last entry is
-    // user / tool result) DON'T trigger — we keep the working context.
-    if (entry.from === 'user') {
+    // agent broadcast), (b) the buffer is non-empty, (c) the buffer's
+    // last entry is from the assistant, and (d) the agent is IDLE — not
+    // mid-turn.
+    //
+    // (d) is critical and was missing: this snapshot+reset wipes the LIVE
+    // contextMemory buffer. Inbox messages only ever arrive while the
+    // agent is BUSY (an idle agent parked at prompt_user consumes input
+    // via the fast path, never the inbox), so without the busy guard this
+    // ALWAYS fired mid-turn — e.g. the user asks a question while the
+    // agent is awaiting two parallel image generations. Resetting the
+    // buffer then erases the in-flight turn's context: when the actions
+    // return the agent has lost what it was doing and stalls, looking
+    // "stuck thinking". Condition (c) ("last entry is assistant") can't
+    // tell a concluded exchange from a turn that merely printed something
+    // before continuing — only the busy state can.
+    let agentBusy = true; // default busy → skip (safe) when state is unknown
+    try {
+      agentBusy = !!this._agent?.constructor?._cliHooks?.getUiBridge?.()?.agentBusy;
+    } catch { /* indeterminate → treat as busy, skip the reset */ }
+    if (entry.from === 'user' && !agentBusy) {
       const cm = this._agent.contextMemory ?? this._agent._activeContextMemory;
       const buf = cm?._buffer;
       if (Array.isArray(buf) && buf.length > 0 && buf[buf.length - 1]?.role === 'assistant') {
@@ -158,6 +180,7 @@ export class MessageInbox {
   clear() {
     this._pending = [];
     this._processed = [];
+    this._clearGen++;
   }
 
   /** ─────────────────────── Internal ─────────────────────── */
@@ -165,6 +188,26 @@ export class MessageInbox {
   async _processNext() {
     const entry = this._pending.shift();
     if (!entry) return;
+
+    // Tell ui-bridge this user message's classification has settled, so it
+    // can release the FIFO hold on any newer message it queued behind it
+    // (see ui-bridge `_inflightClassifications`). Fires exactly once per
+    // user message regardless of how it was handled (delivered / applied /
+    // dropped). No-op outside the GUI/CLI bridge.
+    let _settled = false;
+    const _settle = () => {
+      if (_settled || entry.from !== 'user') return;
+      _settled = true;
+      try {
+        this._agent?.constructor?._cliHooks?.getUiBridge?.()?._onClassificationSettled?.();
+      } catch { /* non-fatal */ }
+    };
+
+    // Snapshot the clear generation. Classification is async (an LLM call):
+    // if the user presses Stop while THIS message is being classified,
+    // clear() bumps `_clearGen`, and we drop the result below instead of
+    // publishing it — it was typed before the Stop barrier.
+    const gen = this._clearGen;
 
     let result;
     try {
@@ -191,6 +234,16 @@ export class MessageInbox {
       result = { kind: 'noop', reasoning: `classifier error: ${err?.message || err}` };
     }
 
+    // Stop pressed mid-classification → this message is part of the
+    // discarded pre-Stop batch. Drop it: no cross-agent mutation, no
+    // contextMemory note, no input-queue delivery. (Messages typed AFTER
+    // the Stop captured the new generation and pass through normally.)
+    if (gen !== this._clearGen) {
+      channel.log('inbox', `${this._agent.name}: dropped "${entry.text.substring(0, 40)}" — Stop pressed during classification`);
+      _settle();
+      return;
+    }
+
     channel.log('inbox', `${this._agent.name}: classified "${entry.text.substring(0, 60)}" → ${result.kind}${result.targetTaskId ? ` (task #${result.targetTaskId})` : ''}${result.target?.source ? ` [${result.target.source}]` : ''}`);
 
     // Cross-agent modifications can't wait for the classifier agent's
@@ -210,7 +263,11 @@ export class MessageInbox {
     if (entry.from === 'user') {
       try {
         let applied = false;
-        if (result.kind === 'modify_task' && result.target?.source) {
+        if (result.kind === 'modify_task' && result.target?.source === 'root') {
+          // The user corrected what root (System) is doing DIRECTLY right
+          // now — no delegate/task to mutate; redirect root itself.
+          applied = await this._applyRootRedirectIfNeeded(entry, result);
+        } else if (result.kind === 'modify_task' && result.target?.source) {
           applied = await this._applyCrossAgentModifyIfNeeded(entry, result);
         } else if (result.kind === 'cancel_task' && result.target?.source) {
           applied = await this._applyCrossAgentCancelIfNeeded(entry, result);
@@ -261,6 +318,7 @@ export class MessageInbox {
     // SECOND time so the same message re-enters the input queue and
     // resurfaces as their "last message" again.
     this._processed.push({ message: entry, result });
+    _settle();
     this._wakeAgent();
   }
 
@@ -285,6 +343,73 @@ export class MessageInbox {
    * iteration either way. The urgent case is per-agent workqueue
    * rewrites where the delegate has no reason to re-read otherwise.
    */
+  /**
+   * Redirect root (System) when the user corrects a request that root is
+   * handling DIRECTLY — no delegate, no task to mutate, so the existing
+   * cross-agent modify path (which only touches `workqueue:` targets) has
+   * nothing to grab. This is the root-level twin of that path:
+   *
+   *   1. Inject a STRONG correction note into root's live contextMemory so
+   *      the next LLM turn abandons the old topic and re-plans.
+   *   2. Make the corrected text root's active `_lastUserMessage` (drives
+   *      CURRENT FOCUS / compose templates).
+   *   3. If `abortInFlight`, abort root's own in-flight LLM with reason
+   *      'modify' — the reactive loop CONTINUES (does not exit) and re-reads
+   *      the corrected context on its next iteration, immediately.
+   *
+   * Mark `entry._preDelivered` so the drain-side `_applyInboxResult` does
+   * NOT also deliver the raw text to a prompt_user waiter (we've already
+   * applied it as a context redirect, not a fresh answer).
+   *
+   * Returns true when applied. `this._agent` here is always root, because
+   * user messages only ever land in System's inbox (delegates use the
+   * local classifier, not the global one).
+   */
+  async _applyRootRedirectIfNeeded(entry, result) {
+    const target = result.target;
+    if (!target || target.source !== 'root') return false;
+
+    const root = this._agent;
+    const rewrite = result.rewrittenTask || {};
+    const newSubject = rewrite.subject || entry.text;
+    const newDesc = rewrite.description || '';
+
+    const cm = root._activeContextMemory;
+    if (cm && typeof cm.add === 'function') {
+      cm.add(
+        'user',
+        `⚠️ The user CORRECTED their request mid-flight.\n\n` +
+        `User said: "${entry.text}"\n\n` +
+        `Your current request is now SUPERSEDED. Use THIS as the authoritative instruction going forward:\n` +
+        `  ${newSubject}${newDesc ? `\n  ${newDesc}` : ''}\n\n` +
+        `Abandon the previous topic ENTIRELY. Do NOT keep working on it. Re-plan from here.`,
+        `User redirected: ${newSubject}`,
+        null,
+      );
+    }
+    // Corrected text becomes the active intent for downstream consumers.
+    root._lastUserMessage = newSubject;
+    // Suppress the drain-side re-delivery — we've applied the correction
+    // as a context redirect, not a prompt_user answer.
+    entry._preDelivered = true;
+    channel.log('inbox', `${root.name}: redirected own in-flight intent → "${String(newSubject).substring(0, 60)}"`);
+
+    if (result.abortInFlight) {
+      try {
+        if (typeof root.abort === 'function') {
+          root.abort('modify');
+          channel.log('inbox', `${root.name}: aborted own in-flight LLM (reason=modify) to apply the correction immediately`);
+        }
+      } catch (err) {
+        channel.log('inbox', `${root.name}: self-abort failed: ${err?.message || err}`);
+      }
+    }
+
+    // Wake root in case it's parked between iterations.
+    this._wakeAgent();
+    return true;
+  }
+
   async _applyCrossAgentModifyIfNeeded(entry, result) {
     const target = result.target;
     if (!target || !target.source || !target.source.startsWith('workqueue:')) return false;

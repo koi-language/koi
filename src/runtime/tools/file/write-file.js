@@ -43,7 +43,7 @@ export default {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path to write. Accepts an absolute or relative path, or a `@mention` handle that resolves via MediaLibrary to a previously-tagged file (overwriting it). For brand-new files, pass a fresh path; for updating tagged ones, prefer edit_file.' },
-      content: { type: 'string', description: 'Full file content to write' },
+      content: { type: 'string', description: 'Full file content to write. For HTML/CSS/code or any punctuation-heavy payload, do NOT inline it — set content to a heredoc reference "KOI_HEREDOC_<n>" and place the verbatim file body between ###KOI_HEREDOC_<n>_START### / ###KOI_HEREDOC_<n>_END### marker lines AFTER the YAML document. The body is taken literally, so colons, braces, quotes and # are all safe.' },
       internal: { type: 'boolean', description: 'Optional. When true, the write is silent: no "Create file" card in the chat, no permission dialog. Use for files only the agent itself will read (workflow state, scratch JSON). Paths under `.koi/` default to true automatically — pass false there to force-show a specific write to the user.' }
     },
     required: ['path', 'content']

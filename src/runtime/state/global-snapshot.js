@@ -49,6 +49,10 @@ import { taskManager } from './task-manager.js';
  * @property {DelegateRef[]} runningDelegates
  * @property {{role: string, text: string}[]} recentTurns
  *   Last N messages from the root's context memory (trimmed).
+ * @property {{id: string, subject: string, owner: string} | null} rootIntent
+ *   Root's in-flight, directly-handled request (no task/delegate yet),
+ *   exposed as the synthetic target `root#current`. Null when root is
+ *   idle or the work is already delegated.
  */
 
 /**
@@ -179,12 +183,45 @@ export async function buildGlobalSnapshot(opts = {}) {
     }
   } catch { /* non-fatal */ }
 
+  // ── Root direct-handling intent ──────────────────────────────────────
+  // When root (System) is processing a user request ITSELF — busy, with
+  // no delegate running and nothing in_progress — there is no task object
+  // to target, yet the user may still correct/redirect that in-flight work
+  // ("better about cars instead", "make it for beginners"). Surface root's
+  // current intent as a synthetic, targetable item (`root#current`) so the
+  // classifier can route a correction back to root the SAME way it routes
+  // one to a delegate. Without this, such a correction has no valid target
+  // and gets downgraded to a phantom parallel new_task that root ignores.
+  let rootIntent = null;
+  try {
+    let rootBusy = false;
+    try { rootBusy = !!Agent._cliHooks?.getUiBridge?.()?.agentBusy; } catch { /* non-fatal */ }
+    const hasInProgress = tasks.some((t) => t.status === 'in_progress');
+    if (root && rootBusy && runningDelegates.length === 0 && !hasInProgress) {
+      // Current intent = the most recent user turn we surfaced above.
+      let subject = '';
+      for (let i = recentTurns.length - 1; i >= 0; i--) {
+        if (recentTurns[i]?.role === 'user' && recentTurns[i]?.text) {
+          subject = recentTurns[i].text;
+          break;
+        }
+      }
+      // Fall back to the agent's last-user-message if the dialogue filter
+      // dropped everything (e.g. the very first turn).
+      if (!subject && typeof root._lastUserMessage === 'string') subject = root._lastUserMessage;
+      if (subject) {
+        rootIntent = { id: 'current', subject: _clip(subject, maxDescriptionChars), owner: root.name || 'System' };
+      }
+    }
+  } catch { /* non-fatal */ }
+
   return {
     activeWorkflow,
     activeWorkflowPhase,
     tasks,
     runningDelegates,
     recentTurns,
+    rootIntent,
   };
 }
 
@@ -225,6 +262,11 @@ export function renderSnapshotForPrompt(snap) {
       const hint = d.activityHint ? ` — ${d.activityHint}` : '';
       lines.push(`- ${d.name} (on task #${d.parentTaskKey})${skills}${hint}`);
     }
+  }
+
+  if (snap.rootIntent) {
+    lines.push('\nASSISTANT IS HANDLING THIS DIRECTLY RIGHT NOW (no task/delegate created yet) — target key root#current:');
+    lines.push(`- ${snap.rootIntent.subject.replace(/\n/g, ' ')}`);
   }
 
   if (snap.recentTurns.length > 0) {

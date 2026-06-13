@@ -2815,14 +2815,33 @@ export class Agent {
             channel.beginScope('Shell', `${_syncGroup.length} commands`);
           }
 
-          // Per-delegate timeout: if a delegate hangs (no LLM response, stuck permission, etc.)
-          // it should not block the entire parallel group forever.
+          // Per-delegate timeout: if a delegate hangs (no LLM response,
+          // stuck permission, a media provider that never answers, etc.)
+          // it must NOT block the entire parallel group — and the turn —
+          // forever. Without this a single wedged `generate_image` HTTP
+          // call leaves the agent "stuck thinking" with no recovery, since
+          // Promise.all only resolves when EVERY delegate settles. The
+          // ceiling is generous (10 min, env-overridable) so legitimately
+          // slow media generation isn't killed; it only catches true
+          // hangs. On timeout we resolve with an error result (never
+          // throw) so the group completes and the reactive loop recovers.
+          const _PARALLEL_DELEGATE_TIMEOUT_MS =
+            Number(process.env.KOI_PARALLEL_DELEGATE_TIMEOUT_MS) || 600000;
           const _syncResults = await Promise.all(_syncGroup.map(async (pa) => {
             const paIntent = pa.intent || pa.type || 'unknown';
             const paDetail = pa.url ? ` url=${pa.url.substring(0, 100)}` : pa.query ? ` q="${pa.query.substring(0, 60)}"` : pa.path ? ` path=${pa.path}` : '';
             channel.log('action', `${this.name}: Starting parallel delegate: ${paIntent}${paDetail}`);
+            let _timer = null;
             try {
-              const { result } = await this._executeAction(pa, pa, session.actionContext);
+              const _exec = this._executeAction(pa, pa, session.actionContext)
+                .then(({ result }) => result);
+              const _timeout = new Promise((_, reject) => {
+                _timer = setTimeout(
+                  () => reject(new Error(`parallel delegate "${paIntent}" timed out after ${Math.round(_PARALLEL_DELEGATE_TIMEOUT_MS / 1000)}s`)),
+                  _PARALLEL_DELEGATE_TIMEOUT_MS,
+                );
+              });
+              const result = await Promise.race([_exec, _timeout]);
               if (pa.id) {
                 session.actionContext[pa.id] = { output: result };
               }
@@ -2836,6 +2855,8 @@ export class Agent {
               const failedIntent = pa?.intent || pa?.type || 'unknown';
               channel.log('error', `${this.name}: Parallel action "${failedIntent}" failed: ${error.message}`);
               return { action: pa, result: null, error };
+            } finally {
+              if (_timer) clearTimeout(_timer);
             }
           }));
 
@@ -4094,21 +4115,6 @@ export class Agent {
           }
         }
 
-        // ── User-stop abort (Ctrl+C / Stop): DISCARD queued input ───────
-        // If the user pressed stop, any message they typed while the
-        // agent was busy is dropped — NOT replayed. Without this, the
-        // drain below re-delivers that message into the input queue and
-        // the prompt_user call consumes it, so it resurfaces as the
-        // user's "last message" on the next turn, again and again — the
-        // exact bug being fixed. We gate on reason !== 'cancel' so the
-        // cancel_task / cancel_plan ACK path below still works (those
-        // aborts WANT their note drained and acknowledged).
-        if (this._abortReason !== 'cancel') {
-          try { this._inbox?.clear?.(); } catch { /* non-fatal */ }
-          try { Agent._cliHooks?.getUiBridge?.()?.clearInputQueue?.(); } catch { /* non-fatal */ }
-          channel.log('inbox', `${this.name}: user-stop abort — discarded queued input (reason=${this._abortReason ?? 'user-stop'})`);
-        }
-
         // If the loop exited while a classified inbox message is still
         // undrained (classic case: cancel_task / cancel_plan aborted
         // the loop mid-batch, before the next top-of-loop drain could
@@ -4117,8 +4123,14 @@ export class Agent {
         //   2. `deliverClassifiedInput` queues the user's text for
         //      the prompt_user below, so the agent doesn't wait
         //      silently with no visible ACK.
-        // After a user-stop discard above, hasWork() is false, so this
-        // is naturally skipped.
+        //
+        // NOTE: input the user typed BEFORE pressing Stop is already
+        // gone by this point — uiBridge.abort() clears the input queues
+        // AND every agent inbox at the moment Stop is pressed (the abort
+        // barrier), and the inbox generation guard drops any message that
+        // was still mid-classification when the barrier fired. So this
+        // drain only ever sees messages typed AFTER the Stop, which the
+        // user DOES want answered.
         if (this._inbox?.hasWork?.()) {
           try {
             const processed = this._inbox.drainProcessed();
