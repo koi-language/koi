@@ -5920,8 +5920,13 @@ Many commands are inherently slow and produce little or no output for extended p
           }
           return result;
         }
-      } else if (intent && typeof intent === 'string' && intent.trim() !== '') {
-        // No teams defined - fall back to global router (rare case)
+      } else if (intent && typeof intent === 'string' && intent.trim() !== '' && !intent.includes('::')) {
+        // Global-router fallback for NATURAL-LANGUAGE intents only. We
+        // deliberately skip it for an explicit `agent::capability` intent that
+        // didn't resolve above: the user/model named a specific target that
+        // doesn't exist, so loose-routing the literal "agent::cap" string to
+        // the closest agent (matches[0], no confidence floor) would fabricate
+        // success — it must fail cleanly instead (→ executeDirectly / throw).
         const { agentRouter } = await import('../router.js');
         let matches = await agentRouter.findMatches(intent, 5);
 
@@ -6046,6 +6051,26 @@ Many commands are inherently slow and produce little or no output for extended p
             return { agent: member, event: matchingEvent, alias: memberName };
             }
           }
+        }
+      }
+      // Explicit `agent::capability` delegate whose AGENT half names no
+      // accessible member → the target does not exist. Do NOT fall through to
+      // the semantic router below: it returns the closest agent regardless of
+      // confidence, silently mis-routing a phantom delegate to a generic
+      // worker that just echoes the args as a "result" — i.e. it CLAIMS the
+      // task was done while nothing ran (the "said it published to X but never
+      // tried" bug). Return null so the delegate surfaces a real failure
+      // instead of fabricating success. Only enforced for the explicit `::`
+      // syntax — a `.` may be incidental (e.g. "node.js" in a prose intent).
+      if (colonIdx >= 0) {
+        const agentExists = accessibleTeams.some(team =>
+          Object.entries(team.members).some(([mn, m]) =>
+            m !== this && (mn.toLowerCase() === agentPart || m.name.toLowerCase() === agentPart)));
+        if (!agentExists) {
+          if (process.env.KOI_DEBUG_LLM) {
+            console.error(`[Agent:${this.name}] ✗ Qualified delegate "${intent}" → unknown agent "${agentPart}"; refusing to semantic-route (would fabricate success). Returning null.`);
+          }
+          return null;
         }
       }
     }
@@ -6339,6 +6364,13 @@ Many commands are inherently slow and produce little or no output for extended p
 
     // If it's a very simple task description, LLM can handle it
     const intent = action.intent || action.description || '';
+    // An explicit `agent::capability` intent that reached here did NOT resolve
+    // to any handler / skill / team member upstream. Letting it "execute
+    // directly" drops it into the LLM-execute fallback, which fabricates a
+    // result (e.g. "published to X" when nothing ran). The model named a
+    // specific target that doesn't exist — fail cleanly so the parent retries
+    // with a real approach (activate the skill, run the actual tool/shell).
+    if (intent.includes('::')) return false;
     if (intent.length < 100 && !action.requiresExternalAgent) {
       return true;
     }
@@ -6365,34 +6397,28 @@ Many commands are inherently slow and produce little or no output for extended p
       return await actionDef.execute(action, this);
     }
 
-    // Execute with LLM
-    if (!this.llmProvider) {
-      this.llmProvider = new LLMProvider(this.llm);
-    }
-
-    let prompt;
-
+    // Inline playbook: a deliberate LLM task with caller-provided instructions.
     if (action.playbook) {
-      prompt = action.playbook;
-    } else {
-      // Generate simple prompt
-      const intent = action.intent || action.description;
-      const data = action.data || action.input || {};
-
-      prompt = `
-Task: ${intent}
-
-Input data:
-${JSON.stringify(data, null, 2)}
-
-Context:
-${JSON.stringify(context, null, 2)}
-
-Execute this task and return the result as JSON.
-`;
+      if (!this.llmProvider) {
+        this.llmProvider = new LLMProvider(this.llm);
+      }
+      return await this.llmProvider.callJSON(action.playbook, this);
     }
 
-    return await this.llmProvider.callJSON(prompt, this);
+    // No registered executor and no playbook. This used to ask the cheapest
+    // model to "execute this task and return JSON" — which executes NOTHING and
+    // fabricates a plausible-looking result (the live "published to X" bug:
+    // a hallucinated {skill,action,arguments} was accepted as success). That
+    // hallucination fallback is removed: fail loudly so the agent retries with
+    // a REAL approach instead of inventing an outcome.
+    const intent = action.intent || action.description || '(unknown)';
+    throw new Error(
+      `No executor for "${intent}". It is not a registered action and did not resolve to a ` +
+      `handler, skill, or team member — so there is nothing to run. Do NOT fabricate a result. ` +
+      `Use a real action: if a skill can do this (e.g. publishing, sending, deploying), activate ` +
+      `it and run its actual tool/command (shell), then verify it happened; otherwise pick a ` +
+      `registered action.`
+    );
   }
 
   /**

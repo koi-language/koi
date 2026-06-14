@@ -95,14 +95,16 @@ Pick the ONE category (A-G) that best describes this user request AND detect the
 
 IMPORTANT: Pick the category that MATCHES the request. Do NOT over-classify — a simple "create an app" is just C or D (the agent will decompose it). Only use E for requests that explicitly need multi-system integration or architecture redesign.
 
+CRITICAL: A request to perform a REAL-WORLD ACTION on the user's behalf through an external integration — publish/post/share to a social network (X, LinkedIn, Instagram…), send an email or message, deploy, make a payment, place an order, delete data — is NEVER A, B or C. It looks short ("post X to Twitter") but it requires careful tool/skill orchestration (activate the skill, run the right command with the right arguments, handle accounts/OAuth, and VERIFY it actually happened) and carries irreversible side effects. A weak model fabricates success without doing the work. Classify these as at least D (or G for pure ops/deploy).
+
 For "lang": return the English name of the natural language used in the request (e.g. "Spanish", "English", "French", "German", "Portuguese", "Italian", "Japanese", "Chinese", "Arabic", "Russian", "Dutch", "Polish"). If the message is too short or language-neutral (single emoji, code-only), return "English" as default.
 
 CATEGORIES:
 
 A: Greeting, chitchat, thanks, goodbye, casual conversation — no real task
 B: Simple question — factual, explanation, comparison, non-technical — no code needed
-C: Quick task — a single direct action: rename, fix typo, small script, find something in codebase, explain code, run a command
-D: Moderate task — a focused feature, bug fix, creative/media production (image, poster, video, infographic), review, or investigation
+C: Quick task — a single direct action: rename, fix typo, small script, find something in codebase, explain code, run a command. NOTE: actions with external side effects on the user's behalf (publish/send/deploy/pay) do NOT belong here — see the CRITICAL note above.
+D: Moderate task — a focused feature, bug fix, creative/media production (image, poster, video, infographic), review, investigation, OR performing a side-effecting external action on the user's behalf (publish/post/share to a social network, send an email/message)
 E: Complex task — needs planning, decomposition, multi-file changes, integration, or architecture decisions
 F: Review or audit — code review, security audit, quality check, performance analysis
 G: Ops / infrastructure — deploy, run services, check logs, manage environments, CI/CD
@@ -112,7 +114,7 @@ EXAMPLES:
 A: "hello", "hola qué tal", "thanks!", "bye", "good morning", "hey", "gracias", "ok"
 B: "what's the capital of France?", "explain what Kubernetes is", "compare React vs Vue", "what time is it?", "summarize this article"
 C: "rename userId to user_id", "fix the typo", "write a bash script to backup the DB", "where is the auth middleware?", "how does the login flow work?", "add a loading spinner", "change the port to 8080", "run flutter run", "npm start"
-D: "add a GET /health endpoint with tests", "fix the checkout bug", "implement email verification", "add Stripe integration", "the button doesn't work on mobile", "generate an image of a cat", "make me a poster about X", "create an infographic", "design a logo", "hazme un dibujo realista"
+D: "add a GET /health endpoint with tests", "fix the checkout bug", "implement email verification", "add Stripe integration", "the button doesn't work on mobile", "generate an image of a cat", "make me a poster about X", "create an infographic", "design a logo", "hazme un dibujo realista", "publica un post en X que diga ...", "post this to LinkedIn", "share this on Instagram", "send this email to the team", "tuitea esto"
 E: "build a notification system", "refactor auth into a shared module", "create a multi-tenant architecture", "implement real-time collaboration", "build a custom template engine", "haz una app de gestión tributaria", "create an infographic researching a topic from the web with high quality prompts"
 F: "review this PR", "check for security issues", "audit the API for OWASP top 10", "review queries for N+1 problems"
 G: "deploy to production", "check the Railway logs", "docker compose up", "why aren't emails sending?", "the CI pipeline broke", "restart the backend service", "check if SSL cert is valid"
@@ -163,6 +165,7 @@ CRITICAL GUIDANCE (common mis-classifications):
 - Any task that says "comprehensive", "full analysis", "top to bottom", "all sections", or lists explicit section headings is P (planning + decomposition needed).
 - If the expected output is a file the agent has to write, it is at minimum M (multi-file work / real code output). Never A-E.
 - Delegation to another agent ("invoke SoftwareDeveloper to do X") inherits X's complexity — classify by WHAT is being delegated, not by the delegation wrapper.
+- Performing a real-world action with EXTERNAL SIDE EFFECTS on the user's behalf (publish/post/share to a social network, send an email/message, deploy, make a payment, place an order) is K or N — NEVER A/B/C. It requires running the right tool/skill with correct arguments and verifying it actually happened; a weak model hallucinates success without acting.
 ${projectContext ? `\nPROJECT CONTEXT (use this to gauge complexity — a rename in a 500-file project is harder than in a 5-file project):\n${projectContext}\n` : ''}${discoveryContext ? `\nDISCOVERY CONTEXT (what the agent found while exploring — use this to refine your estimate):\n${discoveryContext}\n` : ''}
 
 CATEGORIES:
