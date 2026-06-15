@@ -1501,6 +1501,36 @@ CRITICAL RULES:
       if (session._hasAudioAttachments) session._hasAudioAttachments = false;
       if (session._hasFileAttachments)  session._hasFileAttachments  = false;
 
+      // ── Prompt-cache continuity check ────────────────────────────────────
+      // Prompt caches are per-model (and per-provider). If auto-routing picks a
+      // different model than the previous turn of THIS session, the entire
+      // cached prefix is lost on this request — we pay full input price and a
+      // fresh cache write. Common triggers: input growth crossing a contextK
+      // threshold, an image/video/audio attachment forcing a multimodal model,
+      // or a provider cooldown after a timeout. Log it loudly so we can see how
+      // often it's happening and what's causing it.
+      {
+        const _prevModel    = session._autoModel;
+        const _prevProvider = session._autoProvider;
+        if (_prevModel && (_prevModel !== resolved.model || _prevProvider !== resolved.provider)) {
+          const _reasons = [
+            _requiresImage ? 'image' : null,
+            _requiresVideo ? 'video' : null,
+            _requiresAudio ? 'audio' : null,
+            _requiresFile  ? 'file'  : null,
+            `ctxK≥${_minContextK}`,
+            `task=${profile.taskType}`,
+            `diff=${profile.difficulty}`,
+          ].filter(Boolean).join(', ');
+          channel.log(
+            'llm',
+            `[cache] ⚠ model switch in-session (${agentName || 'agent'}): ` +
+            `${_prevProvider}/${_prevModel} → ${resolved.provider}/${resolved.model} ` +
+            `— prompt cache LOST this turn [${_reasons}]`
+          );
+        }
+      }
+
       // Store for cost tracking after the finally block restores this.model → 'auto'
       session._autoProvider = resolved.provider;
       session._autoModel    = resolved.model;

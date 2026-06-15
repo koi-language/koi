@@ -58,7 +58,7 @@ export default {
     // `skillDeactivated` event still fires so the GUI can update its
     // skills state without a chat line.
     channel.log('skill', `Skill deactivated: ${skillName}`);
-    channel.skillDeactivated?.({ agent: agent.name, skill: skillName });
+    channel.skillDeactivated?.({ agent: agent.name, instanceId: agent.state?._uiInstanceId, skill: skillName });
 
     return {
       deactivated: true,

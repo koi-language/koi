@@ -121,17 +121,22 @@ G: "deploy to production", "check the Railway logs", "docker compose up", "why a
 
 ${taskDescription}`;
 
+    // Capability floor: ONLY greetings/chitchat (A) stay on a cheap model.
+    // Everything else floors reasoning above 50 so a low-reasoning flash model
+    // (e.g. Gemini 3 Flash @39) is never selected — even a "simple" question or
+    // quick task hallucinates / makes things up on the cheap tier, and
+    // overestimating costs pennies while underestimating costs quality.
     const CATEGORY_PROFILES = {
       A: { code: 0,   reasoning: 10,  risk: 0,  reasoningEffort: EFFORT_NONE },
-      B: { code: 0,   reasoning: 20,  risk: 0,  reasoningEffort: EFFORT_NONE },
-      C: { code: 30,  reasoning: 25,  risk: 10, reasoningEffort: EFFORT_LOW },
+      B: { code: 30,  reasoning: 55,  risk: 0,  reasoningEffort: EFFORT_LOW },
+      C: { code: 45,  reasoning: 55,  risk: 10, reasoningEffort: EFFORT_LOW },
       // Media production (image/poster/infographic) and complex tasks need a
       // capable model: reasoning 65 keeps low-reasoning models (e.g. Gemini 3
       // Flash @39) out, which otherwise botch detailed prompt assembly.
-      D: { code: 45,  reasoning: 65,  risk: 15, reasoningEffort: EFFORT_MEDIUM },
+      D: { code: 50,  reasoning: 65,  risk: 15, reasoningEffort: EFFORT_MEDIUM },
       E: { code: 60,  reasoning: 65,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
-      F: { code: 50,  reasoning: 50,  risk: 10, reasoningEffort: EFFORT_LOW },
-      G: { code: 40,  reasoning: 45,  risk: 50, reasoningEffort: EFFORT_LOW },
+      F: { code: 55,  reasoning: 60,  risk: 10, reasoningEffort: EFFORT_MEDIUM },
+      G: { code: 50,  reasoning: 60,  risk: 50, reasoningEffort: EFFORT_MEDIUM },
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);

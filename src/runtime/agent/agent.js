@@ -289,6 +289,9 @@ export class Agent {
   }
 
   constructor(config) {
+    // Kept so a parallel delegate branch can spawn its OWN independent
+    // instance (forkInstance) instead of racing on a shared `this`.
+    this._initConfig = config;
     this.name = config.name;
     this.displayName = config.displayName || this.name;
     this.instanceId = config.instanceId ?? Agent._nextInstanceId++;
@@ -367,7 +370,12 @@ export class Agent {
     // Register in the global inbox registry so external callers can
     // push messages by agent name. Last-write-wins if the same name is
     // registered twice; in practice each Agent name is unique per process.
-    Agent._inboxRegistry.set(String(this.name || '').toLowerCase(), this);
+    // Ephemeral forks (one-shot parallel-delegate instances) must NOT
+    // register — they'd clobber the real agent's registry entry by name
+    // and steal its inbox routing.
+    if (!config._ephemeralFork) {
+      Agent._inboxRegistry.set(String(this.name || '').toLowerCase(), this);
+    }
 
     // Initialize LLM provider if needed
     this.llmProvider = null;
@@ -451,6 +459,22 @@ export class Agent {
     if (this._abortController.signal.aborted) return;
     this._abortReason = reason;
     try { this._abortController.abort(reason); } catch { /* non-fatal */ }
+  }
+
+  /**
+   * Spawn a fresh, INDEPENDENT instance of this agent for a single parallel
+   * delegate branch. Parallel delegates would otherwise all run `.handle()`
+   * on the SAME shared object and race on every non-`state` `this.*` field
+   * (the live "3 workers, 1 banner / skills on one row / 2 stuck on the
+   * permission prompt" bugs). Sharing `this` was only ever safe for SEQUENTIAL
+   * delegation. The fork shares definitional config (role, peers, playbooks,
+   * phases, MCP) BY REFERENCE but gets its own mutable state, inbox and runtime
+   * fields. `_ephemeralFork` keeps it out of the global inbox-by-name registry,
+   * and its own `_resetAbortController()` (run in the constructor) re-chains to
+   * the global Stop so the fork stays cancelable.
+   */
+  forkInstance() {
+    return new Agent({ ...this._initConfig, state: {}, instanceId: undefined, _ephemeralFork: true });
   }
 
   /** Get this agent's work queue (lazy-initialized). */
@@ -1206,12 +1230,18 @@ export class Agent {
       if (_fromDelegation) {
         // Delegated invocations run inside an isolated state context so
         // parallel delegates of the same agent don't share/overwrite each
-        // other's phase.
-        const freshState = {};
+        // other's phase. Seed it with THIS invocation's UI instanceId so
+        // skill-activation events can carry it — parallel delegates share
+        // the same `name` ("Worker"), so the footer can only attach skills
+        // to the right row by instanceId, not name. Lives in the isolated
+        // state (NOT on `this`) precisely so parallel invocations don't
+        // overwrite each other's id.
+        const freshState = { _uiInstanceId: _instanceId };
         return await _invocationStateStorage.run(freshState, () =>
           this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn)
         );
       }
+      this._rootState._uiInstanceId = _instanceId;
       return await this._handleInner(eventName, args, _fromDelegation, _parentAnswerFn);
     } finally {
       channel.agentEnded?.({ name: this.name, instanceId: _instanceId });
@@ -1841,7 +1871,7 @@ export class Agent {
       // assignment would silently desync the UI.
       const _priorSkills = Array.isArray(this.state?.skills) ? [...this.state.skills] : [];
       for (const _sk of _priorSkills) {
-        try { channel.skillDeactivated?.({ agent: this.name, skill: _sk }); } catch { /* non-fatal */ }
+        try { channel.skillDeactivated?.({ agent: this.name, instanceId: this.state?._uiInstanceId, skill: _sk }); } catch { /* non-fatal */ }
       }
       this.state.skills = [];
       this.state._skillContents = {};
@@ -2831,6 +2861,26 @@ export class Agent {
             const paIntent = pa.intent || pa.type || 'unknown';
             const paDetail = pa.url ? ` url=${pa.url.substring(0, 100)}` : pa.query ? ` q="${pa.query.substring(0, 60)}"` : pa.path ? ` path=${pa.path}` : '';
             channel.log('action', `${this.name}: Starting parallel delegate: ${paIntent}${paDetail}`);
+            // Log the FULL task spec each parallel delegate is handed — same as
+            // the sequential delegate path does. Without this, a parallel fan-out
+            // (e.g. 3 photoshoot concepts) only logged "Starting parallel
+            // delegate: worker::do_task" with NO way to see what each worker was
+            // actually told — so you couldn't audit whether the briefs differed
+            // or whether the REQUIRED SKILLS line made it into each description.
+            if (pa.actionType === 'delegate') {
+              const _ts = pa.data || pa.task || {};
+              const _subj = _ts.subject || _ts.id || '(no subject)';
+              const _desc = typeof _ts.description === 'string' ? _ts.description : '(no description)';
+              channel.log(
+                'action',
+                `${this.name}: Delegating (parallel) to ${paIntent} — subject="${_subj}"\n` +
+                `--- task description (full) ---\n${_desc}\n--- end task description ---`,
+              );
+              // Run this branch on its OWN agent instance, not the shared one.
+              // resolveAction reads this flag and forks teamMember/router agents
+              // so concurrent siblings never collide on a shared `this`.
+              pa._forkParallelInstance = true;
+            }
             let _timer = null;
             try {
               const _exec = this._executeAction(pa, pa, session.actionContext)
@@ -2854,6 +2904,34 @@ export class Agent {
             } catch (error) {
               const failedIntent = pa?.intent || pa?.type || 'unknown';
               channel.log('error', `${this.name}: Parallel action "${failedIntent}" failed: ${error.message}`);
+              // The timeout/error abandoned the underlying _executeAction promise
+              // BEFORE its task-completion code ran — so the task it marked
+              // `in_progress` would otherwise spin forever in the UI (the live
+              // "one worker hung, spinner never stops" bug). Revert it to
+              // `pending` so the spinner clears and the System can retry/handle
+              // it. taskId is the safe key; fall back to a UNIQUE subject match
+              // (never an ambiguous one — reverting the wrong task is its own bug).
+              try {
+                let _tid = pa?.data?.taskId ?? pa?.data?.id ?? pa?.task?.id;
+                const { taskManager: _tmRevert } = await import('../state/task-manager.js');
+                if (_tid == null) {
+                  const _subj = pa?.data?.subject;
+                  if (_subj) {
+                    const _norm = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+                    const _ns = _norm(_subj);
+                    const _matches = _tmRevert.list().filter(t =>
+                      t.status === 'in_progress' && _norm(t.subject) === _ns);
+                    if (_matches.length === 1) _tid = _matches[0].id;
+                  }
+                }
+                if (_tid != null) {
+                  const _t = _tmRevert.get(String(_tid));
+                  if (_t && _t.status === 'in_progress') {
+                    _tmRevert.update(String(_tid), { status: 'pending' });
+                    channel.log('agent', `${this.name}: Reverted task #${_tid} to pending after parallel delegate failure/timeout`);
+                  }
+                }
+              } catch { /* non-fatal */ }
               return { action: pa, result: null, error };
             } finally {
               if (_timer) clearTimeout(_timer);
@@ -4846,10 +4924,24 @@ export class Agent {
             const { taskManager: _tmFb } = await import('../state/task-manager.js');
             const _norm = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
             const _ns = _norm(_subject);
-            const _match = _tmFb.list().find(t =>
-              (t.status === 'pending' || t.status === 'in_progress') &&
-              (_norm(t.subject) === _ns || _ns.includes(_norm(t.subject)) || _norm(t.subject).includes(_ns))
-            );
+            const _open = _tmFb.list().filter(t => t.status === 'pending' || t.status === 'in_progress');
+            // Prefer an EXACT normalized subject match. Only accept a substring
+            // match when it is UNAMBIGUOUS (exactly one candidate): with several
+            // similar subjects (e.g. "Generate photoshoot - Studio Elegance / -
+            // Urban Lifestyle / - Sleek Tech Grid") the old loose `.find()`
+            // substring match would claim the WRONG task — checking off a
+            // sibling, or letting two parallel delegates both grab the first
+            // match. When ambiguous, do NOT guess; leave taskId unresolved.
+            let _match = _open.find(t => _norm(t.subject) === _ns);
+            if (!_match) {
+              const _subMatches = _open.filter(t =>
+                _ns.includes(_norm(t.subject)) || _norm(t.subject).includes(_ns));
+              if (_subMatches.length === 1) {
+                _match = _subMatches[0];
+              } else if (_subMatches.length > 1) {
+                channel.log('agent', `${this.name}: subject "${_subject}" ambiguously matches ${_subMatches.length} open tasks — not auto-resolving taskId (the delegate should pass an explicit taskId).`);
+              }
+            }
             if (_match) _taskId = _match.id;
           } catch { /* non-fatal */ }
         }
@@ -5815,7 +5907,14 @@ Many commands are inherently slow and produce little or no output for extended p
         }
 
         // Search within team members - team defines communication boundaries
-        const teamMember = await this.findTeamMemberForIntent(intent);
+        let teamMember = await this.findTeamMemberForIntent(intent);
+        // Parallel branch → run on an INDEPENDENT fork, never the shared team
+        // agent (concurrent siblings would race on its `this`). Wrapping in a
+        // new object means the displayName / _pendingImagesToPropagate mutations
+        // below touch the fork, not the shared original.
+        if (teamMember && action._forkParallelInstance) {
+          teamMember = { ...teamMember, agent: teamMember.agent.forkInstance() };
+        }
 
         if (teamMember) {
           // Show delegation with indentation
@@ -5934,7 +6033,11 @@ Many commands are inherently slow and produce little or no output for extended p
         matches = matches.filter(match => match.agent !== this);
 
         if (matches.length > 0) {
-          const best = matches[0];
+          let best = matches[0];
+          // Parallel branch → independent fork (see teamMember branch above).
+          if (action._forkParallelInstance) {
+            best = { ...best, agent: best.agent.forkInstance() };
+          }
           const actionTitle = action.title || intent;
           const _routerSlot = `${best.agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           const _routerParentSlotId = channel.getCurrentSlotId() ?? null;

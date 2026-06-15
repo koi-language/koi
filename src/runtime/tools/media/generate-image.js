@@ -201,6 +201,17 @@ const generateImageAction = {
   ],
 
   async execute(action, agent) {
+    // ── Per-call concurrency checkpoint tracing ─────────────────────────────
+    // Three parallel workers calling generate_image at once interleave their
+    // log lines AND all log as "Worker", so a hang is impossible to attribute.
+    // Tag every checkpoint with the worker's UI instanceId + a per-call id so
+    // an interleaved log can be read per-call and the exact stalled `await`
+    // is visible. Temporary diagnostic for the "2 of 3 concurrent gens hang
+    // before the gateway call" bug. Remove once the deadlock is found.
+    const _wtag = `${agent?.name || 'gen'}#${String(agent?.state?._uiInstanceId || '').slice(-6) || '?'}`;
+    const _ck = (msg) => { try { channel.log('image', `[gen-trace ${_wtag}] ${msg}`); } catch { /* non-fatal */ } };
+    _ck('execute() entered');
+
     // Guard: a blind first call returns docs instead of executing.
     // Forces the agent to see labels (`erotic`, `porn`, …),
     // excludeProviders/excludeModels, the live per-model catalog,
@@ -278,12 +289,12 @@ const generateImageAction = {
     // Visual-storyboard provenance guard.
     //
     // When the agent calls us with `label: "visual_storyboard"` (the
-    // route the `visual-storyboard` skill uses), the produced PNG is
+    // route the `visual-panels` skill uses), the produced PNG is
     // expected to carry a metadata link back to where it came from —
     // either `sourceStoryboard` (path to the interactive storyboard
     // JSON) or `storyboardOrigin: "idea"` (explicit declaration that
     // there's no JSON, the sheet was built from a raw prompt). Without
-    // ONE of those, the downstream `visual-storyboard-to-video` skill
+    // ONE of those, the downstream `visual-panels-to-video` skill
     // can't re-attach the source JSON when rendering the final video,
     // and (reported bug) the agent falls back to disk-searching the
     // storyboards folder and confabulating which JSON "matches" the
@@ -296,8 +307,8 @@ const generateImageAction = {
         const msg =
           'generate_image was called with `label: "visual_storyboard"` but ' +
           '`metadata.sourceStoryboard` is missing AND `metadata.storyboardOrigin` ' +
-          'is not "idea". The visual-storyboard skill REQUIRES one of those so ' +
-          'the downstream `visual-storyboard-to-video` skill can re-attach the ' +
+          'is not "idea". The visual-panels skill REQUIRES one of those so ' +
+          'the downstream `visual-panels-to-video` skill can re-attach the ' +
           'source storyboard JSON (or know there is none). Pass `metadata: ' +
           '{ sourceStoryboard: "<abs-path>", storyboardPart: K, storyboardParts: ' +
           'K_total, storyboardShotIds: [...] }` when the sheet derives from an ' +
@@ -670,11 +681,13 @@ const generateImageAction = {
           try {
             const { MediaLibrary } = await import('../../state/media-library.js');
             const lib = MediaLibrary.global();
+            _ck(`MediaLibrary.save() START (${path.basename(resolvedPath)})`);
             const result = await lib.save({
               filePath: resolvedPath,
               metadata: { source: 'reference', usedForGeneration: true, alias: alias || undefined },
               description: `Reference image${alias ? ` (${alias})` : ''}: ${path.basename(resolvedPath)}`,
             });
+            _ck(`MediaLibrary.save() DONE (isNew=${result.isNew})`);
             _savedRefIds[resolvedPath] = result.id;
             channel.log('image', `Reference image ${result.isNew ? 'saved to' : 'already in'} media library: ${result.id}${alias ? ` [${alias}]` : ''}`);
           } catch (mlErr) {
@@ -718,7 +731,9 @@ const generateImageAction = {
         const { adaptImageInput } = await import('../../llm/providers/_constraints.js');
         for (let i = 0; i < referenceImages.length; i++) {
           const ref = referenceImages[i];
+          _ck(`adaptImageInput() START [ref ${i}]`);
           const adapted = await adaptImageInput(ref.data, pickedImageModel, 'referenceImages');
+          _ck(`adaptImageInput() DONE [ref ${i}] changed=${adapted.changed}`);
           if (adapted.changed) {
             referenceImages[i] = { data: adapted.buffer, mimeType: adapted.mimeType };
           }
@@ -754,7 +769,7 @@ const generateImageAction = {
     // hand-wrote a position (correct or wrong), we strip it first
     // and re-write the authoritative one. Skills should write
     // positional references as "IMAGE N" inline (see the
-    // visual-storyboard SKILL); the backtick-alias auto-annotation
+    // visual-panels SKILL); the backtick-alias auto-annotation
     // here is a safety net for skills that still emit aliases.
     let effectivePrompt = prompt;
     if (_refAliases.some((a) => a && a.length > 0)) {
@@ -855,7 +870,7 @@ const generateImageAction = {
           // EXCEPTION — when the caller passed an explicit output dim
           // (`resolution` OR `targetSize{width,height}`), the agent is
           // NOT editing the base ref's canvas: they want a fresh
-          // generation at the requested size (e.g. a visual-storyboard
+          // generation at the requested size (e.g. a visual-panels
           // sheet at 4K that just happens to use the base ref as
           // identity input, or an outpaint where the caller pre-computed
           // the target canvas). Setting targetSize to the padded ref
@@ -1139,6 +1154,7 @@ const generateImageAction = {
       }
       return '?';
     });
+    _ck('reached model dispatch (about to call the gateway)');
     channel.log('image', `generate_image: ${resolved.provider}/${resolved.model}, prompt="${effectivePrompt.substring(0, 150)}...", aspectRatio=${effectiveAspect || '-'}, resolution=${effectiveResolution || '-'}, n=${action.n || 1}, refs=${refSummary.length}${refSummary.length ? ' [' + refSummary.join(', ') + ']' : ''}, saveTo=${action.saveTo || 'default'}`);
 
     // Passthrough: only forward params the agent actually supplied. The
@@ -1252,7 +1268,9 @@ const generateImageAction = {
 
     let result;
     try {
+      _ck('gateway generate() START');
       result = await instance.generate(effectivePrompt, genOpts);
+      _ck('gateway generate() DONE');
       // Log the ACTUAL slug the router picked (e.g. "fal-ai/flux/dev")
       // instead of the declared "auto" — the user needs to know which
       // model produced each image, so this hits stdout AND the image
@@ -1635,7 +1653,7 @@ const generateImageAction = {
       usage: result.usage,
       // Non-fatal contract violations surface here. Currently used by the
       // `visual_storyboard` label to flag missing source-JSON metadata —
-      // the call succeeded but the downstream `visual-storyboard-to-video`
+      // the call succeeded but the downstream `visual-panels-to-video`
       // link is broken (see _warnings collection at the top of execute()).
       ...(_warnings.length > 0 ? { warnings: _warnings } : {}),
     };

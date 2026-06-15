@@ -271,7 +271,7 @@ function _normalize(sb, existing) {
   const rootRefs = _normRefs(sb.references);
   const continuity = _normStrList(sb.continuity);
   // Authoritative production totals, stamped on every save so any reader
-  // (esp. the visual-storyboard skill's chunking step) consumes ONE number
+  // (esp. the visual-panels skill's chunking step) consumes ONE number
   // instead of re-summing per-shot durations by hand — which the agent gets
   // wrong: a 40 s storyboard (13 + 4.5 + 22.5) was mis-read as "20 s" and
   // chunked into 2 PART sheets instead of 3. Computed here, the single write

@@ -126,6 +126,37 @@ function _ensureLastMessageIsUser(messages) {
 export class OpenAIChatLLM extends BaseLLM {
   get providerName() { return 'openai'; }
 
+  /**
+   * Add the stable per-session id as `session_id` so OpenRouter pins every
+   * turn of this session to the same upstream provider (sticky routing).
+   *
+   * Why this matters: prompt caches are per-(provider endpoint, prefix). When
+   * the braxil gateway fronts OpenRouter, OpenRouter normally derives its
+   * sticky key from a hash of the messages — which our per-request dynamic
+   * system block (timestamp, cwd, …) perturbs, scattering turns across upstream
+   * endpoints and cold-missing the cache every time. OpenRouter docs: "When a
+   * session_id is present, OpenRouter uses it directly as the sticky routing
+   * key" and activates stickiness from the first request, before any cache is
+   * even observed. So a stable session_id keeps the whole session on one
+   * endpoint and the prompt cache warm.
+   *
+   * Gated on gateway mode (`KOI_AUTH_TOKEN` set, not offline) — the exact
+   * condition under which ALL traffic routes through the gateway and this
+   * class is the gateway client. On direct-OpenAI calls (own API key, no
+   * gateway) we skip it, since `session_id` isn't a valid OpenAI field.
+   *
+   * NOTE: this is necessary but not sufficient — the gateway service must
+   * forward `session_id` through to OpenRouter for the stickiness to take
+   * effect upstream.
+   */
+  _cleanParams(params) {
+    const p = super._cleanParams(params);
+    const _gateway = process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE;
+    const _sid = process.env.KOI_SESSION_ID;
+    if (_gateway && _sid && p.session_id === undefined) p.session_id = _sid;
+    return p;
+  }
+
   async streamReactive(messages, opts = {}) {
     const { abortSignal, onChunk, onHeartbeat } = opts;
     this._logStart();

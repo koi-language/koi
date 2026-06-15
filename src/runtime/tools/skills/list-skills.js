@@ -30,7 +30,7 @@ import { listAdminPluginDirs } from '../../plugins/admin-root.js';
  * previous hand-rolled line-by-line parser only saw the first line of
  * a folded value and ended up returning the literal `>` as the
  * description (the reported bug — visible in the agent's catalog as
- * `### visual-storyboard\n>` instead of the actual paragraph).
+ * `### visual-panels\n>` instead of the actual paragraph).
  */
 function parseFrontmatter(content) {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---/);

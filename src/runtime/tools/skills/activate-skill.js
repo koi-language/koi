@@ -97,7 +97,9 @@ export default {
     // Live lifecycle event: lets the GUI footer attach this skill to the
     // agent that activated it and drop it later on deactivate. Safe no-op
     // on channels that don't implement it.
-    channel.skillActivated?.({ agent: agent.name, skill: skillName });
+    // instanceId disambiguates parallel delegates that share `name` ("Worker"):
+    // without it the footer attaches the skill to only the first matching row.
+    channel.skillActivated?.({ agent: agent.name, instanceId: agent.state?._uiInstanceId, skill: skillName });
 
     return {
       activated: true,
