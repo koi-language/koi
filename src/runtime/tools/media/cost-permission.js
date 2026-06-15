@@ -28,6 +28,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { isAutoApprove } from '../../util/interactivity.js';
 import { getAuthHeaders, fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { channel } from '../../io/channel.js';
 import { runPermissionDialog } from '../../code/permission-queue.js';
@@ -119,7 +120,7 @@ export async function confirmMediaCost(channel, info = {}) {
   // Headless / scripted runs and a persisted auto-approve both proceed
   // without prompting. `KOI_YES=1` is the same global "yes to everything"
   // escape hatch the shell tool honours.
-  if (process.env.KOI_YES === '1') return true;
+  if (isAutoApprove()) return true;
   _hydrate();
   if (_autoApproveMedia) return true;
   if (!channel || typeof channel.select !== 'function') return true;
@@ -204,7 +205,7 @@ export async function preflightMediaCost(bannerKind, act, agent) {
   if (!kind) return true;
 
   // Auto-approve / KOI_YES short-circuit before we even touch the catalog.
-  if (process.env.KOI_YES === '1') return true;
+  if (isAutoApprove()) return true;
   _hydrate();
   if (_autoApproveMedia) return true;
 

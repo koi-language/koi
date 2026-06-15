@@ -19,6 +19,7 @@
 import path from 'path';
 import fs from 'fs';
 import { runPermissionDialog } from './permission-queue.js';
+import { isAutoApprove } from '../util/interactivity.js';
 
 /**
  * Check if `dir` is equal to or a subdirectory of `allowedDir`.
@@ -109,8 +110,8 @@ export class FilePermissions {
    * @returns {{ permitted: boolean, scope: 'file'|'directory'|null }}
    */
   isAllowed(filePath, level = 'read') {
-    // --yes flag: auto-accept all file permissions
-    if (process.env.KOI_YES === '1') return true;
+    // --yes / YOLO / headless: auto-accept all file permissions
+    if (isAutoApprove()) return true;
 
     // GUI: auto-approve paths explicitly attached by user
     if (level === 'read' && globalThis.__guiApprovedPaths?.size > 0) {

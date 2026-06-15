@@ -38,6 +38,20 @@ export function isNonInteractive() {
 }
 
 /**
+ * True when every permission gate (shell command, file write, media cost
+ * consent) must auto-approve — treat the user as having said "yes" to all.
+ *
+ * `KOI_YES` (`--auto-accept`) is the explicit "yes to everything" flag. A
+ * non-interactive run (YOLO or --exit) also implies it: there is no one to
+ * ask, and YOLO's whole point is "never pause for permission". This is the
+ * ONE predicate every permission short-circuit consults — don't read the raw
+ * env at the call site.
+ */
+export function isAutoApprove() {
+  return process.env.KOI_YES === '1' || isNonInteractive();
+}
+
+/**
  * Set/clear the per-session YOLO flag at runtime. All `isNonInteractive()`
  * call sites read `process.env` on each invocation, so flipping this takes
  * effect on the very next prompt/turn — no engine restart needed.

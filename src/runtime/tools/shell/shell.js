@@ -24,6 +24,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { isAutoApprove } from '../../util/interactivity.js';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
@@ -642,7 +643,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
       return _globalIndividualPerms.isAllowed(baseCmd, effectiveDir);
     };
 
-    let permitted = isSilent || _commandTouchesKoi || process.env.KOI_YES === '1' || checkPermitted();
+    let permitted = isSilent || _commandTouchesKoi || isAutoApprove() || checkPermitted();
     let reportDone;
     let descriptionShown = false;
 
