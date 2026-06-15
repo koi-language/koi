@@ -18,6 +18,7 @@
 
 import path from 'path';
 import fs from 'fs';
+import { runPermissionDialog } from './permission-queue.js';
 
 /**
  * Check if `dir` is equal to or a subdirectory of `allowedDir`.
@@ -202,19 +203,16 @@ export function getFilePermissions(_agent) {
 // the parallel batch hangs forever.
 // ---------------------------------------------------------------------------
 
-let _filePermQueueTail = Promise.resolve();
-
 /**
- * Run `fn` (an async permission dialog) serially with respect to other file
- * permission dialogs. Returns the promise returned by fn.
+ * Run `fn` (an async permission dialog) serially. Thin alias over the ONE
+ * global permission-dialog queue (`permission-queue.js`) — file, shell and
+ * media-cost prompts MUST share a single queue, else a file dialog and a media
+ * dialog requested concurrently still overlap and deadlock. Kept as a named
+ * export so the file tools' call sites don't churn.
  *
  * Usage:
  *   const value = await runFilePermDialog(() => cliSelect(...));
  */
 export function runFilePermDialog(fn) {
-  // Chain fn after the current tail; errors in fn propagate to the caller
-  // but never break the chain for subsequent waiters.
-  const result = _filePermQueueTail.then(() => fn());
-  _filePermQueueTail = result.then(() => {}, () => {});
-  return result;
+  return runPermissionDialog(fn);
 }

@@ -269,20 +269,25 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     parsed = parseYaml(cleaned, { uniqueKeys: false });
     if (parsed === undefined) throw new Error('empty YAML document');
     // A bare scalar (string/number/bool) means the model answered in PROSE,
-    // not an action map/sequence — surface it verbatim as a print (same as
-    // the prose fallback in the catch below). YAML is lenient enough that a
-    // sentence with no colon parses as a plain string.
+    // not an action map/sequence. We used to surface it verbatim as a print;
+    // removed — fail instead so the agent re-emits a real action. (If the
+    // model wants to show text to the user it must emit `intent: print` with
+    // the text under `message`.)
     if (parsed === null || typeof parsed !== 'object') {
-      return normalizeReactiveAction({
-        actionType: 'direct', intent: 'print', message: String(parsed ?? '').trim(),
-      });
+      throw new Error(
+        'Your response was a bare value, not an action. Emit a YAML action ' +
+        'with an "intent"/"actionType". To show text to the user, emit:\n' +
+        'actionType: direct\nintent: print\nmessage: "..."\n' +
+        `Got: ${String(parsed ?? '').trim().substring(0, 120)}`
+      );
     }
-    // YAML coerced prose-with-a-colon ("Note: done.") into a 1-key map. If
-    // NONE of the keys look like a real action, it was prose, not a tool
-    // call — print the original text instead of throwing on a bogus action.
-    // BUT if the raw text carries action structure (batch:/actionType:/intent:)
-    // it's a MALFORMED action, not prose — throw so the agent retries rather
-    // than vomiting the raw YAML into the chat.
+    // YAML parsed to an object but NONE of the keys look like a real action.
+    // We used to print the raw text to the user when it didn't carry the
+    // literal action keywords — that's the bug: a stray `return:` / `summary:`
+    // / `taskCount:` block parses fine, isn't an action, and got dumped raw
+    // into the chat. We now FAIL in every non-action case so the agent retries
+    // with a valid action (the `_looksLikeYamlAction` branch still attempts a
+    // mechanical prose+action recovery first).
     if (!_looksLikeAction(parsed)) {
       if (_looksLikeYamlAction(_rawCleaned)) {
         const _rec = _recoverProseThenAction(_rawCleaned);
@@ -297,9 +302,13 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
           );
         }
       } else {
-        return normalizeReactiveAction({
-          actionType: 'direct', intent: 'print', message: _rawCleaned.trim(),
-        });
+        throw new Error(
+          'Your YAML parsed but is not a valid action (no "intent"/"actionType"). ' +
+          'Do NOT wrap output in keys like "return:" / "summary:" / "taskCount:". ' +
+          'To show text to the user, emit:\n' +
+          'actionType: direct\nintent: print\nmessage: "..."\n' +
+          `Got: ${_rawCleaned.trim().substring(0, 120)}`
+        );
       }
     }
   } catch (firstErr) {
@@ -355,29 +364,15 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
           } catch { /* fall through */ }
         }
       }
-      // The model answered in plain PROSE — it never even tried to emit a
-      // JSON action. This is common when a model just "answers the question"
-      // directly (e.g. it watched a video and wrote the whole shot-list table
-      // as its reply). Throwing here discards a perfectly good answer AND
-      // forces a retry that often makes the agent thrash into other tools
-      // (shell / ffmpeg). So when there is NO JSON structure at all — the
-      // response doesn't start with `{` or `[`, and every extraction fallback
-      // above came up empty — treat the entire response as a `print`: surface
-      // the answer to the user verbatim instead of erroring.
-      //
-      // We do this ONLY for clear prose. A response that DID start with `{` /
-      // `[` but failed to parse is a genuinely malformed / truncated JSON
-      // action — that still throws to retry, so we never silently swallow a
-      // half-formed tool call (the exact anti-pattern the user banned).
-      const _trimmed = cleaned.trim();
-      if (_trimmed.length > 0 && !_trimmed.startsWith('{') && !_trimmed.startsWith('[')
-          && !_looksLikeYamlAction(_trimmed)) {
-        return normalizeReactiveAction({
-          actionType: 'direct',
-          intent: 'print',
-          message: _trimmed,
-        });
-      }
+      // NOTE: we used to treat unparseable plain prose (no JSON/YAML structure)
+      // as a `print` and surface it to the user verbatim. Removed deliberately:
+      // when the model emits a structured-but-broken response, that band-aid
+      // dumped raw YAML straight into the chat. We now FAIL instead — the model
+      // must always emit a real action (use `intent: print` to show text to the
+      // user). Genuine "prose head + action tail" responses are still recovered
+      // mechanically just below (that slices out an action the model actually
+      // emitted, not a guess); if no action can be recovered, we throw at the
+      // end of this block so the agent retries.
 
       // Prose head + action tail (the response DOES carry action lines, the
       // prose ahead of them is what broke the YAML parse). Recover the action,

@@ -30,12 +30,19 @@ import path from 'path';
 import os from 'os';
 import { getAuthHeaders, fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { channel } from '../../io/channel.js';
+import { runPermissionDialog } from '../../code/permission-queue.js';
 
 // One flag for ALL media kinds — per the product spec, enabling auto-approve
 // on any media confirmation suppresses the prompt for every subsequent media
 // generation. Lazily hydrated from disk on first use, then kept in memory.
 let _autoApproveMedia = false;
 let _hydrated = false;
+
+// The media-cost confirmation shares the ONE global permission-dialog queue
+// (`permission-queue.js`) with file + shell prompts. A per-media queue would
+// stop media↔media overlap but NOT file↔media or shell↔media — those would
+// still fire two `channel.select`s at once and deadlock. One queue = never two
+// dialogs concurrently, whatever asked.
 
 function _stateFile() {
   return path.join(os.homedir(), '.koi', 'media-cost-approve.json');
@@ -117,6 +124,15 @@ export async function confirmMediaCost(channel, info = {}) {
   if (_autoApproveMedia) return true;
   if (!channel || typeof channel.select !== 'function') return true;
 
+  // Ask ONE AT A TIME. Concurrent media generations would otherwise each fire a
+  // `channel.select` simultaneously and the extra dialogs never resolve → those
+  // workers hang. Serialising also lets a single "Auto-approve" answer release
+  // every queued sibling (we re-check the flag below after taking our turn).
+  return runPermissionDialog(async () => {
+  // A sibling prompt that resolved while we waited in the queue may have just
+  // enabled auto-approve — honour it and skip asking again.
+  if (_autoApproveMedia) return true;
+
   const { kind, model, resolution, aspectRatio, maxCredits } = info;
   const balance = await fetchAvailableBalance(info.abortSignal);
 
@@ -160,6 +176,7 @@ export async function confirmMediaCost(channel, info = {}) {
     return true;
   }
   return value === 'yes';
+  });
 }
 
 /**

@@ -1,4 +1,5 @@
 import { channel } from '../../io/channel.js';
+import { isNonInteractive, isExitOnComplete } from '../../util/interactivity.js';
 /**
  * Prompt User Action - Ask user for input via command line
  *
@@ -31,9 +32,10 @@ Do not print a question separately before prompt_user.
 
 IMPORTANT: When presenting options that involve technical decisions (tech stacks, frameworks, databases, deployment, architecture, etc.), do NOT use prompt_user — use prompt_form instead. prompt_form supports "description" and "recommended" fields on each option, so the user sees a brief explanation of what each choice means. The user may not be technical. Always include a "Let me decide" / "No preference" option.`,
   thinkingHint: 'Processing your answer',
-  // In non-interactive mode, hide when there's nothing queued to consume.
+  // In non-interactive mode (--exit OR per-session YOLO), hide the ask tool
+  // once there's nothing queued to consume — the agent must not ask the user.
   // Visible while the initial prompt is still in the queue; hidden after it's consumed.
-  hidden: () => process.env.KOI_EXIT_ON_COMPLETE === '1' && process.env._KOI_INITIAL_PROMPT_CONSUMED === '1',
+  hidden: () => isNonInteractive() && process.env._KOI_INITIAL_PROMPT_CONSUMED === '1',
   permission: 'prompt_user',
 
   schema: {
@@ -112,18 +114,22 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     // agent.js:1387, 1576, 2929, 3057) emit the same shape with
     // `_runtime: true`. No validation: allow it.
 
-    // --exit mode: allow consuming the initial prompt from the queue,
-    // but block any subsequent prompt_user calls (no user to answer).
-    if (process.env.KOI_EXIT_ON_COMPLETE === '1') {
+    // Non-interactive (--exit OR per-session YOLO): allow consuming the initial
+    // prompt from the queue, but block any subsequent prompt_user calls (no user
+    // to answer — assume every answer and proceed autonomously).
+    if (isNonInteractive()) {
       if (process.env._KOI_INITIAL_PROMPT_CONSUMED === '1') {
         // Track how many times prompt_user has been blocked
         const blockedCount = Number(process.env._KOI_PROMPT_BLOCKED_COUNT || '0') + 1;
         process.env._KOI_PROMPT_BLOCKED_COUNT = String(blockedCount);
-        channel.log('prompt_user', `[exit-mode] Blocked (${blockedCount}/3). agent=${agent?.name || 'unknown'} message=${(message || '').substring(0, 100)} question=${(question || '').substring(0, 100)}`);
+        channel.log('prompt_user', `[non-interactive] Blocked (${blockedCount}). agent=${agent?.name || 'unknown'} message=${(message || '').substring(0, 100)} question=${(question || '').substring(0, 100)}`);
         if (message) channel.print(channel.renderMarkdown(message));
 
-        // After 3 blocked attempts, force exit to prevent infinite loop
-        if (blockedCount >= 3) {
+        // ONLY the headless --exit one-shot mode exits the process here. YOLO is
+        // a live chat tab: never exit — just keep auto-answering so the agent
+        // stops asking and continues. (After 3 blocks in --exit, force exit to
+        // prevent an infinite loop with no user present.)
+        if (blockedCount >= 3 && isExitOnComplete()) {
           channel.log('prompt_user', `[exit-mode] Too many blocked prompt_user attempts — forcing exit.`);
           process.exit(0);
         }

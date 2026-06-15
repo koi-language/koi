@@ -29,6 +29,7 @@ import { fileURLToPath } from 'url';
 
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
+import { runPermissionDialog } from '../../code/permission-queue.js';
 import { channel } from '../../io/channel.js';
 import { commandCreationDirHit, creationDirHit, creationDirBlockedMessage } from '../_creation-dir-guard.js';
 
@@ -416,7 +417,13 @@ async function _drainPermQueue() {
     // collapsed "Show technical details" toggle.
     const _shellHeader = `${agentName || 'Agent'} ${t('wantsToExecute') || 'wants to execute shell command'}`;
     const _permCategory = permissionCategory(baseCmd); // 'READ' | 'WRITE' | <baseCmd>
-    const value = await Promise.race([
+    // Funnel through the ONE global permission-dialog queue so a shell prompt is
+    // never shown concurrently with a file or media-cost prompt (cross-type
+    // overlap would deadlock — only one card surfaces at a time). Shell's own
+    // _permQueue still orders shell prompts among themselves; this adds the
+    // cross-type exclusion. The cancel race is kept INSIDE so a timeout still
+    // releases both this dialog and the shared queue turn.
+    const value = await runPermissionDialog(() => Promise.race([
       channel.select('', [
         { title: t('permYes'), value: 'yes' },
         { title: alwaysLabel, value: 'always' },
@@ -432,7 +439,7 @@ async function _drainPermQueue() {
         agentName: agentName || null,
       } }),
       _cancelToken,
-    ]);
+    ]));
 
     _activeSelectCancel = null;
 

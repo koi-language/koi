@@ -9,6 +9,7 @@ import { getBuiltinSlotMap } from '../prompt/builtin-slot-maps.js';
 import { channel } from '../io/channel.js';
 import * as memory from '../memory/index.js';
 import { listWorkflowsCatalog } from '../state/workflows-catalog.js';
+import { isNonInteractive, isYoloMode } from '../util/interactivity.js';
 
 // ── Active-document kind classifier ─────────────────────────────────────────
 // Robustly identify WHAT the user is actually looking at, so the WORKING AREA
@@ -469,13 +470,17 @@ When you finish all the work that belongs to the current phase, call \`phase_don
   // prompt_user requires 'prompt_user' permission — only System and ProjectOnBoarding have it
   const hasPromptUser = agent?.hasPermission?.('prompt_user') ?? false;
 
-  // Non-interactive mode: agent must act without asking for confirmation
-  const nonInteractiveBlock = process.env.KOI_EXIT_ON_COMPLETE === '1' ? `
+  // Non-interactive mode: agent must act without asking for confirmation.
+  // Fires for BOTH the headless `--exit` mode and the per-session YOLO toggle
+  // (same "never ask" behavior, centralized in isNonInteractive()). The header
+  // surfaces YOLO explicitly in the prompt so the model knows the user enabled
+  // it for this chat.
+  const nonInteractiveBlock = isNonInteractive() ? `
 
 ========================================
-NON-INTERACTIVE MODE
+${isYoloMode() ? 'YOLO MODE ACTIVATED — FULL AUTOPILOT' : 'NON-INTERACTIVE MODE'}
 ========================================
-
+${isYoloMode() ? '\nThe user has enabled YOLO mode for this chat. Act fully autonomously: assume every answer is "yes / go ahead", never pause to confirm, and keep working until the task is done.\n' : ''}
 You are running in non-interactive (headless) mode. There is no human to answer follow-up questions.
 
 **CRITICAL RULES:**

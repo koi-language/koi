@@ -12,6 +12,7 @@ import { createPhaseAccessor } from './phase-accessor.js';
 import { initSessionTracker, sessionTracker, setConversationIndexProvider } from '../state/session-tracker.js';
 import { ContextMemory, classifyFeedback } from '../state/context-memory.js';
 import { channel } from '../io/channel.js';
+import { isNonInteractive, isExitOnComplete } from '../util/interactivity.js';
 
 // Per-async-context call stack: each parallel branch has its own isolated stack,
 // so concurrent delegates to the same agent don't produce false "infinite loop" errors.
@@ -3152,8 +3153,9 @@ export class Agent {
 
             if (!_recoveredToTasks) {
               channel.log('agent', `${this.name}: Task completed, waiting for next input`);
-              // Non-interactive mode: task is done, exit cleanly.
-              if (process.env.KOI_EXIT_ON_COMPLETE === '1' && !this.amnesia) {
+              // Headless --exit one-shot: task done → exit. NOT YOLO — a YOLO
+              // chat tab stays alive and waits for the next message.
+              if (isExitOnComplete() && !this.amnesia) {
                 channel.log('agent', `[exit-mode] Root agent returned — exiting.`);
                 if (returnData?.summary) channel.print(returnData.summary);
                 process.exit(0);
@@ -5305,7 +5307,7 @@ export class Agent {
                   item = await iter.next(null);
                   continue;
                 }
-                if (answer === null && process.env.KOI_EXIT_ON_COMPLETE === '1') {
+                if (answer === null && isNonInteractive()) {
                   // Non-interactive: can't provide input — kill process and return error
                   this._shellKilledByClassifier = update.output_so_far || '';
                   this._shellKilledNonInteractive = true;
@@ -5546,8 +5548,8 @@ Many commands are inherently slow and produce little or no output for extended p
         const answer = await _cliInput(label, { secret: true });
         return answer ?? null;
       }
-      // Non-interactive mode: can't ask the user — kill the process
-      if (process.env.KOI_EXIT_ON_COMPLETE === '1') {
+      // Non-interactive (--exit or YOLO): can't ask the user — kill the process
+      if (isNonInteractive()) {
         channel.log('shell', `[${this.name}] _resolveProcessInput: no auto-answer in non-interactive mode — returning null to kill process`);
         return null;
       }
@@ -5721,7 +5723,7 @@ Many commands are inherently slow and produce little or no output for extended p
         // `state.statusPhase` directly. Validates bare idents at runtime
         // against the agent's declared `phases { }` block.
         phase: createPhaseAccessor(this),
-        nonInteractive: process.env.KOI_EXIT_ON_COMPLETE === '1', // backward compat
+        nonInteractive: isNonInteractive(), // --exit OR per-session YOLO
         // User object — accessible as user.message, user.language, user.email, etc.
         user: {
           message: this._lastUserMessage ?? _composeArgs?.goal ?? null,
@@ -5729,7 +5731,7 @@ Many commands are inherently slow and produce little or no output for extended p
           email: process.env.KOI_LOGIN_EMAIL || null,
           name: process.env.KOI_LOGIN_NAME || null,
           plan: process.env.KOI_PLAN_NAME || null,
-          interactive: process.env.KOI_EXIT_ON_COMPLETE !== '1',
+          interactive: !isNonInteractive(),
         },
       };
 
