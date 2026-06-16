@@ -140,6 +140,15 @@ export default {
       }
     } catch { /* MCP servers attach on next restart */ }
 
+    // Invalidate the per-session prompt caches so the just-installed plugin and
+    // its skills surface in the next prompt rebuild — otherwise the agent keeps
+    // seeing the pre-install catalog until restart (see llm-provider.js, which
+    // caches _skillCatalog / _pluginsInfo on agent.state).
+    if (agent?.state) {
+      delete agent.state._skillCatalog;
+      delete agent.state._pluginsInfo;
+    }
+
     const caps = Object.keys(result.capabilities || {});
     const parts = [];
     if (result.skillsCopied) parts.push(`${result.skillsCopied} skill(s)`);

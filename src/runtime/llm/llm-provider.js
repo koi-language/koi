@@ -817,6 +817,44 @@ export class LLMProvider {
           _skillCatalog = [];
         }
       }
+      // Installed plugins — tell the agent up front what's installed (and that
+      // each plugin's skills appear below namespaced as `<plugin-id>:<skill>`),
+      // so it knows its baseline capabilities and when a missing one warrants an
+      // `install_plugin` call. Built from the same pluginManager load that
+      // list_skills already did, cached per-session on agent.state.
+      let _pluginsInfo = agent.state?._pluginsInfo;
+      if (!_pluginsInfo) {
+        try {
+          const _projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
+          const { pluginManager } = await import('../plugins/plugin-manager.js');
+          pluginManager.load(_projectRoot); // idempotent — no-op once loaded
+          _pluginsInfo = pluginManager.list().filter(p => p.active);
+        } catch {
+          _pluginsInfo = [];
+        }
+        if (agent.state) agent.state._pluginsInfo = _pluginsInfo;
+      }
+      const _capSummary = (caps) => Object.entries(caps || {})
+        .filter(([, n]) => n > 0)
+        .map(([k, n]) => `${n} ${k}`)
+        .join(', ');
+      const _installedPluginsBlock = '\n\n## INSTALLED PLUGINS\n\n'
+        + (_pluginsInfo.length > 0
+            ? 'These plugins are installed and active. Their skills appear in '
+              + 'AVAILABLE SKILLS below, named `<plugin-id>:<skill>` — that prefix tells '
+              + 'you which plugin a skill comes from.\n\n'
+              + _pluginsInfo
+                  .map(p => {
+                    const ver = p.version ? ` (v${p.version})` : '';
+                    const caps = _capSummary(p.capabilities);
+                    const desc = p.description || '(no description)';
+                    return `- **${p.id}**${ver} — ${desc}${caps ? ` · ${caps}` : ''}`;
+                  })
+                  .join('\n')
+            : 'No plugins are installed.')
+        + '\n\nNeed a capability no installed plugin provides? Add one with the '
+        + '`install_plugin` intent (in: { pluginId, repo } or { pluginId, marketplaceRepo, source }).';
+
       const _catalogBlock = _skillCatalog.length > 0
         ? '\n\n## AVAILABLE SKILLS\n\n'
           + 'These skills exist on disk. Each one is identified by name + description. '
@@ -853,7 +891,7 @@ export class LLMProvider {
           ).join('\n\n---\n\n')
         : '';
 
-      const _skillBlock = _catalogBlock + _activeBlock;
+      const _skillBlock = _installedPluginsBlock + _catalogBlock + _activeBlock;
 
       // Structured cache-aware prompt: store boundary for cache_control injection
       if (typeof systemPromptResult === 'object' && systemPromptResult?._cacheKey !== undefined) {
