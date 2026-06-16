@@ -58,54 +58,92 @@ function parseFrontmatter(content) {
 }
 
 /**
+ * Read a single skill directory (one that contains SKILL.md) into a skill
+ * object. Returns null when the dir has no valid SKILL.md / frontmatter.
+ */
+function readSkillDir(skillDir) {
+  const skillMdPath = path.join(skillDir, 'SKILL.md');
+  if (!fs.existsSync(skillMdPath)) return null;
+
+  let content;
+  try {
+    content = fs.readFileSync(skillMdPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const meta = parseFrontmatter(content);
+  if (!meta) return null;
+
+  // List bundled resources (references/, scripts/, assets/)
+  const resources = [];
+  for (const subdir of ['references', 'scripts', 'assets']) {
+    const subdirPath = path.join(skillDir, subdir);
+    if (fs.existsSync(subdirPath)) {
+      try {
+        for (const f of fs.readdirSync(subdirPath)) {
+          resources.push(`${subdir}/${f}`);
+        }
+      } catch { /* skip unreadable dirs */ }
+    }
+  }
+
+  return {
+    name: meta.name,
+    description: meta.description,
+    location: skillMdPath,
+    directory: skillDir,
+    ...(meta.compatibility && { compatibility: meta.compatibility }),
+    ...(resources.length > 0 && { resources }),
+  };
+}
+
+/**
  * Scan a directory for skill subdirectories containing SKILL.md.
  */
-function scanSkillsDirectory(dirPath, maxDepth = 4) {
+function scanSkillsDirectory(dirPath) {
   const skills = [];
   if (!fs.existsSync(dirPath)) return skills;
 
   try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-    for (const entry of entries) {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       if (entry.name === '.git' || entry.name === 'node_modules') continue;
-
-      const skillMdPath = path.join(dirPath, entry.name, 'SKILL.md');
-      if (fs.existsSync(skillMdPath)) {
-        try {
-          const content = fs.readFileSync(skillMdPath, 'utf-8');
-          const meta = parseFrontmatter(content);
-          if (meta) {
-            // List bundled resources (references/, scripts/, assets/)
-            const skillDir = path.join(dirPath, entry.name);
-            const resources = [];
-            for (const subdir of ['references', 'scripts', 'assets']) {
-              const subdirPath = path.join(skillDir, subdir);
-              if (fs.existsSync(subdirPath)) {
-                try {
-                  const files = fs.readdirSync(subdirPath);
-                  for (const f of files) {
-                    resources.push(`${subdir}/${f}`);
-                  }
-                } catch { /* skip unreadable dirs */ }
-              }
-            }
-
-            skills.push({
-              name: meta.name,
-              description: meta.description,
-              location: skillMdPath,
-              directory: skillDir,
-              ...(meta.compatibility && { compatibility: meta.compatibility }),
-              ...(resources.length > 0 && { resources }),
-            });
-          }
-        } catch { /* skip unreadable files */ }
-      }
+      const skill = readSkillDir(path.join(dirPath, entry.name));
+      if (skill) skills.push(skill);
     }
   } catch { /* skip unreadable dirs */ }
 
   return skills;
+}
+
+/**
+ * Resolve a skill reference (as typed by an agent) against a list of
+ * discovered skills. A reference may be the canonical id (`plugin:name`
+ * for plugin skills, bare `name` for standalone ones) or just the bare
+ * name when that is unambiguous.
+ *
+ * Returns `{ skill }` on a unique hit, `{ error }` when the bare name is
+ * ambiguous across plugins, or `{ skill: null }` when nothing matches.
+ */
+export function resolveSkillRef(query, skills) {
+  if (!query || !Array.isArray(skills)) return { skill: null };
+
+  // 1. Exact canonical id (covers both `plugin:name` and bare standalone).
+  const byId = skills.filter(s => s.id === query);
+  if (byId.length === 1) return { skill: byId[0] };
+
+  // 2. Bare-name match — unique wins, multiple is ambiguous.
+  const byName = skills.filter(s => s.name === query);
+  if (byName.length === 1) return { skill: byName[0] };
+  if (byName.length > 1) {
+    return {
+      skill: null,
+      error: `Skill "${query}" is ambiguous — it ships in multiple plugins. `
+        + `Use the qualified name: ${byName.map(s => s.id).join(', ')}`,
+    };
+  }
+
+  return { skill: null };
 }
 
 export default {
@@ -126,54 +164,82 @@ export default {
   ],
 
   async execute(action, agent) {
-    const allSkills = new Map(); // keyed by name, project-level overrides global
+    // Keyed by CANONICAL id, not bare name. Standalone skills use their
+    // bare name as id; plugin skills use `<pluginId>:<name>` so two
+    // plugins shipping a same-named skill never collide (the old bug:
+    // both landed on the same Map key / the same `~/.koi/skills/<name>`
+    // folder and silently clobbered each other).
+    const allSkills = new Map();
 
     const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
 
-    // 1. Global skills: ~/.koi/skills/
+    // 1. Standalone global skills: ~/.koi/skills/<name>  (id = bare name)
     const globalDir = path.join(os.homedir(), '.koi', 'skills');
     const globalSkills = scanSkillsDirectory(globalDir);
     for (const skill of globalSkills) {
-      allSkills.set(skill.name, { ...skill, scope: 'global' });
+      allSkills.set(skill.name, { ...skill, id: skill.name, plugin: null, scope: 'global' });
     }
 
-    // 2. Project-level skills: <projectRoot>/.koi/skills/  (overrides global)
+    // 2. Standalone project skills: <projectRoot>/.koi/skills/<name>
+    //    (overrides a same-named global standalone skill)
     const projectDir = path.join(projectRoot, '.koi', 'skills');
     const projectSkills = scanSkillsDirectory(projectDir);
     for (const skill of projectSkills) {
-      allSkills.set(skill.name, { ...skill, scope: 'project' });
+      allSkills.set(skill.name, { ...skill, id: skill.name, plugin: null, scope: 'project' });
     }
 
-    // 3. Admin-level skills: each admin plugin contributes the skills
-    //    inside its own `<plugin>/skills/` subdir. Writes go LAST so
-    //    admin entries override project + global by virtue of Map
-    //    insertion order. No-op on end-user installs where the admin
-    //    tier doesn't exist.
+    // 3. Plugin skills — discovered IN PLACE from each active plugin's
+    //    own `skills/` dir (installed cache, project plugins, and the
+    //    admin/dev marketplace checkout all flow through the plugin
+    //    registry). NEVER flattened into the shared skills dir, and
+    //    namespaced as `<pluginId>:<name>` so collisions are impossible.
+    let pluginSkillCount = 0;
+    try {
+      const { pluginManager } = await import('../../plugins/plugin-manager.js');
+      pluginManager.load(projectRoot); // idempotent — no-op once loaded
+      for (const ps of pluginManager.getActiveSkills()) {
+        // ps: { name, path, dir, pluginId }
+        const skill = readSkillDir(ps.dir);
+        if (!skill) continue;
+        const id = `${ps.pluginId}:${skill.name}`;
+        allSkills.set(id, { ...skill, id, plugin: ps.pluginId, scope: 'plugin' });
+        pluginSkillCount++;
+      }
+    } catch { /* plugin manager unavailable — standalone skills only */ }
+
+    // 4. Admin/dev marketplace checkout (koi-language/plugins next to the
+    //    koi-cli source). Scanned explicitly — and LAST — so in-development
+    //    plugin skills always show and override a same-id installed plugin,
+    //    even when they aren't marked "active" in the saved plugin config.
+    //    The qualified `<pluginId>:<name>` id means anything already added
+    //    via getActiveSkills() above simply dedupes on the same Map key.
     for (const p of listAdminPluginDirs()) {
-      const skillsRoot = path.join(p.dir, 'skills');
-      const adminSkills = scanSkillsDirectory(skillsRoot);
-      for (const skill of adminSkills) {
-        allSkills.set(skill.name, { ...skill, scope: 'admin', plugin: p.id });
+      for (const skill of scanSkillsDirectory(path.join(p.dir, 'skills'))) {
+        const id = `${p.id}:${skill.name}`;
+        allSkills.set(id, { ...skill, id, plugin: p.id, scope: 'admin' });
+        pluginSkillCount++;
       }
     }
 
     if (allSkills.size === 0) {
       const { channel: ch } = await import('../../io/channel.js');
-      ch.log('skills', `list_skills: no skills found. Searched: global=${globalDir} (${globalSkills.length}), project=${projectDir} (${projectSkills.length}), KOI_PROJECT_ROOT=${projectRoot}`);
+      ch.log('skills', `list_skills: no skills found. Searched: global=${globalDir} (${globalSkills.length}), project=${projectDir} (${projectSkills.length}), plugins=${pluginSkillCount}, KOI_PROJECT_ROOT=${projectRoot}`);
     }
 
     const skills = Array.from(allSkills.values());
 
-    // Public output: only name + description (no file paths)
-    const publicSkills = skills.map(({ name, description }) => ({ name, description }));
+    // Public output: the agent sees the CANONICAL id as the skill name so
+    // it learns to call plugin skills as `plugin:name`. Standalone skills
+    // keep their bare name unchanged.
+    const publicSkills = skills.map(({ id, description }) => ({ name: id, description }));
 
     let catalog = '';
     if (skills.length > 0) {
-      const entries = skills.map(s => `  <skill name="${s.name}">${s.description}</skill>`);
+      const entries = skills.map(s => `  <skill name="${s.id}">${s.description}</skill>`);
       catalog = '<available_skills>\n' + entries.join('\n') + '\n</available_skills>';
     }
 
-    // _fullSkills includes location/directory for internal use by activate_skill
+    // _fullSkills includes id/location/directory for internal use by activate_skill
     return { skills: publicSkills, _fullSkills: skills, catalog };
   },
 };

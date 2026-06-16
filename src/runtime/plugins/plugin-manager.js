@@ -506,23 +506,29 @@ class PluginManager {
       const installedPaths = { skills: [], agents: [], workflows: [] };
       const isProject = scope === 'project' && projectRoot;
 
-      let skillsCopied = 0;
-      if (caps.skills) {
-        const skillsTarget = isProject
-          ? path.join(projectRoot, '.koi', 'skills')
-          : path.join(os.homedir(), '.koi', 'skills');
-        if (!fs.existsSync(skillsTarget)) fs.mkdirSync(skillsTarget, { recursive: true });
-        for (const skill of caps.skills) {
-          const dest = path.join(skillsTarget, skill.name);
-          // Always overwrite: a (re)install MUST land the freshest code.
-          // Autoinstall runs install() on every boot precisely so plugins
-          // update — skip-if-exists froze users on stale versions forever.
-          if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
-          this._copyRecursive(skill.dir, dest);
-          installedPaths.skills.push(dest);
-          skillsCopied++;
+      // Skills are NOT copied into the shared `.koi/skills` dir. They are
+      // discovered IN PLACE from this plugin's own cache dir (list-skills.js
+      // → pluginManager.getActiveSkills()) and namespaced `<pluginId>:<name>`.
+      // Flattening them here was the collision bug: two plugins shipping a
+      // skill with the same bare name landed on the same folder and clobbered
+      // each other. `installedPaths.skills` stays empty — uninstall removes
+      // the whole cache dir, which takes the in-place skills with it.
+      let skillsCopied = caps.skills ? caps.skills.length : 0;
+      // Migration: older builds DID flatten skills into `.koi/skills/<name>`.
+      // Remove exactly those previously-recorded copies (read from this
+      // plugin's prior manifest) so they don't double-list as bare-name
+      // standalone skills next to the in-place namespaced ones. Reading the
+      // old manifest — rather than guessing by name — guarantees we never
+      // delete a legitimate standalone/bundled skill that merely shares a name.
+      try {
+        const oldManifestPath = path.join(baseDir, '.koi-plugin', 'install-manifest.json');
+        if (fs.existsSync(oldManifestPath)) {
+          const old = JSON.parse(fs.readFileSync(oldManifestPath, 'utf8'));
+          for (const p of (old.installedPaths?.skills || [])) {
+            try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch { /* */ }
+          }
         }
-      }
+      } catch { /* no/ corrupt old manifest — nothing to migrate */ }
 
       let agentsCopied = 0;
       if (caps.agents) {

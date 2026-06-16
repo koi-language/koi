@@ -8,6 +8,7 @@
 import fs from 'fs';
 import path from 'path';
 import { channel } from '../../io/channel.js';
+import { resolveSkillRef } from './list-skills.js';
 
 export default {
   type: 'activate_skill',
@@ -45,11 +46,18 @@ export default {
       return { activated: false, error: 'Could not discover skills' };
     }
 
-    const skill = skills.find(s => s.name === skillName);
+    // Resolve by canonical id (`plugin:name`) or bare name (when unique).
+    const { skill, error: resolveError } = resolveSkillRef(skillName, skills);
+    if (resolveError) {
+      return { activated: false, error: resolveError };
+    }
     if (!skill) {
-      const available = skills.map(s => s.name).join(', ');
+      const available = skills.map(s => s.id || s.name).join(', ');
       return { activated: false, error: `Skill "${skillName}" not found. Available: ${available}` };
     }
+    // Everything downstream keys off the canonical id so two same-named
+    // skills from different plugins never overwrite each other in state.
+    const skillId = skill.id || skill.name;
 
     // Read the SKILL.md content
     let content;
@@ -62,18 +70,19 @@ export default {
       return { activated: false, error: `Failed to read ${skill.location}: ${err.message}` };
     }
 
-    // Store skill name in agent state (for prompt display).
+    // Store the canonical skill id in agent state (for prompt display).
     // Skill CONTENT is injected by the runtime directly into the system prompt —
     // it does NOT go through state to avoid bloating the user prompt with duplicate content.
     const currentSkills = Array.isArray(agent.state?.skills) ? [...agent.state.skills] : [];
-    if (!currentSkills.includes(skillName)) {
-      currentSkills.push(skillName);
+    if (!currentSkills.includes(skillId)) {
+      currentSkills.push(skillId);
     }
 
     // Store content in state._skillContents (internal, not serialized to user prompt).
-    // The runtime reads this for system prompt injection.
+    // The runtime reads this for system prompt injection. Keyed by canonical
+    // id so two same-named plugin skills don't clobber each other's content.
     const currentContents = agent.state?._skillContents || {};
-    currentContents[skillName] = content;
+    currentContents[skillId] = content;
     agent.state._skillContents = currentContents;
 
     // Only names go to state
@@ -93,17 +102,17 @@ export default {
       }
     }
 
-    channel.log('skill', `Skill activated: ${skillName}`);
+    channel.log('skill', `Skill activated: ${skillId}`);
     // Live lifecycle event: lets the GUI footer attach this skill to the
     // agent that activated it and drop it later on deactivate. Safe no-op
     // on channels that don't implement it.
     // instanceId disambiguates parallel delegates that share `name` ("Worker"):
     // without it the footer attaches the skill to only the first matching row.
-    channel.skillActivated?.({ agent: agent.name, instanceId: agent.state?._uiInstanceId, skill: skillName });
+    channel.skillActivated?.({ agent: agent.name, instanceId: agent.state?._uiInstanceId, skill: skillId });
 
     return {
       activated: true,
-      name: skillName,
+      name: skillId,
       content,
       directory: skillDir,
       ...(resources.length > 0 && { resources }),
