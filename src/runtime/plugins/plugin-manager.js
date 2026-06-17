@@ -39,6 +39,11 @@ class PluginManager {
   constructor() {
     this._plugins = new Map();       // id → PluginEntry
     this._activePlugins = new Set();  // ids of enabled plugins
+    // id → bool. Per-plugin "keep this up to date automatically" flag.
+    // Absent ⇒ ON by default (see getAutoUpdate). The GUI compares the
+    // installed version against the marketplace catalog and, on boot,
+    // silently re-installs (= upgrades) plugins whose flag is on.
+    this._autoUpdate = new Map();
     this._loaded = false;
   }
 
@@ -325,6 +330,9 @@ class PluginManager {
       }
       const data = JSON.parse(fs.readFileSync(GLOBAL_CONFIG, 'utf8'));
       this._activePlugins = new Set(data.active || []);
+      // autoUpdate is an { id: bool } map. Only explicit entries are
+      // stored; everything absent defaults to ON via getAutoUpdate.
+      this._autoUpdate = new Map(Object.entries(data.autoUpdate || {}));
     } catch {
       this._activePlugins = new Set(this._plugins.keys());
     }
@@ -335,7 +343,21 @@ class PluginManager {
     if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
     fs.writeFileSync(GLOBAL_CONFIG, JSON.stringify({
       active: [...this._activePlugins],
+      autoUpdate: Object.fromEntries(this._autoUpdate),
     }, null, 2));
+  }
+
+  /// Per-plugin auto-update flag. Defaults to ON — a plugin the user
+  /// never touched should track upstream — and only flips off when the
+  /// user explicitly disables it via setAutoUpdate.
+  getAutoUpdate(pluginId) {
+    return this._autoUpdate.has(pluginId) ? this._autoUpdate.get(pluginId) : true;
+  }
+
+  setAutoUpdate(pluginId, enabled) {
+    this._autoUpdate.set(pluginId, !!enabled);
+    this._saveConfig();
+    return this.getAutoUpdate(pluginId);
   }
 
   // ── Installation ───────────────────────────────────────────────────────
@@ -719,6 +741,7 @@ class PluginManager {
       keywords: p.keywords,
       scope: p.scope,
       active: this._activePlugins.has(p.id),
+      autoUpdate: this.getAutoUpdate(p.id),
       dir: p.dir,
       capabilities: Object.fromEntries(
         Object.entries(p.capabilities).map(([k, v]) => [k, Array.isArray(v) ? v.length : 1])

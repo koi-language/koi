@@ -110,6 +110,13 @@ export default {
     // without it the footer attaches the skill to only the first matching row.
     channel.skillActivated?.({ agent: agent.name, instanceId: agent.state?._uiInstanceId, skill: skillId });
 
+    // Record the activation so the prompt can pre-expand most-used / recent
+    // skills (best-effort — never block activation on usage stats).
+    try {
+      const { recordSkillUse } = await import('./skill-usage-store.js');
+      recordSkillUse(skillId);
+    } catch { /* usage tracking is optional */ }
+
     return {
       activated: true,
       name: skillId,

@@ -855,34 +855,53 @@ export class LLMProvider {
         + '\n\nNeed a capability no installed plugin provides? Add one with the '
         + '`install_plugin` intent (in: { pluginId, repo } or { pluginId, marketplaceRepo, source }).';
 
+      // Only NAMES go in the prompt to keep it small (like the tools list).
+      // Descriptions are pre-expanded ONLY for the skills the user leans on —
+      // the most-used and most-recently-used (≤3 each, deduped) — so the
+      // relevant ones are one glance away; everything else is a describe_skill
+      // call away. Ranking comes from skill-usage-store (per activate_skill).
+      let _topUsedIds = [];
+      let _recentIds = [];
+      try {
+        const { topUsedSkillIds, recentSkillIds } = await import('../tools/skills/skill-usage-store.js');
+        _topUsedIds = topUsedSkillIds(3);
+        _recentIds = recentSkillIds(3);
+      } catch { /* no usage history yet — names-only is fine */ }
+      const _byName = new Map(_skillCatalog.map(s => [s.name, s]));
+      const _expandIds = [];
+      for (const id of [..._topUsedIds, ..._recentIds]) {
+        if (_byName.has(id) && !_expandIds.includes(id)) _expandIds.push(id);
+      }
+      const _expandedSkills = _expandIds.map(id => _byName.get(id));
+      const _expandedSet = new Set(_expandIds);
+      const _mark = (name) => _activeNames.has(name) ? '✓ ' : '';
+
       const _catalogBlock = _skillCatalog.length > 0
         ? '\n\n## AVAILABLE SKILLS\n\n'
-          + 'These skills exist on disk. Each one is identified by name + description. '
-          + 'The FULL body of a skill is NOT in context until you load it with the '
-          + '`activate_skill` intent; that loads its instructions into the '
-          + '`# Active Skill Instructions` block below. Skills already loaded are '
-          + 'marked with ✓.\n\n'
-          + 'Tools to manage skills:\n'
-          + ' - **activate_skill** — load a skill\'s body into context. In: { "name" }\n'
-          + ' - **deactivate_skill** — remove a loaded skill\'s body from context. In: { "name" }\n\n'
-          + 'WHEN TO ACTIVATE A SKILL (read the descriptions carefully):\n'
-          + '1. PRIMARY — at the start of a task, scan the descriptions below and '
-          + 'activate every skill whose description matches what the user is '
-          + 'asking for. The description tells you exactly when the skill applies; '
-          + 'treat it like a routing rule. Activate BEFORE you start the work so '
-          + 'the skill\'s instructions guide your approach. If two skills both '
-          + 'plausibly apply, activate both — they compose.\n'
-          + '2. SECONDARY — mid-task, activate a skill when a body you have already '
-          + 'loaded references another skill by name (e.g. via a markdown link '
-          + '`[firecrawl-cli](firecrawl-cli)`) AND that name appears in this catalog. '
-          + 'The link itself is just text — you decide whether to load the '
-          + 'referenced skill\'s body.\n\n'
-          + 'Do NOT skip activation just because you "think you know how to do it." '
-          + 'Skills carry project-specific conventions, gotchas, and recipes that you '
-          + 'will not derive from general knowledge. If a description matches, activate.\n\n'
+          + 'Skills are reusable instruction packs on disk. To keep this prompt small, '
+          + 'only their NAMES are listed below — a skill\'s description and full body are '
+          + 'NOT in context until you look them up. Manage them with:\n'
+          + ' - **describe_skill** — read a skill\'s description, to decide if it fits. In: { "name" } or { "names": [...] }\n'
+          + ' - **activate_skill** — load a skill\'s body into context so it guides your work. In: { "name" }\n'
+          + ' - **deactivate_skill** — remove a loaded skill\'s body. In: { "name" }\n\n'
+          + 'HOW TO USE: at the start of a task, scan the names below. For any name that '
+          + 'plausibly matches the task but isn\'t self-explanatory, call describe_skill to '
+          + 'read what it does — WHEN IN DOUBT, describe_skill rather than guessing. Then '
+          + 'activate_skill the ones that fit (they compose). Skills carry project-specific '
+          + 'conventions, gotchas and recipes you won\'t derive from general knowledge — if '
+          + 'one matches, use it. Loaded skills are marked ✓.\n'
+          + (_expandedSkills.length > 0
+              ? '\n### Your most-used & recent skills\n\n'
+                + _expandedSkills
+                    .map(s => `- **${_mark(s.name)}${s.name}** — ${s.description}`)
+                    .join('\n')
+                + '\n'
+              : '')
+          + '\n### All skills (names only — describe_skill for details)\n\n'
           + _skillCatalog
-              .map(s => `### ${_activeNames.has(s.name) ? '✓ ' : ''}${s.name}\n${s.description}`)
-              .join('\n\n')
+              .filter(s => !_expandedSet.has(s.name))
+              .map(s => `- ${_mark(s.name)}${s.name}`)
+              .join('\n')
         : '';
 
       const _activeBlock = _activeNames.size > 0

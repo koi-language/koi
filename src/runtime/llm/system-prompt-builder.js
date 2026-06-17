@@ -1585,20 +1585,14 @@ export function buildExpandedResourceSection(resources, agent) {
 
   if (delegateResources.length > 0) {
     doc += '## AVAILABLE AGENTS\n\n';
+    doc += 'You can delegate work to these agents. Only their names are listed here '
+      + 'to keep this prompt small. Call `describe_agent({ "name" })` to read what an '
+      + 'agent does and its delegable intents (with params) before delegating — WHEN '
+      + 'IN DOUBT about which agent fits or how to call it, describe_agent first.\n\n';
     for (const resource of delegateResources) {
-      doc += `### ${resource.agentPureName}\n`;
-      if (resource.agentDescription) {
-        doc += `${resource.agentDescription}\n`;
-      }
-      for (const handler of resource.intents) {
-        const _asyncTag = handler.isAsync ? ' [async — runs in background, add "await": true to wait]' : '';
-        doc += ` - ${handler.name}${_asyncTag}: ${handler.description}\n`;
-        if (handler.params?.length > 0) {
-          doc += `    In: { ${handler.params.map(p => `"${p}"`).join(', ')} }\n`;
-        }
-      }
-      doc += '\n';
+      doc += `- ${resource.agentPureName}\n`;
     }
+    doc += '\n';
   }
 
   // ── AVAILABLE WORKFLOWS ─────────────────────────────────────────────────
