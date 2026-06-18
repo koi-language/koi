@@ -875,8 +875,16 @@ export class LLMProvider {
       };
       const _line = (s, max) => {
         const natural = String(s.description || '').trim();
-        const give = Math.min(natural.length, max);
-        if (give >= _FLOOR && natural) return `- **${_mark(s.name)}${s.name}** — ${_cut(natural, give)}`;
+        if (!natural) return `- ${_mark(s.name)}${s.name}`;
+        // Full description already fits → show it verbatim (a SHORT full
+        // description is never misleading, so the floor must not suppress it).
+        if (natural.length <= max) return `- **${_mark(s.name)}${s.name}** — ${natural}`;
+        // Truncation needed → only worth inlining if the fragment clears the
+        // floor (a sub-floor cut keeps the generic "When the user wants to…"
+        // prefix while dropping the distinguishing keyword — name-only is
+        // clearer there). The unused-tier cap below guarantees `max >= _FLOOR`,
+        // so in practice every skill with a description gets a capped one.
+        if (max >= _FLOOR) return `- **${_mark(s.name)}${s.name}** — ${_cut(natural, max)}`;
         return `- ${_mark(s.name)}${s.name}`;
       };
 
@@ -891,8 +899,16 @@ export class LLMProvider {
       });
 
       // Tier 2 — unused skills split the rest EQUALLY: one shared per-entry cap.
+      // The cap is ELASTIC with a floor: when there are so many unused skills
+      // that an equal split would fall below `_MIN_DESC`, every entry still gets
+      // `_MIN_DESC` chars (so the budget grows a bit rather than starving the
+      // long tail to bare names). This is why a machine with many skills used to
+      // show the tail name-only: floor(remaining/N) dropped under _FLOOR and the
+      // whole unused tier degraded together. Each capped line ends in "…" and the
+      // full text is always one describe_skill away.
+      const _MIN_DESC = Math.max(_FLOOR, Number(process.env.KOI_SKILL_DESC_MIN_CHARS) || 120);
       const _equalCap = _unusedSkills.length > 0
-        ? Math.min(_MAXE, Math.floor(_remaining / _unusedSkills.length))
+        ? Math.max(_MIN_DESC, Math.min(_MAXE, Math.floor(_remaining / _unusedSkills.length)))
         : 0;
       const _unusedLines = _unusedSkills.map(s => _line(s, _equalCap));
 
