@@ -299,6 +299,12 @@ export class Agent {
     this.description = config.description || null;
     this.role = config.role;
     this.skills = config.skills || [];
+    // Claude-Code-style SKILL.md skills declared in the agent's `.md`
+    // frontmatter (`skills: [...]`). These are auto-activated at the start of
+    // every invocation (see the auto-activate block in _executePlaybookReactive).
+    // Distinct from `this.skills` above, which is the legacy SkillRegistry
+    // function concept. Lives on _initConfig so it survives forkInstance().
+    this.autoActivateSkills = config.autoActivateSkills || [];
     this.usesTeams = config.usesTeams || []; // Teams this agent uses as a client
     this.usesMCPNames = config.usesMCP || []; // MCP server names this agent uses
     this.llm = config.llm || { provider: 'auto', model: 'auto', temperature: 0.2 };
@@ -1903,6 +1909,26 @@ export class Agent {
       // siblings.
     }
 
+    // ── FRONTMATTER-DECLARED SKILLS ─────────────────────────────────────────
+    // Agents whose `.md` frontmatter lists `skills: [...]` get those activated
+    // automatically at the start of EVERY invocation. This is an explicit
+    // author opt-in ("this agent ALWAYS needs these"), distinct from — and
+    // compatible with — progressive disclosure: the catalog of every OTHER
+    // skill is still injected for the agent to pick from at runtime. Runs for
+    // both delegates (re-activating after the wipe above) and the root agent.
+    if (Array.isArray(this.autoActivateSkills) && this.autoActivateSkills.length) {
+      for (const _declared of this.autoActivateSkills) {
+        try {
+          const _res = await this.callAction('activate_skill', { name: _declared });
+          if (!_res?.activated) {
+            channel.log('skill', `${this.name}: frontmatter skill "${_declared}" not activated: ${_res?.error || 'unknown'}`);
+          }
+        } catch (err) {
+          channel.log('skill', `${this.name}: frontmatter skill "${_declared}" activation threw: ${err?.message || err}`);
+        }
+      }
+    }
+
     let isFirstCall = true;
     // Helper for i18n in agent hints
     const _h = (key, fallback) => globalThis.__koiStrings?.[key] ?? fallback ?? key;
@@ -3190,6 +3216,22 @@ export class Agent {
                   );
                   if (_activeWorkflow && !_stillPending) {
                     await this.callAction('deactivate_workflow', { name: _activeWorkflow });
+                  }
+                  // Auto-deactivate skills now that the root is back to idle.
+                  // Delegates wipe their skills at the START of every
+                  // invocation; the root never does, so without this it
+                  // accumulates whatever it activated for task #1 and leaks
+                  // those instructions into every later, unrelated turn —
+                  // and the next task re-activates fresh anyway via the
+                  // catalog (progressive disclosure). Only when no work is
+                  // pending, so a multi-step plan still in flight keeps its
+                  // skills. Frontmatter `autoActivateSkills` are re-applied
+                  // at the next invocation, so dropping them here is safe.
+                  if (!_stillPending) {
+                    const _active = Array.isArray(this.state?.skills) ? [...this.state.skills] : [];
+                    for (const _sk of _active) {
+                      try { await this.callAction('deactivate_skill', { name: _sk }); } catch { /* non-fatal */ }
+                    }
                   }
                 } catch { /* non-fatal — banner stays active, no harm */ }
               }

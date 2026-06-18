@@ -160,6 +160,56 @@ export default {
     const coerced = [];
     const forcedMulti = [];
     for (const field of fields) {
+      // ── Deterministic option normalization ──────────────────────────────
+      // The schema asks for `options: [{ title, ... }]`, but the LLM very
+      // often emits plain strings or objects keyed by `label`/`name`/`text`/
+      // `value` instead of `title`. The renderer reads `option.title`, so any
+      // other shape paints as numbered rows with NO text (the empty-options
+      // bug). Coerce every option into `{ title, ... }` so the user always
+      // sees the label regardless of which key the model chose.
+      if (Array.isArray(field.options) && field.options.length > 0) {
+        field.options = field.options.map((opt) => {
+          if (typeof opt === 'string') return { title: opt, value: opt };
+          if (opt && typeof opt === 'object') {
+            let title = opt.title ?? opt.label ?? opt.name ?? opt.text ?? opt.value;
+            if (title == null) {
+              // Single hallucinated key — use the first primitive value, which
+              // then doubles as both title and value (one attribute = both).
+              title = Object.values(opt).find((v) => v != null && typeof v !== 'object');
+            }
+            const t = title != null ? String(title) : '';
+            return { ...opt, title: t, value: opt.value != null ? opt.value : t };
+          }
+          return { title: String(opt ?? ''), value: String(opt ?? '') };
+        }).filter((o) => o.title !== '');
+      }
+
+      // ── Deterministic file-field shape normalization ────────────────────
+      // The runtime contract is `field.files = { multiple?, extensions? }`,
+      // but the LLM frequently flattens it: `type: "files"` with `extensions`
+      // and `multiple` sitting directly on the field. Rebuild the `files`
+      // object from that flat shape so the picker (and its extension filter)
+      // render instead of silently degrading to a text input.
+      const _fieldType = typeof field.type === 'string' ? field.type.toLowerCase() : '';
+      if (!field.files && (_fieldType === 'files' || _fieldType === 'file')) {
+        field.files = {};
+      }
+      if (field.files && typeof field.files === 'object') {
+        if (field.files.extensions == null && Array.isArray(field.extensions)) {
+          field.files.extensions = field.extensions;
+        }
+        if (field.files.multiple == null && typeof field.multiple === 'boolean') {
+          field.files.multiple = field.multiple;
+        }
+        // Extensions must be bare (no leading dot) per the browse-dialog
+        // filter; the LLM often writes ".pdf", ".png". Strip + lowercase.
+        if (Array.isArray(field.files.extensions)) {
+          field.files.extensions = field.files.extensions
+            .map((e) => String(e).replace(/^\.+/, '').toLowerCase())
+            .filter(Boolean);
+        }
+      }
+
       let hasFiles = field.files && typeof field.files === 'object';
       const hasOptions = Array.isArray(field.options) && field.options.length > 0;
       if (!hasFiles && !hasOptions && looksLikeFileField(field)) {

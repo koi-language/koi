@@ -129,6 +129,11 @@ function _createAgentFromMd(filePath, Agent, Role) {
   let name = _toCamelCase(fileName);
   let description = '';
   let prompt = content;
+  // Skills declared in the frontmatter `skills:` list — Claude-Code-style
+  // SKILL.md skills the agent author wants auto-activated on load (see the
+  // auto-activate block in agent.js). Distinct from the legacy `this.skills`
+  // SkillRegistry concept.
+  let skills = [];
 
   // Parse optional YAML frontmatter — supports plain values, quoted
   // scalars, and block scalars (`|` literal, `>` folded) so Claude-style
@@ -148,6 +153,7 @@ function _createAgentFromMd(filePath, Agent, Role) {
         if (!m) { i++; continue; }
         const key = m[1];
         let value = m[2].trim();
+        let listValue = null;
         if (value === '|' || value === '>') {
           const folded = value === '>';
           const collected = [];
@@ -163,6 +169,28 @@ function _createAgentFromMd(filePath, Agent, Role) {
             collected.pop();
           }
           value = (folded ? collected.join(' ') : collected.join('\n')).trim();
+        } else if (value.startsWith('[') && value.endsWith(']')) {
+          // Inline flow sequence: `skills: [a, b, c]`
+          listValue = value
+            .slice(1, -1)
+            .split(',')
+            .map(s => s.trim().replace(/^["']|["']$/g, ''))
+            .filter(Boolean);
+          i++;
+        } else if (value === '') {
+          // Possible block sequence on following indented `- item` lines:
+          //   skills:
+          //     - api-conventions
+          //     - error-handling-patterns
+          const collected = [];
+          i++;
+          while (i < lines.length) {
+            const lm = lines[i].match(/^\s+-\s*(.+)$/);
+            if (!lm) break;
+            collected.push(lm[1].trim().replace(/^["']|["']$/g, ''));
+            i++;
+          }
+          if (collected.length) listValue = collected;
         } else if (
           (value.startsWith('"') && value.endsWith('"')) ||
           (value.startsWith("'") && value.endsWith("'"))
@@ -174,6 +202,7 @@ function _createAgentFromMd(filePath, Agent, Role) {
         }
         if (key === 'name' && value) name = value;
         if (key === 'description' && value) description = value;
+        if (key === 'skills' && listValue) skills = listValue;
       }
     }
   }
@@ -212,6 +241,7 @@ function _createAgentFromMd(filePath, Agent, Role) {
     description,
     role,
     handlers: { do: handler },
+    autoActivateSkills: skills,
     state: {},
   });
 

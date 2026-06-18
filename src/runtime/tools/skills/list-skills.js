@@ -221,6 +221,31 @@ export default {
       }
     }
 
+    // Defensive dedup against the old flatten bug. Older builds copied each
+    // plugin's skills into the shared `.koi/skills/<name>` dir as bare-name
+    // standalone folders. Now that plugin skills are discovered in place and
+    // namespaced `<pluginId>:<name>`, those leftover flat copies double-list —
+    // e.g. `ab-testing` (stale standalone) next to `marketing-skills:ab-testing`
+    // (the canonical namespaced one). Drop a standalone skill whenever a
+    // plugin/admin skill ships the same bare name. Self-healing: works even
+    // when the install manifest that the plugin-manager migration relies on is
+    // missing, so old checkouts stop showing every skill twice.
+    const _pluginBareNames = new Set();
+    for (const s of allSkills.values()) {
+      if (s.scope === 'plugin' || s.scope === 'admin') _pluginBareNames.add(s.name);
+    }
+    const _shadowed = [];
+    for (const [key, s] of allSkills) {
+      if ((s.scope === 'global' || s.scope === 'project') && _pluginBareNames.has(s.name)) {
+        allSkills.delete(key);
+        _shadowed.push(s.location);
+      }
+    }
+    if (_shadowed.length > 0) {
+      const { channel: ch } = await import('../../io/channel.js');
+      ch.log('skills', `list_skills: hid ${_shadowed.length} stale flattened standalone skill(s) shadowed by namespaced plugin skills (delete these dirs to silence): ${_shadowed.join(', ')}`);
+    }
+
     if (allSkills.size === 0) {
       const { channel: ch } = await import('../../io/channel.js');
       ch.log('skills', `list_skills: no skills found. Searched: global=${globalDir} (${globalSkills.length}), project=${projectDir} (${projectSkills.length}), plugins=${pluginSkillCount}, KOI_PROJECT_ROOT=${projectRoot}`);

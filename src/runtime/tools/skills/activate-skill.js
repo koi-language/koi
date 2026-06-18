@@ -13,7 +13,7 @@ import { resolveSkillRef } from './list-skills.js';
 export default {
   type: 'activate_skill',
   intent: 'activate_skill',
-  description: 'Activate a skill by name. Reads its SKILL.md instructions and adds it to active skills. Fields: "name" (required). → Returns: { activated, name, content, directory, resources }',
+  description: 'Activate a skill by name. Reads its SKILL.md instructions and adds it to active skills (its full body is injected into your system prompt under "# Active Skill Instructions" — it is NOT returned here to avoid duplication). Fields: "name" (required). → Returns: { activated, name, directory, resources }',
   thinkingHint: (action) => `Activating skill: ${action.name || '...'}`,
   permission: null,
 
@@ -117,10 +117,14 @@ export default {
       recordSkillUse(skillId);
     } catch { /* usage tracking is optional */ }
 
+    // NOTE: do NOT return `content` here. The full SKILL.md body is injected
+    // into the system prompt by the runtime from state._skillContents (see
+    // llm-provider.js `# Active Skill Instructions`). Returning it again would
+    // duplicate the entire skill in the tool result — the LLM already has it in
+    // context, and the GUI would render the whole body a second time.
     return {
       activated: true,
       name: skillId,
-      content,
       directory: skillDir,
       ...(resources.length > 0 && { resources }),
     };

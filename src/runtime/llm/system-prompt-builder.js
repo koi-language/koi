@@ -1574,6 +1574,31 @@ export function buildExpandedResourceSection(resources, agent) {
     }
   }
 
+  // Shared budgeted listing for AGENTS and WORKFLOWS. Same idea as the skill
+  // catalog: show a description per entry, but bound the total with a budget
+  // and each entry with a per-entry cap so one giant description (or a long
+  // list) can't bloat the prompt. There is no usage store for agents/workflows,
+  // so every entry is treated EQUALLY — same per-entry cap = min(maxEntry,
+  // budget/count) — and when that falls below a useful floor they ALL drop to
+  // name-only together (no list-order entry is singled out). The full text is
+  // always available via describe_agent / describe_workflow.
+  const _budgetedDescList = (entries, { budget, maxEntry, floor = 80 }) => {
+    const cut = (text, max) => {
+      const s = String(text || '').trim();
+      if (s.length <= max) return s;
+      const slice = s.slice(0, max);
+      const sp = slice.lastIndexOf(' ');
+      return (sp > max * 0.6 ? slice.slice(0, sp) : slice).trimEnd() + '…';
+    };
+    const cap = entries.length > 0 ? Math.min(maxEntry, Math.floor(budget / entries.length)) : 0;
+    return entries.map(e => {
+      const natural = String(e.description || '').trim();
+      const give = Math.min(natural.length, cap);
+      const body = (give >= floor && natural) ? ` — ${cut(natural, give)}` : '';
+      return `- ${e.label}${body}`;
+    });
+  };
+
   // ── AVAILABLE AGENTS ────────────────────────────────────────────────────
   let delegateResources = resources.filter(r => r.type === 'delegate');
 
@@ -1585,14 +1610,18 @@ export function buildExpandedResourceSection(resources, agent) {
 
   if (delegateResources.length > 0) {
     doc += '## AVAILABLE AGENTS\n\n';
-    doc += 'You can delegate work to these agents. Only their names are listed here '
-      + 'to keep this prompt small. Call `describe_agent({ "name" })` to read what an '
-      + 'agent does and its delegable intents (with params) before delegating — WHEN '
-      + 'IN DOUBT about which agent fits or how to call it, describe_agent first.\n\n';
-    for (const resource of delegateResources) {
-      doc += `- ${resource.agentPureName}\n`;
-    }
-    doc += '\n';
+    doc += 'You can delegate work to these agents. Descriptions are budgeted (some may be '
+      + 'shortened or omitted to keep this prompt small). Call `describe_agent({ "name" })` '
+      + 'to read an agent\'s FULL description and its delegable intents (with params) before '
+      + 'delegating — WHEN IN DOUBT about which agent fits or how to call it, describe_agent '
+      + 'first.\n\n';
+    const _agentBudget = Number(process.env.KOI_AGENT_LISTING_BUDGET) || 4000;
+    const _agentMaxEntry = Number(process.env.KOI_AGENT_DESC_MAX_CHARS) || 300;
+    const _agentLines = _budgetedDescList(
+      delegateResources.map(r => ({ label: r.agentPureName, description: r.agentDescription })),
+      { budget: _agentBudget, maxEntry: _agentMaxEntry },
+    );
+    doc += _agentLines.join('\n') + '\n\n';
   }
 
   // ── AVAILABLE WORKFLOWS ─────────────────────────────────────────────────
@@ -1612,13 +1641,17 @@ export function buildExpandedResourceSection(resources, agent) {
       const catalog = listWorkflowsCatalog();
       if (catalog.length > 0) {
         doc += '## AVAILABLE WORKFLOWS\n\n';
-        doc += 'Pre-approved task plans curated for this project. **WORKFLOW-FIRST routing rule**: when one of these clearly matches the user\'s request, invoke `run_workflow("<name>")` INSTEAD of delegating to `planner::do_plan`. The planner is the fallback for requests no workflow covers. The name + description below is all you need to route — do NOT pre-fetch the workflow body before deciding (the body is internal to `run_workflow`; reading it would just lead you to inline its steps instead of running it).\n\n';
-        for (const wf of catalog) {
-          const scope = wf.scope ? ` _(${wf.scope})_` : '';
-          const desc = (wf.description || '').trim();
-          doc += `- **${wf.name}**${scope}${desc ? ` — ${desc}` : ''}\n`;
-        }
-        doc += '\n';
+        doc += 'Pre-approved task plans curated for this project. **WORKFLOW-FIRST routing rule**: when one of these clearly matches the user\'s request, invoke `run_workflow("<name>")` INSTEAD of delegating to `planner::do_plan`. The planner is the fallback for requests no workflow covers. Descriptions are budgeted (some may be shortened or omitted) — call `describe_workflow({ "name" })` for the full text if a name looks relevant but its description is short. Do NOT pre-fetch the workflow body before deciding to run it (the body is internal to `run_workflow`; reading it would just lead you to inline its steps instead of running it).\n\n';
+        const _wfBudget = Number(process.env.KOI_WORKFLOW_LISTING_BUDGET) || 4000;
+        const _wfMaxEntry = Number(process.env.KOI_WORKFLOW_DESC_MAX_CHARS) || 400;
+        const _wfLines = _budgetedDescList(
+          catalog.map(wf => ({
+            label: `**${wf.name}**${wf.scope ? ` _(${wf.scope})_` : ''}`,
+            description: wf.description,
+          })),
+          { budget: _wfBudget, maxEntry: _wfMaxEntry },
+        );
+        doc += _wfLines.join('\n') + '\n\n';
       }
     } catch { /* non-fatal */ }
   }

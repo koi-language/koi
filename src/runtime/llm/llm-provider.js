@@ -817,91 +817,111 @@ export class LLMProvider {
           _skillCatalog = [];
         }
       }
-      // Installed plugins — tell the agent up front what's installed (and that
-      // each plugin's skills appear below namespaced as `<plugin-id>:<skill>`),
-      // so it knows its baseline capabilities and when a missing one warrants an
-      // `install_plugin` call. Built from the same pluginManager load that
-      // list_skills already did, cached per-session on agent.state.
-      let _pluginsInfo = agent.state?._pluginsInfo;
-      if (!_pluginsInfo) {
-        try {
-          const _projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd();
-          const { pluginManager } = await import('../plugins/plugin-manager.js');
-          pluginManager.load(_projectRoot); // idempotent — no-op once loaded
-          _pluginsInfo = pluginManager.list().filter(p => p.active);
-        } catch {
-          _pluginsInfo = [];
-        }
-        if (agent.state) agent.state._pluginsInfo = _pluginsInfo;
-      }
-      const _capSummary = (caps) => Object.entries(caps || {})
-        .filter(([, n]) => n > 0)
-        .map(([k, n]) => `${n} ${k}`)
-        .join(', ');
-      const _installedPluginsBlock = '\n\n## INSTALLED PLUGINS\n\n'
-        + (_pluginsInfo.length > 0
-            ? 'These plugins are installed and active. Their skills appear in '
-              + 'AVAILABLE SKILLS below, named `<plugin-id>:<skill>` — that prefix tells '
-              + 'you which plugin a skill comes from.\n\n'
-              + _pluginsInfo
-                  .map(p => {
-                    const ver = p.version ? ` (v${p.version})` : '';
-                    const caps = _capSummary(p.capabilities);
-                    const desc = p.description || '(no description)';
-                    return `- **${p.id}**${ver} — ${desc}${caps ? ` · ${caps}` : ''}`;
-                  })
-                  .join('\n')
-            : 'No plugins are installed.')
-        + '\n\nNeed a capability no installed plugin provides? Add one with the '
-        + '`install_plugin` intent (in: { pluginId, repo } or { pluginId, marketplaceRepo, source }).';
-
-      // Only NAMES go in the prompt to keep it small (like the tools list).
-      // Descriptions are pre-expanded ONLY for the skills the user leans on —
-      // the most-used and most-recently-used (≤3 each, deduped) — so the
-      // relevant ones are one glance away; everything else is a describe_skill
-      // call away. Ranking comes from skill-usage-store (per activate_skill).
+      // Every skill is listed WITH a description, ordered by how much the user
+      // leans on it (most-used + most-recent first). Descriptions share a total
+      // character budget: the highest-priority skills get their full text (up to
+      // a per-entry cap), and as the budget fills the LEAST-used skills get
+      // their descriptions shortened progressively, dropping to name-only only
+      // once there is no budget left. This mirrors Claude Code's skill-listing
+      // budget (full text upfront, graceful degradation by priority) — the full
+      // description is always one describe_skill call away, so shortening the
+      // listing never loses information, only inline convenience.
+      //   - KOI_SKILL_LISTING_BUDGET  — total chars for all descriptions (default 8000)
+      //   - KOI_SKILL_DESC_MAX_CHARS  — per-entry hard cap (default 500)
       let _topUsedIds = [];
       let _recentIds = [];
       try {
         const { topUsedSkillIds, recentSkillIds } = await import('../tools/skills/skill-usage-store.js');
-        _topUsedIds = topUsedSkillIds(3);
-        _recentIds = recentSkillIds(3);
-      } catch { /* no usage history yet — names-only is fine */ }
+        _topUsedIds = topUsedSkillIds(_skillCatalog.length || 1000);
+        _recentIds = recentSkillIds(_skillCatalog.length || 1000);
+      } catch { /* no usage history yet — fall back to catalog order */ }
       const _byName = new Map(_skillCatalog.map(s => [s.name, s]));
-      const _expandIds = [];
-      for (const id of [..._topUsedIds, ..._recentIds]) {
-        if (_byName.has(id) && !_expandIds.includes(id)) _expandIds.push(id);
-      }
-      const _expandedSkills = _expandIds.map(id => _byName.get(id));
-      const _expandedSet = new Set(_expandIds);
       const _mark = (name) => _activeNames.has(name) ? '✓ ' : '';
+
+      // Two tiers, NOT a per-position ramp. The old greedy allocation gave
+      // earlier-listed skills more budget than later ones even when they had
+      // the SAME usage (zero) — purely an accident of catalog order, which
+      // starved the bottom of the list into stubs. Correct rule: skills with
+      // EQUAL usage get an EQUAL cut.
+      //   - USED tier   (in topUsed/recent): priority — full text, up to cap.
+      //   - UNUSED tier (everything else, all equal usage): split the REMAINING
+      //     budget EQUALLY, so every unused skill gets the same length. When the
+      //     budget can't give them a useful length they ALL drop to name-only
+      //     together, rather than the list-order tail being singled out.
+      const _usedSet = new Set();
+      for (const id of [..._topUsedIds, ..._recentIds]) {
+        if (_byName.has(id)) _usedSet.add(id);
+      }
+      const _usedSkills = [];
+      const _usedSeen = new Set();
+      for (const id of [..._topUsedIds, ..._recentIds]) {
+        if (_byName.has(id) && !_usedSeen.has(id)) { _usedSeen.add(id); _usedSkills.push(_byName.get(id)); }
+      }
+      const _unusedSkills = _skillCatalog.filter(s => !_usedSet.has(s.name));
+
+      const _BUDGET = Number(process.env.KOI_SKILL_LISTING_BUDGET) || 8000;
+      const _MAXE = Number(process.env.KOI_SKILL_DESC_MAX_CHARS) || 500;
+      const _FLOOR = 80; // below this a fragment is useless (and worse,
+                         // misleading when many descriptions share a generic
+                         // "When the user wants to…" prefix that a short cut
+                         // keeps while dropping the distinguishing keyword) →
+                         // name-only instead.
+      const _cut = (text, max) => {
+        const s = String(text || '').trim();
+        if (s.length <= max) return s;
+        const slice = s.slice(0, max);
+        const sp = slice.lastIndexOf(' ');
+        return (sp > max * 0.6 ? slice.slice(0, sp) : slice).trimEnd() + '…';
+      };
+      const _line = (s, max) => {
+        const natural = String(s.description || '').trim();
+        const give = Math.min(natural.length, max);
+        if (give >= _FLOOR && natural) return `- **${_mark(s.name)}${s.name}** — ${_cut(natural, give)}`;
+        return `- ${_mark(s.name)}${s.name}`;
+      };
+
+      // Tier 1 — used skills get full text (capped), priority on the budget.
+      let _remaining = _BUDGET;
+      const _usedLines = _usedSkills.map(s => {
+        const line = _line(s, Math.min(_MAXE, _remaining));
+        // Recover the rendered description length to debit the budget.
+        const dash = line.indexOf(' — ');
+        if (dash !== -1) _remaining -= (line.length - dash - 3);
+        return line;
+      });
+
+      // Tier 2 — unused skills split the rest EQUALLY: one shared per-entry cap.
+      const _equalCap = _unusedSkills.length > 0
+        ? Math.min(_MAXE, Math.floor(_remaining / _unusedSkills.length))
+        : 0;
+      const _unusedLines = _unusedSkills.map(s => _line(s, _equalCap));
+
+      const _lines = [..._usedLines, ..._unusedLines];
 
       const _catalogBlock = _skillCatalog.length > 0
         ? '\n\n## AVAILABLE SKILLS\n\n'
-          + 'Skills are reusable instruction packs on disk. To keep this prompt small, '
-          + 'only their NAMES are listed below — a skill\'s description and full body are '
-          + 'NOT in context until you look them up. Manage them with:\n'
-          + ' - **describe_skill** — read a skill\'s description, to decide if it fits. In: { "name" } or { "names": [...] }\n'
+          + 'Skills are reusable instruction packs on disk. They are listed below with '
+          + 'descriptions; the ones you use most come first and in full, and the rest share '
+          + 'the remaining space evenly (so a description may be shortened or omitted to fit), '
+          + 'but the full text and body are always available on demand. Manage them with:\n'
+          + ' - **describe_skill** — read a skill\'s FULL description, to decide if it fits. In: { "name" } or { "names": [...] }\n'
           + ' - **activate_skill** — load a skill\'s body into context so it guides your work. In: { "name" }\n'
           + ' - **deactivate_skill** — remove a loaded skill\'s body. In: { "name" }\n\n'
-          + 'HOW TO USE: at the start of a task, scan the names below. For any name that '
-          + 'plausibly matches the task but isn\'t self-explanatory, call describe_skill to '
-          + 'read what it does — WHEN IN DOUBT, describe_skill rather than guessing. Then '
+          + 'HOW TO USE: at the start of a task, scan the list below. For any skill that '
+          + 'plausibly matches the task — especially one whose description is shortened or '
+          + 'missing — call describe_skill to read the full text rather than guessing. Then '
           + 'activate_skill the ones that fit (they compose). Skills carry project-specific '
           + 'conventions, gotchas and recipes you won\'t derive from general knowledge — if '
-          + 'one matches, use it. Loaded skills are marked ✓.\n'
-          + (_expandedSkills.length > 0
-              ? '\n### Your most-used & recent skills\n\n'
-                + _expandedSkills
-                    .map(s => `- **${_mark(s.name)}${s.name}** — ${s.description}`)
-                    .join('\n')
-                + '\n'
-              : '')
-          + '\n### All skills (names only — describe_skill for details)\n\n'
-          + _skillCatalog
-              .filter(s => !_expandedSet.has(s.name))
-              .map(s => `- ${_mark(s.name)}${s.name}`)
-              .join('\n')
+          + 'one matches, use it. Loaded skills are marked ✓.\n\n'
+          + 'ORDER — ACTIVATE BEFORE YOU ASK: before you open a briefing/form or call '
+          + 'prompt_user / prompt_form / prompt_files, you MUST first activate every on-topic '
+          + 'skill. A skill frequently changes WHICH questions to ask, HOW to ask them, the '
+          + 'fields a form should have, or whether to ask at all (it may already specify the '
+          + 'answer). If you ask first and activate after, you have likely asked the wrong '
+          + 'things and wasted the user\'s time. So the order is ALWAYS: (1) scan + activate '
+          + 'matching skills, (2) let the skill shape the questions, (3) only then prompt the '
+          + 'user. Never show a briefing form before loading the matching skill.\n\n'
+          + _lines.join('\n')
         : '';
 
       const _activeBlock = _activeNames.size > 0
@@ -910,7 +930,7 @@ export class LLMProvider {
           ).join('\n\n---\n\n')
         : '';
 
-      const _skillBlock = _installedPluginsBlock + _catalogBlock + _activeBlock;
+      const _skillBlock = _catalogBlock + _activeBlock;
 
       // Structured cache-aware prompt: store boundary for cache_control injection
       if (typeof systemPromptResult === 'object' && systemPromptResult?._cacheKey !== undefined) {
