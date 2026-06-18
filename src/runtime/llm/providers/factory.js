@@ -159,7 +159,15 @@ function _resolveLLM(req) {
   if (_declined?.size > 0) {
     channel.log('llm', `[auto] Provider filter: available=[${availableProviders.join(',')}] filtered=[${_filteredProviders.join(',')}] declined=[${[..._declined.entries()].map(([p,e]) => `${p}(risk${e.risk})`).join(',')}] taskRisk=${_currentRisk}`);
   }
-  const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, requiresVideo, requiresAudio, requiresFile, minContextK, profile });
+  // Prompt-cache stickiness: prefer the model this session/task already
+  // settled on (set after the previous resolution) so we don't invalidate the
+  // per-model prompt cache by switching to a marginally-cheaper sibling. Only
+  // honoured when that model is still a valid candidate for this turn (see
+  // selectAutoModel) — a harder turn or a new multimodal input still switches.
+  const _stickyModel = (session?._autoModel && session?._autoProvider)
+    ? { model: session._autoModel, provider: session._autoProvider }
+    : null;
+  const selected = selectAutoModel(taskType, effectiveDifficulty, _filteredProviders.length > 0 ? _filteredProviders : availableProviders, { requiresImage, requiresVideo, requiresAudio, requiresFile, minContextK, profile, stickyModel: _stickyModel });
   if (!selected) throw new Error('NO_MODELS: No suitable model found for the current task — check your available providers.');
   const provider = selected.provider;
   const model    = selected.model;

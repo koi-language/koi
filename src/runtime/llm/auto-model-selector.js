@@ -404,7 +404,7 @@ function _maybeDegradeForLatency(winner) {
  * @param {string[]} availableProviders - providers with API keys
  * @returns {{ provider: string, model: string, useThinking: boolean } | null}
  */
-export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, requiresVideo = false, requiresAudio = false, requiresFile = false, minContextK = 0, profile = null } = {}) {
+export function selectAutoModel(taskType, difficulty, availableProviders, { requiresImage = false, requiresVideo = false, requiresAudio = false, requiresFile = false, minContextK = 0, profile = null, stickyModel = null } = {}) {
   // Code tasks require minimum scores to ensure capable models are selected.
   // Cheap/fast models can't reliably generate structured output like unified diffs.
   if (taskType === 'code') {
@@ -494,6 +494,28 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
     // Use thinking scores if the candidate was selected with thinking enabled.
     return (bCode + bReas) - (aCode + aReas);
   });
+
+  // ── Prompt-cache stickiness ───────────────────────────────────────────
+  // If the previous turn's model is STILL a valid candidate for THIS turn —
+  // i.e. it passed every hard filter (image/video/audio/file/contextK,
+  // cooldown) AND meets the difficulty/capability thresholds, so it's in the
+  // qualifying pool — reuse it instead of switching to a marginally cheaper
+  // sibling. A model switch invalidates the ENTIRE per-model prompt cache,
+  // which costs far more in re-sent input tokens than the small per-token
+  // delta between two equally-capable models. The agent therefore sticks to
+  // the model chosen for its task as long as that model remains adequate; it
+  // only switches when the task genuinely needs a different model (harder turn
+  // → model filtered out → switch up; new image/video → vision required; etc).
+  // Skipped for the relaxed/degraded pool — there we want the most capable
+  // model available, not cache continuity.
+  if (stickyModel?.model && stickyModel?.provider && !relaxedProfile) {
+    const stuck = candidates.find(
+      c => c.model === stickyModel.model && c.provider === stickyModel.provider,
+    );
+    if (stuck) {
+      return _maybeDegradeForLatency({ provider: stuck.provider, model: stuck.model, useThinking: stuck.useThinking, caps: stuck.caps });
+    }
+  }
 
   const winner = candidates[0];
   return _maybeDegradeForLatency({ provider: winner.provider, model: winner.model, useThinking: winner.useThinking, caps: winner.caps });

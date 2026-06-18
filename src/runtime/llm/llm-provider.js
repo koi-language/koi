@@ -1171,12 +1171,27 @@ CRITICAL RULES:
           // Build text references for attached files
           const _promptAtts = session._promptAttachments || [];
           const _imgPaths = _promptAtts.filter(a => a.type === 'image').map(a => a.path);
+          // Resolve the PERSISTENT att-N id for each attached image so the
+          // agent re-reads it with read_file("att-N") — those ids resolve from
+          // the session dialogue log, so they survive restarts / context
+          // scroll-out. Attachments are part of the conversation forever.
+          let _attIdByPath = {};
+          if (_imgPaths.length > 0) {
+            try {
+              const { attachmentRegistry: _ar } = await import('../state/attachment-registry.js');
+              for (const p of _imgPaths) { try { _ar.register(p); } catch { /* */ } }
+              for (const e of _ar.all()) { _attIdByPath[path.resolve(e.path)] = e.id; }
+            } catch { /* best-effort — fall back to bare paths */ }
+          }
           // Markdown bullet list — easier for the LLM to read AND to copy
           // verbatim into delegate task descriptions than a single inline
           // `["x", "y", …]` array. Each path on its own line means the LLM
           // also can't accidentally split the list mid-quote.
           const _imgRef = _imgPaths.length > 0
-            ? `\n\n**Attached images:**\n${_imgPaths.map(p => `- ${p}`).join('\n')}`
+            ? `\n\n**Attached images** (permanent — re-read any of them ANY time with read_file("att-N")):\n${_imgPaths.map(p => {
+                const _id = _attIdByPath[path.resolve(p)];
+                return _id ? `- ${_id} → ${p}` : `- ${p}`;
+              }).join('\n')}`
             : '';
           const _imgShort = _imgPaths.length > 0
             ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
