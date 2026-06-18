@@ -250,6 +250,24 @@ export function killShellByActionId(actionId) {
 }
 
 /**
+ * Gracefully COMPLETE a running shell: terminate a process that has finished
+ * its one-shot task but is idling without exiting (a lingering open handle /
+ * polling loop). Unlike killShellByActionId, this does NOT set `userKilled`
+ * and the generator reports SUCCESS (exit 0) with the captured output — so the
+ * card flips to done and the agent gets the result instead of being stuck on a
+ * "Running" process that already did its work. Called by the streaming-output
+ * classifier when it judges the task complete (agent.js _classifyShellOutput).
+ */
+export function completeShellByActionId(actionId) {
+  if (!actionId) return false;
+  const entry = _runningShellsByAction.get(actionId);
+  if (!entry) return false;
+  entry.gracefulComplete = true;
+  try { entry.kill(); } catch { /* non-fatal */ }
+  return true;
+}
+
+/**
  * Detect potentially dangerous command patterns and return a warning string,
  * or null if no concerns are found.
  */
@@ -1110,7 +1128,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
     // `userKilled` flag before calling kill() — we read it back on close.
     // _shellActionId was captured earlier (at beginAction) so it remains
     // stable even if another action opens in parallel.
-    const _registryEntry = { kill: () => proc.kill(), userKilled: false };
+    const _registryEntry = { kill: () => proc.kill(), userKilled: false, gracefulComplete: false };
     if (_shellActionId) {
       _runningShellsByAction.set(_shellActionId, _registryEntry);
     }
@@ -1153,7 +1171,8 @@ When a command requires sudo, just use sudo normally in the command. The system 
               promptContext: info.promptContext,
               output_so_far: outputSoFar,
               elapsed,
-              command: cmdPreview
+              command: cmdPreview,
+              _actionId: _shellActionId,
             };
             _passwordPending = false;
             _inputNeededInfo = null;
@@ -1194,6 +1213,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
               output_so_far: outputSoFar,
               elapsed,
               command: cmdPreview,
+              _actionId: _shellActionId,
               ...(_staleCount >= _STALE_THRESHOLD ? { _isStale: true } : {}),
             };
           }
@@ -1288,8 +1308,30 @@ When a command requires sudo, just use sudo normally in the command. The system 
         );
       };
 
+      // Task complete but the process was idling without exiting — the
+      // streaming classifier terminated it via completeShellByActionId. Report
+      // SUCCESS with the captured output (NOT a kill/error/timeout): the work
+      // was done; only a lingering open handle kept the process alive. Checked
+      // FIRST so the SIGTERM exit signal doesn't fall through to the error
+      // branches below.
+      if (_registryEntry.gracefulComplete) {
+        _shellOutputCallback?.(false);
+        reportDone?.();
+        if (!isSilent) {
+          _showOutputPreview(combinedStr);
+          if (channel.sendShellFullOutput) channel.sendShellFullOutput(_shellActionId, command, combinedStr);
+        }
+        if (!isSilent) channel.endAction(true, 'completed (idle process terminated)', _shellActionId);
+        yield {
+          success: true,
+          exitCode: 0,
+          stdout: stdoutStr,
+          stderr: stderrTrunc,
+          _completedWhileIdle: true,
+          message: 'The task completed successfully. The process had finished its work but was idling without exiting (a lingering open handle / polling loop), so it was terminated cleanly. The output above is the full result — do NOT re-run it.'
+        };
       // Command exceeded its timeout — kill confirmed.
-      if (timedOut) {
+      } else if (timedOut) {
         _shellOutputCallback?.(false);
         reportDone?.();
         if (!isSilent) {

@@ -5323,16 +5323,40 @@ export class Agent {
             const update = item.value;
             if (update._isProgress) {
               if (update._inputNeeded) {
-                // Process went silent — first classify whether it crashed or is waiting for input.
-                // _classifyShellOutput is purpose-built for this (wait/kill/ask).
+                // Process went silent — first classify whether it crashed, is
+                // waiting for input, or has already FINISHED its work and is
+                // just idling (a polling loop / lingering open handle / a
+                // forgotten process.exit left running after the success
+                // message). A silent process IS the idle signal, so classify
+                // with isStale:true so the "done" verdict is in play — without
+                // this the silent path could only kill/ask/wait, so an
+                // already-finished idle process (e.g. a Telegram bot that found
+                // its chat ID and sent the test message but keeps long-polling)
+                // would sit on "Running" forever.
                 const outputSoFar = update.output_so_far || '';
-                const preClassify = await this._classifyShellOutput(outputSoFar, resolvedAction.command || '');
+                const preClassify = await this._classifyShellOutput(outputSoFar, resolvedAction.command || '', { isStale: true });
                 if (preClassify === 'kill') {
                   channel.log('shell', `${this.name}: silence → classified as crash/error, killing process`);
                   this._shellKilledByClassifier = outputSoFar;
                   iterState.killed = true;
                   try { iter.return(); } catch {}
                   break;
+                }
+                if (preClassify === 'done' && update._actionId) {
+                  // Task completed but the process is idling without exiting.
+                  // Close the shell as SUCCESS with the captured output (the
+                  // generator's gracefulComplete path reports exit 0 and the
+                  // GUI card flips from "Running" to done) instead of asking the
+                  // agent for input it will never need. Resume the generator
+                  // with `null` (write nothing to stdin); completeShellByActionId
+                  // kills the idle process, which drives the generator to its
+                  // final success result.
+                  channel.log('shell', `${this.name}: silence → classified as task-complete but idling — terminating gracefully`);
+                  import('../tools/shell/shell.js')
+                    .then(m => { try { m.completeShellByActionId(update._actionId); } catch {} })
+                    .catch(() => {});
+                  item = await iter.next(null);
+                  continue;
                 }
 
                 // Not a crash — ask the running agent to decide what input to provide.
@@ -5381,6 +5405,17 @@ export class Agent {
                       this._shellKilledByClassifier = outputSoFar;
                       iterState.killed = true;
                       try { iter.return(); } catch {} // triggers generator finally → proc.kill()
+                    } else if (verdict === 'done' && isStale && !iterState.killed && update._actionId) {
+                      // Task completed but the process is idling without exiting.
+                      // Gate on `isStale` so we only terminate a genuinely IDLE
+                      // process (output unchanged for a sustained period), never
+                      // one still doing work. The generator reports SUCCESS with
+                      // the captured output (see completeShellByActionId) and the
+                      // GUI card flips from "Running" to done.
+                      channel.log('shell', `[${this.name}] LLM classified task complete but process idling — terminating gracefully`);
+                      import('../tools/shell/shell.js')
+                        .then(m => { try { m.completeShellByActionId(update._actionId); } catch {} })
+                        .catch(() => {});
                     }
                     // 'ask' verdict is handled naturally by the _inputNeeded path
                     // when the process goes silent after asking for input
@@ -5459,6 +5494,7 @@ Respond with ONE of:
 - {"action":"wait"} — process is running normally (compiling, downloading, starting up, showing logs, warnings). Keep waiting.
 - {"action":"kill","reason":"brief reason"} — process has hit a fatal error and will NOT recover on its own (missing env vars, missing modules, syntax errors, crash, stuck in infinite loop). It should be killed so the agent can fix the problem.
 - {"action":"ask","question":"what to ask the user"} — process is interactively asking for input (a question, a prompt, a confirmation). The question field should contain what the process is asking.
+- {"action":"done","reason":"brief reason"} — the process has CLEARLY COMPLETED its one-shot task SUCCESSFULLY (it printed its final result / a success or confirmation message, e.g. "saved", "sent", "✓ done", "captured X", "finished") but is NOT exiting — it sits idle producing no new output, kept alive by a lingering open handle / polling loop / a forgotten process.exit. Terminate it so the agent gets the result. STRICT: only use "done" when BOTH (a) the output shows the task genuinely finished, AND (b) it is NOT a server / watcher / REPL / dev-server / long-running listener meant to stay up — i.e. NONE of "listening on", "ready on", "watching for changes", "waiting for connections", "server running", "compiled successfully" (dev server), "press q to quit". When unsure, return "wait", NEVER "done".
 
 IMPORTANT: Only "kill" for truly FATAL and IRRECOVERABLE errors where the process cannot continue or will not recover on its own. If the output shows warnings, deprecation notices, notices, informational logs, progress, or non-fatal errors that could be retried/recovered, return "wait". Only choose "kill" when you are confident the process is doomed (e.g., hard crashes, unrecoverable missing requirements, infinite error loops).
 
@@ -5468,6 +5504,7 @@ Many commands are inherently slow and produce little or no output for extended p
       const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim());
 
       if (parsed?.action === 'kill') return 'kill';
+      if (parsed?.action === 'done') return 'done';
       if (parsed?.action === 'ask') return { ask: parsed.question || 'Please provide input' };
       return 'wait';
     } catch (err) {

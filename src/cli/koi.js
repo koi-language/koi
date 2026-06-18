@@ -567,23 +567,35 @@ async function runFile(sourcePath, options = {}) {
   const tsxLocal = path.join(__dirname, '../../node_modules/.bin/tsx');
   const jsDir = path.dirname(jsPath);
   const jsBasename = './' + path.basename(jsPath);
+  const jsAbs = path.resolve(jsPath);
   let tsxBin, tsxArgs, tsxCwd;
   if (process.platform === 'win32' && _exists(tsxCliCjs)) {
+    // Windows: pass only the basename with cwd=jsDir so tsx never receives an
+    // absolute drive-letter path as an ESM specifier (which Node rejects).
     tsxBin = process.execPath;
     tsxArgs = [tsxCliCjs, jsBasename];
     tsxCwd = jsDir;
   } else if (_exists(tsxCliMjs)) {
+    // macOS / Linux: pass the ABSOLUTE compiled path and keep the child's cwd
+    // at the PROJECT ROOT — NOT the internal `.build` compile dir. tsx
+    // resolves an absolute path fine on POSIX, and the compiled `.ts`'s module
+    // resolution is location-based (`.build/package.json` + absolute file://
+    // runtime imports), so cwd doesn't affect it. The payoff: the agent's
+    // `process.cwd()` equals KOI_PROJECT_ROOT, so shell/file tools and the
+    // prompt's "Working directory" all point at the user's project instead of
+    // `.../src/agents/.build`. (Matches the packaged binary, which never goes
+    // through tsx/.build.)
     tsxBin = process.execPath;
-    tsxArgs = [tsxCliMjs, jsBasename];
-    tsxCwd = jsDir;
+    tsxArgs = [tsxCliMjs, jsAbs];
+    tsxCwd = projectRoot;
   } else if (_exists(tsxLocal) && process.platform !== 'win32') {
     tsxBin = tsxLocal;
-    tsxArgs = [jsPath];
-    tsxCwd = undefined;
+    tsxArgs = [jsAbs];
+    tsxCwd = projectRoot;
   } else {
     tsxBin = 'npx';
-    tsxArgs = ['tsx', jsPath];
-    tsxCwd = undefined;
+    tsxArgs = ['tsx', jsAbs];
+    tsxCwd = projectRoot;
   }
 
   const child = spawn(tsxBin, tsxArgs, {
