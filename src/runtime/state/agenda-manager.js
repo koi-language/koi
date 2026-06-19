@@ -26,6 +26,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { Cron } from 'croner';
 import { channel } from '../io/channel.js';
@@ -53,11 +54,26 @@ class AgendaManager {
   }
 
   _getFilePath() {
+    // SINGLE global agenda (one per machine/team), NOT per-project. Each entry
+    // carries its own `workDir` so the scheduler can run it in the directory it
+    // was scheduled in. Override with KOI_AGENDA_FILE for tests.
     if (!this._filePath) {
-      const root = process.env.KOI_PROJECT_ROOT || process.cwd();
-      this._filePath = path.join(root, '.koi', 'agenda.json');
+      this._filePath = process.env.KOI_AGENDA_FILE
+        || path.join(os.homedir(), '.koi', 'agenda.json');
     }
     return this._filePath;
+  }
+
+  /**
+   * Force a re-read from disk. The agenda is a single global file shared across
+   * processes (the scheduler daemon + any spawned task session that calls
+   * agenda_update). The daemon calls this before each fire so it sees status
+   * changes (e.g. a watch a child marked 'completed') instead of acting on a
+   * stale in-memory copy.
+   */
+  refresh() {
+    this._loaded = false;
+    this._loadIfNeeded();
   }
 
   _loadIfNeeded() {
@@ -149,9 +165,18 @@ class AgendaManager {
   /**
    * Fire a triggered entry: notify the agent and update status.
    */
-  _triggerEntry(entry, notifyFn) {
-    const message = `📅 AGENDA REMINDER: "${entry.title}"${entry.description ? ` — ${entry.description}` : ''} (scheduled by ${entry.agentName})`;
-    const fullMessage = `[AGENDA] Scheduled item is now due:\n${message}\n\nPlease handle this agenda item.`;
+  _triggerEntry(scheduledEntry, fireFn) {
+    // Reconcile with disk first — the global agenda is shared across processes,
+    // so the entry may have been cancelled/updated since we scheduled it.
+    this.refresh();
+    const entry = this._entries[scheduledEntry.id];
+    if (!entry || entry.status !== 'pending') {
+      this._unscheduleEntry(scheduledEntry.id);
+      return;
+    }
+
+    const message = `📅 AGENDA: "${entry.title}"${entry.description ? ` — ${entry.description}` : ''}`;
+    const prompt = `[AGENDA] A scheduled task is now due. Carry it out now, autonomously, then finish:\n\n${message}`;
 
     entry.lastTriggeredAt = new Date().toISOString();
     entry.updatedAt = new Date().toISOString();
@@ -166,15 +191,29 @@ class AgendaManager {
     // Cron-based: keep status as pending, croner handles the next run automatically
 
     this._save();
-    notifyFn(fullMessage);
-    channel.log('agenda', `Triggered entry #${entry.id}: "${entry.title}"`);
+    // fireFn spawns a fresh headless YOLO session in entry.workDir to run the
+    // task and exit (see the scheduler daemon). It receives the full entry so
+    // it knows the work directory.
+    try { fireFn({ entry: { ...entry }, prompt }); } catch (err) {
+      channel.log('agenda', `fireFn failed for #${entry.id}: ${err.message}`);
+    }
+    channel.log('agenda', `Triggered entry #${entry.id}: "${entry.title}" → ${entry.workDir}`);
   }
 
   /**
    * Fire a watch check: inject instructions for the agent to verify a condition.
    * The agent decides whether the condition is met and calls agenda_update(status='completed') if so.
    */
-  _triggerWatch(entry, notifyFn) {
+  _triggerWatch(scheduledEntry, fireFn) {
+    // Reconcile with disk — a spawned check session may have marked this watch
+    // 'completed' (condition met) since the last tick.
+    this.refresh();
+    const entry = this._entries[scheduledEntry.id];
+    if (!entry || entry.status !== 'pending') {
+      this._unscheduleEntry(scheduledEntry.id);
+      return;
+    }
+
     entry.checkCount = (entry.checkCount || 0) + 1;
     entry.lastTriggeredAt = new Date().toISOString();
     entry.updatedAt = new Date().toISOString();
@@ -184,17 +223,17 @@ class AgendaManager {
       entry.status = 'cancelled';
       this._unscheduleEntry(entry.id);
       this._save();
-      const timeoutMsg = `[AGENDA WATCH #${entry.id}] ⏰ Watch "${entry.title}" has reached its maximum of ${entry.maxAttempts} checks without the condition being met. The watch has been cancelled. Inform the user.`;
-      notifyFn(timeoutMsg);
       channel.log('agenda', `Watch #${entry.id} timed out after ${entry.maxAttempts} attempts`);
       return;
     }
 
     this._save();
 
-    const fullMessage = `[AGENDA WATCH #${entry.id}] Periodic check (attempt ${entry.checkCount}${entry.maxAttempts ? `/${entry.maxAttempts}` : ''}): "${entry.title}"\nInstructions: ${entry.checkInstructions}\nIf the condition IS met: inform the user and call agenda_update with id="${entry.id}" and status="completed".\nIf the condition is NOT met: BE COMPLETELY SILENT. Do NOT print anything to the user. Do NOT say "still checking" or "still in progress". Just call prompt_user with no prior output.`;
-    notifyFn(fullMessage);
-    channel.log('agenda', `Watch #${entry.id} check #${entry.checkCount}: "${entry.title}"`);
+    const prompt = `[AGENDA WATCH #${entry.id}] Periodic check (attempt ${entry.checkCount}${entry.maxAttempts ? `/${entry.maxAttempts}` : ''}): "${entry.title}"\nInstructions: ${entry.checkInstructions}\nIf the condition IS met: do what the instructions say, then call agenda_update with id="${entry.id}" and status="completed".\nIf the condition is NOT met: do nothing and finish — you'll be checked again next interval.`;
+    try { fireFn({ entry: { ...entry }, prompt }); } catch (err) {
+      channel.log('agenda', `fireFn failed for watch #${entry.id}: ${err.message}`);
+    }
+    channel.log('agenda', `Watch #${entry.id} check #${entry.checkCount}: "${entry.title}" → ${entry.workDir}`);
   }
 
   /**
@@ -218,7 +257,7 @@ class AgendaManager {
    * @param {string} [opts.agentName] - Agent that created the entry
    * @returns {Object} The created entry
    */
-  add({ title, scheduledAt, description, recurrence, agentName } = {}) {
+  add({ title, scheduledAt, description, recurrence, agentName, workDir } = {}) {
     this._loadIfNeeded();
     if (!title) throw new Error('agenda_add: "title" is required');
     if (!scheduledAt) throw new Error('agenda_add: "scheduledAt" is required');
@@ -264,6 +303,10 @@ class AgendaManager {
       recurrence: rec,
       status: 'pending',
       agentName: agentName || 'unknown',
+      // The directory this task runs in when it fires. Defaults to where it was
+      // scheduled. The scheduler daemon spawns the task session with this as
+      // KOI_PROJECT_ROOT.
+      workDir: workDir || process.env.KOI_PROJECT_ROOT || process.cwd(),
       createdAt: now,
       updatedAt: now,
       lastTriggeredAt: null,
@@ -277,7 +320,7 @@ class AgendaManager {
       this._scheduleEntry(entry);
     }
 
-    channel.log('agenda', `[${agentName || '?'}] Scheduled: "${title}" at ${parsedDate.toLocaleString()} (${cronExpr || 'once'})`);
+    channel.log('agenda', `[${agentName || '?'}] Scheduled: "${title}" at ${parsedDate.toLocaleString()} (${cronExpr || 'once'}) in ${entry.workDir}`);
 
     return { ...entry };
   }
@@ -291,7 +334,7 @@ class AgendaManager {
    * opts.maxAttempts - Max checks before giving up, default 60 (0 = unlimited)
    * opts.agentName - Agent that created the watch
    */
-  addWatch({ title, checkInstructions, interval, maxAttempts, agentName } = {}) {
+  addWatch({ title, checkInstructions, interval, maxAttempts, agentName, workDir } = {}) {
     this._loadIfNeeded();
     if (!title) throw new Error('agenda_watch: "title" is required');
     if (!checkInstructions) throw new Error('agenda_watch: "checkInstructions" is required');
@@ -319,6 +362,7 @@ class AgendaManager {
       recurrence: cronExpr,
       status: 'pending',
       agentName: agentName || 'unknown',
+      workDir: workDir || process.env.KOI_PROJECT_ROOT || process.cwd(),
       maxAttempts: maxAttempts != null ? maxAttempts : 60,
       checkCount: 0,
       createdAt: now,
@@ -448,11 +492,15 @@ class AgendaManager {
 
   /**
    * Start the scheduler. Loads all pending entries and creates Cron jobs.
-   * @param {Function} notifyFn - Called with a message string when entries are due.
+   * Intended to run in ONE process only (the agenda daemon) — the agenda is a
+   * single global file, so multiple schedulers would each fire every task.
+   * @param {Function} fireFn - Called as fireFn({ entry, prompt }) when an entry
+   *   is due. The daemon spawns a fresh headless YOLO session in entry.workDir
+   *   that runs `prompt` and exits.
    */
-  startScheduler(notifyFn) {
+  startScheduler(fireFn) {
     if (this._started) return;
-    this._notifyFn = notifyFn;
+    this._notifyFn = fireFn;
     this._started = true;
     this._loadIfNeeded();
 
@@ -466,6 +514,35 @@ class AgendaManager {
     }
 
     channel.log('agenda', `Scheduler started (croner). ${count} pending entry/entries loaded.`);
+  }
+
+  /**
+   * Reconcile in-memory cron jobs with the on-disk agenda. The daemon calls
+   * this on a timer so entries ADDED by other processes (session agents calling
+   * agenda_add) get scheduled, and entries that were cancelled/completed get
+   * their jobs stopped. Returns { added, removed } counts.
+   */
+  syncJobs() {
+    if (!this._started) return { added: 0, removed: 0 };
+    this.refresh();
+    let added = 0;
+    let removed = 0;
+    // Schedule any pending entry that has no live job yet.
+    for (const entry of Object.values(this._entries)) {
+      if (entry.status === 'pending' && !this._jobs.has(entry.id)) {
+        this._scheduleEntry(entry);
+        if (this._jobs.has(entry.id)) added++;
+      }
+    }
+    // Stop jobs whose entry is gone or no longer pending.
+    for (const id of [...this._jobs.keys()]) {
+      const e = this._entries[id];
+      if (!e || e.status !== 'pending') {
+        this._unscheduleEntry(id);
+        removed++;
+      }
+    }
+    return { added, removed };
   }
 
   /**

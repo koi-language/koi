@@ -22,7 +22,7 @@ function looksLikeFileField(field) {
 export default {
   type: 'prompt_form',
   intent: 'prompt_form',
-  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. **Rule: if the field is asking the user to attach files or references of any kind, ALWAYS set `files`. Never a plain text field for attachments.** (If you forget, the runtime tries to detect the intent and auto-coerce — do not rely on that.) Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/options fields, array of absolute paths for `files` fields).',
+  description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. **Rule: if the field is asking the user to attach files or references of any kind, ALWAYS set `files`. Never a plain text field for attachments.** (If you forget, the runtime tries to detect the intent and auto-coerce — do not rely on that.) Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/single-select fields, array of selected values for `multiSelect` fields, array of absolute paths for `files` fields). If the user closes the form without submitting, returns { answers: null, cancelled: true }.',
   thinkingHint: 'Waiting for your input',
   permission: null,
 
@@ -53,17 +53,22 @@ export default {
             },
             options: {
               type: 'array',
-              description: 'If provided, shows a select menu instead of free text. The user picks one with ↑↓ + Enter.',
+              description: 'If provided, shows a select menu instead of free text. Single-select by default (user picks one with ↑↓ + Enter); set the field\'s `multiSelect: true` for a checkbox list. `label`/`description` text may contain markdown links — they render clickable.',
               items: {
                 type: 'object',
                 properties: {
                   title: { type: 'string', description: 'Option label (bold in the list)' },
-                  description: { type: 'string', description: 'Optional description shown below the title in dim text' },
+                  description: { type: 'string', description: 'Optional description shown below the title in dim text (may contain markdown links)' },
                   value: { type: 'string', description: 'The value returned when this option is selected. Defaults to title if not set.' },
-                  recommended: { type: 'boolean', description: 'Show "(Recommended)" after the title' }
+                  recommended: { type: 'boolean', description: 'Show "(Recommended)" after the title' },
+                  disabled: { type: 'boolean', description: 'Render this option greyed-out and untoggleable (multiSelect fields only — e.g. an interaction the platform has turned off).' }
                 },
                 required: ['title']
               }
+            },
+            multiSelect: {
+              type: 'boolean',
+              description: 'When true AND `options` is set, render a CHECKBOX LIST — the user can pick several at once. The submitted value for this field is an array of the selected option `value`s. Default: false (single-select radio).'
             },
             allowFreeText: {
               type: 'boolean',
