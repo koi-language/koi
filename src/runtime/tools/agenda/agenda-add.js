@@ -10,7 +10,7 @@ import { agendaManager } from '../../state/agenda-manager.js';
 export default {
   type: 'agenda_add',
   intent: 'agenda_add',
-  description: 'Schedule a new agenda entry. Fields: "title" (short description), "scheduledAt" (ISO 8601 date/time, e.g. "2026-03-22T14:30:00+01:00"), "description" (optional details), "recurrence" (once|daily|weekly|monthly OR a cron expression like "0 9 * * MON-FRI", default: once). → Returns: { id, title, scheduledAt, recurrence, status }',
+  description: 'Schedule a task to run LATER — record it and STOP (do NOT do the work now; an autonomous session runs it when it fires). Fields: "title", "scheduledAt" (ISO 8601 +TZ, e.g. "2026-03-22T14:30:00+01:00"), "description" (the full self-contained instruction the future session runs), "recurrence" (once|daily|weekly|monthly|cron, default once). → Returns: { id, title, scheduledAt, recurrence, status }',
   thinkingHint: 'Scheduling agenda entry',
   permission: 'agenda',
   hidden: false,
@@ -28,7 +28,7 @@ export default {
       },
       description: {
         type: 'string',
-        description: 'Optional detailed description or instructions for when the entry triggers',
+        description: 'The full self-contained instruction the firing session runs. It has no memory of this chat and cannot ask the user, so include everything it needs: steps, commands, URLs, paths, IDs, success criteria. Only ask the user upfront for what the future session couldn\'t get itself (credentials, an id, a choice).',
       },
       recurrence: {
         type: 'string',

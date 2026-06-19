@@ -13,11 +13,9 @@
  *   - Simple recurrence shortcuts (daily, weekly, monthly)
  *   - Timezone-aware via Intl.DateTimeFormat
  *   - Triggers agents by injecting synthetic input when entries are due
- *   - Watchers: periodic condition checks that notify agents when a condition is met
  *
  * Usage:
- *   agendaManager.add({ title, scheduledAt, description?, cron?, agentName? })
- *   agendaManager.addWatch({ title, checkInstructions, interval?, maxAttempts?, agentName? })
+ *   agendaManager.add({ title, scheduledAt, description?, cron?, agentName?, workDir? })
  *   agendaManager.list({ from?, to?, status?, agentName?, type? })
  *   agendaManager.remove(id)
  *   agendaManager.update(id, { title?, scheduledAt?, description?, cron?, status? })
@@ -50,7 +48,35 @@ class AgendaManager {
     this._notifyFn = null;
     // Map of entry ID → Cron instance (active scheduled jobs)
     this._jobs = new Map();
+    // Map of entry ID → schedule signature (cron|scheduledAt) the job was
+    // created with, so syncJobs can detect a rescheduled entry and rebuild it.
+    this._jobSig = new Map();
     this._started = false;
+  }
+
+  /** Signature of an entry's timing — changes when it's rescheduled. */
+  _scheduleSig(entry) {
+    return `${entry.cron || ''}|${entry.scheduledAt || ''}`;
+  }
+
+  /**
+   * Resolve a recurrence value into a cron expression (or null for one-off).
+   * 'once' → null; daily/weekly/monthly → derived from scheduledDate's time;
+   * anything else → treated as a raw cron expression (validated). Shared by
+   * add() and update() so editing recurrence behaves identically to creating.
+   */
+  _resolveCron(recurrence, scheduledDate) {
+    const rec = (recurrence || 'once').trim();
+    if (rec === 'once') return null;
+    if (RECURRENCE_TO_CRON[rec]) {
+      return RECURRENCE_TO_CRON[rec](
+        scheduledDate.getMinutes(), scheduledDate.getHours(),
+        scheduledDate.getDay(), scheduledDate.getDate(),
+      );
+    }
+    const test = new Cron(rec); // throws on an invalid expression
+    test.stop();
+    return rec;
   }
 
   _getFilePath() {
@@ -137,13 +163,10 @@ class AgendaManager {
 
     try {
       let job;
-      const isWatch = entry.entryType === 'watch';
-      const callback = isWatch
-        ? () => self._triggerWatch(entry, notifyFn)
-        : () => self._triggerEntry(entry, notifyFn);
+      const callback = () => self._triggerEntry(entry, notifyFn);
 
       if (entry.cron) {
-        // Cron-based recurring/watch entry
+        // Cron-based recurring entry
         job = new Cron(entry.cron, { timezone }, callback);
       } else {
         // One-time entry at specific date
@@ -157,6 +180,7 @@ class AgendaManager {
       }
 
       this._jobs.set(entry.id, job);
+      this._jobSig.set(entry.id, this._scheduleSig(entry));
     } catch (err) {
       channel.log('agenda', `Failed to schedule entry #${entry.id}: ${err.message}`);
     }
@@ -205,42 +229,6 @@ class AgendaManager {
   }
 
   /**
-   * Fire a watch check: inject instructions for the agent to verify a condition.
-   * The agent decides whether the condition is met and calls agenda_update(status='completed') if so.
-   */
-  _triggerWatch(scheduledEntry, fireFn) {
-    // Reconcile with disk — a spawned check session may have marked this watch
-    // 'completed' (condition met) since the last tick.
-    this.refresh();
-    const entry = this._entries[scheduledEntry.id];
-    if (!entry || entry.status !== 'pending') {
-      this._unscheduleEntry(scheduledEntry.id);
-      return;
-    }
-
-    entry.checkCount = (entry.checkCount || 0) + 1;
-    entry.lastTriggeredAt = new Date().toISOString();
-    entry.updatedAt = new Date().toISOString();
-
-    // Check if max attempts exceeded
-    if (entry.maxAttempts && entry.checkCount > entry.maxAttempts) {
-      entry.status = 'cancelled';
-      this._unscheduleEntry(entry.id);
-      this._save();
-      channel.log('agenda', `Watch #${entry.id} timed out after ${entry.maxAttempts} attempts`);
-      return;
-    }
-
-    this._save();
-
-    const prompt = `[AGENDA WATCH #${entry.id}] Periodic check (attempt ${entry.checkCount}${entry.maxAttempts ? `/${entry.maxAttempts}` : ''}): "${entry.title}"\nInstructions: ${entry.checkInstructions}\nIf the condition IS met: do what the instructions say, then call agenda_update with id="${entry.id}" and status="completed".\nIf the condition is NOT met: do nothing and finish — you'll be checked again next interval.`;
-    try { fireFn({ entry: { ...entry }, prompt }); } catch (err) {
-      channel.log('agenda', `fireFn failed for watch #${entry.id}: ${err.message}`);
-    }
-    channel.log('agenda', `Watch #${entry.id} check #${entry.checkCount}: "${entry.title}" → ${entry.workDir}`);
-  }
-
-  /**
    * Stop and remove the Cron job for a specific entry.
    */
   _unscheduleEntry(id) {
@@ -249,6 +237,7 @@ class AgendaManager {
       job.stop();
       this._jobs.delete(id);
     }
+    this._jobSig.delete(id);
   }
 
   /**
@@ -262,7 +251,7 @@ class AgendaManager {
    * @returns {Object} The created entry
    */
   add({ title, scheduledAt, description, recurrence, agentName, workDir } = {}) {
-    this._loadIfNeeded();
+    this.refresh(); // shared global file — re-read so we don't clobber other processes' writes
     if (!title) throw new Error('agenda_add: "title" is required');
     if (!scheduledAt) throw new Error('agenda_add: "scheduledAt" is required');
 
@@ -272,27 +261,12 @@ class AgendaManager {
     }
 
     // Determine cron expression from recurrence
-    let cronExpr = null;
     const rec = (recurrence || 'once').trim();
-
-    if (rec === 'once') {
-      cronExpr = null; // One-time, uses scheduledAt directly
-    } else if (RECURRENCE_TO_CRON[rec]) {
-      // Simple keyword → derive cron from scheduledAt time
-      const m = parsedDate.getMinutes();
-      const h = parsedDate.getHours();
-      const dow = parsedDate.getDay(); // 0=Sun
-      const dom = parsedDate.getDate();
-      cronExpr = RECURRENCE_TO_CRON[rec](m, h, dow, dom);
-    } else {
-      // Assume it's a raw cron expression — validate it
-      try {
-        const test = new Cron(rec);
-        test.stop();
-        cronExpr = rec;
-      } catch (err) {
-        throw new Error(`agenda_add: Invalid recurrence/cron "${rec}": ${err.message}`);
-      }
+    let cronExpr;
+    try {
+      cronExpr = this._resolveCron(rec, parsedDate);
+    } catch (err) {
+      throw new Error(`agenda_add: Invalid recurrence/cron "${rec}": ${err.message}`);
     }
 
     const id = String(this._nextId++);
@@ -330,68 +304,10 @@ class AgendaManager {
   }
 
   /**
-   * Add a watch entry — periodic condition check that notifies the agent.
-   *
-   * opts.title - Short description of what to watch for
-   * opts.checkInstructions - Instructions for the agent on what to check and how
-   * opts.interval - Cron expression for check frequency (default: every 2 min)
-   * opts.maxAttempts - Max checks before giving up, default 60 (0 = unlimited)
-   * opts.agentName - Agent that created the watch
-   */
-  addWatch({ title, checkInstructions, interval, maxAttempts, agentName, workDir } = {}) {
-    this._loadIfNeeded();
-    if (!title) throw new Error('agenda_watch: "title" is required');
-    if (!checkInstructions) throw new Error('agenda_watch: "checkInstructions" is required');
-
-    // Validate and default the interval cron expression
-    const cronExpr = (interval || '*/2 * * * *').trim();
-    try {
-      const test = new Cron(cronExpr);
-      test.stop();
-    } catch (err) {
-      throw new Error(`agenda_watch: Invalid interval cron "${cronExpr}": ${err.message}`);
-    }
-
-    const id = String(this._nextId++);
-    const now = new Date().toISOString();
-
-    const entry = {
-      id,
-      entryType: 'watch',
-      title,
-      description: checkInstructions,
-      checkInstructions,
-      scheduledAt: now,
-      cron: cronExpr,
-      recurrence: cronExpr,
-      status: 'pending',
-      agentName: agentName || 'unknown',
-      workDir: workDir || process.env.KOI_PROJECT_ROOT || process.cwd(),
-      maxAttempts: maxAttempts != null ? maxAttempts : 60,
-      checkCount: 0,
-      createdAt: now,
-      updatedAt: now,
-      lastTriggeredAt: null,
-    };
-
-    this._entries[id] = entry;
-    this._save();
-
-    // If scheduler is running, schedule immediately
-    if (this._started) {
-      this._scheduleEntry(entry);
-    }
-
-    channel.log('agenda', `[${agentName || '?'}] Watch: "${title}" every ${cronExpr} (max ${entry.maxAttempts} checks)`);
-
-    return { ...entry };
-  }
-
-  /**
    * Remove an agenda entry by ID.
    */
   remove(id) {
-    this._loadIfNeeded();
+    this.refresh(); // shared global file — re-read first
     const strId = String(id);
     const entry = this._entries[strId];
     if (!entry) throw new Error(`Agenda entry ${strId} not found`);
@@ -409,7 +325,7 @@ class AgendaManager {
    * Update an agenda entry.
    */
   update(id, updates = {}) {
-    this._loadIfNeeded();
+    this.refresh(); // shared global file — re-read first
     const strId = String(id);
     const entry = this._entries[strId];
     if (!entry) throw new Error(`Agenda entry ${strId} not found`);
@@ -431,11 +347,24 @@ class AgendaManager {
       }
       entry.scheduledAt = parsedDate.toISOString();
     }
+    // Recurrence change → recompute cron (mirrors add(), uses the effective
+    // scheduledAt). An explicit `cron` update, if given, wins.
     if (updates.cron !== undefined) {
       entry.cron = updates.cron;
-    }
-    if (updates.recurrence !== undefined) {
-      entry.recurrence = updates.recurrence;
+      if (updates.recurrence !== undefined) entry.recurrence = updates.recurrence;
+    } else if (updates.recurrence !== undefined) {
+      const rec = (updates.recurrence || 'once').trim();
+      try {
+        entry.cron = this._resolveCron(rec, new Date(entry.scheduledAt));
+      } catch (err) {
+        throw new Error(`agenda_update: Invalid recurrence/cron "${rec}": ${err.message}`);
+      }
+      entry.recurrence = rec;
+    } else if (updates.scheduledAt !== undefined
+               && entry.recurrence && RECURRENCE_TO_CRON[entry.recurrence]) {
+      // A keyword-recurring entry (daily/weekly/monthly) whose time moved —
+      // its cron is derived from the time of day, so recompute it.
+      entry.cron = this._resolveCron(entry.recurrence, new Date(entry.scheduledAt));
     }
 
     entry.updatedAt = new Date().toISOString();
@@ -456,7 +385,7 @@ class AgendaManager {
    * Get a single entry by ID.
    */
   get(id) {
-    this._loadIfNeeded();
+    this.refresh(); // shared global file — always read the latest (the daemon updates statuses)
     const entry = this._entries[String(id)];
     return entry ? { ...entry } : null;
   }
@@ -465,7 +394,7 @@ class AgendaManager {
    * List agenda entries with optional filters.
    */
   list(filters = {}) {
-    this._loadIfNeeded();
+    this.refresh(); // shared global file — always read the latest (the daemon updates statuses)
     let entries = Object.values(this._entries);
 
     // Exclude cancelled by default unless explicitly requested
@@ -527,15 +456,23 @@ class AgendaManager {
    * their jobs stopped. Returns { added, removed } counts.
    */
   syncJobs() {
-    if (!this._started) return { added: 0, removed: 0 };
+    if (!this._started) return { added: 0, removed: 0, rescheduled: 0 };
     this.refresh();
     let added = 0;
     let removed = 0;
-    // Schedule any pending entry that has no live job yet.
+    let rescheduled = 0;
     for (const entry of Object.values(this._entries)) {
-      if (entry.status === 'pending' && !this._jobs.has(entry.id)) {
+      if (entry.status !== 'pending') continue;
+      if (!this._jobs.has(entry.id)) {
+        // New pending entry (added by a session via agenda_add) — schedule it.
         this._scheduleEntry(entry);
         if (this._jobs.has(entry.id)) added++;
+      } else if (this._jobSig.get(entry.id) !== this._scheduleSig(entry)) {
+        // Already scheduled but its time/cron changed (a session called
+        // agenda_update) — rebuild the cron job so the new time takes effect.
+        this._unscheduleEntry(entry.id);
+        this._scheduleEntry(entry);
+        rescheduled++;
       }
     }
     // Stop jobs whose entry is gone or no longer pending.
@@ -546,7 +483,7 @@ class AgendaManager {
         removed++;
       }
     }
-    return { added, removed };
+    return { added, removed, rescheduled };
   }
 
   /**
