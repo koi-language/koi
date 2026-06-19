@@ -266,6 +266,11 @@ class ActionRegistry {
       // agents either fabricated the call shape ("get_tool_info('<skill-name>')")
       // or narrated activation in prose without ever firing the tool.
       'activate_skill', 'deactivate_skill',
+      // Agenda/scheduling is core: the agent reaches for it constantly
+      // ("remind me…", "every day…", "what's scheduled?") and the params are
+      // simple, so surface the brief descriptions inline instead of hiding them
+      // behind the `agenda` toolset + a get_tool_info round-trip.
+      'agenda_add', 'agenda_watch', 'agenda_list', 'agenda_update', 'agenda_remove',
     ]);
 
     // Media tools get a dedicated "always-visible with one-liner"

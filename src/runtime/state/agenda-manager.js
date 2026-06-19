@@ -175,8 +175,12 @@ class AgendaManager {
       return;
     }
 
-    const message = `📅 AGENDA: "${entry.title}"${entry.description ? ` — ${entry.description}` : ''}`;
-    const prompt = `[AGENDA] A scheduled task is now due. Carry it out now, autonomously, then finish:\n\n${message}`;
+    // The scheduled task IS the instruction handed to the new session's System
+    // agent — exactly as it was scheduled, nothing more. (The session runs it in
+    // YOLO + exit-on-complete, so no extra "do this autonomously" framing needed.)
+    const prompt = entry.description
+      ? `${entry.title}\n\n${entry.description}`
+      : entry.title;
 
     entry.lastTriggeredAt = new Date().toISOString();
     entry.updatedAt = new Date().toISOString();
