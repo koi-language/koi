@@ -388,8 +388,7 @@ class ActionRegistry {
     // visual / audio transformation of a media file.
     if (mediaActions.length > 0) {
       doc += '\n### Media tools — ALWAYS use these for image / video / audio work\n';
-      doc += '**HARD RULE**: any time the user asks for a visual or audio transformation of a media file — change colours, swap a background, restyle, animate a still, extend or shorten a clip, upscale, outpaint, isolate a subject, add SFX, transcribe speech, generate a voice, lip-sync an avatar, ANY of those — you call the dedicated AI tool listed below. NEVER write a Python / shell / ffmpeg script to do it pixel-by-pixel or sample-by-sample. `write_file modify_color.py` with PIL is a category error for "make the letters white": the right answer is `generate_image` with the image as `referenceImages` and a prompt describing the change. Same for `ffmpeg` shell-outs to crop/concat/extract — the dedicated tools (`extract_frame`, `generate_video`, etc.) handle that internally with the right model picks and codec choices.\n\n';
-      doc += '**You still MUST call `get_tool_info("<tool>")` once before invoking any tool here** (parameters are rich and provider-specific). The descriptions below tell you WHEN to reach for each one; `get_tool_info` tells you HOW.\n\n';
+      doc += '**HARD RULE** (full policy above): for ANY visual/audio transformation of a media file — recolour, swap background, restyle, animate a still, trim/extend, upscale, outpaint, isolate a subject, add SFX, transcribe, generate a voice, lip-sync — call the dedicated AI tool below; NEVER a Python/shell/ffmpeg/PIL script. The lines below say WHEN to reach for each; call `get_tool_info("<tool>")` once for the HOW (params are rich and provider-specific).\n\n';
       for (const action of mediaActions) {
         doc += _renderActionLine(action);
       }

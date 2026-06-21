@@ -358,10 +358,10 @@ ${taskDescription}`;
     // gets "No models available" even though providers arrive ~700ms later.
     try { await this._waitForReadyFn?.(); } catch (_) {}
 
-    // Get candidate models for classification, sorted by cost (cheapest first).
-    // The classifier MUST be a competent model — a weak model (like nano) will underestimate
-    // task complexity and then get selected for the task itself, creating a feedback loop.
-    // Minimum reasoning:40 ensures we skip nano/haiku/lite but allow flash/gpt-5.1 as classifiers.
+    // Candidate models for classification. The classifier MUST be a competent
+    // model — a weak one (like nano) underestimates task complexity and then
+    // gets selected for the task itself, a feedback loop. Minimum reasoning:40
+    // skips nano/haiku/lite but allows flash/gpt-5.1 as classifiers.
     const _allModels = getAllCandidates('reasoning', 40, this._getAvailableProvidersFn());
     const _candidates = _allModels.map(c => ({
       client: this._getClient(c.provider),
@@ -374,7 +374,27 @@ ${taskDescription}`;
       this._log('llm', `[classify] No models available for classification — default profile`);
       return DEFAULT_TASK_PROFILE;
     }
-    this._log('llm', `[classify] ${_candidates.length} candidate models: ${_candidates.map(c => c.model).join(', ')}`);
+
+    // Order by OBSERVED SPEED, not cost. This is a tiny latency-sensitive JSON
+    // call on the hot path before every reply: `getAllCandidates` sorts by cost
+    // (cheapest first), which can put a cheap-but-slow/cold model first — it
+    // blows the 5s per-attempt timeout, then the loop falls back to the next
+    // cheapest, which is often an EXPENSIVE reasoning model (gpt-5.1) that's
+    // also slow → the ~9s classify stall seen in production. The backend ships
+    // a live `p50LatencyMs` per model in /gateway/models.json; sort by it
+    // (fastest first), then by the static `speed` score. Models with no
+    // observed latency yet go last so a known-fast model always wins. This
+    // also means the FALLBACK after a timeout is the next-fastest model, never
+    // a slow reasoning model.
+    _candidates.sort((a, b) => {
+      const ap = a.caps?.p50LatencyMs, bp = b.caps?.p50LatencyMs;
+      const aHas = typeof ap === 'number', bHas = typeof bp === 'number';
+      if (aHas && bHas && ap !== bp) return ap - bp;
+      if (aHas !== bHas) return aHas ? -1 : 1; // known-latency models first
+      return (b.caps?.speed || 0) - (a.caps?.speed || 0);
+    });
+
+    this._log('llm', `[classify] ${_candidates.length} candidate models (by p50 latency): ${_candidates.map(c => `${c.model}${typeof c.caps?.p50LatencyMs === 'number' ? `(${c.caps.p50LatencyMs}ms)` : ''}`).join(', ')}`);
 
     this._log('llm', `[classify] Using ${_candidates[0].model} for classification`);
 

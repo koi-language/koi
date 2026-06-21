@@ -627,15 +627,7 @@ long value, prefer a single-line double-quoted string with \\n escapes over a "|
 EXECUTION FLOW
 ========================================
 
-Your response MUST be ONE YAML document per step and it MUST be one of two forms — never mix them:
-1. A single action mapping:
-   actionType: direct
-   intent: ...
-2. A batch:
-   batch:
-     - ...action mappings...
-
-Use sequential steps only when later actions depend on earlier results.
+Each response is ONE YAML document — a single action mapping or a "batch:" (per OUTPUT CONTRACT above). Use sequential steps only when later actions depend on earlier results.
 
 Parallelism is mandatory:
 - If 2+ actions are independent, they MUST go inside a "parallel" block
@@ -1699,9 +1691,10 @@ export function buildExpandedResourceSection(resources, agent) {
   }
 
   // ── INVOCATION SYNTAX ───────────────────────────────────────────────────
+  // (The direct actionType/intent/params shape is already defined by ACTION
+  // MODEL above; here we only show the concrete delegate + MCP examples with
+  // real names, which ACTION MODEL does not carry.)
   doc += '---\n';
-  doc += 'To execute an action (intent MUST be an exact name from AVAILABLE ACTIONS):\n';
-  doc += 'actionType: direct\nintent: <action_name>\n<param1>: <value1>\n<param2>: <value2>\n\n';
 
   if (delegateResources.length > 0) {
     const ex = delegateResources[0];

@@ -279,6 +279,17 @@ export class EmbeddingProvider {
   async getEmbeddingBatch(texts) {
     if (!texts.length) return [];
 
+    // A single-text "batch" is just one embed. Route it through the cached,
+    // coalesced, lock-FREE single path: callers that embed one query at a time
+    // (conversation KNN, conversation indexing) then dedupe with the prompt
+    // builder's other same-text embeds AND stop serializing behind the global
+    // batch lock below. This is the common case in the per-turn recall (the
+    // trace showed repeated "Embedding batch: 1 texts" calls queued on the
+    // lock). Errors propagate exactly as the gateway batch path would.
+    if (texts.length === 1) {
+      return [await this.getEmbedding(texts[0])];
+    }
+
     // Serialize batch requests — re-check lock after waking up to prevent
     // multiple waiters from proceeding concurrently.
     while (this._embeddingBatchLock) {

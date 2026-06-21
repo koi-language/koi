@@ -79,16 +79,19 @@ export async function loadSlotMap(agentName, agentsRoot) {
  * @returns {Promise<Array<{ id, mode, content, slotConfig }>>}
  */
 export async function resolveSlots(slotMap, ctx) {
-  const out = [];
-  for (const slotConfig of slotMap.slots) {
+  // Resolve slots CONCURRENTLY. Each slot's source is independent — they only
+  // READ ctx and (memory/conversation slots) issue their own embedding +
+  // vector-search round-trip; the only shared write is `ctx.warnings.push`,
+  // which is safe to interleave. This used to be a serial `for await` loop, so
+  // the System agent's 4 memory/conversation slots each paid their ~700ms
+  // round-trip one after another (~2-3s of the per-turn recall latency). Run
+  // in parallel and the wall time collapses to roughly the slowest single
+  // slot. Promise.all preserves array order, so slot ordering is unchanged.
+  return Promise.all(slotMap.slots.map(async (slotConfig) => {
     if (!slotConfig.id) throw new Error('slot map: every slot needs an id');
-    const sourceName = slotConfig.source;
-    const source = SOURCES[sourceName];
+    const source = SOURCES[slotConfig.source];
     let content = '';
-    if (!source) {
-      // Unknown source — leave empty, mark in metadata via empty content.
-      content = '';
-    } else {
+    if (source) {
       try {
         content = await source.resolve(slotConfig, ctx);
       } catch (err) {
@@ -97,14 +100,14 @@ export async function resolveSlots(slotMap, ctx) {
         content = '';
       }
     }
-    out.push({
+    // Unknown source → leave empty (marked via empty content in metadata).
+    return {
       id: slotConfig.id,
       mode: _normalizeBudget(slotConfig.budget),
       content: content ?? '',
       slotConfig,
-    });
-  }
-  return out;
+    };
+  }));
 }
 
 function _normalizeBudget(budget) {
