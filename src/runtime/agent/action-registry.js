@@ -388,7 +388,7 @@ class ActionRegistry {
     // visual / audio transformation of a media file.
     if (mediaActions.length > 0) {
       doc += '\n### Media tools — ALWAYS use these for image / video / audio work\n';
-      doc += '**HARD RULE** (full policy above): for ANY visual/audio transformation of a media file — recolour, swap background, restyle, animate a still, trim/extend, upscale, outpaint, isolate a subject, add SFX, transcribe, generate a voice, lip-sync — call the dedicated AI tool below; NEVER a Python/shell/ffmpeg/PIL script. The lines below say WHEN to reach for each; call `get_tool_info("<tool>")` once for the HOW (params are rich and provider-specific).\n\n';
+      doc += '**HARD RULE**: for ANY visual/audio transformation of a media file — recolour, swap background, restyle, animate a still, trim/extend, upscale, outpaint, isolate a subject, add SFX, transcribe, generate a voice, lip-sync — call the dedicated AI tool below; NEVER a Python/shell/ffmpeg/PIL script (it bypasses the gallery/billing). The lines below say WHEN to reach for each; call `get_tool_info("<tool>")` once for the HOW (params are rich and provider-specific).\n\n';
       for (const action of mediaActions) {
         doc += _renderActionLine(action);
       }
