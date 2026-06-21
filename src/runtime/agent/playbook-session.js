@@ -128,20 +128,26 @@ export class PlaybookSession {
   }
 
   /**
-   * Did any action in the CURRENT user turn fail or get blocked? Gates the
-   * blocked-result handling prompt block (see system.koi `@if (recentFailure)`).
-   * Scans explicitly for `blocked === true` / `success === false` / a thrown
-   * error — NOT `consecutiveErrors`/`lastError`, because a provider BlockedResult
-   * carries `reason` (not `error`) so it doesn't bump those counters, and they
-   * reset on the next successful `print`/`prompt_user` mid-reaction.
+   * Did an action FAIL in the current turn? Gates the blocked-result handling
+   * prompt block (see the `@if (recentFailure)` in system.koi / team.koi).
+   *
+   * "Failure" is detected DIRECTLY from the action outcome — a result with
+   * `success === false` OR a thrown `error`. It is deliberately NOT keyed off the
+   * `blocked` flag: `blocked` has its own (provider-block) semantics, and relying
+   * on the runtime to upgrade other cases (e.g. a delegate self-refusal) into
+   * `blocked:true` is fragile — that coupling could change. A provider
+   * BlockedResult already carries `success: false`, so it's naturally included
+   * here without inspecting `blocked` at all.
+   *
+   * Window resets per user turn via `markTurnStart` (root); a delegate's session
+   * is already task-scoped so it starts clean each invocation.
    */
   hasRecentFailure() {
     for (let i = Math.max(0, this._turnStartIndex); i < this.actionHistory.length; i++) {
       const e = this.actionHistory[i];
       if (!e) continue;
       if (e.error) return true;
-      const r = e.result;
-      if (r && (r.blocked === true || r.success === false)) return true;
+      if (e.result && e.result.success === false) return true;
     }
     return false;
   }
