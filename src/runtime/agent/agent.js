@@ -3603,6 +3603,10 @@ export class Agent {
               }
             }
             this._lastUserMessage = _lastUserText;
+            // New user message → reset the blocked-result window so the
+            // handling block (gated on `recentFailure`) drops once the user
+            // moves on from whatever failed last turn.
+            if (!_isBgWakeup && _lastUserText) session.markTurnStart();
             channel.log('agent', `${this.name}: _lastUserMessage set to: ${this._lastUserMessage ? `"${this._lastUserMessage.substring(0, 50)}"` : 'null'} (isBgWakeup=${_isBgWakeup}, answer=${result?.answer ? `"${result.answer.substring(0, 50)}"` : 'null'})`);
 
             // Fire user.message reaction
@@ -5803,6 +5807,11 @@ Many commands are inherently slow and produce little or no output for extended p
         // against the agent's declared `phases { }` block.
         phase: createPhaseAccessor(this),
         nonInteractive: isNonInteractive(), // --exit OR per-session YOLO
+        // True when an action in the CURRENT user turn was blocked/failed.
+        // Gates the blocked-result handling block: `@if (recentFailure) { … }`
+        // — keeps ~150 lines of failure-recovery instructions out of every
+        // normal turn, present only when the agent must react to a failure.
+        recentFailure: this._activeSession?.hasRecentFailure?.() ?? false,
         // User object — accessible as user.message, user.language, user.email, etc.
         user: {
           message: this._lastUserMessage ?? _composeArgs?.goal ?? null,

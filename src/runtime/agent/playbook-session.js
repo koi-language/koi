@@ -20,6 +20,12 @@ export class PlaybookSession {
 
     // Action history: { action, result, error, timestamp, iteration }
     this.actionHistory = [];
+    // Marks where the CURRENT user turn began in actionHistory. Used by
+    // `hasRecentFailure()` so the blocked-result handling prompt block is only
+    // injected while the agent is reacting to a failure FROM THIS TURN — and
+    // disappears the moment a fresh user message arrives. Stamped by
+    // `markTurnStart()` on each new user message.
+    this._turnStartIndex = 0;
     // Index into actionHistory up to which feedback has already been fed to the LLM.
     // Allows multiple actions executed between LLM calls (e.g. a batch of prompt_user)
     // to each be added as individual messages instead of only the last one.
@@ -110,6 +116,34 @@ export class PlaybookSession {
       // This action+target succeeded — clear any previous failure for it
       this._errorLog.delete(errorKey);
     }
+  }
+
+  /**
+   * Mark the start of a new user turn — call on every fresh user message.
+   * `hasRecentFailure()` only scans actions recorded AFTER this point, so the
+   * blocked-result prompt block resets cleanly when the user moves on.
+   */
+  markTurnStart() {
+    this._turnStartIndex = this.actionHistory.length;
+  }
+
+  /**
+   * Did any action in the CURRENT user turn fail or get blocked? Gates the
+   * blocked-result handling prompt block (see system.koi `@if (recentFailure)`).
+   * Scans explicitly for `blocked === true` / `success === false` / a thrown
+   * error — NOT `consecutiveErrors`/`lastError`, because a provider BlockedResult
+   * carries `reason` (not `error`) so it doesn't bump those counters, and they
+   * reset on the next successful `print`/`prompt_user` mid-reaction.
+   */
+  hasRecentFailure() {
+    for (let i = Math.max(0, this._turnStartIndex); i < this.actionHistory.length; i++) {
+      const e = this.actionHistory[i];
+      if (!e) continue;
+      if (e.error) return true;
+      const r = e.result;
+      if (r && (r.blocked === true || r.success === false)) return true;
+    }
+    return false;
   }
 
   /**

@@ -837,6 +837,14 @@ export class LLMProvider {
       } catch { /* no usage history yet — fall back to catalog order */ }
       const _byName = new Map(_skillCatalog.map(s => [s.name, s]));
       const _mark = (name) => _activeNames.has(name) ? '✓ ' : '';
+      // Once ANY skill is active the agent has already committed to a task and
+      // its body is injected below — the catalog then only needs to keep the
+      // OTHER skills DISCOVERABLE, not describe them. Collapse every entry to
+      // name-only (full text stays one describe_skill away) to reclaim the
+      // tokens the descriptions would cost on every subsequent turn. With no
+      // active skill (fresh routing decision) the descriptions are what the
+      // agent picks from, so the tiered rendering below stays intact.
+      const _nameOnly = _activeNames.size > 0;
 
       // Two tiers, NOT a per-position ramp. The old greedy allocation gave
       // earlier-listed skills more budget than later ones even when they had
@@ -874,6 +882,8 @@ export class LLMProvider {
         return (sp > max * 0.6 ? slice.slice(0, sp) : slice).trimEnd() + '…';
       };
       const _line = (s, max) => {
+        // Name-only mode (a skill is already active) — drop all descriptions.
+        if (_nameOnly) return `- ${_mark(s.name)}${s.name}`;
         const natural = String(s.description || '').trim();
         if (!natural) return `- ${_mark(s.name)}${s.name}`;
         // Full description already fits → show it verbatim (a SHORT full
@@ -914,12 +924,18 @@ export class LLMProvider {
 
       const _lines = [..._usedLines, ..._unusedLines];
 
-      const _catalogBlock = _skillCatalog.length > 0
-        ? '\n\n## AVAILABLE SKILLS\n\n'
-          + 'Skills are reusable instruction packs on disk. They are listed below with '
+      const _intro = _nameOnly
+        ? 'Skills are reusable instruction packs on disk. You already have a skill '
+          + 'active (its body is in "# Active Skill Instructions" below), so the rest are '
+          + 'listed by NAME ONLY here — call describe_skill on any whose name looks '
+          + 'relevant to read its full description before activating. Manage them with:\n'
+        : 'Skills are reusable instruction packs on disk. They are listed below with '
           + 'descriptions; the ones you use most come first and in full, and the rest share '
           + 'the remaining space evenly (so a description may be shortened or omitted to fit), '
-          + 'but the full text and body are always available on demand. Manage them with:\n'
+          + 'but the full text and body are always available on demand. Manage them with:\n';
+      const _catalogBlock = _skillCatalog.length > 0
+        ? '\n\n## AVAILABLE SKILLS\n\n'
+          + _intro
           + ' - **describe_skill** — read a skill\'s FULL description, to decide if it fits. In: { "name" } or { "names": [...] }\n'
           + ' - **activate_skill** — load a skill\'s body into context so it guides your work. In: { "name" }\n'
           + ' - **deactivate_skill** — remove a loaded skill\'s body. In: { "name" }\n\n'
@@ -1334,9 +1350,16 @@ CRITICAL RULES:
         }
 
         // ── Dispatch to the appropriate classifier ───────────────────────
+        // Timing probe: this auto-model-selection classifier is a serial LLM
+        // round-trip that runs BEFORE the real answer on every user message,
+        // so it's the prime suspect for the "tarda desde que escribo" latency
+        // when the agent is idle. Logs elapsed ms so we can confirm with real
+        // numbers instead of guessing.
+        const _clsT0 = Date.now();
         if (_isInteraction && _savedUserMessage) {
           // User just sent a message → interaction classifier (clean message, speed-oriented)
           session._autoProfile = await this.classifyUserRequest(_savedUserMessage, agentName);
+          channel.log('llm', `[classify] interaction classifier took ${Date.now() - _clsT0}ms → cat profile ${session._autoProfile?.label || session._autoProfile?.category || '?'}`);
           // ── Language detection side-effect ─────────────────────────────
           // The interaction classifier ALSO returns `userLanguage` as part
           // of the same LLM call (see task-classifier.js). Writing it to
@@ -1386,6 +1409,7 @@ CRITICAL RULES:
           }
           if (_classifyArgs) {
             session._autoProfile = await this.classifyTaskDifficulty(agent?.description, _classifyArgs, agentName);
+            channel.log('llm', `[classify] task classifier took ${Date.now() - _clsT0}ms`);
           }
         }
         // Only fall back to DEFAULT if we truly have zero context AND the LLM call failed

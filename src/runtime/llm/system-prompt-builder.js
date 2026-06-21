@@ -694,9 +694,7 @@ FINAL NON-NEGOTIABLE RULES
 5. Never return before the whole task is done
 6. Always prefer evidence over speculation
 
-${resourceSection}${intentNesting}
-
-CRITICAL: Return a single YAML action mapping, or a "batch:" with a sequence of them. Block style, 2-space indent. No markdown, no code fences, no prose outside the YAML.`;
+${resourceSection}${intentNesting}`;
 
   // ── Working area: documents the user has open in the GUI ──
   // Pulled from the in-memory store (open-documents-store), populated by the

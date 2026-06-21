@@ -111,6 +111,20 @@ export async function classifyGlobalMessage(agent, message) {
   // modify_task instead of a phantom new_task. See global-snapshot.js.
   if (snapshot.rootIntent) validTargets.push('root#current');
 
+  // ── Empty-runtime fast path ───────────────────────────────────────────
+  // When nothing is in flight — no pending/in-progress tasks, no running
+  // delegate, no root intent — there is NOTHING for the router to route
+  // AGAINST: modify_task / cancel_task / cancel_plan are all impossible. So
+  // skip the classifier LLM call (the dominant latency the user sees BEFORE
+  // the real prompt goes out) and just hand the user's message straight to
+  // the agent as a new_task — exactly as if the classifier had passed it
+  // through unchanged. No local heuristics (greeting / language guessing):
+  // the agent's own turn handles the message and infers the language.
+  if (validTargets.length === 0) {
+    channel.log('inbox', `${agent.name}: empty runtime — passthrough new_task (skipped classifier LLM)`);
+    return _defaultNewTask(message);
+  }
+
   const prompt = `You are the GLOBAL message router for an AI agent runtime. A user message just arrived. You see the complete runtime state: all pending/in-progress tasks (across the root's workqueue AND the global task plan), any delegate currently executing one of them, and the recent dialogue.
 
 Decide ONE of:

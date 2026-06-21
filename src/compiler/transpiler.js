@@ -642,13 +642,14 @@ export class KoiTranspiler {
       'state',        // changes (phase transitions, permissions) — but discriminator handles phase
       'args',         // task args — can change on delegation
       'user',         // user.message changes every turn, user.language can change
+      'recentFailure', // true only while reacting to a this-turn failure — must be re-evaluated every call
       // NOT tainted: nonInteractive (env var, constant), agentName (constant)
     ]);
 
     // Detect team agent variables used in the template (e.g., projectOnboarding.result)
     // These are ephemeral — only populated when that agent just returned.
     const agentVars = new Set();
-    const _reservedVars = new Set(['state', 'args', 'user', 'agentName', 'nonInteractive', 'callAction', 'context', 'phase', 'tool']);
+    const _reservedVars = new Set(['state', 'args', 'user', 'agentName', 'nonInteractive', 'callAction', 'context', 'phase', 'tool', 'recentFailure']);
     for (const rawLine of lines) {
       const matches = rawLine.matchAll(/\b(\w+)\.result\b/g);
       for (const m of matches) {
@@ -778,7 +779,7 @@ export class KoiTranspiler {
     const cacheAware = true;
 
     // Build destructuring with all known variables + any agent variables found in template
-    const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user', 'phase'];
+    const _baseVars = ['args', 'state', 'agentName', 'nonInteractive', 'user', 'phase', 'recentFailure'];
     const _allVars = [..._baseVars, ...agentVars];
     const jsLines = [
       `const { ${_allVars.join(', ')} } = context || {};`,
