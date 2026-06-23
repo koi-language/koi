@@ -273,6 +273,23 @@ class ActionRegistry {
       'agenda_add', 'agenda_list', 'agenda_update', 'agenda_remove',
     ]);
 
+    // Mode-aware core. A truly UNATTENDED scheduled task (headless, exit-on-
+    // complete, NOT a live GUI/Telegram session) has no user watching and no
+    // default channel — so print/prompt_user are NOT how it communicates. The
+    // explicit telegram_send/telegram_ask ARE (only when the task asks for it).
+    // In an active session (GUI, or a user-initiated Telegram chat) it's the
+    // opposite: print/prompt_user are core, Telegram tools are specialised.
+    const _unattended = process.env.KOI_EXIT_ON_COMPLETE === '1'
+      && process.env.KOI_TG_CHAT !== '1'
+      && process.env.KOI_GUI_MODE !== '1';
+    if (_unattended) {
+      CORE_INTENTS.delete('print');
+      CORE_INTENTS.delete('prompt_user');
+      CORE_INTENTS.delete('prompt_form');
+      CORE_INTENTS.add('telegram_send');
+      CORE_INTENTS.add('telegram_ask');
+    }
+
     // Media tools get a dedicated "always-visible with one-liner"
     // section, even though they live in the `media` toolset and still
     // require `get_tool_info` before the agent can call them. Reason:

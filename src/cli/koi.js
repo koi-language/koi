@@ -598,6 +598,28 @@ async function runFile(sourcePath, options = {}) {
     tsxCwd = projectRoot;
   }
 
+  // KOI_CHANNEL_MODULE hook: run a tiny wrapper that mounts a frontend-provided
+  // channel (e.g. koi-cli's TelegramChannel) BEFORE the compiled agent, so a
+  // headless run can route its output somewhere other than stdout. The wrapper
+  // imports the SAME runtime channel.js the agent uses (so setChannel hits the
+  // same singleton), then imports the compiled agent.
+  if (process.env.KOI_CHANNEL_MODULE) {
+    try {
+      const runtimePath = process.env.KOI_RUNTIME_PATH || path.resolve(__dirname, '../runtime');
+      const wrapPath = path.join(jsDir, '.koi-channel-wrap.mjs');
+      fs.writeFileSync(wrapPath,
+        `import { setChannel } from ${JSON.stringify(pathToFileURL(path.join(runtimePath, 'io/channel.js')).href)};\n` +
+        `import * as _m from ${JSON.stringify(pathToFileURL(process.env.KOI_CHANNEL_MODULE).href)};\n` +
+        `try { const _c = _m.createChannelFromEnv ? _m.createChannelFromEnv() : null; if (_c) setChannel(_c); }\n` +
+        `catch (e) { console.error('[koi] channel mount failed:', e && e.message); }\n` +
+        `await import(${JSON.stringify(pathToFileURL(jsAbs).href)});\n`);
+      const wrapArg = process.platform === 'win32' ? './' + path.basename(wrapPath) : wrapPath;
+      tsxArgs = tsxArgs.slice(0, -1).concat([wrapArg]);
+    } catch (e) {
+      console.error('[koi] KOI_CHANNEL_MODULE setup failed:', e && e.message);
+    }
+  }
+
   const child = spawn(tsxBin, tsxArgs, {
     stdio: 'inherit',
     env,

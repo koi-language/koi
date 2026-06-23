@@ -337,6 +337,11 @@ class AgendaManager {
 
     if (updates.title !== undefined) entry.title = updates.title;
     if (updates.description !== undefined) entry.description = updates.description;
+    // Agent-written completion summary (shown in the calendar once completed).
+    if (updates.summary !== undefined) entry.summary = updates.summary;
+    // Agent-written publication preview (post text + media), shown in the
+    // calendar's Preview tab when available.
+    if (updates.preview !== undefined) entry.preview = updates.preview;
     if (updates.status !== undefined && ENTRY_STATUSES.includes(updates.status)) {
       entry.status = updates.status;
     }
@@ -397,8 +402,10 @@ class AgendaManager {
     this.refresh(); // shared global file — always read the latest (the daemon updates statuses)
     let entries = Object.values(this._entries);
 
-    // Exclude cancelled by default unless explicitly requested
-    if (!filters.status) {
+    // Exclude cancelled by default unless explicitly requested (by status
+    // filter or by the includeCancelled flag — the calendar shows cancelled
+    // entries struck-through rather than hiding them).
+    if (!filters.status && !filters.includeCancelled) {
       entries = entries.filter(e => e.status !== 'cancelled');
     }
 

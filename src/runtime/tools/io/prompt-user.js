@@ -119,6 +119,27 @@ IMPORTANT: When presenting options that involve technical decisions (tech stacks
     // to answer — assume every answer and proceed autonomously).
     if (isNonInteractive()) {
       if (process.env._KOI_INITIAL_PROMPT_CONSUMED === '1') {
+        // Telegram chat mode: a hand-back prompt_user means "my turn is done,
+        // it's yours now". There IS a user — they'll just reply with a NEW
+        // Telegram message (a fresh resumed turn). So show the reply and EXIT,
+        // instead of telling the agent "no user present, work autonomously"
+        // (which makes it narrate internal queue/phase processing — the garbage
+        // the user sees). This is what turns a "hola" into a clean greeting.
+        if (process.env.KOI_TG_CHAT === '1') {
+          const _out = [message, question].filter(Boolean).join('\n\n');
+          if (_out) channel.print(channel.renderMarkdown(_out));
+          // Persist the conversation BEFORE exiting so the NEXT Telegram message
+          // resumes the SAME session (one ongoing thread, like the Braxil chat),
+          // instead of starting blank each time.
+          try {
+            const { sessionTracker } = await import('../../state/session-tracker.js');
+            if (sessionTracker && agent?.contextMemoryState) {
+              sessionTracker.saveConversation(agent.name, agent.contextMemoryState);
+            }
+          } catch { /* */ }
+          try { if (typeof channel.drain === 'function') await channel.drain(); } catch { /* */ }
+          process.exit(0);
+        }
         // Track how many times prompt_user has been blocked
         const blockedCount = Number(process.env._KOI_PROMPT_BLOCKED_COUNT || '0') + 1;
         process.env._KOI_PROMPT_BLOCKED_COUNT = String(blockedCount);

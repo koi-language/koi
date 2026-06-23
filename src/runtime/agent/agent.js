@@ -3053,7 +3053,13 @@ export class Agent {
           const _phaseName = this.state?.statusPhase;
           const _phaseConfig = this.phases?.[_phaseName];
           const _phaseCant = Array.isArray(_phaseConfig?.deniedPermissions) ? _phaseConfig.deniedPermissions : null;
-          if (_phaseCant && _phaseCant.includes('return')) {
+          // In headless exit-on-complete mode (scheduled task OR a Telegram chat
+          // turn) `return` means "I'm done" → let it terminate so the process
+          // exits, instead of looping until the prompt_user backstop force-quits.
+          // The `cant return` phase guard only applies to interactive multi-phase
+          // flows (GUI), where the agent must advance phases explicitly.
+          const _unattendedExit = process.env.KOI_EXIT_ON_COMPLETE === '1';
+          if (_phaseCant && _phaseCant.includes('return') && !_unattendedExit) {
             const _errMsg = `Action 'return' is not allowed in phase '${_phaseName}': permission 'return' is denied (\`cant return\`). Call 'phase_done' when you are finished with this phase to advance to a terminal phase before returning.`;
             channel.log('agent', `${this.name}: phase-gate rejected 'return' in phase '${_phaseName}' — blocked by \`cant return\``);
             session.recordAction(action, { success: false, error: _errMsg, phaseGated: true });

@@ -753,6 +753,12 @@ ${resourceSection}${intentNesting}`;
       {
         const loc = active.path || active.url || '';
         lines.push(`The user is currently looking at: [${_classifyDoc(active)}] ${active.title}${loc ? ' — `' + loc + '`' : ''}`);
+        // Precedence rule: an image attached to the latest message (a result
+        // you just generated, or a file the user attached this turn) is the
+        // CURRENT subject and takes priority over this working-area file as the
+        // reference — otherwise an iterative edit ("make the lines thicker")
+        // keeps re-editing the original here instead of your own last output.
+        lines.push('If an image is attached to the latest message (one you just generated, or a file the user attached this turn), THAT image is the current subject — use it as your reference/edit base, NOT this working-area file, unless the user clearly means the document above.');
         // For videos, surface the exact playhead position so the agent
         // knows which frame the user is paused on. The GUI stamps
         // `playheadMs` onto the video doc payload at submit time.

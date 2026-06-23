@@ -451,15 +451,40 @@ class Channel {
 let _channel = new Channel();
 
 /**
- * Get the current channel instance.
- * @returns {Channel}
+ * Per-async-context channel override. When a piece of work runs inside
+ * `runWithChannel(impl, fn)`, every `getChannel()` / `channel.*` access made
+ * within that async context (and anything it awaits) resolves to `impl`
+ * instead of the process-wide `_channel`.
+ *
+ * This is what lets a single process host SEVERAL independent sessions at
+ * once without their output crossing wires — e.g. the GUI engine talking
+ * over its WsChannel while the agenda daemon drives one headless Telegram
+ * session per working directory, each bound to its own TelegramChannel and
+ * each running inside its own `runWithChannel(...)` scope. Without this, the
+ * last `setChannel()` would win and every session's output would funnel into
+ * a single channel.
+ *
+ * @private
  */
-export function getChannel() {
-  return _channel;
+const _channelStorage = new AsyncLocalStorage();
+
+/** @private Resolve the channel active for the current async context. */
+function _activeChannel() {
+  return _channelStorage.getStore() ?? _channel;
 }
 
 /**
- * Set the channel implementation. Called by the frontend at startup.
+ * Get the current channel instance — the per-context override if one is
+ * active, otherwise the process-wide channel.
+ * @returns {Channel}
+ */
+export function getChannel() {
+  return _activeChannel();
+}
+
+/**
+ * Set the process-wide channel implementation. Called by the frontend at
+ * startup. Does NOT affect work already running inside `runWithChannel`.
  * @param {Channel} impl - Channel implementation (e.g. TerminalChannel from koi-cli)
  */
 export function setChannel(impl) {
@@ -467,19 +492,35 @@ export function setChannel(impl) {
 }
 
 /**
- * Proxy object that always delegates to the current channel singleton.
- * This is what most of the runtime imports and uses.
+ * Run `fn` with `impl` bound as the active channel for the current async
+ * context. Any `getChannel()` / `channel.*` access made while `fn` (and
+ * anything it awaits) runs resolves to `impl`. The override is automatically
+ * torn down when `fn` settles, restoring whatever channel was active before.
+ *
+ * @template T
+ * @param {Channel} impl - Channel to bind for this scope.
+ * @param {() => T} fn - Work to run under the bound channel.
+ * @returns {T}
+ */
+export function runWithChannel(impl, fn) {
+  return _channelStorage.run(impl, fn);
+}
+
+/**
+ * Proxy object that always delegates to the channel active for the current
+ * async context. This is what most of the runtime imports and uses.
  */
 export const channel = new Proxy({}, {
   get(_, prop) {
-    const val = _channel[prop];
+    const active = _activeChannel();
+    const val = active[prop];
     if (typeof val === 'function') {
-      return val.bind(_channel);
+      return val.bind(active);
     }
     return val;
   },
   set(_, prop, value) {
-    _channel[prop] = value;
+    _activeChannel()[prop] = value;
     return true;
   },
 });

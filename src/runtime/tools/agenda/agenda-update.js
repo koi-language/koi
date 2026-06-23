@@ -9,7 +9,7 @@ import { agendaManager } from '../../state/agenda-manager.js';
 export default {
   type: 'agenda_update',
   intent: 'agenda_update',
-  description: 'Update an existing agenda entry. Fields: "id" (required), "title", "scheduledAt" (ISO 8601), "description", "recurrence" (once|daily|weekly|monthly), "status" (pending|triggered|completed|cancelled). → Returns: { id, title, scheduledAt, status }',
+  description: 'Update an existing agenda entry. Fields: "id" (required), "title", "scheduledAt" (ISO 8601), "description", "recurrence" (once|daily|weekly|monthly), "status" (pending|triggered|completed|cancelled), "summary", "preview". IMPORTANT: when you finish a scheduled task and set status to "completed", also pass a concise "summary" (1-3 sentences) of what you accomplished — shown to the user in the calendar. For PUBLISHING tasks (social posts), also pass "preview" = an array of posts, each { "networks": ["Facebook","X",…], "text": "the post caption", "media": ["/abs/path/to/image.png", …] } so the user can preview exactly what will be / was posted. → Returns: { id, title, scheduledAt, status }',
   thinkingHint: 'Updating agenda entry',
   permission: 'agenda',
   hidden: false,
@@ -43,6 +43,22 @@ export default {
         enum: ['pending', 'triggered', 'completed', 'cancelled'],
         description: 'New status for the entry',
       },
+      summary: {
+        type: 'string',
+        description: 'Concise summary (1-3 sentences) of what was accomplished. Set this when marking a scheduled task completed — shown to the user in the calendar.',
+      },
+      preview: {
+        type: 'array',
+        description: 'For publishing tasks: the post(s) that will be / were published, so the user can preview them. Each item: { networks: ["Facebook","X",…], text: "the caption", media: ["/abs/path/to/file.png", …] }.',
+        items: {
+          type: 'object',
+          properties: {
+            networks: { type: 'array', items: { type: 'string' } },
+            text: { type: 'string' },
+            media: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to the generated media files' },
+          },
+        },
+      },
     },
     required: ['id'],
   },
@@ -63,7 +79,7 @@ export default {
   ],
 
   async execute(action) {
-    const { id, title, scheduledAt, description, recurrence, status } = action;
+    const { id, title, scheduledAt, description, recurrence, status, summary, preview } = action;
 
     if (!id) {
       return { success: false, error: 'agenda_update: "id" is required' };
@@ -76,6 +92,8 @@ export default {
       if (description !== undefined) updates.description = description;
       if (recurrence !== undefined) updates.recurrence = recurrence;
       if (status !== undefined) updates.status = status;
+      if (summary !== undefined) updates.summary = summary;
+      if (preview !== undefined) updates.preview = preview;
 
       const entry = agendaManager.update(id, updates);
       return {

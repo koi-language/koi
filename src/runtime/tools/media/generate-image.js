@@ -1638,6 +1638,31 @@ const generateImageAction = {
       }
     } catch { /* lineage is best-effort — never fail the tool on it */ }
 
+    // Queue the generated image(s) into the NEXT turn's vision so the agent
+    // SEES what it just produced. Without this it stays BLIND to its own
+    // output — only the working-area document is attached as vision — so it
+    // thinks nothing changed and loops, re-generating or firing parallel
+    // variants ("no se queda conforme con lo que genera"). Mirrors read_file's
+    // vision queueing. Best-effort; never fail the tool on it. Storyboard
+    // thumbnails are ephemeral working assets, not outputs the agent reviews.
+    if (action.label !== 'storyboard_card') {
+      try {
+        const session = agent?._activeSession;
+        if (session) {
+          const { readNormalisedImageForVision } = await import('./_normalize-image-for-vision.js');
+          if (!session._pendingMcpImages) session._pendingMcpImages = [];
+          for (const img of savedImages) {
+            if (!img.savedTo) continue;
+            const norm = await readNormalisedImageForVision(img.savedTo);
+            session._pendingMcpImages.push({ mimeType: norm.mimeType, data: norm.base64, _debugPath: img.savedTo });
+            channel.log('image', `Generated image queued for vision: ${img.savedTo}`);
+          }
+        }
+      } catch (e) {
+        channel.log('image', `Could not queue generated image for vision: ${e?.message || e}`);
+      }
+    }
+
     // Response contract (uniform across media tools): `savedTo` is the
     // canonical original in ~/.koi/images (stable, indexed by the creations
     // drawer); `exportedTo`, when present, is the COPY at the caller's saveTo.
