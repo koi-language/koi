@@ -6,6 +6,7 @@
  */
 
 import { agendaManager } from '../../state/agenda-manager.js';
+import { isExitOnComplete } from '../../util/interactivity.js';
 
 export default {
   type: 'agenda_add',
@@ -13,7 +14,13 @@ export default {
   description: 'Schedule a task to run LATER — record it and STOP (do NOT do the work now; an autonomous session runs it when it fires). Fields: "title", "scheduledAt" (ISO 8601 +TZ, e.g. "2026-03-22T14:30:00+01:00"), "description" (the full self-contained instruction the future session runs), "recurrence" (once|daily|weekly|monthly|cron, default once). NOTE: a task that is ITSELF a fired scheduled run cannot use this — if such a task fails, do NOT schedule a retry; instead mark it completed via agenda_update with a "summary" of what failed. → Returns: { id, title, scheduledAt, recurrence, status }',
   thinkingHint: 'Scheduling agenda entry',
   permission: 'agenda',
-  hidden: false,
+  // Hidden + blocked in headless exit mode (`--exit`): an unattended one-shot
+  // run must not touch the agenda. agenda_update stays available so a fired task
+  // can still mark itself completed / report its summary.
+  // EXCEPTION: a Telegram chat (KOI_TG_CHAT=1) is a live conversation with the
+  // user present — not a one-shot task — so it CAN schedule. The KOI_AGENDA_FIRED
+  // backstop below still blocks a fired task from self-rescheduling.
+  hidden: () => isExitOnComplete() && process.env.KOI_TG_CHAT !== '1',
 
   schema: {
     type: 'object',
@@ -74,6 +81,17 @@ export default {
 
   async execute(action, agent) {
     const { title, scheduledAt, description, recurrence } = action;
+
+    // Headless exit mode (`--exit`): the agenda tools are hidden and disabled.
+    // Guard the execute path too, in case the tool is invoked directly. A live
+    // Telegram chat (KOI_TG_CHAT=1) is exempt — the user is present and can ask
+    // to schedule things; only true one-shot/unattended runs are blocked.
+    if (isExitOnComplete() && process.env.KOI_TG_CHAT !== '1') {
+      return {
+        success: false,
+        error: 'agenda_add is not available in headless exit mode (--exit). Agenda scheduling is disabled in unattended one-shot runs.',
+      };
+    }
 
     // A fired agenda task may NOT schedule new agenda entries. This is the hard
     // backstop against runaway self-rescheduling: a task that fails its work

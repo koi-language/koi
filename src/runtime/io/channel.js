@@ -149,6 +149,15 @@ class Channel {
    */
   clipMediaGenerating(info) {}
 
+  // ── Media tool progress (generate_image/video/audio …) ──────────────────
+  // UI hooks the GUI uses to show a "generating…" card with a live status and
+  // then resolve it. Headless/minimal channels (terminal, Telegram) leave these
+  // as no-ops — calling an UNDEFINED method here used to throw
+  // "channel.mediaToolStart is not a function" and crash the whole turn.
+  mediaToolStart(info) { return null; }
+  mediaToolStatus(info) {}
+  mediaToolEnd(info) {}
+
   // ── Workflow lifecycle ─────────────────────────────────────────────────
   // `workflowActivating` fires BEFORE any tasks are created, giving the
   // GUI a chance to show a banner with a countdown and let the user

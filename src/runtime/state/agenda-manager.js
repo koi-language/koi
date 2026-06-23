@@ -29,7 +29,11 @@ import path from 'path';
 import { Cron } from 'croner';
 import { channel } from '../io/channel.js';
 
-const ENTRY_STATUSES = ['pending', 'triggered', 'completed', 'cancelled'];
+// Lifecycle: pending → (fired) → running → completed (one-time) | pending (cron).
+// `running` is set by the agenda daemon when it spawns the headless session and
+// cleared when that process exits. `triggered` is the legacy one-time "fired"
+// marker kept for backward compatibility with old agenda.json files.
+const ENTRY_STATUSES = ['pending', 'triggered', 'running', 'completed', 'cancelled'];
 
 // Map simple recurrence keywords to cron expressions.
 // The time part (minute/hour) is filled in from scheduledAt.
@@ -195,7 +199,15 @@ class AgendaManager {
     this.refresh();
     const entry = this._entries[scheduledEntry.id];
     if (!entry || entry.status !== 'pending') {
-      this._unscheduleEntry(scheduledEntry.id);
+      // Only tear down the cron job for entries that are gone or terminal
+      // (cancelled/completed). A 'running' cron entry means the PREVIOUS
+      // occurrence is still in flight — skip this tick to avoid overlap, but
+      // keep the job alive so future occurrences still fire.
+      if (!entry || entry.status === 'cancelled' || entry.status === 'completed' || entry.status === 'triggered') {
+        this._unscheduleEntry(scheduledEntry.id);
+      } else {
+        channel.log('agenda', `Skipped overlapping fire of #${scheduledEntry.id} (status: ${entry.status})`);
+      }
       return;
     }
 
@@ -387,6 +399,86 @@ class AgendaManager {
   }
 
   /**
+   * Mark an entry as RUNNING — called by the agenda daemon when it spawns the
+   * headless session for a fired task. The fired session itself has no agenda
+   * access (the agenda tools are disabled in exit mode), so the daemon owns the
+   * lifecycle: pending/triggered → running.
+   */
+  markRunning(id) {
+    this.refresh(); // shared global file — re-read first
+    const strId = String(id);
+    const entry = this._entries[strId];
+    if (!entry) return null;
+
+    entry.status = 'running';
+    entry.runStartedAt = new Date().toISOString();
+    entry.updatedAt = entry.runStartedAt;
+    delete entry.runError;
+    this._save();
+    channel.log('agenda', `Running #${strId}: "${entry.title}"`);
+    return { ...entry };
+  }
+
+  /**
+   * Mark an entry as FINISHED — called by the agenda daemon when the headless
+   * session process exits. Success/failure is derived purely from the process
+   * exit code; the agent does not (and cannot) self-report. One-time entries
+   * become `completed`; recurring (cron) entries return to `pending` so the
+   * next occurrence can fire.
+   */
+  markFinished(id, { success = true, exitCode = 0 } = {}) {
+    this.refresh(); // shared global file — re-read first
+    const strId = String(id);
+    const entry = this._entries[strId];
+    if (!entry) return null;
+
+    const finishedAt = new Date().toISOString();
+    entry.lastRun = {
+      success: !!success,
+      exitCode,
+      startedAt: entry.runStartedAt || null,
+      finishedAt,
+    };
+    entry.updatedAt = finishedAt;
+
+    if (entry.cron) {
+      // Recurring: ready for the next occurrence (croner still owns the job).
+      entry.status = 'pending';
+    } else {
+      // One-time: terminal. We record completed even on failure so it doesn't
+      // re-fire; the failure is visible via lastRun.success/exitCode.
+      entry.status = 'completed';
+    }
+
+    this._save();
+    channel.log('agenda', `Finished #${strId}: "${entry.title}" (${success ? 'success' : `failed, exit ${exitCode}`})`);
+    return { ...entry };
+  }
+
+  /**
+   * Reconcile orphaned `running` entries left behind when the daemon died
+   * mid-run (so the process-exit handler never fired). Called on daemon start.
+   * Recurring entries go back to `pending`; one-time entries are marked
+   * completed-with-unknown-result so they don't get stuck or re-fire forever.
+   */
+  reconcileOrphans() {
+    this.refresh();
+    let changed = false;
+    for (const entry of Object.values(this._entries)) {
+      if (entry.status === 'running') {
+        entry.status = entry.cron ? 'pending' : 'completed';
+        entry.updatedAt = new Date().toISOString();
+        if (!entry.lastRun) {
+          entry.lastRun = { success: false, exitCode: null, startedAt: entry.runStartedAt || null, finishedAt: null, orphaned: true };
+        }
+        changed = true;
+        channel.log('agenda', `Reconciled orphaned running entry #${entry.id}: "${entry.title}" → ${entry.status}`);
+      }
+    }
+    if (changed) this._save();
+  }
+
+  /**
    * Get a single entry by ID.
    */
   get(id) {
@@ -482,10 +574,12 @@ class AgendaManager {
         rescheduled++;
       }
     }
-    // Stop jobs whose entry is gone or no longer pending.
+    // Stop jobs whose entry is gone or terminal. Keep the job alive while an
+    // occurrence is 'running' — markFinished returns a cron entry to 'pending'
+    // so its job must still exist for the next occurrence.
     for (const id of [...this._jobs.keys()]) {
       const e = this._entries[id];
-      if (!e || e.status !== 'pending') {
+      if (!e || (e.status !== 'pending' && e.status !== 'running')) {
         this._unscheduleEntry(id);
         removed++;
       }

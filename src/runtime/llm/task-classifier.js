@@ -375,26 +375,39 @@ ${taskDescription}`;
       return DEFAULT_TASK_PROFILE;
     }
 
-    // Order by OBSERVED SPEED, not cost. This is a tiny latency-sensitive JSON
-    // call on the hot path before every reply: `getAllCandidates` sorts by cost
-    // (cheapest first), which can put a cheap-but-slow/cold model first — it
-    // blows the 5s per-attempt timeout, then the loop falls back to the next
-    // cheapest, which is often an EXPENSIVE reasoning model (gpt-5.1) that's
-    // also slow → the ~9s classify stall seen in production. The backend ships
-    // a live `p50LatencyMs` per model in /gateway/models.json; sort by it
-    // (fastest first), then by the static `speed` score. Models with no
-    // observed latency yet go last so a known-fast model always wins. This
-    // also means the FALLBACK after a timeout is the next-fastest model, never
-    // a slow reasoning model.
+    // Order so the FIRST candidate is "fast enough, then cheapest". A classify
+    // call is a tiny, low-stakes JSON call on the hot path before every reply —
+    // it must not blow the 5s timeout, but it also must NOT default to the most
+    // EXPENSIVE model just because it scores highest on raw speed (that's how
+    // gpt-5.4 — $17.5/1M — was winning over gemini-flash — $10.5/1M, reasoning
+    // 96 — which classifies just as well). Two regimes:
+    //   • OBSERVED latency present (/gateway/models.json p50LatencyMs): fastest
+    //     wins, but ties WITHIN a latency band break by COST (sub-band latency
+    //     differences are noise — don't pay extra for them).
+    //   • No observed latency yet (cold/local — the common case): among models
+    //     FAST ENOUGH to clear the timeout (static speed ≥ floor), pick the
+    //     CHEAPEST; below the floor fall back to fastest. So a timeout still
+    //     falls back to the next-fastest, never a slow reasoning model.
+    const _cost = (c) => (c.caps?.inputPer1M || 0) + (c.caps?.outputPer1M || 0);
+    const SPEED_FLOOR = 50; // static speed below this risks the 5s classify timeout
+    const LAT_BAND = 400;   // ms: latency differences under this are noise
     _candidates.sort((a, b) => {
       const ap = a.caps?.p50LatencyMs, bp = b.caps?.p50LatencyMs;
       const aHas = typeof ap === 'number', bHas = typeof bp === 'number';
-      if (aHas && bHas && ap !== bp) return ap - bp;
-      if (aHas !== bHas) return aHas ? -1 : 1; // known-latency models first
-      return (b.caps?.speed || 0) - (a.caps?.speed || 0);
+      if (aHas && bHas) {
+        const ab = Math.round(ap / LAT_BAND), bb = Math.round(bp / LAT_BAND);
+        if (ab !== bb) return ap - bp;          // meaningfully different latency → fastest
+        return _cost(a) - _cost(b);             // same band → cheaper
+      }
+      if (aHas !== bHas) return aHas ? -1 : 1;  // known-latency models first
+      const aFast = (a.caps?.speed || 0) >= SPEED_FLOOR;
+      const bFast = (b.caps?.speed || 0) >= SPEED_FLOOR;
+      if (aFast !== bFast) return aFast ? -1 : 1;
+      if (aFast) return _cost(a) - _cost(b) || (b.caps?.speed || 0) - (a.caps?.speed || 0);
+      return (b.caps?.speed || 0) - (a.caps?.speed || 0); // both slow → fastest
     });
 
-    this._log('llm', `[classify] ${_candidates.length} candidate models (by p50 latency): ${_candidates.map(c => `${c.model}${typeof c.caps?.p50LatencyMs === 'number' ? `(${c.caps.p50LatencyMs}ms)` : ''}`).join(', ')}`);
+    this._log('llm', `[classify] ${_candidates.length} candidate models (fast-enough, then cheapest): ${_candidates.map(c => `${c.model}${typeof c.caps?.p50LatencyMs === 'number' ? `(${c.caps.p50LatencyMs}ms)` : ''}($${_cost(c)}/1M)`).join(', ')}`);
 
     this._log('llm', `[classify] Using ${_candidates[0].model} for classification`);
 

@@ -5,6 +5,7 @@
  */
 
 import { agendaManager } from '../../state/agenda-manager.js';
+import { isExitOnComplete } from '../../util/interactivity.js';
 
 export default {
   type: 'agenda_list',
@@ -12,7 +13,9 @@ export default {
   description: 'List scheduled agenda entries with optional filters. Fields (all optional): "from" (ISO date, entries from this date), "to" (ISO date, entries until this date), "status" (pending|triggered|completed|cancelled), "agentName" (filter by creator). → Returns: { entries, count }',
   thinkingHint: 'Loading agenda',
   permission: 'agenda',
-  hidden: false,
+  // Hidden + blocked in headless exit mode (`--exit`) — see agenda-add.js.
+  // A live Telegram chat (KOI_TG_CHAT=1) is exempt: the user is present.
+  hidden: () => isExitOnComplete() && process.env.KOI_TG_CHAT !== '1',
 
   schema: {
     type: 'object',
@@ -45,6 +48,13 @@ export default {
   ],
 
   async execute(action) {
+    if (isExitOnComplete() && process.env.KOI_TG_CHAT !== '1') {
+      return {
+        success: false,
+        error: 'agenda_list is not available in headless exit mode (--exit). Agenda access is disabled in unattended one-shot runs.',
+      };
+    }
+
     const { from, to, status, agentName } = action;
 
     try {

@@ -5,6 +5,7 @@
  */
 
 import { agendaManager } from '../../state/agenda-manager.js';
+import { isExitOnComplete } from '../../util/interactivity.js';
 
 export default {
   type: 'agenda_update',
@@ -12,7 +13,12 @@ export default {
   description: 'Update an existing agenda entry. Fields: "id" (required), "title", "scheduledAt" (ISO 8601), "description", "recurrence" (once|daily|weekly|monthly), "status" (pending|triggered|completed|cancelled), "summary", "preview". IMPORTANT: when you finish a scheduled task and set status to "completed", also pass a concise "summary" (1-3 sentences) of what you accomplished — shown to the user in the calendar. For PUBLISHING tasks (social posts), also pass "preview" = an array of posts, each { "networks": ["Facebook","X",…], "text": "the post caption", "media": ["/abs/path/to/image.png", …] } so the user can preview exactly what will be / was posted. → Returns: { id, title, scheduledAt, status }',
   thinkingHint: 'Updating agenda entry',
   permission: 'agenda',
-  hidden: false,
+  // Hidden + blocked in headless exit mode (`--exit`). A fired scheduled task
+  // has NO agenda awareness: it just runs its injected prompt and exits. The
+  // task's lifecycle (running on start, completed/failed on exit) is owned by
+  // the agenda daemon, not self-reported by the agent. See agenda-add.js.
+  // A live Telegram chat (KOI_TG_CHAT=1) is exempt: the user is present.
+  hidden: () => isExitOnComplete() && process.env.KOI_TG_CHAT !== '1',
 
   schema: {
     type: 'object',
@@ -79,6 +85,13 @@ export default {
   ],
 
   async execute(action) {
+    if (isExitOnComplete() && process.env.KOI_TG_CHAT !== '1') {
+      return {
+        success: false,
+        error: 'agenda_update is not available in headless exit mode (--exit). A scheduled run has no agenda awareness; its status is managed by the agenda daemon.',
+      };
+    }
+
     const { id, title, scheduledAt, description, recurrence, status, summary, preview } = action;
 
     if (!id) {
