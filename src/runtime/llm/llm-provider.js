@@ -39,6 +39,7 @@ import { executeCompose as _executeCompose, callJSONWithMessages as _callJSONWit
 import { StreamingPrintParser } from './streaming-print.js';
 import { optimizeImage, resolveAttachments, injectMcpImages, pruneOldImages, injectCacheControl } from './message-builder.js';
 import { isQuotaExceededError, toQuotaExceededError } from './quota-exceeded-error.js';
+import { attachmentTypeFromPath } from '../state/attachment-registry.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -1155,10 +1156,34 @@ CRITICAL RULES:
             // Capture attachments from the user prompt — they'll be passed
             // directly to contextMemory.add() and resolved when building messages
             const _atts = Array.isArray(entry.result.attachments)
-              ? entry.result.attachments.filter(a => a.path && fs.existsSync(a.path))
+              ? entry.result.attachments
+                  .filter(a => a.path && fs.existsSync(a.path))
+                  // GUI attachments arrive as bare paths typed 'file'; re-derive
+                  // the kind from the extension so a mic recording (.m4a) is
+                  // typed 'audio' and rides as native input_audio instead of a
+                  // filename the model can't hear. An explicit non-'file' type
+                  // (e.g. a Telegram voice note already typed 'audio') wins.
+                  .map(a => ({
+                    ...a,
+                    type: (a.type && a.type !== 'file') ? a.type : attachmentTypeFromPath(a.path),
+                  }))
               : [];
             if (_atts.length > 0) {
               session._promptAttachments = _atts;
+              // Audio attachments (e.g. a Telegram voice note on the prompt) must
+              // ride the `_pendingMcpAudios` channel — contextMemory.toMessages()
+              // only emits { role, content } and drops `msg.attachments`, so the
+              // attachment loop never sees them. Queue them here so the injection
+              // block attaches native `input_audio` to this turn's user message.
+              const _audioAtts = _atts.filter(a => a.type === 'audio');
+              if (_audioAtts.length > 0) {
+                try {
+                  const { attachAudioFileToSession } = await import('./attach-audio.js');
+                  for (const a of _audioAtts) await attachAudioFileToSession(session, a.path);
+                } catch (e) {
+                  channel.log('llm', `[audio] failed to queue prompt audio: ${e?.message || e}`);
+                }
+              }
             }
           }
         }
@@ -1207,6 +1232,17 @@ CRITICAL RULES:
           const _imgShort = _imgPaths.length > 0
             ? ` [images: ${_imgPaths.map(p => p.split('/').pop()).join(', ')}]`
             : '';
+          // Audio attachments (e.g. a Telegram voice note) carry the bytes
+          // separately; the request builder attaches them as native `input_audio`
+          // this turn. But a voice-note-only message has an EMPTY answer, which
+          // would leave `immediate` blank and the whole user turn (with its
+          // audio) gets dropped. Add a non-empty marker so the turn survives and
+          // the model knows to act on what it HEARS — no transcription needed.
+          const _audioPaths = _promptAtts.filter(a => a.type === 'audio').map(a => a.path);
+          const _audioRef = _audioPaths.length > 0
+            ? `${classified.immediate ? '\n\n' : ''}🎤 The user sent ${_audioPaths.length === 1 ? 'a voice message' : `${_audioPaths.length} voice messages`} — the audio is attached to THIS message. Listen to it and respond to what is said. You can hear it directly; do NOT call transcribe_audio.`
+            : '';
+          const _audioShort = _audioPaths.length > 0 ? ' [voice message]' : '';
           // "Continue." signals the LLM to keep working. Skip it for
           // terminal/display actions that don't need a follow-up:
           //   - prompt_user: user's actual words
@@ -1217,9 +1253,9 @@ CRITICAL RULES:
           const _lastIntent = lastEntry.action?.intent || lastEntry.action?.type || '';
           const _terminalIntents = new Set(['prompt_user', 'print', 'return']);
           const _continueTag = _terminalIntents.has(_lastIntent) ? '' : '\nContinue.';
-          const immediate = `${classified.immediate}${_imgRef}${_continueTag}`;
-          const _shortWithImg = _imgShort
-            ? `${classified.shortTerm || ''}${_imgShort}`
+          const immediate = `${classified.immediate}${_imgRef}${_audioRef}${_continueTag}`;
+          const _shortWithImg = (_imgShort || _audioShort)
+            ? `${classified.shortTerm || ''}${_imgShort}${_audioShort}`
             : classified.shortTerm;
           // Pass attachments as part of the message — they are resolved when building LLM request
           contextMemory.add('user', immediate, _shortWithImg, classified.permanent, {
@@ -1532,7 +1568,13 @@ CRITICAL RULES:
         || !!(session._pendingMcpVideos?.length)
         || !!(session._consumedVideosThisCall?.length)
         || _hasFileTypeAtt('video');
-      const _requiresAudio = !!session._hasAudioAttachments || _hasFileTypeAtt('audio');
+      // Like video: tie the requirement to the actual audio BYTES so a
+      // retry/continuation turn never drops `requiresAudio` and picks a model
+      // with no inputAudio (which would silently skip the audio).
+      const _requiresAudio = !!session._hasAudioAttachments
+        || !!(session._pendingMcpAudios?.length)
+        || !!(session._consumedAudiosThisCall?.length)
+        || _hasFileTypeAtt('audio');
       const _requiresFile  = !!session._hasFileAttachments  || _hasFileTypeAtt('file') || _hasFileTypeAtt('document') || _hasFileTypeAtt('pdf');
 
       // When images are attached, enforce minimum difficulty so we get a model
@@ -1746,24 +1788,51 @@ CRITICAL RULES:
         const imageAtts = msg.attachments.filter(a =>
           a.type === 'image' && a.path && fs.existsSync(a.path)
         );
+        const audioAtts = msg.attachments.filter(a =>
+          a.type === 'audio' && a.path && fs.existsSync(a.path)
+        );
 
         // Remove attachments field (LLM API doesn't understand it)
         delete msg.attachments;
 
-        if (imageAtts.length === 0) continue;
+        if (imageAtts.length === 0 && audioAtts.length === 0) continue;
 
-        const textContent = typeof msg.content === 'string' ? msg.content : '';
+        const textContent = typeof msg.content === 'string' ? msg.content
+          : Array.isArray(msg.content) ? (msg.content.find(p => p.type === 'text')?.text ?? '') : '';
 
-        const imageParts = (await Promise.all(
+        const imageParts = imageAtts.length === 0 ? [] : (await Promise.all(
           imageAtts.map(async a => {
             const opt = await _optimizeImage(a.path);
             return opt ? { ...opt, path: a.path } : null;
           })
         )).filter(Boolean);
 
-        if (imageParts.length === 0) continue;
+        // Audio attachments on the CURRENT prompt are sent natively in THIS turn
+        // (no separate read_file needed), as `input_audio` blocks on the same
+        // message — exactly like an image attachment becomes vision. Only for
+        // providers that take raw audio bytes; otherwise leave the text path (the
+        // agent can still transcribe). Non-mp3/wav (Telegram voice = OGG/Opus) is
+        // transcoded to mp3 first.
+        const _audioCapable =
+          this.provider === 'gemini' || this.provider === 'openrouter' || this.provider === 'gateway';
+        let audioParts = [];
+        if (audioAtts.length > 0 && _audioCapable) {
+          const { loadAudioBlock } = await import('./attach-audio.js');
+          audioParts = (await Promise.all(
+            audioAtts.map(async a => {
+              const r = await loadAudioBlock(a.path);
+              return r.ok ? r : null;
+            })
+          )).filter(Boolean);
+        } else if (audioAtts.length > 0) {
+          channel.log('llm', `[audio] prompt has audio but provider=${this.provider} can't take raw audio — left for transcription`);
+        }
+
+        if (imageParts.length === 0 && audioParts.length === 0) continue;
 
         if (this.provider === 'anthropic') {
+          // Anthropic chat takes images but not raw audio — audio (if any) was
+          // already skipped above for this provider.
           messages[i] = {
             role: msg.role,
             content: [
@@ -1780,21 +1849,31 @@ CRITICAL RULES:
               { type: 'text', text: textContent },
               ...imageParts.map(p => ({
                 type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.b64}` }
-              }))
+              })),
+              ...audioParts.map(a => ({
+                type: 'input_audio', input_audio: { data: a.data, format: a.format }
+              })),
             ]
           };
         }
-        _debugAttachPaths.push(...imageParts.map(p => p.path));
-        // Record for delegate propagation. Shape matches `_pendingMcpImages`
-        // entries so the delegate's reactive loop can re-inject them
-        // verbatim (see agent.js:1470 and llm-provider.js:1640+).
-        for (const p of imageParts) {
-          _resolvedUserImages.push({
-            data: p.b64,
-            mimeType: p.mime,
-            _debugPath: p.path,
-            role: 'user_attachment',
-          });
+        if (imageParts.length > 0) {
+          _debugAttachPaths.push(...imageParts.map(p => p.path));
+          // Record for delegate propagation. Shape matches `_pendingMcpImages`
+          // entries so the delegate's reactive loop can re-inject them
+          // verbatim (see agent.js:1470 and llm-provider.js:1640+).
+          for (const p of imageParts) {
+            _resolvedUserImages.push({
+              data: p.b64,
+              mimeType: p.mime,
+              _debugPath: p.path,
+              role: 'user_attachment',
+            });
+          }
+        }
+        if (audioParts.length > 0) {
+          try {
+            channel.log('llm', `[audio] attaching ${audioParts.length} prompt audio clip(s) to ${this.provider} request → ${audioParts.map(a => `${(a.path || '').split('/').pop()} (${a.format})`).join(', ')}`);
+          } catch { /* */ }
         }
       }
     }
@@ -2038,6 +2117,59 @@ CRITICAL RULES:
       session._pendingMcpVideos = null;
     }
 
+    // Inject audio results (read_file on an .mp3/.ogg/…, a Telegram voice note,
+    // etc.) as native `input_audio` content blocks. OpenRouter exposes the
+    // `input_audio` content type for audio-capable models — the auto-selector
+    // already picked a model with inputAudio:true (Gemini) because the queuing
+    // side set `_hasAudioAttachments`. Anthropic / OpenAI-chat don't accept raw
+    // audio bytes, so we skip the injection for them (the caller's transcribe
+    // fallback handles those).
+    if (session._pendingMcpAudios?.length > 0) {
+      const _audios = session._pendingMcpAudios;
+      const _supportsAudio =
+        this.provider === 'gemini' ||
+        this.provider === 'openrouter' ||
+        this.provider === 'gateway';
+      if (_supportsAudio) {
+        const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
+        if (lastUserIdx >= 0) {
+          const existing = messages[lastUserIdx].content;
+          const textContent = typeof existing === 'string'
+            ? existing
+            : Array.isArray(existing)
+              ? existing.find((p) => p.type === 'text')?.text ?? ''
+              : '';
+          const audioBlocks = _audios.flatMap((a) => {
+            const blocks = [];
+            if (a.caption) blocks.push({ type: 'text', text: a.caption });
+            // OpenRouter/OpenAI audio shape: raw base64 + short format, NO data: URI.
+            blocks.push({ type: 'input_audio', input_audio: { data: a.data, format: a.format } });
+            return blocks;
+          });
+          if (Array.isArray(existing)) {
+            messages[lastUserIdx] = { role: 'user', content: [...existing, ...audioBlocks] };
+          } else {
+            messages[lastUserIdx] = {
+              role: 'user',
+              content: [{ type: 'text', text: textContent }, ...audioBlocks],
+            };
+          }
+          try {
+            const _attachReport = _audios.map((a, i) => {
+              const kb = Math.round(((a.data?.length || 0) * 3 / 4) / 1024);
+              const file = (a._debugPath || '').split('/').pop() || `aud-${i}`;
+              return `${file} (${a.format || 'audio'}, ${kb}KB)`;
+            }).join(', ');
+            channel.log('llm', `[audio] attaching ${_audios.length} audio clip(s) to ${this.provider} request → ${_attachReport}`);
+          } catch { /* logging is best-effort */ }
+        }
+      } else {
+        channel.log('llm', `[audio] skipping audio attach — provider=${this.provider} does not accept raw audio bytes via input_audio`);
+      }
+      session._consumedAudiosThisCall = [...session._pendingMcpAudios];
+      session._pendingMcpAudios = null;
+    }
+
     // Prune image blocks from all messages EXCEPT the last user message.
     // This prevents old screenshots from accumulating in the conversation
     // (e.g. from merged multimodal messages or batched image results).
@@ -2046,27 +2178,31 @@ CRITICAL RULES:
       const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
       let _pruned = 0;
       let _prunedVideos = 0;
+      let _prunedAudios = 0;
       for (let i = 0; i < messages.length; i++) {
-        if (i === lastUserIdx) continue; // keep current images / videos
+        if (i === lastUserIdx) continue; // keep current images / videos / audio
         const c = messages[i].content;
         if (!Array.isArray(c)) continue;
-        const hasMedia = c.some(p => p.type === 'image' || p.type === 'image_url' || p.type === 'video_url');
+        const hasMedia = c.some(p => p.type === 'image' || p.type === 'image_url' || p.type === 'video_url' || p.type === 'input_audio');
         if (!hasMedia) continue;
-        // Strip image / video blocks, keep text
+        // Strip image / video / audio blocks, keep text
         const textOnly = c.filter(p => p.type === 'text');
         const imgCount = c.filter(p => p.type === 'image' || p.type === 'image_url').length;
         const vidCount = c.filter(p => p.type === 'video_url').length;
+        const audCount = c.filter(p => p.type === 'input_audio').length;
         _pruned += imgCount;
         _prunedVideos += vidCount;
+        _prunedAudios += audCount;
         const textContent = textOnly.map(p => p.text).join('\n');
         const note = [
           imgCount > 0 ? `${imgCount} image(s)` : null,
           vidCount > 0 ? `${vidCount} video(s)` : null,
+          audCount > 0 ? `${audCount} audio clip(s)` : null,
         ].filter(Boolean).join(', ');
         messages[i] = { role: messages[i].role, content: textContent + ` [${note} pruned]` };
       }
-      if ((_pruned > 0 || _prunedVideos > 0) && process.env.KOI_DEBUG_LLM) {
-        console.error(`[media-prune] Stripped ${_pruned} image(s) + ${_prunedVideos} video(s) from conversation history`);
+      if ((_pruned > 0 || _prunedVideos > 0 || _prunedAudios > 0) && process.env.KOI_DEBUG_LLM) {
+        console.error(`[media-prune] Stripped ${_pruned} image(s) + ${_prunedVideos} video(s) + ${_prunedAudios} audio clip(s) from conversation history`);
       }
     }
 
@@ -2531,6 +2667,7 @@ CRITICAL RULES:
       if (session) {
         session._consumedThisCall = null;
         session._consumedVideosThisCall = null;
+        session._consumedAudiosThisCall = null;
       }
     } catch (_callErr) {
       // Restore pending media so the retry re-injects them. Without this,
@@ -2544,6 +2681,10 @@ CRITICAL RULES:
       if (session?._consumedVideosThisCall?.length && !session._pendingMcpVideos?.length) {
         session._pendingMcpVideos = [...session._consumedVideosThisCall];
         channel.log('llm', `[auto] Restoring ${session._consumedVideosThisCall.length} video(s) after LLM error for retry`);
+      }
+      if (session?._consumedAudiosThisCall?.length && !session._pendingMcpAudios?.length) {
+        session._pendingMcpAudios = [...session._consumedAudiosThisCall];
+        channel.log('llm', `[auto] Restoring ${session._consumedAudiosThisCall.length} audio clip(s) after LLM error for retry`);
       }
       // Resolve which model actually handled this call so the per-model
       // cooldown hits the specific failing model (e.g. gemini-3.1-pro-preview)

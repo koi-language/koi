@@ -7,6 +7,7 @@
 
 import { sessionTracker } from '../../state/session-tracker.js';
 import { channel } from '../../io/channel.js';
+import { isExitOnComplete, blockedChatInteraction } from '../../util/interactivity.js';
 
 export default {
   type: 'session_history',
@@ -14,7 +15,9 @@ export default {
   description: 'Show the history of all changesets in this session as an interactive list. Each entry has a description and timestamp. The user can select one to see its diff or restore to that point. No arguments needed.',
   thinkingHint: 'Loading history',
   permission: 'manage_session',
-  hidden: false,
+  // Interactive changeset picker (channel.select) — would hang in headless
+  // --exit mode with no user. Hide it there (execute() guards the path too).
+  hidden: () => isExitOnComplete(),
 
   schema: {
     type: 'object',
@@ -23,6 +26,11 @@ export default {
   },
 
   async execute(action, agent) {
+    // Headless --exit backstop: the changeset picker can't be answered, so fail
+    // loudly instead of hanging on channel.select().
+    const _blocked = blockedChatInteraction('session_history');
+    if (_blocked) return _blocked;
+
     if (!sessionTracker) {
       return { success: false, error: 'No session tracker initialized' };
     }

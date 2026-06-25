@@ -3696,10 +3696,13 @@ export class Agent {
             // sibling field lets the replay reconstruct the full
             // "text + **Attached files:** bullet list" verbatim, so the
             // delegate sees the same message body the root agent saw.
+            const { attachmentTypeFromPath: _attType } = await import('../state/attachment-registry.js');
             const _dialogueAtts = Array.isArray(result.attachments)
               ? result.attachments
                   .filter(a => a && a.path)
-                  .map(a => ({ path: a.path, type: a.type || 'file' }))
+                  // Type from the extension (not a bare 'file') so a replayed
+                  // delegate session sees a mic recording as 'audio' too.
+                  .map(a => ({ path: a.path, type: (a.type && a.type !== 'file') ? a.type : _attType(a.path) }))
               : [];
             sessionTracker.appendDialogue({
               ts: Date.now(),

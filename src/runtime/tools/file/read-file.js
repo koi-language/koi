@@ -988,6 +988,54 @@ export default {
       const ext = path.extname(resolvedPath).slice(1).toLowerCase();
       const meta = await _probeAudioMetadata(resolvedPath);
       const sizeKb = Math.round(stat.size / 1024);
+      const _metaFields = meta ? {
+        durationSec: meta.durationSec,
+        durationFormatted: meta.durationSec != null ? _formatDuration(meta.durationSec) : null,
+        bitRateKbps: meta.bitRateKbps,
+        codec: meta.codec,
+        sampleRateHz: meta.sampleRateHz,
+        channels: meta.channels,
+        channelLayout: meta.channels === 1 ? 'mono'
+          : meta.channels === 2 ? 'stereo'
+          : meta.channels ? `${meta.channels}-channel`
+          : null,
+        formatName: meta.formatName,
+      } : {
+        probe: 'unavailable',
+        probeHint: 'ffprobe not found — install ffmpeg locally to surface duration / codec / sample rate; the file itself is fine.',
+      };
+
+      // Native audio input: attach the bytes so an audio-capable model (Gemini)
+      // HEARS the clip on the next turn — same UX as reading an image. The
+      // auto-selector is forced onto an inputAudio:true model. Non-mp3/wav is
+      // transcoded to mp3 first (Telegram voice = OGG/Opus).
+      const session = agent?._activeSession;
+      if (session) {
+        try {
+          const { attachAudioFileToSession } = await import('../../llm/attach-audio.js');
+          const r = await attachAudioFileToSession(session, resolvedPath);
+          if (r.ok) {
+            channel.log('read_file', `Audio attached for native audio input (${sizeKb}KB${r.transcoded ? `, transcoded to ${r.format}` : ''}): ${filePath}`);
+            return {
+              success: true,
+              path: filePath,
+              type: 'audio',
+              attachedAs: 'input_audio',
+              format: ext,
+              sizeBytes: stat.size,
+              sizeKb,
+              modified: stat.mtime.toISOString(),
+              ..._metaFields,
+              message: `Audio attached natively — you will HEAR it on your next turn as an audio block${r.transcoded ? ` (transcoded to ${r.format} for compatibility)` : ''}. No transcription step needed; just respond to what you hear.`,
+            };
+          }
+          channel.log('read_file', `[audio] native attach skipped (${r.reason}) — returning metadata + transcribe hint: ${filePath}`);
+        } catch (e) {
+          channel.log('read_file', `[audio] native attach failed (${e?.message || e}) — returning metadata + transcribe hint`);
+        }
+      }
+
+      // Fallback (no session, too large, or attach failed): metadata only.
       return {
         success: true,
         path: filePath,
@@ -996,25 +1044,8 @@ export default {
         sizeBytes: stat.size,
         sizeKb,
         modified: stat.mtime.toISOString(),
-        ...(meta ? {
-          durationSec: meta.durationSec,
-          durationFormatted: meta.durationSec != null
-            ? _formatDuration(meta.durationSec)
-            : null,
-          bitRateKbps: meta.bitRateKbps,
-          codec: meta.codec,
-          sampleRateHz: meta.sampleRateHz,
-          channels: meta.channels,
-          channelLayout: meta.channels === 1 ? 'mono'
-            : meta.channels === 2 ? 'stereo'
-            : meta.channels ? `${meta.channels}-channel`
-            : null,
-          formatName: meta.formatName,
-        } : {
-          probe: 'unavailable',
-          probeHint: 'ffprobe not found — install ffmpeg locally to surface duration / codec / sample rate; the file itself is fine.',
-        }),
-        hint: 'This is an audio file — the runtime returns metadata, never the raw bytes. To transcribe, call generate_audio with mode="transcribe". To drive an avatar video, pass the path to generate_avatar_video.',
+        ..._metaFields,
+        hint: 'Audio could not be attached natively (too large or no audio-capable model). To get its content, call transcribe_audio with this path. To drive an avatar video, pass the path to generate_avatar_video.',
       };
     }
 

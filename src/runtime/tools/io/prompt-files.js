@@ -1,4 +1,5 @@
 import { channel } from '../../io/channel.js';
+import { isExitOnComplete, blockedChatInteraction } from '../../util/interactivity.js';
 /**
  * Prompt Files Action - Inline file-attachment picker.
  *
@@ -17,6 +18,10 @@ export default {
   description: 'Ask the user to attach one or more files. Renders an inline drop-zone + Browse button inside the chat (same family as prompt_form). Use this when you need ACTUAL files from the user — logos, PDFs, audio/video samples, datasets, etc. — not a textual answer. Returns: { paths: string[] } with absolute file paths the agent can then read / move / process. Cancelled by the user → { paths: null, cancelled: true }.',
   thinkingHint: 'Waiting for files',
   permission: null,
+  // Headless `--exit`: no UI/user to attach files — channel.files() would hang.
+  // Hidden from the agent in that mode (execute() guards the path too); stays
+  // available in a live YOLO chat tab where the picker renders for a real user.
+  hidden: () => isExitOnComplete(),
 
   schema: {
     type: 'object',
@@ -70,6 +75,11 @@ export default {
   ],
 
   async execute(action, agent) {
+    // Backstop for the `hidden` gate above: in headless --exit mode there is no
+    // user to attach files, so fail loudly instead of hanging on channel.files().
+    const _blocked = blockedChatInteraction('prompt_files');
+    if (_blocked) return _blocked;
+
     const title = action.title || action.data?.title || '';
     const question = action.question
       || action.data?.question

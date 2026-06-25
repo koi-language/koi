@@ -32,10 +32,30 @@ const MIME_BY_EXT = {
   '.py': 'text/x-python', '.html': 'text/html', '.css': 'text/css',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.opus': 'audio/opus', '.flac': 'audio/flac',
 };
 
 function _mimeOf(filePath) {
   return MIME_BY_EXT[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
+
+/**
+ * Coarse attachment kind from a path's extension: 'image' | 'audio' | 'video'
+ * | 'document' | 'file'. The GUI sends attachments as bare paths, so they reach
+ * the LLM request builder typed 'file' by default — which silently skips the
+ * native vision / `input_audio` paths (a mic recording was never sent to the
+ * model, only its filename). Use this to TYPE a prompt attachment from its
+ * extension so audio rides as native audio and images as vision.
+ */
+export function attachmentTypeFromPath(filePath) {
+  const mime = _mimeOf(filePath);
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime === 'application/pdf' || mime.startsWith('text/') || mime === 'application/json') {
+    return 'document';
+  }
+  return 'file';
 }
 
 function _sessionDir() {

@@ -1,4 +1,5 @@
 import { channel } from '../../io/channel.js';
+import { isExitOnComplete, blockedChatInteraction } from '../../util/interactivity.js';
 
 /**
  * Prompt Form Action - Multi-step form wizard for collecting multiple fields.
@@ -25,6 +26,11 @@ export default {
   description: 'Multi-step form wizard for collecting multiple pieces of information. Shows one question at a time with a nav bar at the top, then a review/submit step. Use instead of multiple prompt_user calls. ALSO use this (even for a single question) when presenting technical options (tech stacks, frameworks, databases, etc.) because it supports "description" and "recommended" fields on each option — the user may not be technical. Any field can additionally carry a `files: { multiple?, extensions? }` config — when present, that step renders the inline file-picker (drop zone + Browse + thumbnails) instead of text/options, so you can ask for image/audio/video/document attachments in the same wizard. **Rule: if the field is asking the user to attach files or references of any kind, ALWAYS set `files`. Never a plain text field for attachments.** (If you forget, the runtime tries to detect the intent and auto-coerce — do not rely on that.) Returns: { answers: { [fieldLabel]: string | string[] } } (string for text/single-select fields, array of selected values for `multiSelect` fields, array of absolute paths for `files` fields). If the user closes the form without submitting, returns { answers: null, cancelled: true }.',
   thinkingHint: 'Waiting for your input',
   permission: null,
+  // Headless `--exit` (unattended one-shot): no UI to render the form into and
+  // no user to submit it — blocking on channel.form() hangs forever. Hide it
+  // from the agent in that mode (execute() guards the path too). A live YOLO
+  // chat tab keeps it visible: there the form renders and a user is present.
+  hidden: () => isExitOnComplete(),
 
   schema: {
     type: 'object',
@@ -155,6 +161,11 @@ export default {
   ],
 
   async execute(action, agent) {
+    // Backstop for the `hidden` gate above: in headless --exit mode a form can
+    // never be answered, so fail loudly instead of hanging on channel.form().
+    const _blocked = blockedChatInteraction('prompt_form');
+    if (_blocked) return _blocked;
+
     const title = action.title || action.data?.title || '';
     const fields = action.fields || action.data?.fields || [];
 
