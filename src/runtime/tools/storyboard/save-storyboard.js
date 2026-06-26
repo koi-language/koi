@@ -419,34 +419,26 @@ export default {
     const dir = path.join(home, '.koi', 'storyboards');
     let filePath = path.join(dir, `${sb.id}.json`);
 
-    // CREATE-vs-UPDATE collision guard. A genuine UPDATE reads the existing
-    // JSON (which carries `createdAt`) and saves the whole mutated object back,
-    // so `sb.createdAt` is present. A CREATE builds a fresh object and — per the
-    // skill — omits `createdAt`. If a CREATE lands on an id whose file already
-    // exists, the agent has unwittingly reused a taken slug: saving would
-    // OVERWRITE the other storyboard and resurrect ITS cached panel images
-    // (the "new storyboard shows shots from an old one" bug). Auto-uniquify the
-    // id so a "new" storyboard is ALWAYS genuinely new. Fail-safe: the worst case
-    // is an extra file, never a clobbered one.
-    const isUpdateIntent = _isStr(sb.createdAt) && !!sb.createdAt.trim();
-    let collisionRenamedFrom = null;
-    try {
-      if (!isUpdateIntent && fs.existsSync(filePath)) {
-        const baseId = sb.id;
-        let n = 2;
-        let candidateId = `${baseId}-${n}`;
-        while (fs.existsSync(path.join(dir, `${candidateId}.json`)) && n < 1000) {
-          n += 1;
-          candidateId = `${baseId}-${n}`;
+    // Read the file currently at this id FIRST, so create-vs-update is decided
+    // from real content (not just a flag), and so createdAt is preserved.
+    const _collectIds = (doc) => {
+      const ids = new Set();
+      if (Array.isArray(doc?.scenes)) {
+        for (const sc of doc.scenes) {
+          if (_isStr(sc?.id)) ids.add('sc:' + sc.id);
+          if (Array.isArray(sc?.shots)) {
+            for (const sh of sc.shots) if (_isStr(sh?.id)) ids.add('sh:' + sh.id);
+          }
         }
-        collisionRenamedFrom = baseId;
-        sb.id = candidateId;
-        filePath = path.join(dir, `${sb.id}.json`);
       }
-    } catch { /* ignore — fall through to write under the original id */ }
+      return ids;
+    };
+    const _sharesAnyId = (a, b) => {
+      const A = _collectIds(a);
+      for (const id of _collectIds(b)) if (A.has(id)) return true;
+      return false;
+    };
 
-    // Read the existing file (if any) so we can preserve createdAt
-    // and so the `created` flag in the response is accurate.
     let existing = null;
     let existed = false;
     try {
@@ -456,6 +448,38 @@ export default {
         try { existing = JSON.parse(raw); } catch { /* corrupted prior file — overwrite */ }
       }
     } catch { /* ignore — fall through to write */ }
+
+    // CREATE-vs-UPDATE collision guard. The normal, wanted case is "iterate MY
+    // storyboard": the agent saves under the SAME id to UPDATE it in place. We
+    // treat a save as the SAME storyboard (→ overwrite, preserve createdAt)
+    // whenever ANY of these hold: it carried `createdAt` (a read-modify-save),
+    // it shares a scene/shot id with the on-disk doc, or its name is unchanged.
+    // (The old guard keyed ONLY on createdAt, so a modify that rebuilt the
+    // object without it forked into a DUPLICATE storyboard — the reported bug.)
+    // ONLY when a file exists at this id AND none of those hold (a genuinely
+    // DIFFERENT storyboard whose name coincidentally slugged to a taken id) do
+    // we auto-uniquify, so we never silently clobber an unrelated storyboard.
+    const isUpdateIntent = _isStr(sb.createdAt) && !!sb.createdAt.trim();
+    const _sameStoryboard = existing != null && (
+      isUpdateIntent ||
+      (_isStr(existing.name) && _isStr(sb.name) && existing.name === sb.name) ||
+      _sharesAnyId(existing, sb)
+    );
+    let collisionRenamedFrom = null;
+    if (existed && !_sameStoryboard) {
+      const baseId = sb.id;
+      let n = 2;
+      let candidateId = `${baseId}-${n}`;
+      while (fs.existsSync(path.join(dir, `${candidateId}.json`)) && n < 1000) {
+        n += 1;
+        candidateId = `${baseId}-${n}`;
+      }
+      collisionRenamedFrom = baseId;
+      sb.id = candidateId;
+      filePath = path.join(dir, `${sb.id}.json`);
+      existing = null;
+      existed = false;
+    }
 
     const normalized = _normalize(sb, existing);
     const serialized = JSON.stringify(normalized, null, 2) + '\n';

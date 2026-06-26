@@ -4308,9 +4308,21 @@ export class Agent {
         // Add user's new message to context and restart the reactive loop.
         // Re-evaluate the playbook via playbookResolver so compose blocks pick up
         // any runtime state changes (e.g. tasks created since the session started).
+        const { attachmentTypeFromPath: _attType } = await import('../state/attachment-registry.js');
         const _promptAtts = Array.isArray(promptResult.attachments)
-          ? promptResult.attachments.filter(a => a.path)
+          ? promptResult.attachments
+              .filter(a => a.path)
+              // Type from the extension so audio is recognised (the GUI sends
+              // bare paths typed 'file'); an explicit non-'file' type wins.
+              .map(a => ({ ...a, type: (a.type && a.type !== 'file') ? a.type : _attType(a.path) }))
           : [];
+        // Audio attachments ride as NATIVE input_audio with their own 🎤 note
+        // ("listen to it directly"). Listing the audio path as an "Attached
+        // files:" bullet makes the model hunt for the file (read_file /
+        // recall_media) instead of just listening — the reported bug. So the
+        // bullet lists only NON-audio files; the audio still rides via the
+        // entry's `attachments` metadata below.
+        const _bulletAtts = _promptAtts.filter(a => a.type !== 'audio');
         // Track user message so compose templates can use {{userMessage}} /
         // @if (userMessage). Append a markdown bullet list of attached
         // file paths when the prompt carried attachments so the CURRENT
@@ -4320,17 +4332,17 @@ export class Agent {
         // resolution.
         {
           let _msg = promptResult.answer;
-          if (_promptAtts.length > 0) {
-            const _bullets = _promptAtts.map(a => `- ${a.path}`).join('\n');
+          if (_bulletAtts.length > 0) {
+            const _bullets = _bulletAtts.map(a => `- ${a.path}`).join('\n');
             _msg = `${_msg}\n\n**Attached files:**\n${_bullets}`;
           }
           this._lastUserMessage = _msg;
         }
         // Same bullet-list format goes into the contextMemory user
         // entry. Attachments are also kept on the entry's metadata so
-        // the multimodal pipeline can resolve the bytes for vision.
-        const _attNote = _promptAtts.length > 0
-          ? `\n\n**Attached files:**\n${_promptAtts.map(a => `- ${a.path}`).join('\n')}`
+        // the multimodal pipeline can resolve the bytes for vision/audio.
+        const _attNote = _bulletAtts.length > 0
+          ? `\n\n**Attached files:**\n${_bulletAtts.map(a => `- ${a.path}`).join('\n')}`
           : '';
         contextMemory.add('user', promptResult.answer + _attNote, promptResult.answer + _attNote, null,
           _promptAtts.length > 0 ? { attachments: _promptAtts } : {});
