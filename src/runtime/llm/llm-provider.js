@@ -1146,7 +1146,16 @@ CRITICAL RULES:
         for (const entry of newEntries) {
           if (entry.error) continue;
           const _intent = entry.action.intent || entry.action.type;
-          if (_intent === 'prompt_user' && entry.result?.answer != null) {
+          // Run for any prompt_user result that carries an answer OR attachments.
+          // A voice-note-only (or image-only) message has an EMPTY/null answer but
+          // MUST still have its attachments captured — otherwise the audio is never
+          // queued, `_hasAudioAttachments`/`requiresAudio` stay false, the selector
+          // picks a non-audio model (e.g. Opus, kept for the on-screen image's
+          // vision), and the spoken instructions are SILENTLY DROPPED. Symptom: user
+          // records a voice note with no typed text → agent replies "files attached
+          // but no instruction". The audio must ALWAYS reach the LLM this same turn.
+          const _hasPromptAtts = Array.isArray(entry.result?.attachments) && entry.result.attachments.length > 0;
+          if (_intent === 'prompt_user' && (entry.result?.answer != null || _hasPromptAtts)) {
             const _answerText = typeof entry.result.answer === 'string'
               ? entry.result.answer
               : (entry.result.answer?.text ?? '');
@@ -1240,7 +1249,7 @@ CRITICAL RULES:
           // the model knows to act on what it HEARS — no transcription needed.
           const _audioPaths = _promptAtts.filter(a => a.type === 'audio').map(a => a.path);
           const _audioRef = _audioPaths.length > 0
-            ? `${classified.immediate ? '\n\n' : ''}🎤 The user sent ${_audioPaths.length === 1 ? 'a voice message' : `${_audioPaths.length} voice messages`} — the audio is attached to THIS message. Listen to it and respond to what is said. You can hear it directly; do NOT call transcribe_audio.`
+            ? `${classified.immediate ? '\n\n' : ''}🎤 The user sent ${_audioPaths.length === 1 ? 'a voice message' : `${_audioPaths.length} voice messages`} — the audio is ALREADY attached to THIS message and you can hear it directly. Listen to it and act on what is said RIGHT NOW. Do NOT call transcribe_audio, recall_media, read_file, or any tool to "find" or "open" the voice note — it is already here.`
             : '';
           const _audioShort = _audioPaths.length > 0 ? ' [voice message]' : '';
           // "Continue." signals the LLM to keep working. Skip it for
@@ -1500,39 +1509,12 @@ CRITICAL RULES:
         }
       }
 
-      // Escalate model on repeated LLM errors (truncated JSON, parse failures, etc.)
-      // The classifier may keep returning the same category, so we force-bump scores
-      // to break out of the "weak model → truncated → reclassify → same model" loop.
-      // BUT skip escalation when:
-      //   - All recent errors are network/gateway failures — pushing to a
-      //     bigger model just wastes credits on a request that will also fail.
-      //   - All recent errors are "no content" exhaustion — the model
-      //     accepted the request and emitted nothing. Bumping scores drives
-      //     the selector to the highest-tier model (often the same one),
-      //     which is exactly what the per-model cooldown is trying to
-      //     prevent. Let agent.js's cooldown handling + reclassify do its
-      //     job without inflating the profile.
-      const _isNoContent = (err) => /no content.*reasoning|exhausted max_tokens.*reasoning|returned no content/i.test(err?.message || '');
-      if (_isLoop && _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === '_llm_error')) {
-        const { isNetworkError } = await import('./is-network-error.js');
-        const _allNetErrs = _recentActions.every(e => isNetworkError(e.error));
-        const _allNoContent = _recentActions.every(e => _isNoContent(e.error));
-        if (_allNetErrs) {
-          channel.log('llm', `[classify] LLM error escalation skipped — all recent errors are network/transient (no model bump)`);
-        } else if (_allNoContent) {
-          channel.log('llm', `[classify] LLM error escalation skipped — all recent errors are "no content" exhaustion (cooldown + reclassify will route us off the failing model)`);
-        } else {
-          const _bump = Math.min(30, _recentActions.length * 10); // 30 for 3 errors, capped
-          profile = {
-            ...profile,
-            code: Math.min(100, (profile.code || 50) + _bump),
-            reasoning: Math.min(100, (profile.reasoning || 50) + _bump),
-            difficulty: Math.min(100, (profile.difficulty || 50) + _bump),
-          };
-          session._autoProfile = profile;
-          channel.log('llm', `[classify] LLM error escalation: bumped scores by +${_bump} → code:${profile.code}, reasoning:${profile.reasoning}`);
-        }
-      }
+      // NOTE: difficulty/score escalation on repeated LLM errors was REMOVED by
+      // product decision — it was too aggressive (a few transient errors would
+      // ramp the profile to the top tier and burn credits). We NEVER bump the
+      // difficulty on failure. Recovery from a failing model is handled purely
+      // by agent.js's per-model cooldown + reclassify, which routes OFF the bad
+      // model without inflating the profile.
 
       // Require a vision-capable model if images are pending (user attachments or MCP screenshots)
       const _requiresImage = !!(session._hasImageAttachments) ||
@@ -1574,6 +1556,10 @@ CRITICAL RULES:
       const _requiresAudio = !!session._hasAudioAttachments
         || !!(session._pendingMcpAudios?.length)
         || !!(session._consumedAudiosThisCall?.length)
+        // `_turnAudios` keeps the requirement TRUE for every LLM call of the
+        // current user turn (not just the first), so a voice note never gets
+        // re-routed to a non-audio model on a follow-up call mid-turn.
+        || !!(session._turnAudios?.length)
         || _hasFileTypeAtt('audio');
       const _requiresFile  = !!session._hasFileAttachments  || _hasFileTypeAtt('file') || _hasFileTypeAtt('document') || _hasFileTypeAtt('pdf');
 
@@ -2124,6 +2110,15 @@ CRITICAL RULES:
     // side set `_hasAudioAttachments`. Anthropic / OpenAI-chat don't accept raw
     // audio bytes, so we skip the injection for them (the caller's transcribe
     // fallback handles those).
+    // Re-inject this turn's voice-note audio on EVERY call of the turn. The
+    // first call consumes + nulls `_pendingMcpAudios`; `_turnAudios` is the
+    // turn-scoped copy (cleared by markTurnStart on the next user message), so
+    // restoring from it here keeps the spoken instructions in front of the
+    // model across an ack→answer multi-call turn instead of vanishing after
+    // call #1.
+    if (!session._pendingMcpAudios?.length && session._turnAudios?.length) {
+      session._pendingMcpAudios = [...session._turnAudios];
+    }
     if (session._pendingMcpAudios?.length > 0) {
       const _audios = session._pendingMcpAudios;
       const _supportsAudio =

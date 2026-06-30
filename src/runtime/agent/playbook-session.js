@@ -125,6 +125,10 @@ export class PlaybookSession {
    */
   markTurnStart() {
     this._turnStartIndex = this.actionHistory.length;
+    // Drop the previous turn's persisted voice-note audio — it belonged to the
+    // message the user already moved on from. The new turn re-queues its own
+    // audio (if any) via attachAudioFileToSession. See `_turnAudios`.
+    this._turnAudios = null;
   }
 
   /**

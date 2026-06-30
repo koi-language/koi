@@ -301,8 +301,13 @@ export class MessageInbox {
       const uiBridge = cliHooks?.getUiBridge?.();
       if (uiBridge?.hasInputWaiter && entry.from === 'user' && typeof cliHooks?.deliverClassifiedInput === 'function') {
         entry._preDelivered = true;
-        cliHooks.deliverClassifiedInput(entry.text);
-        channel.log('inbox', `${this._agent.name}: unblocked waiting prompt_user with classified input`);
+        // Deliver the FULL message (text + attachments), not just text. A voice
+        // note / image sent while the agent is busy goes the slow inbox path;
+        // dropping attachments here means the resolved prompt_user never sees the
+        // audio, so it's never queued as native input_audio and the model has to
+        // hunt for the file (recall_media/read_file) instead of just hearing it.
+        cliHooks.deliverClassifiedInput({ text: entry.text, attachments: entry.attachments || [] });
+        channel.log('inbox', `${this._agent.name}: unblocked waiting prompt_user with classified input${entry.attachments?.length ? ` (+${entry.attachments.length} attachment(s))` : ''}`);
       }
     } catch (err) {
       channel.log('inbox', `${this._agent.name}: pre-deliver failed: ${err?.message || err}`);

@@ -642,9 +642,32 @@ export class Agent {
    * @param {import('./message-inbox.js').ClassifierResult} result
    * @param {ContextMemory} contextMemory
    */
-  async _applyInboxResult(msg, result, contextMemory) {
+  async _applyInboxResult(msg, result, contextMemory, session = null) {
     const queue = this.workQueue || (await this.ensureWorkQueue?.());
     const kind = result?.kind || 'noop';
+
+    // ── Queue voice-note audio as native input_audio (chokepoint) ─────
+    // Every user message — whatever its classification — funnels through
+    // here with its ORIGINAL attachments intact (the various prompt_user
+    // delivery paths downstream may strip them). Queue any audio NOW so the
+    // bytes ride as native input_audio on the next LLM call and the model
+    // HEARS the note this turn, instead of only seeing a "(see attached)"
+    // text note and hunting for the file via recall_media/read_file.
+    if (msg.from === 'user' && session && Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+      try {
+        const { attachmentTypeFromPath: _attType } = await import('../state/attachment-registry.js');
+        const _audioPaths = msg.attachments
+          .filter(a => a?.path)
+          .filter(a => ((a.type && a.type !== 'file') ? a.type : _attType(a.path)) === 'audio');
+        if (_audioPaths.length > 0) {
+          const { attachAudioFileToSession } = await import('../llm/attach-audio.js');
+          for (const a of _audioPaths) await attachAudioFileToSession(session, a.path);
+          channel.log('inbox', `${this.name}: queued ${_audioPaths.length} voice-note audio clip(s) for native input_audio`);
+        }
+      } catch (e) {
+        channel.log('inbox', `${this.name}: failed to queue inbox audio: ${e?.message || e}`);
+      }
+    }
 
     // ── Language detection (ONLY for messages from the user) ─────────
     // The inbox classifier detects the natural language of each user
@@ -840,8 +863,11 @@ export class Agent {
       try {
         const _deliver = Agent._cliHooks?.deliverClassifiedInput;
         if (typeof _deliver === 'function') {
-          _deliver(msg.text);
-          channel.log('inbox', `${this.name}: delivered classified input to agent (${kind})`);
+          // Deliver text + attachments so a voice note / image sent while busy
+          // reaches the prompt_user result intact (audio then rides as native
+          // input_audio instead of being dropped).
+          _deliver({ text: msg.text, attachments: msg.attachments || [] });
+          channel.log('inbox', `${this.name}: delivered classified input to agent (${kind})${msg.attachments?.length ? ` (+${msg.attachments.length} attachment(s))` : ''}`);
         }
       } catch (err) {
         channel.log('inbox', `${this.name}: deliverClassifiedInput failed: ${err?.message || err}`);
@@ -2024,7 +2050,7 @@ export class Agent {
         try {
           const processed = this._inbox.drainProcessed();
           for (const entry of processed) {
-            await this._applyInboxResult(entry.message, entry.result, contextMemory);
+            await this._applyInboxResult(entry.message, entry.result, contextMemory, session);
           }
         } catch (err) {
           channel.log('inbox', `${this.name}: drain error: ${err?.message || err}`);
@@ -3600,12 +3626,19 @@ export class Agent {
             // so a delegate can copy the list verbatim into a
             // referenceImages / referenceVideos call.
             let _lastUserText = _isBgWakeup ? null : (result?.answer || null);
-            if (_lastUserText && Array.isArray(result?.attachments) && result.attachments.length > 0) {
+            // A voice-note / image-only message has an EMPTY answer but is STILL
+            // a real user turn (the user spoke their instructions instead of
+            // typing). Append the attachment paths even when the text is empty
+            // so `_lastUserMessage` is non-null — otherwise the turn is treated
+            // as "the user said nothing": no markTurnStart, no reclassify, no
+            // user.message reaction, and the model keeps the stale (non-audio)
+            // route from the previous turn.
+            if (!_isBgWakeup && Array.isArray(result?.attachments) && result.attachments.length > 0) {
               const _paths = result.attachments
                 .filter(a => a && a.path)
                 .map(a => a.path);
               if (_paths.length > 0) {
-                _lastUserText = `${_lastUserText}\n\n**Attached files:**\n${_paths.map(p => `- ${p}`).join('\n')}`;
+                _lastUserText = `${_lastUserText ? _lastUserText + '\n\n' : ''}**Attached files:**\n${_paths.map(p => `- ${p}`).join('\n')}`;
               }
             }
             this._lastUserMessage = _lastUserText;
@@ -3672,7 +3705,10 @@ export class Agent {
           }
 
           // Flag the session for reclassification — the user's new message may require a different model.
-          if (intent === 'prompt_user' && result?.answer) {
+          // An empty-text message that carries attachments (a voice note / image)
+          // still counts: it's a new user turn that may need a different (e.g.
+          // audio-capable) model.
+          if (intent === 'prompt_user' && (result?.answer || (Array.isArray(result?.attachments) && result.attachments.length > 0))) {
             session._needsReclassify = true;
             // New user message → reset compliance exhaustion so providers get a fresh chance
             session._complianceExhausted = false;
@@ -4270,7 +4306,7 @@ export class Agent {
           try {
             const processed = this._inbox.drainProcessed();
             for (const entry of processed) {
-              await this._applyInboxResult(entry.message, entry.result, contextMemory);
+              await this._applyInboxResult(entry.message, entry.result, contextMemory, session);
             }
             channel.log('inbox', `${this.name}: drained ${processed.length} pending inbox result(s) in recovery path`);
           } catch (err) {

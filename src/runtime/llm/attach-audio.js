@@ -92,8 +92,21 @@ export async function attachAudioFileToSession(session, audioPath) {
   if (!session) return { ok: false, reason: 'no-session' };
   const r = await loadAudioBlock(audioPath);
   if (!r.ok) return r;
+  const _block = { data: r.data, format: r.format, mimeType: r.mimeType, _debugPath: r.path, role: 'audio_full' };
   if (!session._pendingMcpAudios) session._pendingMcpAudios = [];
-  session._pendingMcpAudios.push({ data: r.data, format: r.format, mimeType: r.mimeType, _debugPath: r.path, role: 'audio_full' });
+  session._pendingMcpAudios.push(_block);
   session._hasAudioAttachments = true;
+  // Persist for the WHOLE user turn, not just the next LLM call. The agent
+  // often makes several LLM calls per turn (e.g. an ack/print, then the real
+  // answer). `_pendingMcpAudios` is consumed + nulled after the FIRST call, so
+  // without this the spoken instructions vanish on call #2 and the model
+  // (re-routed off audio because requiresAudio drops to false) replies "files
+  // attached but no instruction". `_turnAudios` is re-injected before every
+  // call this turn and cleared by `markTurnStart()` when a new user message
+  // arrives. Dedupe by resolved path so repeated queues don't stack copies.
+  if (!session._turnAudios) session._turnAudios = [];
+  if (!session._turnAudios.some(a => a._debugPath === _block._debugPath)) {
+    session._turnAudios.push(_block);
+  }
   return { ok: true, format: r.format, mimeType: r.mimeType, sizeBytes: r.sizeBytes, transcoded: r.transcoded };
 }

@@ -410,287 +410,16 @@ function _renderTextSelection(active) {
  * @param {Agent} agent - The agent
  * @returns {{ static: string, dynamic: string }} Complete system prompt
  */
-export async function buildSystemPrompt(agent) {
-  const hasTeams = agent && agent.usesTeams && agent.usesTeams.length > 0;
-  const resourceSection = await buildSmartResourceSection(agent);
-  const intentNesting = hasTeams ? '\nIMPORTANT: Do NOT nest "intent" inside "data". The "intent" field must be at the top level.' : '';
-  const koiMd = loadKoiMd(); // Always inject — project specs apply to all agents
-
-  // ── Runtime Context block (universal for all agents) ──
-  // Use local time with UTC offset so the LLM knows the user's timezone.
-  // e.g. "2026-03-22T21:53:14+01:00" instead of "2026-03-22T20:53:14" (ambiguous UTC)
-  const _now = new Date();
-  const _pad = (n) => String(n).padStart(2, '0');
-  const _offsetMin = _now.getTimezoneOffset(); // negative for east of UTC
-  const _absH = _pad(Math.floor(Math.abs(_offsetMin) / 60));
-  const _absM = _pad(Math.abs(_offsetMin) % 60);
-  const _offsetStr = `${_offsetMin <= 0 ? '+' : '-'}${_absH}:${_absM}`;
-  const now = `${_now.getFullYear()}-${_pad(_now.getMonth() + 1)}-${_pad(_now.getDate())}T${_pad(_now.getHours())}:${_pad(_now.getMinutes())}:${_pad(_now.getSeconds())}${_offsetStr}`;
-  const cwd = process.cwd();
-  // Platform — tell the agent explicitly so it picks the right shell
-  // builtins. Without this, agents guess from cwd shape ("/Users/..." →
-  // mac, "C:\..." → Windows) and often propose bash-only commands
-  // (`ls`, `chmod`, `rm -rf`) on Windows where they don't exist.
-  const _platformLabel = process.platform === 'darwin' ? 'macOS (darwin)'
-    : process.platform === 'win32' ? 'Windows (win32) — shell is cmd.exe / PowerShell, NOT bash. Use `dir`, `type`, `copy`, `move`, `del`, `where`, `mkdir`. PowerShell cmdlets also work: `Get-ChildItem`, `Remove-Item`, `Test-Path`'
-    : process.platform === 'linux' ? 'Linux'
-    : process.platform;
-  const platformField = `\n| Platform | ${_platformLabel} |`;
-  const agentDisplayName = agent?.name || 'unknown';
-  const statusPhase = agent?.state?.statusPhase || null;
-  const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
-  // User language — set automatically by the inbox classifier ("ear")
-  // when a user message arrives. Agents never set it themselves; it is
-  // always authoritative for the language of the user's latest message.
-  const stateLanguage = agent?.state?.userLanguage;
-  if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
-  const userLanguage = globalThis.__koiUserLanguage || null;
-  const langField = userLanguage ? `\n| User language | ${userLanguage} |` : '';
-
-  // Timezone (IANA)
-  let timezone = '';
-  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
-
-  // ── Phase system explanation (only when agent uses phases) ──
-  const hasPhaseDone = agent?.hasPermission?.('phase_done') ?? (agent?._availableActions?.has?.('phase_done') ?? true);
-  const phaseSystemBlock = statusPhase ? `
-========================================
-PHASE SYSTEM
-========================================
-
-You operate in phases. Each phase controls which actions, agents, and rules are loaded — keeping your context focused and minimal.
-
-Your current phase is \`${statusPhase}\`. Only the actions and agents relevant to this phase are shown below.
-
-**You do NOT choose your phase.** Phase transitions are handled by the runtime based on events declared in the agent's reactions block (user messages, delegate returns, errors, phase completion). The \`statusPhase\` field is read-only from your point of view — any attempt to change it via \`update_state\` will be silently ignored.
-
-When you finish all the work that belongs to the current phase, call \`phase_done\` to signal completion. The runtime will then fire the \`phase.done\` event and transition to the next phase based on the agent's reactions. Do not try to pick the next phase yourself.
-` : '';
-
-  // prompt_user requires 'prompt_user' permission — only System and ProjectOnBoarding have it
-  const hasPromptUser = agent?.hasPermission?.('prompt_user') ?? false;
-
-  // Non-interactive mode: agent must act without asking for confirmation.
-  // Fires for BOTH the headless `--exit` mode and the per-session YOLO toggle
-  // (same "never ask" behavior, centralized in isNonInteractive()). The header
-  // surfaces YOLO explicitly in the prompt so the model knows the user enabled
-  // it for this chat.
-  const nonInteractiveBlock = isNonInteractive() ? `
-
-========================================
-${isYoloMode() ? 'YOLO MODE ACTIVATED — FULL AUTOPILOT' : 'NON-INTERACTIVE MODE'}
-========================================
-${isYoloMode() ? '\nThe user has enabled YOLO mode for this chat. Act fully autonomously: assume every answer is "yes / go ahead", never pause to confirm, and keep working until the task is done.\n' : ''}
-You are running in non-interactive (headless) mode. There is no human to answer follow-up questions.
-
-**CRITICAL RULES:**
-- Do NOT ask for confirmation — execute actions directly.
-- Do NOT use prompt_user to ask "Do you want me to...?" — just do it.
-- Complete the ENTIRE task autonomously: investigate, implement, verify.
-- Only call prompt_user at the very end to report what you did.
-
-**USE TOOLS, NOT YOUR OWN KNOWLEDGE:**
-- You are an agent with access to tools (shell, web_search, read_file, etc.). Use them.
-- If a task requires domain expertise you lack (chess, math, science, music, etc.), search the web for APIs, libraries, or tools that can help. Install them with shell and use them programmatically.
-- Example: for chess analysis, install stockfish or python-chess. For math proofs, use sympy. For image processing, use python libraries. Never try to solve domain-specific problems from memory alone.
-
-**ANNOTATION IMAGES — user instructions drawn on screen:**
-- Attachments marked as ANNOTATION are screenshots where the user has drawn arrows, circles, crosses, or text directly on the screen to indicate changes they want.
-- Annotations are INSTRUCTIONS, not decorations. Examine them carefully to understand what the user wants changed: circled elements mean "change this", crossed-out elements mean "remove this", arrows mean "move this", text annotations are literal instructions.
-- IGNORE annotation colors (red, blue, green, etc.) — they are just visual markers to make annotations visible. The color of an annotation does NOT mean "make it this color". A red circle around text means "change this text", not "make this text red".
-- When the user says "haz ese cambio" / "make that change" with annotations attached, the annotations ARE the change description. Do NOT ask what to change — look at the annotations.
-- If both an original image and an annotated version are attached, compare them to understand the differences the user wants.
-
-**VERIFY DATA EXTRACTED FROM IMAGES:**
-- When you extract spacial data from an image (positions, coordinates, ...), ALWAYS verify it programmatically before using it.
-- If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, reference attachments by their ID (e.g. att-1). The delegate can call read_file("att-1") to access the image. NEVER include raw file paths — always use attachment IDs.' : ''}
-` : '';
-
-  // BRAXIL.md / CLAUDE.md is already injected via koiMd (_loadKoiMd) above.
-
-  // ── Prompt layout: STATIC content first (cacheable), DYNAMIC content last ──
-  // LLM prompt caching works on identical prefixes — the longer the unchanging
-  // prefix, the higher the cache hit rate. Static rules/tools go first;
-  // runtime context (timestamp, phase, cwd) goes at the end.
-  //
-  // NOTE: koiMd (BRAXIL.md / CLAUDE.md) is returned separately so
-  // buildReactiveSystemPrompt can inject it as the VERY FIRST thing in the
-  // prompt, before even the agent's playbook.
-  const staticPart = `
-========================================
-OUTPUT CONTRACT (MUST FOLLOW)
-========================================
-
-Return exactly ONE valid YAML document and nothing else.
-- No markdown code fences
-- No explanations
-- No prose outside the YAML
-- The ENTIRE response is the YAML: either a single action mapping (top-level keys like actionType/intent) or a "batch:" mapping.
-
-Use block style with 2-space indentation. For ANY multi-line or punctuation-heavy text value (a prompt, a message, a director's brief), use a YAML block scalar with "|" so colons, quotes, "#" and newlines inside it are safe:
-
-intent: print
-message: |
-  Multi-line text goes here.
-  Colons (a: b), "quotes", and # are all safe inside a | block.
-
-FILE CONTENT (write_file "content", edit_file "diff"): do NOT inline HTML/CSS/code as a YAML value and do NOT use a "|" block for it — punctuation like "line-height: 1.6;" or "{ margin: 0; }" breaks the parser, and block-scalar indentation is the #1 batch-breaker. Instead pass it as a HEREDOC: set the field to a reference token "KOI_HEREDOC_<n>", then place the verbatim payload between sentinel lines AFTER the YAML document. The body is taken literally — no escaping, no indentation, any characters are safe:
-
-batch:
-  - actionType: direct
-    intent: write_file
-    path: page.html
-    content: KOI_HEREDOC_1
-###KOI_HEREDOC_1_START###
-<!doctype html>
-<style>body { margin: 0; line-height: 1.6; }</style>
-<h1>Hi: there # really</h1>
-###KOI_HEREDOC_1_END###
-
-Use a distinct number per file (KOI_HEREDOC_1, KOI_HEREDOC_2, …) and one START/END pair per token. Put all heredoc blocks after the YAML. The START/END marker lines must each be on their own line.
-
-Never output invalid YAML. Invalid YAML crashes the system.
-
-========================================
-GOLDEN RULE (ABSOLUTE)
-========================================
-
-You are FORBIDDEN from generating any fact, summary, analysis, conclusion, or user-facing content that has not been obtained from an actual action result in this conversation.
-
-If the task requires reading a file, fetching a URL, running a command, or retrieving any external/internal data, you MUST do it in separate steps:
-
-1) emit only the retrieval action
-2) wait for the real result
-3) only then emit analysis, summary, print, or return content based on that result
-
-NEVER combine in the same batch:
-- a retrieval action (read_file, shell, web_fetch, web_search, grep, search, semantic_code_search, etc.)
-with
-- a print, answer, summary, conclusion, or return payload that depends on that retrieval
-
-Until the action result exists in the conversation, any such content would be fabricated.
-
-Always follow:
-retrieve first → wait for result → analyze/respond
-
-This rule overrides any optimization, batching preference, or attempt to save steps.
-Correctness beats fewer steps.
-
-========================================
-ACTION MODEL
-========================================
-
-Every action mapping MUST include:
-- actionType
-- intent
-
-ONE action = ONE intent = ONE mapping. Each mapping contains ONLY the fields defined for that specific intent. NEVER add fields from a different intent into the same mapping — extra fields are silently ignored and the second action will NOT execute. If you need two actions, use a batch with two separate mappings.
-
-Valid action types:
-- direct${hasTeams ? '\n- delegate' : ''}
-
-Intent rules:
-- For direct actions: "intent" MUST be exactly one of AVAILABLE ACTIONS.${hasTeams ? '\n- For delegate actions: "intent" MUST follow "agentKey::eventName" and refer to a valid available agent/event.' : ''}
-- Never invent new intents.
-- Never put descriptive text inside "intent". Put that text in "query", "pattern", "message", "question", or other parameters.
-
-Invalid:
-actionType: direct
-intent: semantic index supported languages
-
-Valid:
-actionType: direct
-intent: semantic_code_search
-query: semantic index language parser support
-
-========================================
-BATCH
-========================================
-
-"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with actionType, intent, or any other action field. If you need to do multiple things in one turn (e.g. print + phase_done), use a batch — a "batch:" key whose value is a sequence ("- ") of action mappings:
-
-batch:
-  - actionType: direct
-    intent: print
-    message: "Here is the result."
-  - actionType: direct
-    intent: phase_done
-
-CRITICAL YAML INDENTATION (this is the #1 way a batch breaks): every "- actionType:" in a
-batch MUST sit at the SAME indent. When an action has a multi-line value ("message: |" /
-"prompt: |"), EVERY line of that block MUST be indented DEEPER than its key, and the NEXT
-"- actionType:" MUST dedent back to the sequence indent — otherwise the block silently
-swallows the following actions and they never run. If you are unsure about indentation for a
-long value, prefer a single-line double-quoted string with \\n escapes over a "|" block.
-
-========================================
-EXECUTION FLOW
-========================================
-
-Each response is ONE YAML document — a single action mapping or a "batch:" (per OUTPUT CONTRACT above). Use sequential steps only when later actions depend on earlier results.
-
-Parallelism is mandatory:
-- If 2+ actions are independent, they MUST go inside a "parallel" block
-- Never place independent actions sequentially in a batch${hasPromptUser ? '\n- EXCEPTION: prompt_user must NEVER be inside a parallel block' : ''}
-
-Examples:
-
-Single action:
-actionType: direct
-intent: semantic_code_search
-query: authentication login session token
-
-Parallel:
-batch:
-  - parallel:
-      - actionType: direct
-        intent: semantic_code_search
-        query: semantic index build embed vector store
-      - actionType: direct
-        intent: semantic_code_search
-        query: language support parser javascript typescript python
-
-Sequential then parallel:
-batch:
-  - actionType: direct
-    intent: read_file
-    path: src/index.ts
-    offset: 0
-    limit: 120
-  - parallel:
-      - actionType: direct
-        intent: grep
-        pattern: semanticIndex
-      - actionType: direct
-        intent: grep
-        pattern: supportedLanguages
-
-Only emit this when the full task is complete:
-actionType: direct
-intent: return
-data:
-  ...
-
-Do not return early.
-Do not treat exploration alone as task completion.
-You must complete all required follow-up actions before returning.
-
-========================================
-FINAL NON-NEGOTIABLE RULES
-========================================
-
-1. Never answer in natural language
-2. Never invent intents
-3. Never fabricate facts not present in action results
-4. Never emit incomplete actions
-5. Never return before the whole task is done
-6. Always prefer evidence over speculation
-
-${resourceSection}${intentNesting}`;
-
-  // ── Working area: documents the user has open in the GUI ──
-  // Pulled from the in-memory store (open-documents-store), populated by the
-  // CLI layer when the GUI reports tab changes.
+/**
+ * Build the `# WORKING AREA` prompt block from the open-documents turn
+ * snapshot (the docs/images/annotations the user has open in the GUI, plus
+ * the guidance on how to use them). Extracted from buildSystemPrompt so
+ * EXTERNAL callers (e.g. the Claude driver) inject the EXACT same context
+ * instead of duplicating the logic. Reads the process-global
+ * openDocumentsStore snapshot; returns a markdown string ('' when there is
+ * no active document).
+ */
+export async function buildWorkingAreaBlock() {
   let openDocumentsBlock = '';
   try {
     const { openDocumentsStore } = await import('../state/open-documents-store.js');
@@ -1274,6 +1003,291 @@ content: "..."`);
       console.error('[prompt] [working-area] ERROR building block — block omitted:', err);
     }
   }
+  return openDocumentsBlock;
+}
+
+export async function buildSystemPrompt(agent) {
+  const hasTeams = agent && agent.usesTeams && agent.usesTeams.length > 0;
+  const resourceSection = await buildSmartResourceSection(agent);
+  const intentNesting = hasTeams ? '\nIMPORTANT: Do NOT nest "intent" inside "data". The "intent" field must be at the top level.' : '';
+  const koiMd = loadKoiMd(); // Always inject — project specs apply to all agents
+
+  // ── Runtime Context block (universal for all agents) ──
+  // Use local time with UTC offset so the LLM knows the user's timezone.
+  // e.g. "2026-03-22T21:53:14+01:00" instead of "2026-03-22T20:53:14" (ambiguous UTC)
+  const _now = new Date();
+  const _pad = (n) => String(n).padStart(2, '0');
+  const _offsetMin = _now.getTimezoneOffset(); // negative for east of UTC
+  const _absH = _pad(Math.floor(Math.abs(_offsetMin) / 60));
+  const _absM = _pad(Math.abs(_offsetMin) % 60);
+  const _offsetStr = `${_offsetMin <= 0 ? '+' : '-'}${_absH}:${_absM}`;
+  const now = `${_now.getFullYear()}-${_pad(_now.getMonth() + 1)}-${_pad(_now.getDate())}T${_pad(_now.getHours())}:${_pad(_now.getMinutes())}:${_pad(_now.getSeconds())}${_offsetStr}`;
+  const cwd = process.cwd();
+  // Platform — tell the agent explicitly so it picks the right shell
+  // builtins. Without this, agents guess from cwd shape ("/Users/..." →
+  // mac, "C:\..." → Windows) and often propose bash-only commands
+  // (`ls`, `chmod`, `rm -rf`) on Windows where they don't exist.
+  const _platformLabel = process.platform === 'darwin' ? 'macOS (darwin)'
+    : process.platform === 'win32' ? 'Windows (win32) — shell is cmd.exe / PowerShell, NOT bash. Use `dir`, `type`, `copy`, `move`, `del`, `where`, `mkdir`. PowerShell cmdlets also work: `Get-ChildItem`, `Remove-Item`, `Test-Path`'
+    : process.platform === 'linux' ? 'Linux'
+    : process.platform;
+  const platformField = `\n| Platform | ${_platformLabel} |`;
+  const agentDisplayName = agent?.name || 'unknown';
+  const statusPhase = agent?.state?.statusPhase || null;
+  const phaseField = statusPhase ? `\n| Current phase | \`${statusPhase}\` |` : '';
+  // User language — set automatically by the inbox classifier ("ear")
+  // when a user message arrives. Agents never set it themselves; it is
+  // always authoritative for the language of the user's latest message.
+  const stateLanguage = agent?.state?.userLanguage;
+  if (stateLanguage) globalThis.__koiUserLanguage = stateLanguage;
+  const userLanguage = globalThis.__koiUserLanguage || null;
+  const langField = userLanguage ? `\n| User language | ${userLanguage} |` : '';
+
+  // Timezone (IANA)
+  let timezone = '';
+  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+
+  // ── Phase system explanation (only when agent uses phases) ──
+  const hasPhaseDone = agent?.hasPermission?.('phase_done') ?? (agent?._availableActions?.has?.('phase_done') ?? true);
+  const phaseSystemBlock = statusPhase ? `
+========================================
+PHASE SYSTEM
+========================================
+
+You operate in phases. Each phase controls which actions, agents, and rules are loaded — keeping your context focused and minimal.
+
+Your current phase is \`${statusPhase}\`. Only the actions and agents relevant to this phase are shown below.
+
+**You do NOT choose your phase.** Phase transitions are handled by the runtime based on events declared in the agent's reactions block (user messages, delegate returns, errors, phase completion). The \`statusPhase\` field is read-only from your point of view — any attempt to change it via \`update_state\` will be silently ignored.
+
+When you finish all the work that belongs to the current phase, call \`phase_done\` to signal completion. The runtime will then fire the \`phase.done\` event and transition to the next phase based on the agent's reactions. Do not try to pick the next phase yourself.
+` : '';
+
+  // prompt_user requires 'prompt_user' permission — only System and ProjectOnBoarding have it
+  const hasPromptUser = agent?.hasPermission?.('prompt_user') ?? false;
+
+  // Non-interactive mode: agent must act without asking for confirmation.
+  // Fires for BOTH the headless `--exit` mode and the per-session YOLO toggle
+  // (same "never ask" behavior, centralized in isNonInteractive()). The header
+  // surfaces YOLO explicitly in the prompt so the model knows the user enabled
+  // it for this chat.
+  const nonInteractiveBlock = isNonInteractive() ? `
+
+========================================
+${isYoloMode() ? 'YOLO MODE ACTIVATED — FULL AUTOPILOT' : 'NON-INTERACTIVE MODE'}
+========================================
+${isYoloMode() ? '\nThe user has enabled YOLO mode for this chat. Act fully autonomously: assume every answer is "yes / go ahead", never pause to confirm, and keep working until the task is done.\n' : ''}
+You are running in non-interactive (headless) mode. There is no human to answer follow-up questions.
+
+**CRITICAL RULES:**
+- Do NOT ask for confirmation — execute actions directly.
+- Do NOT use prompt_user to ask "Do you want me to...?" — just do it.
+- Complete the ENTIRE task autonomously: investigate, implement, verify.
+- Only call prompt_user at the very end to report what you did.
+
+**USE TOOLS, NOT YOUR OWN KNOWLEDGE:**
+- You are an agent with access to tools (shell, web_search, read_file, etc.). Use them.
+- If a task requires domain expertise you lack (chess, math, science, music, etc.), search the web for APIs, libraries, or tools that can help. Install them with shell and use them programmatically.
+- Example: for chess analysis, install stockfish or python-chess. For math proofs, use sympy. For image processing, use python libraries. Never try to solve domain-specific problems from memory alone.
+
+**ANNOTATION IMAGES — user instructions drawn on screen:**
+- Attachments marked as ANNOTATION are screenshots where the user has drawn arrows, circles, crosses, or text directly on the screen to indicate changes they want.
+- Annotations are INSTRUCTIONS, not decorations. Examine them carefully to understand what the user wants changed: circled elements mean "change this", crossed-out elements mean "remove this", arrows mean "move this", text annotations are literal instructions.
+- IGNORE annotation colors (red, blue, green, etc.) — they are just visual markers to make annotations visible. The color of an annotation does NOT mean "make it this color". A red circle around text means "change this text", not "make this text red".
+- When the user says "haz ese cambio" / "make that change" with annotations attached, the annotations ARE the change description. Do NOT ask what to change — look at the annotations.
+- If both an original image and an annotated version are attached, compare them to understand the differences the user wants.
+
+**VERIFY DATA EXTRACTED FROM IMAGES:**
+- When you extract spacial data from an image (positions, coordinates, ...), ALWAYS verify it programmatically before using it.
+- If validation fails, re-read the image more carefully and try again.${agent?.hasPermission?.('delegate') ? '\n- When delegating a task that depends on image data, reference attachments by their ID (e.g. att-1). The delegate can call read_file("att-1") to access the image. NEVER include raw file paths — always use attachment IDs.' : ''}
+` : '';
+
+  // BRAXIL.md / CLAUDE.md is already injected via koiMd (_loadKoiMd) above.
+
+  // ── Prompt layout: STATIC content first (cacheable), DYNAMIC content last ──
+  // LLM prompt caching works on identical prefixes — the longer the unchanging
+  // prefix, the higher the cache hit rate. Static rules/tools go first;
+  // runtime context (timestamp, phase, cwd) goes at the end.
+  //
+  // NOTE: koiMd (BRAXIL.md / CLAUDE.md) is returned separately so
+  // buildReactiveSystemPrompt can inject it as the VERY FIRST thing in the
+  // prompt, before even the agent's playbook.
+  const staticPart = `
+========================================
+OUTPUT CONTRACT (MUST FOLLOW)
+========================================
+
+Return exactly ONE valid YAML document and nothing else.
+- No markdown code fences
+- No explanations
+- No prose outside the YAML
+- The ENTIRE response is the YAML: either a single action mapping (top-level keys like actionType/intent) or a "batch:" mapping.
+
+Use block style with 2-space indentation. For ANY multi-line or punctuation-heavy text value (a prompt, a message, a director's brief), use a YAML block scalar with "|" so colons, quotes, "#" and newlines inside it are safe:
+
+intent: print
+message: |
+  Multi-line text goes here.
+  Colons (a: b), "quotes", and # are all safe inside a | block.
+
+FILE CONTENT (write_file "content", edit_file "diff"): do NOT inline HTML/CSS/code as a YAML value and do NOT use a "|" block for it — punctuation like "line-height: 1.6;" or "{ margin: 0; }" breaks the parser, and block-scalar indentation is the #1 batch-breaker. Instead pass it as a HEREDOC: set the field to a reference token "KOI_HEREDOC_<n>", then place the verbatim payload between sentinel lines AFTER the YAML document. The body is taken literally — no escaping, no indentation, any characters are safe:
+
+batch:
+  - actionType: direct
+    intent: write_file
+    path: page.html
+    content: KOI_HEREDOC_1
+###KOI_HEREDOC_1_START###
+<!doctype html>
+<style>body { margin: 0; line-height: 1.6; }</style>
+<h1>Hi: there # really</h1>
+###KOI_HEREDOC_1_END###
+
+Use a distinct number per file (KOI_HEREDOC_1, KOI_HEREDOC_2, …) and one START/END pair per token. Put all heredoc blocks after the YAML. The START/END marker lines must each be on their own line.
+
+Never output invalid YAML. Invalid YAML crashes the system.
+
+========================================
+GOLDEN RULE (ABSOLUTE)
+========================================
+
+You are FORBIDDEN from generating any fact, summary, analysis, conclusion, or user-facing content that has not been obtained from an actual action result in this conversation.
+
+If the task requires reading a file, fetching a URL, running a command, or retrieving any external/internal data, you MUST do it in separate steps:
+
+1) emit only the retrieval action
+2) wait for the real result
+3) only then emit analysis, summary, print, or return content based on that result
+
+NEVER combine in the same batch:
+- a retrieval action (read_file, shell, web_fetch, web_search, grep, search, semantic_code_search, etc.)
+with
+- a print, answer, summary, conclusion, or return payload that depends on that retrieval
+
+Until the action result exists in the conversation, any such content would be fabricated.
+
+Always follow:
+retrieve first → wait for result → analyze/respond
+
+This rule overrides any optimization, batching preference, or attempt to save steps.
+Correctness beats fewer steps.
+
+========================================
+ACTION MODEL
+========================================
+
+Every action mapping MUST include:
+- actionType
+- intent
+
+ONE action = ONE intent = ONE mapping. Each mapping contains ONLY the fields defined for that specific intent. NEVER add fields from a different intent into the same mapping — extra fields are silently ignored and the second action will NOT execute. If you need two actions, use a batch with two separate mappings.
+
+Valid action types:
+- direct${hasTeams ? '\n- delegate' : ''}
+
+Intent rules:
+- For direct actions: "intent" MUST be exactly one of AVAILABLE ACTIONS.${hasTeams ? '\n- For delegate actions: "intent" MUST follow "agentKey::eventName" and refer to a valid available agent/event.' : ''}
+- Never invent new intents.
+- Never put descriptive text inside "intent". Put that text in "query", "pattern", "message", "question", or other parameters.
+
+Invalid:
+actionType: direct
+intent: semantic index supported languages
+
+Valid:
+actionType: direct
+intent: semantic_code_search
+query: semantic index language parser support
+
+========================================
+BATCH
+========================================
+
+"batch" is a TOP-LEVEL-ONLY key. It cannot coexist with actionType, intent, or any other action field. If you need to do multiple things in one turn (e.g. print + phase_done), use a batch — a "batch:" key whose value is a sequence ("- ") of action mappings:
+
+batch:
+  - actionType: direct
+    intent: print
+    message: "Here is the result."
+  - actionType: direct
+    intent: phase_done
+
+CRITICAL YAML INDENTATION (this is the #1 way a batch breaks): every "- actionType:" in a
+batch MUST sit at the SAME indent. When an action has a multi-line value ("message: |" /
+"prompt: |"), EVERY line of that block MUST be indented DEEPER than its key, and the NEXT
+"- actionType:" MUST dedent back to the sequence indent — otherwise the block silently
+swallows the following actions and they never run. If you are unsure about indentation for a
+long value, prefer a single-line double-quoted string with \\n escapes over a "|" block.
+
+========================================
+EXECUTION FLOW
+========================================
+
+Each response is ONE YAML document — a single action mapping or a "batch:" (per OUTPUT CONTRACT above). Use sequential steps only when later actions depend on earlier results.
+
+Parallelism is mandatory:
+- If 2+ actions are independent, they MUST go inside a "parallel" block
+- Never place independent actions sequentially in a batch${hasPromptUser ? '\n- EXCEPTION: prompt_user must NEVER be inside a parallel block' : ''}
+
+Examples:
+
+Single action:
+actionType: direct
+intent: semantic_code_search
+query: authentication login session token
+
+Parallel:
+batch:
+  - parallel:
+      - actionType: direct
+        intent: semantic_code_search
+        query: semantic index build embed vector store
+      - actionType: direct
+        intent: semantic_code_search
+        query: language support parser javascript typescript python
+
+Sequential then parallel:
+batch:
+  - actionType: direct
+    intent: read_file
+    path: src/index.ts
+    offset: 0
+    limit: 120
+  - parallel:
+      - actionType: direct
+        intent: grep
+        pattern: semanticIndex
+      - actionType: direct
+        intent: grep
+        pattern: supportedLanguages
+
+Only emit this when the full task is complete:
+actionType: direct
+intent: return
+data:
+  ...
+
+Do not return early.
+Do not treat exploration alone as task completion.
+You must complete all required follow-up actions before returning.
+
+========================================
+FINAL NON-NEGOTIABLE RULES
+========================================
+
+1. Never answer in natural language
+2. Never invent intents
+3. Never fabricate facts not present in action results
+4. Never emit incomplete actions
+5. Never return before the whole task is done
+6. Always prefer evidence over speculation
+
+${resourceSection}${intentNesting}`;
+
+  // ── Working area: documents the user has open in the GUI ──
+  // Pulled from the in-memory store (open-documents-store), populated by the
+  // CLI layer when the GUI reports tab changes.
+  const openDocumentsBlock = await buildWorkingAreaBlock();
 
   // KNOWN MEDIA HANDLES block REMOVED on purpose.
   //
