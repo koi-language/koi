@@ -31,6 +31,11 @@
  * seen the docs and the real execute can proceed.
  */
 export async function requireToolInfoFirst(toolName, agent) {
+  // Trusted programmatic caller (the Braxil MCP running a tool on Claude's
+  // behalf: Claude → MCP → tool.execute directly). This guard protects the
+  // reasoning Braxil agent from blind tool use; it does NOT apply when Claude
+  // is the harness and passes explicit params. Skip it entirely.
+  if (agent?.trusted) return null;
   // Reuse the same map that get_tool_info populates so the two
   // remember-paths stay in sync. The map is keyed by tool name; the
   // value is the iteration when the docs first land in the LLM's

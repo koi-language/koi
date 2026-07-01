@@ -252,7 +252,10 @@ const generateImageAction = {
     // grabbed off disk instead of using it blind. @mention handles, att-N
     // attachments and URLs are exempt; internal tool delegations bypass this
     // (their refs are pre-validated by the delegating tool).
-    if (action._internalDelegate !== true && Array.isArray(action.referenceImages)) {
+    // A trusted programmatic caller (Braxil MCP on Claude's behalf) passes
+    // explicit paths — never guessed off the working area — so this Braxil-agent
+    // guard does not apply.
+    if (!agent?.trusted && action._internalDelegate !== true && Array.isArray(action.referenceImages)) {
       const refPath = (r) => (typeof r === 'string' ? r : (r && typeof r === 'object' ? (r.path || r.url || '') : ''));
       // Bundled SKILL assets (e.g. a skill's `references/LAYOUT_TEMPLATE.png`)
       // are fixed, trusted files shipped with the skill — never a user image the

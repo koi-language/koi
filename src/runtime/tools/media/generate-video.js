@@ -464,7 +464,9 @@ const generateVideoAction = {
     // generate_video on a storyboard sheet it never opened and hallucinated
     // the scene). @mention handles, att-N attachments and URLs are exempt
     // (deliberate named references, not a guessed path).
-    {
+    // Trusted programmatic caller (Braxil MCP on Claude's behalf) passes
+    // explicit paths — never guessed — so this Braxil-agent guard does not apply.
+    if (!agent?.trusted) {
       const { wasRead, isGatedLocalPath } = await import('../../state/read-tracker.js');
       const imgInputs = [
         ['startFrame', action.startFrame],
