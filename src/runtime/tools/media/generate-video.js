@@ -49,6 +49,26 @@ import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-instal
  *  `{ width, height }` or null. Mirrors the helper in
  *  `_pad-and-recover.js` but inlined here so we can probe ahead of
  *  the padIfNeeded call without circular imports. */
+/** Map real pixel dimensions to the closest standard aspect-ratio label
+ *  (the enum vocabulary model catalogs speak). Used by the sacred
+ *  edit/extend rule: the request aspect is derived from the SOURCE
+ *  video's probed dims, never from the caller / the 16:9 default. */
+function _closestAspectLabel(width, height) {
+  if (!(width > 0) || !(height > 0)) return null;
+  const src = width / height;
+  const LABELS = [
+    ['21:9', 21 / 9], ['16:9', 16 / 9], ['3:2', 3 / 2], ['4:3', 4 / 3],
+    ['1:1', 1], ['3:4', 3 / 4], ['2:3', 2 / 3], ['9:16', 9 / 16],
+  ];
+  let best = null;
+  let bestDelta = Infinity;
+  for (const [label, ratio] of LABELS) {
+    const delta = Math.abs(Math.log(src / ratio));
+    if (delta < bestDelta) { bestDelta = delta; best = label; }
+  }
+  return best;
+}
+
 async function _probeRefDims(filePath) {
   const envFf = process.env.KOI_FFMPEG_PATH;
   const envFp = process.env.KOI_FFPROBE_PATH;
@@ -832,6 +852,46 @@ const generateVideoAction = {
     let paddedStartFrame = action.startFrame;
     let pickedModelSlug = null;
     let pickedCaps = null;
+
+    // ── SACRED: edit/extend inherit the SOURCE video's aspect ratio ──
+    // Editing an existing video must NEVER reframe it: the output aspect
+    // is the source's, full stop. The caller's aspectRatio (and especially
+    // the '16:9' default applied when it's unset — the MCP `video` tool
+    // doesn't forward one for edits) previously won here, so a 9:16
+    // vertical video got padded toward a 16:9/square canvas, the model
+    // composed for the wrong frame, and recovery could only rescue the
+    // geometry, not the composition (reported bug). Derive the aspect
+    // label from the probed source dims BEFORE the model peek and the
+    // pad-envelope decision so the whole chain (request aspect, pad
+    // target, recovery expectation) aligns to the source.
+    if ((action.kind === 'edit' || action.kind === 'extend')
+        && Array.isArray(action.referenceVideos)
+        && typeof action.referenceVideos[0] === 'string'
+        && action.referenceVideos[0]) {
+      try {
+        const srcDims = await _probeRefDims(action.referenceVideos[0]);
+        if (srcDims?.width > 0 && srcDims?.height > 0) {
+          const srcAspect = _closestAspectLabel(srcDims.width, srcDims.height);
+          if (srcAspect) {
+            if (action.aspectRatio && action.aspectRatio !== srcAspect) {
+              channel.log(
+                'video',
+                `${action.kind}: overriding aspectRatio ${action.aspectRatio} → ${srcAspect} `
+                + `(source ${srcDims.width}×${srcDims.height} is authoritative)`,
+              );
+            } else if (!action.aspectRatio) {
+              channel.log(
+                'video',
+                `${action.kind}: aspectRatio unset → ${srcAspect} from source ${srcDims.width}×${srcDims.height}`,
+              );
+            }
+            action.aspectRatio = srcAspect;
+          }
+        }
+      } catch (err) {
+        channel.log('video', `${action.kind}: source aspect probe failed (keeping caller aspect): ${err.message}`);
+      }
+    }
 
     if (typeof instance.peekResolvedModel === 'function') {
       // Build the same opts the resolver will see, so the pick is the

@@ -1074,6 +1074,47 @@ export async function recoverFromPadded(filePath, geometry, kind) {
     }
   }
 
+  // ── SACRED aspect conform ─────────────────────────────────────────
+  // Whatever strategy picked the crop rect, the recovered file MUST come
+  // out at the ORIGINAL (pre-pad) content aspect — an edit of a 9:16
+  // video returns a 9:16 video, period. Models routinely disobey the
+  // padded envelope (observed: 9:16 source padded to a 1:1 1920×1920
+  // canvas, model returned 1280×720 16:9; cropdetect found a ~square
+  // bbox and the static-scaled fallback produced a 720×720 SQUARE file —
+  // the reported bug). When the chosen rect's aspect drifts from the
+  // expected content aspect, shrink the larger dimension centered so the
+  // final crop is exactly the source aspect: best-effort composition,
+  // guaranteed-correct geometry.
+  {
+    const _expAspect = geometry.contentW > 0 && geometry.contentH > 0
+        ? geometry.contentW / geometry.contentH
+        : null;
+    if (_expAspect && cropW > 0 && cropH > 0) {
+      const _curAspect = cropW / cropH;
+      if (Math.abs(_curAspect - _expAspect) / _expAspect > 0.02) {
+        if (_curAspect > _expAspect) {
+          const w = Math.floor(cropH * _expAspect);
+          cropX += Math.floor((cropW - w) / 2);
+          cropW = w;
+        } else {
+          const h = Math.floor(cropW / _expAspect);
+          cropY += Math.floor((cropH - h) / 2);
+          cropH = h;
+        }
+        if (cropX % 2 !== 0) cropX -= 1;
+        if (cropY % 2 !== 0) cropY -= 1;
+        if (cropW % 2 !== 0) cropW -= 1;
+        if (cropH % 2 !== 0) cropH -= 1;
+        strategy += '+aspect-conform';
+        channel.log(
+          'pad',
+          `recoverFromPadded: crop aspect ${_curAspect.toFixed(3)} != source content aspect ${_expAspect.toFixed(3)} `
+          + `— conforming centered to ${cropW}×${cropH} (source aspect is authoritative)`,
+        );
+      }
+    }
+  }
+
   channel.log(
     'pad',
     `recoverFromPadded: using ${strategy} crop ${cropW}×${cropH} @ ${cropX},${cropY}`,

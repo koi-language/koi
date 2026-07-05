@@ -133,6 +133,29 @@ export function getAuthHeaders() {
   };
 }
 
+// ── Per-request stall timeouts for media calls ──────────────────────────────
+// A fetch whose only signal is the caller's (often undefined) abortSignal
+// NEVER settles when the TCP connection stalls mid-request — no rejection, no
+// response, nothing for the retry loops to catch. That was the MCP
+// generate_image hang: the /media/image/submit upload (tens of MB of base64
+// reference images) stalled on a flaky uplink, `generate()` never returned,
+// the child never wrote result.json, and Claude's tool call sat busy until
+// the MCP server's own 10-min cap. Every media request now carries a stall
+// timeout composed with the caller's abortSignal:
+//   • submits / uploads / sync work  → _MEDIA_SUBMIT_TIMEOUT_MS (generous —
+//     big payloads on slow uplinks are legitimate; a stalled socket is not)
+//   • status polls                   → _MEDIA_POLL_TIMEOUT_MS (quick GETs)
+// A timeout REJECTS the fetch, which the existing poll loops already treat
+// as a transient error (image/audio tolerate 8 consecutive, video 5) and
+// submit paths surface as a normal tool error instead of hanging forever.
+const _MEDIA_SUBMIT_TIMEOUT_MS = Number(process.env.KOI_MEDIA_SUBMIT_TIMEOUT_MS) || 300 * 1000;
+const _MEDIA_POLL_TIMEOUT_MS = Number(process.env.KOI_MEDIA_POLL_TIMEOUT_MS) || 30 * 1000;
+
+function _stallSignal(abortSignal, timeoutMs) {
+  const t = AbortSignal.timeout(timeoutMs);
+  return abortSignal ? AbortSignal.any([abortSignal, t]) : t;
+}
+
 // ── Shared: resolve mediaCaps from models.json ──────────────────────────────
 
 function _getMediaCaps(model) {
@@ -805,7 +828,7 @@ export class GatewayImageGen extends BaseImageGen {
           method: 'POST',
           headers: getAuthHeaders(),
           body: JSON.stringify(payload),
-          signal: opts.abortSignal,
+          signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
         });
 
         await throwIfQuotaExceeded(submitRes);
@@ -857,7 +880,7 @@ export class GatewayImageGen extends BaseImageGen {
           try {
             pollRes = await fetch(
               `${getGatewayBase()}/media/image/result?id=${encodeURIComponent(id)}`,
-              { headers: getAuthHeaders(), signal: opts.abortSignal },
+              { headers: getAuthHeaders(), signal: _stallSignal(opts.abortSignal, _MEDIA_POLL_TIMEOUT_MS) },
             );
           } catch (netErr) {
             if (opts.abortSignal?.aborted) throw netErr;
@@ -1072,7 +1095,7 @@ export class GatewayImageGen extends BaseImageGen {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(payload),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
 
     await throwIfQuotaExceeded(res);
@@ -1144,7 +1167,7 @@ export class GatewayAudioGen extends BaseAudioGen {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(body),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
     await throwIfQuotaExceeded(submitRes);
     if (!submitRes.ok) {
@@ -1184,7 +1207,7 @@ export class GatewayAudioGen extends BaseAudioGen {
       try {
         pollRes = await fetch(
           `${getGatewayBase()}/media/audio/${kind}/result?id=${encodeURIComponent(id)}`,
-          { headers: getAuthHeaders(), signal: opts.abortSignal },
+          { headers: getAuthHeaders(), signal: _stallSignal(opts.abortSignal, _MEDIA_POLL_TIMEOUT_MS) },
         );
       } catch (netErr) {
         if (opts.abortSignal?.aborted) throw netErr;
@@ -1338,7 +1361,7 @@ export class GatewayAudioGen extends BaseAudioGen {
       uploadHeaders['Content-Type'] = mime;
       const uploadRes = await fetch(
         `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(filename)}`,
-        { method: 'POST', headers: uploadHeaders, body: audio, signal: opts.abortSignal },
+        { method: 'POST', headers: uploadHeaders, body: audio, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
       );
       await throwIfQuotaExceeded(uploadRes);
       if (!uploadRes.ok) {
@@ -1361,7 +1384,7 @@ export class GatewayAudioGen extends BaseAudioGen {
         ...(opts.diarize ? { diarize: true } : {}),
         ...(opts.numSpeakers ? { num_speakers: opts.numSpeakers } : {}),
       }),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
 
     await throwIfQuotaExceeded(res);
@@ -1583,7 +1606,7 @@ export class GatewayAudioGen extends BaseAudioGen {
     uploadHeaders['Content-Type'] = mime;
     const uploadRes = await fetch(
       `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(filename)}`,
-      { method: 'POST', headers: uploadHeaders, body: audioBuffer, signal: opts.abortSignal },
+      { method: 'POST', headers: uploadHeaders, body: audioBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
     );
     await throwIfQuotaExceeded(uploadRes);
     if (!uploadRes.ok) {
@@ -1605,7 +1628,7 @@ export class GatewayAudioGen extends BaseAudioGen {
         ...(opts.language ? { language: opts.language } : {}),
         ...(opts.labels ? { labels: opts.labels } : {}),
       }),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
     await throwIfQuotaExceeded(cloneRes);
     if (!cloneRes.ok) {
@@ -1994,7 +2017,7 @@ export class GatewayVideoGen extends BaseVideoGen {
           method: 'POST',
           headers: getAuthHeaders(),
           body: JSON.stringify(payload),
-          signal: opts.abortSignal,
+          signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
         });
 
         await throwIfQuotaExceeded(res);
@@ -2089,7 +2112,7 @@ export class GatewayVideoGen extends BaseVideoGen {
     const res = await fetch(url, {
       method: 'GET',
       headers: getAuthHeaders(),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_POLL_TIMEOUT_MS),
     });
 
     await throwIfQuotaExceeded(res);
@@ -2188,7 +2211,7 @@ export class GatewayVideoGen extends BaseVideoGen {
     aHeaders['Content-Type'] = audioMime;
     const audioRes = await fetch(
       `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(audioFilename)}`,
-      { method: 'POST', headers: aHeaders, body: audioBuffer, signal: opts.abortSignal },
+      { method: 'POST', headers: aHeaders, body: audioBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
     );
     await throwIfQuotaExceeded(audioRes);
     if (!audioRes.ok) {
@@ -2208,7 +2231,7 @@ export class GatewayVideoGen extends BaseVideoGen {
     iHeaders['Content-Type'] = imageMime;
     const imgRes = await fetch(
       `${getGatewayBase()}/uploads/video?filename=${encodeURIComponent(imageFilename)}`,
-      { method: 'POST', headers: iHeaders, body: imageBuffer, signal: opts.abortSignal },
+      { method: 'POST', headers: iHeaders, body: imageBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
     );
     await throwIfQuotaExceeded(imgRes);
     if (!imgRes.ok) {
@@ -2229,7 +2252,7 @@ export class GatewayVideoGen extends BaseVideoGen {
         ...(opts.aspectRatio ? { aspect_ratio: opts.aspectRatio } : {}),
         ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
       }),
-      signal: opts.abortSignal,
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
     await throwIfQuotaExceeded(submitRes);
     if (!submitRes.ok) {

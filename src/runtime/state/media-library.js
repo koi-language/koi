@@ -309,6 +309,35 @@ export class MediaLibrary {
     if (storyboards > 0) {
       process.stderr.write(`[MediaLibrary] migration: indexed ${storyboards} storyboard(s)\n`);
     }
+
+    // Characters: same model as storyboards. Scan ~/.koi/characters/*.json
+    // and index each one so existing characters become first-class gallery
+    // rows (chronological in the drawer, searchable, deletable). Idempotent —
+    // `saveCharacterEntry` upserts by path. New characters created after this
+    // are mirrored live by save_character.
+    let characters = 0;
+    const charDir = path.join(os.homedir(), '.koi', 'characters');
+    if (fs.existsSync(charDir)) {
+      try {
+        const { saveCharacterEntry } = await import('./media-library.js');
+        for (const f of fs.readdirSync(charDir)) {
+          if (!f.endsWith('.json')) continue;
+          const fp = path.join(charDir, f);
+          try {
+            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            await saveCharacterEntry(fp, body, null);
+            characters++;
+          } catch (e) {
+            process.stderr.write(`[MediaLibrary] migrate character ${f} skipped: ${e.message}\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[MediaLibrary] migrate characters skipped: ${e.message}\n`);
+      }
+    }
+    if (characters > 0) {
+      process.stderr.write(`[MediaLibrary] migration: indexed ${characters} character(s)\n`);
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
@@ -1611,6 +1640,63 @@ export async function saveStoryboardEntry(filePath, storyboard, llmProvider, opt
   return lib.save({
     filePath,
     mediaType: 'storyboard',
+    metadata,
+    description,
+    embedding,
+    replaceByPath: true,
+    createdAt,
+    summary: opts.summary,
+  });
+}
+
+/**
+ * Save (or upsert) a CHARACTER entry — points at the character JSON at
+ * `~/.koi/characters/<id>.json`. Mirrors `saveStoryboardEntry`: the JSON
+ * file is the authoritative artefact, the DB row is the index that makes
+ * the character a first-class creation (shows in the drawer with a real
+ * `created_at`, searchable, deletable). `replaceByPath` keeps one row per
+ * file across edits, and the character's real `createdAt` is preserved so
+ * backfilled rows land at their true position in "Latest".
+ *
+ * @param {string} filePath - Absolute path to the character JSON.
+ * @param {Object} character - Parsed character JSON (normalized shape).
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
+ */
+export async function saveCharacterEntry(filePath, character, llmProvider, opts = {}) {
+  const lib = MediaLibrary.global();
+  const name = character?.name || path.basename(filePath, '.json');
+  const photos = Array.isArray(character?.photos) ? character.photos : [];
+  const photoCount = photos.length;
+  const hasVoice = !!character?.voiceId;
+  const description =
+    `Character "${name}" — ${photoCount} photo${photoCount === 1 ? '' : 's'}` +
+    `${hasVoice ? ', voice: yes' : ''}.`;
+  let embedding = null;
+  if (llmProvider) {
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
+  }
+  const metadata = {
+    source: 'character',
+    characterId: character?.id,
+    name,
+    handle: character?.handle || null,
+    photoCount,
+    voiceId: character?.voiceId || null,
+    updatedAt: character?.updatedAt || null,
+  };
+  // Preserve the character's REAL authored date so backfilled rows land at
+  // their true position in "Latest" instead of clustering at "now".
+  let createdAt = (typeof character?.createdAt === 'string' && character.createdAt)
+    ? character.createdAt
+    : (typeof character?.updatedAt === 'string' && character.updatedAt)
+        ? character.updatedAt
+        : null;
+  if (!createdAt) {
+    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to now */ }
+  }
+  return lib.save({
+    filePath,
+    mediaType: 'character',
     metadata,
     description,
     embedding,

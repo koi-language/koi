@@ -1408,6 +1408,47 @@ const generateImageAction = {
       }
     }
 
+    // ── Blank/black-frame guard ──────────────────────────────────────────
+    // fal-style `safety_checker` (flux / seedream / etc.) returns a SOLID
+    // BLACK png — with HTTP 200, a real URL, and sometimes
+    // has_nsfw_concepts=true — INSTEAD of an error when a borderline prompt
+    // trips a soft NSFW hit. Those bytes otherwise sail through as "success"
+    // and cache a pure-black shot (the intermittent "black storyboard card"
+    // bug: no seed → fresh noise each render → the checker fires on some
+    // renders and not others). Detect a pure/near-black frame via sharp
+    // stats and DROP it (delete file + unset savedTo) so the result is a
+    // FAILURE the caller retries. Threshold is deliberately tight — a real
+    // black safety frame is mean≈0/stdev≈0 (uniform #000000), whereas a
+    // legit dark/night frame always has genuine pixel variance — so a
+    // valid dark shot is never dropped.
+    let _blackDropped = 0;
+    for (const img of (result.images || [])) {
+      if (!img.savedTo) continue;
+      try {
+        const _st = await sharp(img.savedTo).stats();
+        const _blank = _st.channels.length > 0
+          && _st.channels.every((c) => c.stdev < 1.0 && c.mean < 2.0);
+        if (_blank) {
+          _blackDropped++;
+          channel.log('image', `Dropped BLANK/black frame (provider safety filter?): ${img.savedTo}`);
+          try { fs.unlinkSync(img.savedTo); } catch { /* best-effort */ }
+          img.savedTo = undefined;
+        }
+      } catch { /* undecodable → leave it; the generic failure path handles it */ }
+    }
+    if (_blackDropped > 0 && !(result.images || []).some((img) => img.savedTo || img.b64)) {
+      // Every output was a blank frame → nothing usable. Report a clear,
+      // retry-able failure (mirrors the content-policy branch below).
+      return {
+        success: false,
+        provider: resolved.provider,
+        model: resolved.model,
+        error: 'The image provider returned a blank/black frame (a safety filter likely blocked a borderline prompt). No usable image was produced — retry.',
+        diagnostics: ['blank/black frame (provider safety_checker)'],
+        capabilities: caps,
+      };
+    }
+
     // Verify images were actually generated AND we have them locally. A bare
     // `url` we couldn't download (img.savedTo never set) is NOT a usable result:
     // the GUI has nothing to show and nothing got saved to the library. Treating
