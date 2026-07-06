@@ -176,18 +176,6 @@ function _trimCellToContent(raw, targetW, cell) {
 // hint/snap grid below survives only as the FALLBACK for implausible
 // segmentations (legacy sheets keep working through their metadata).
 
-/** Contiguous [start,end) runs where prof[i] >= thr. */
-function _contentRuns(prof, thr) {
-  const out = [];
-  let start = -1;
-  for (let i = 0; i <= prof.length; i++) {
-    const on = i < prof.length && prof[i] >= thr;
-    if (on && start < 0) start = i;
-    if (!on && start >= 0) { out.push({ start, end: i }); start = -1; }
-  }
-  return out;
-}
-
 /** Max of prof over [a,b). */
 function _bandMax(prof, a, b) {
   let m = 0;
@@ -234,25 +222,97 @@ function _mergeSlivers(runs, prof, medianOverride = null) {
 
 /**
  * Segment a sheet into CONTENT ISLANDS at FULL resolution (downsampling
- * blurs thin gutters; loops sample x/y stride 2 for speed):
- *   1) greyscale raw buffer; per-scanline DUAL profile: the FRACTION of
- *      sampled pixels with luminance >= 24 (classification) plus the raw
- *      max (sliver-merge band test);
- *   2) CONTENT STRIPES: a scanline is BACKGROUND when that fraction is
- *      below 0.4% (essentially black, TOLERATING isolated compression
- *      ringing next to bright content: a strict max>=20 test let ONE
- *      bright pixel destroy a whole gutter band and rows merged into 2x2
- *      blocks); content runs shorter than 4% of H are discarded; black
- *      bands of ANY width separate stripes;
- *   3) per stripe: per-column dual profile WITHIN the stripe; CONTENT
- *      ISLANDS are column runs (same fraction test) wider than 4% of W;
- *   4) panels = islands in reading order (stripes top-to-bottom, islands
- *      left-to-right), each the island's bounding box;
- *   5) sliver merge on both axes (see _mergeSlivers), which keeps testing
- *      the intervening band's RAW max (>6): ghost-fragment gaps peak well
- *      below the 24 luminance cut, so the fraction profile can't see them.
+ * blurs thin gutters; loops sample x/y stride 2 for speed).
+ *
+ * islands-v4: SEPARATORS are classified by STRUCTURE (purity + width),
+ * not content by brightness: brightness alone cannot distinguish dark
+ * panel interiors (near-black corridor ceilings/floors) from gutters,
+ * which made v3 eat / split dark panels. Every scanline (row OR column,
+ * identical test) lands in one of three classes:
+ *   - CONTENT: any of the v3 arms fires (>= 50% of samples >= 24, OR
+ *     > 5% >= 41 (p95 > 40), OR >= 0.4% (min 1) >= 64);
+ *   - PURE-DARK: not content AND <= 5% of samples reach luminance 17
+ *     (line p95 <= 16). Measured: true gutters/fillers sit at
+ *     f17 0.000-0.009 while dark panel interiors never fell below
+ *     f17 0.09 (star-wars corridor sheet) / 0.26 (typical);
+ *   - IMPURE-DARK: the rest (dark ceilings, walls, night interiors).
+ * SEPARATORS:
+ *   - every maximal PURE-DARK run, ANY width (thin pure gutters and the
+ *     wide black filler of empty cells alike). The purity boundary is
+ *     exactly where an impure dark panel bottom meets the pure filler,
+ *     so touching dark content never bleeds into the filler;
+ *   - a maximal IMPURE-DARK run ONLY under the HAIRLINE exception: run
+ *     length <= 0.5% of the axis extent AND band frac24 <= 0.30 AND
+ *     BOTH flanking scanlines are SATURATED content (line frac24 >=
+ *     0.85). This is the ringing-contaminated thin gutter between two
+ *     bright panels (mqtz88lw 4/5: f17 16-36%, neighbors f24
+ *     0.99/0.97); dark-content hairlines always have weak flanks
+ *     (measured <= 0.45) and internal pencil-sketch divides are far too
+ *     impure (f17 0.73+) with weak flanks (0.34), so neither splits.
+ * Islands = maximal non-separator spans >= 4% of the extent (stripes on
+ * rows; per-stripe islands on columns), in reading order, each its
+ * bounding span; impure-dark panel edges stay INSIDE their island (no
+ * shaved dark borders). Sliver merge (see _mergeSlivers) remains the
+ * final safety net on both axes, band-tested on the RAW max profile.
  * Returns { W, H, panels: [{left,top,width,height}], stripes }.
  */
+const _LUM_PURE = 17;   // purity luminance (line p95 <= 16 when <= 5% reach it)
+const _LUM_BASE = 24;   // bulk arm luminance
+const _LUM_P95 = 41;    // p95 arm luminance (p95 > 40)
+const _LUM_BRIGHT = 64; // bright-evidence arm luminance
+
+/** Per-arm sample-count thresholds for a scanline of [n] samples. */
+function _armNeeds(n) {
+  return {
+    base: Math.ceil(n * 0.5),            // >= 50% of samples >= 24
+    p95: Math.floor(n * 0.05) + 1,       // > 5% of samples >= 41
+    bright: Math.max(1, Math.ceil(n * 0.004)), // >= 0.4% of samples >= 64
+    pure: Math.floor(n * 0.05),          // <= 5% of samples >= 17
+  };
+}
+
+/**
+ * Classify separator scanlines for one axis (islands-v4).
+ * [cls]: per-line class (2 content, 1 impure-dark, 0 pure-dark);
+ * [f24]: per-line fraction of samples >= 24; [extent] = axis length.
+ * Returns a boolean mask: true = separator line.
+ */
+function _separatorMask(cls, f24, extent) {
+  const sep = new Array(cls.length).fill(false);
+  const hairMax = Math.max(2, Math.round(extent * 0.005));
+  const strong = (i) => i >= 0 && i < cls.length && f24[i] >= 0.85;
+  let i = 0;
+  while (i < cls.length) {
+    const c = cls[i];
+    let j = i;
+    while (j < cls.length && cls[j] === c) j++;
+    if (c === 0) {
+      // Pure-dark: always a separator (gutter or filler).
+      for (let k = i; k < j; k++) sep[k] = true;
+    } else if (c === 1 && j - i <= hairMax) {
+      // Impure-dark: hairline ringing-gutter exception only.
+      let band = 0;
+      for (let k = i; k < j; k++) band += f24[k];
+      if (band / (j - i) <= 0.30 && strong(i - 1) && strong(j)) {
+        for (let k = i; k < j; k++) sep[k] = true;
+      }
+    }
+    i = j;
+  }
+  return sep;
+}
+
+/** Maximal [start,end) runs of NON-separator lines. */
+function _islandSpans(sep) {
+  const out = [];
+  let start = -1;
+  for (let i = 0; i <= sep.length; i++) {
+    const on = i < sep.length && !sep[i];
+    if (on && start < 0) start = i;
+    if (!on && start >= 0) { out.push({ start, end: i }); start = -1; }
+  }
+  return out;
+}
 export async function contentIslands({ sharp, sheet }) {
   // MEASURE ONCE, THEN CACHE (user requirement): the island geometry is
   // persisted at ~/.koi/panels/<base>/geometry.json and shared with the GUI
@@ -270,58 +330,67 @@ export async function contentIslands({ sharp, sheet }) {
   const meta = await sharp(sheet).metadata();
   const W = meta.width, H = meta.height;
   const raw = await sharp(sheet).greyscale().raw().toBuffer(); // FULL res
-  // TOLERANT dark-line test (islands-v2): a scanline is BACKGROUND when
-  // fewer than 0.4% of its sampled pixels reach luminance 24. Isolated
-  // compression-ringing pixels beside bright content (sunset skies, white
-  // robes) no longer destroy a gutter, unlike the old binary max>=20 test.
-  const LUM = 24;
-  const FRAC = 0.004;
 
-  // 1) Row profiles (x stride 2): bright-pixel count for classification
-  //    (early-out once the row is provably content) + raw max for the
-  //    sliver-merge band test (background rows complete the scan).
-  const rowSamples = Math.ceil(W / 2);
-  const rowNeed = Math.max(1, Math.ceil(rowSamples * FRAC));
-  const rowContent = new Array(H).fill(0); // 1 = content scanline
+  // Per-line profile for one axis position: class (2 content / 1 impure
+  // / 0 pure), frac24, and raw max (sliver band test). NO early-out: the
+  // purity and frac24 of every line feed the separator rules.
+  const _profileLine = (get, n, needs) => {
+    let m = 0, c17 = 0, c24 = 0, c41 = 0, c64 = 0;
+    for (let i = 0; i < n; i++) {
+      const v = get(i);
+      if (v > m) m = v;
+      if (v >= _LUM_PURE) {
+        c17++;
+        if (v >= _LUM_BASE) {
+          c24++;
+          if (v >= _LUM_P95) {
+            c41++;
+            if (v >= _LUM_BRIGHT) c64++;
+          }
+        }
+      }
+    }
+    const content = c24 >= needs.base || c41 >= needs.p95 || c64 >= needs.bright;
+    const cls = content ? 2 : (c17 <= needs.pure ? 0 : 1);
+    return { cls, f24: c24 / n, max: m };
+  };
+
+  // 1) Row profiles (x stride 2).
+  const nRow = Math.ceil(W / 2);
+  const rowNeeds = _armNeeds(nRow);
+  const rowCls = new Array(H).fill(0);
+  const rowF24 = new Array(H).fill(0);
   const rowMax = new Array(H).fill(0);
   for (let y = 0; y < H; y++) {
     const off = y * W;
-    let m = 0, cnt = 0;
-    for (let x = 0; x < W; x += 2) {
-      const v = raw[off + x];
-      if (v > m) m = v;
-      if (v >= LUM && ++cnt >= rowNeed) break;
-    }
-    rowContent[y] = cnt >= rowNeed ? 1 : 0;
-    rowMax[y] = m;
+    const p = _profileLine((i) => raw[off + i * 2], nRow, rowNeeds);
+    rowCls[y] = p.cls; rowF24[y] = p.f24; rowMax[y] = p.max;
   }
 
-  // 2) Content stripes + sliver merge (band test on the RAW max profile).
-  let stripes = _contentRuns(rowContent, 1).filter((s) => s.end - s.start >= H * 0.04);
+  // 2) Row separators -> stripes (+ sliver merge on the RAW max profile).
+  const rowSep = _separatorMask(rowCls, rowF24, H);
+  let stripes = _islandSpans(rowSep).filter((s) => s.end - s.start >= H * 0.04);
   stripes = _mergeSlivers(stripes, rowMax);
 
-  // 3+4) Per-stripe islands, reading order. TWO passes: raw islands of every
-  // stripe first, so the sliver merge can use the SHEET-WIDE median island
-  // width (a stripe holding only ghost fragments of a blacked-out cell has no
-  // full-size island of its own to anchor the local median).
+  // 3+4) Per-stripe column separators -> islands, reading order. TWO
+  // passes: raw islands of every stripe first, so the sliver merge can
+  // use the SHEET-WIDE median island width (a stripe holding only ghost
+  // fragments of a blacked-out cell has no full-size island of its own
+  // to anchor the local median).
   const perStripe = [];
   const allWidths = [];
   for (const s of stripes) {
-    const colSamples = Math.max(1, Math.ceil((s.end - s.start) / 2));
-    const colNeed = Math.max(1, Math.ceil(colSamples * FRAC));
-    const colContent = new Array(W).fill(0);
+    const nCol = Math.max(1, Math.ceil((s.end - s.start) / 2));
+    const colNeeds = _armNeeds(nCol);
+    const colCls = new Array(W).fill(0);
+    const colF24 = new Array(W).fill(0);
     const colMax = new Array(W).fill(0);
     for (let x = 0; x < W; x++) {
-      let m = 0, cnt = 0;
-      for (let y = s.start; y < s.end; y += 2) {
-        const v = raw[y * W + x];
-        if (v > m) m = v;
-        if (v >= LUM && ++cnt >= colNeed) break;
-      }
-      colContent[x] = cnt >= colNeed ? 1 : 0;
-      colMax[x] = m;
+      const p = _profileLine((i) => raw[(s.start + i * 2) * W + x], nCol, colNeeds);
+      colCls[x] = p.cls; colF24[x] = p.f24; colMax[x] = p.max;
     }
-    const islands = _contentRuns(colContent, 1).filter((r) => r.end - r.start >= W * 0.04);
+    const colSep = _separatorMask(colCls, colF24, W);
+    const islands = _islandSpans(colSep).filter((r) => r.end - r.start >= W * 0.04);
     for (const r of islands) allWidths.push(r.end - r.start);
     perStripe.push({ stripe: s, colMax, islands });
   }
@@ -510,7 +579,7 @@ export function geometryCachePath(sheet) {
 function _readGeometryCache(sheet, st) {
   try {
     const j = JSON.parse(fs.readFileSync(geometryCachePath(sheet), 'utf8'));
-    if (j?.algo !== 'islands-v2') return null;
+    if (j?.algo !== 'islands-v4') return null;
     if (j.mtimeMs !== Math.floor(st.mtimeMs) || j.fileSize !== st.size) return null;
     if (!Array.isArray(j.islands) || !Number.isInteger(j.width) || !Number.isInteger(j.height)) return null;
     return j;
@@ -523,7 +592,7 @@ function _writeGeometryCache(sheet, st, { width, height, islands }) {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const tmp = `${p}.tmp-${Date.now()}`;
     fs.writeFileSync(tmp, JSON.stringify({
-      algo: 'islands-v2',
+      algo: 'islands-v4',
       mtimeMs: Math.floor(st.mtimeMs),
       fileSize: st.size,
       width,
