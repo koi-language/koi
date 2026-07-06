@@ -419,6 +419,12 @@ function _validateClip(c, settings) {
     // synthetic sentinel) so the filter graph doesn't reference a
     // non-existent `[i:a]` stream and break the whole mix.
     'hasAudio',
+    // Detected shot cuts (planos / "tomas") inside the clip's source, in
+    // SOURCE-time ms. The GUI computes these; the engine doesn't consume them
+    // but MUST round-trip them so they survive to disk — the MCP `extract_take`
+    // reads them to know each take's [from,to] range and cut it. Also
+    // `shotCutVersion` (settings) drives the GUI's re-detect-if-stale check.
+    'shotCuts',
   ];
   for (const key of _passthrough) {
     if (c[key] !== undefined && c[key] !== null) {

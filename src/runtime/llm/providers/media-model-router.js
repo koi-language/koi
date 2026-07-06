@@ -94,6 +94,55 @@ const _inCategory = (m, cat) => {
   return false;
 };
 
+/**
+ * The Koi category an operation REQUIRES, given the media kind and the
+ * request shape. This mirrors the bucket selection inside pickImageModel /
+ * _resolveVideoBucketAndPool / pickAudioModel (keep the three expressions in
+ * sync with this one). It exists so an EXPLICITLY PINNED model can be checked
+ * against the operation's category BEFORE it bypasses the router. Returns null
+ * for an unknown media kind (caller then skips validation).
+ */
+export function wantedCategoryFor(mediaKind, req = {}) {
+  if (mediaKind === 'image') {
+    const intent = typeof req.intent === 'string' ? req.intent.trim() : '';
+    const refsCount = req.refsCount || 0;
+    return (intent === 'bg-remove' || intent === 'background-removal' || intent === 'rembg') ? 'image_background_removal'
+      : (intent === 'upscale' || intent === 'upscaling') ? 'image_upscaling'
+      : (intent === 'outpaint' || intent === 'extend') ? 'image_extend'
+      : (intent === 'edit' || intent === 'inpaint') ? 'image_editing'
+      : refsCount > 0 ? 'image_editing'
+      : 'image_generation';
+  }
+  if (mediaKind === 'video') {
+    const kind = req.kind || '';
+    const hasVideoRefs = (req.videoRefsCount || 0) > 0;
+    return kind === 'avatar' ? 'video_avatar'
+      : kind === 'extend' ? 'video_extend'
+      : (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal'
+      : kind === 'continuation' ? 'video_generation'
+      : (kind === 'edit' || hasVideoRefs) ? 'video_editing'
+      : 'video_generation';
+  }
+  if (mediaKind === 'audio') {
+    const kind = req.kind || 'tts';
+    return kind === 'tts' ? 'audio_tts'
+      : kind === 'transcribe' ? 'audio_transcription'
+      : kind === 'voice-clone' ? 'audio_voice_clone'
+      : kind === 'music' ? 'audio_music'
+      : kind === 'sfx' ? 'audio_sfx'
+      : 'audio_tts';
+  }
+  return null;
+}
+
+/** Alias-aware category membership test for a single model row
+ *  ({ slug, categories[] }). Public wrapper over the internal
+ *  `_inCategory` so callers outside the picker (e.g. the explicit-pin
+ *  guard) validate categories with the SAME alias rules the router uses. */
+export function modelInCategory(model, category) {
+  return _inCategory(model, category);
+}
+
 /** Canonical names of every input a per-slug `requires` array might
  *  list, paired with the `req` flag that signals the caller is sending
  *  that input. Used by `_shapeMatchScore` so the ranker can prefer

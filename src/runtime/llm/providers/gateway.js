@@ -476,7 +476,15 @@ function _collectImages(data) {
 }
 
 async function _resolveMediaModel(kind, explicit, opts, pickFn, req) {
-  if (explicit && explicit !== 'auto') return explicit;
+  if (explicit && explicit !== 'auto') {
+    // GENERIC CATEGORY GUARD: a pinned model bypasses the router (and its
+    // per-operation category bucket). Every media operation requires a
+    // category (image/audio/video: edit, upscale, tts, video_editing…), so
+    // validate the pinned slug carries it. Positively-wrong pins fail with a
+    // self-describing error listing the models that DO support the category.
+    await _assertPinnedModelCategory(kind, explicit, req);
+    return explicit;
+  }
   const caps = await fetchMediaCapabilities(kind);
   if (!caps || !Array.isArray(caps.models) || caps.models.length === 0) {
     const err = new Error(`No active ${kind} models available from the backend`);
@@ -484,6 +492,52 @@ async function _resolveMediaModel(kind, explicit, opts, pickFn, req) {
     throw err;
   }
   return await pickFn(caps.models, req);
+}
+
+/**
+ * GENERIC CATEGORY GUARD for an EXPLICITLY PINNED media model. Every media
+ * operation (image/audio/video) maps to a required Koi category; the router
+ * enforces it when it picks, but an explicit `this.model` pin short-circuits
+ * `_resolveMediaModel` and skips that filter, so validate here too. Only
+ * throws when it can POSITIVELY confirm the model lacks the category (the
+ * row exists in the active catalog and does not carry it); when it cannot
+ * verify (offline, unknown kind, slug absent from the catalog) it stays out
+ * of the way. The error lists the models that DO support the category and the
+ * recommended default, so the agent can pivot instead of forcing a wrong model.
+ */
+async function _assertPinnedModelCategory(kind, slug, req) {
+  let wanted, inCat;
+  try {
+    ({ wantedCategoryFor: wanted, modelInCategory: inCat } = await import('./media-model-router.js'));
+  } catch { return; }
+  const wantedCat = wanted(kind, req || {});
+  if (!wantedCat) return; // unknown media kind: nothing to enforce
+  let rows;
+  try { rows = await fetchMediaModelRows(kind); } catch { rows = []; }
+  if (!Array.isArray(rows) || rows.length === 0) return; // can't verify: don't block
+  const row = rows.find((m) => m.slug === slug);
+  if (!row) return; // pinned slug not in the active catalog: a different error surfaces at submit
+  if (inCat(row, wantedCat)) return; // the pinned model supports the operation: allow
+
+  const eligible = rows.filter((m) => inCat(m, wantedCat));
+  const list = eligible.map((m) => m.slug).join(', ') || '(none configured on the backend)';
+  const def = eligible.find((m) => Array.isArray(m.labels) && m.labels.includes('default'));
+  const rec = def ? def.slug : (eligible[0] ? eligible[0].slug : null);
+  const err = new Error(
+    `Model "${slug}" cannot perform this ${kind} operation: it is not in the required "${wantedCat}" category. `
+    + `Only models tagged "${wantedCat}" can. Allowed: [${list}]`
+    + (rec ? `. Recommended: ${rec}.` : '.')
+    + ` Do NOT pin a different model or switch operation to bypass this; pick one of the allowed models or omit the model to let the backend choose.`,
+  );
+  err.details = {
+    code: 'model_category_mismatch',
+    kind,
+    requiredCategory: wantedCat,
+    attemptedModel: slug,
+    allowedModels: eligible.map((m) => m.slug),
+    recommended: rec,
+  };
+  throw err;
 }
 
 // ── GatewayEmbedding ─────────────────────────────────────────────────────────
@@ -1081,6 +1135,12 @@ export class GatewayImageGen extends BaseImageGen {
       if (typeof opts.faceEnhancement === 'boolean') {
         payload.face_enhancement = opts.faceEnhancement;
       }
+      // Source pixel dims (probed by the upscale tool). Generative "upscalers"
+      // (nano-banana-pro) have no scale-factor knob and render at a fixed
+      // resolution LABEL, so the backend adapter maps source*factor to the
+      // nearest label. Harmless to Topaz/Recraft (they ignore unknown fields).
+      if (typeof opts.sourceWidth === 'number') payload.source_width = opts.sourceWidth;
+      if (typeof opts.sourceHeight === 'number') payload.source_height = opts.sourceHeight;
       // Escape hatch for model-specific fields (Topaz model variant,
       // texture, subject_detection, denoise, …). Object.assign after the
       // normalized keys so callers can override if they really mean to.

@@ -124,9 +124,12 @@ const upscaleImageAction = {
     // smaller than 256px on either side. Catching this client-side gives a
     // clear, actionable error in the same turn instead of burning a gateway
     // round-trip on a model-internal "image too small" rejection.
+    let srcWidth, srcHeight;
     try {
       const sharp = (await import('sharp')).default;
       const meta = await sharp(resolvedPath).metadata();
+      if (meta.width) srcWidth = meta.width;
+      if (meta.height) srcHeight = meta.height;
       if (meta.width && meta.height && (meta.width < 256 || meta.height < 256)) {
         return {
           success: false,
@@ -213,6 +216,8 @@ const upscaleImageAction = {
         ...(action.prompt ? { prompt: String(action.prompt).slice(0, 1024) } : {}),
         ...(creativity !== undefined ? { creativity } : {}),
         ...(typeof action.faceEnhancement === 'boolean' ? { faceEnhancement: action.faceEnhancement } : {}),
+        ...(typeof srcWidth === 'number' ? { sourceWidth: srcWidth } : {}),
+        ...(typeof srcHeight === 'number' ? { sourceHeight: srcHeight } : {}),
         ...(action.extra && typeof action.extra === 'object' ? { extra: action.extra } : {}),
       });
       if (result?.model) channel.log('image', `Model resolved → ${result.model}`);

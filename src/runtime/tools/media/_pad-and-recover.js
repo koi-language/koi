@@ -631,9 +631,11 @@ export function targetDimsForResolutionAspect(resolution, aspectRatio) {
   // aspect on a single rule.
   let shortSide;
   switch (resolution.toLowerCase()) {
+    case '360p': shortSide = 360; break;
     case '480p': shortSide = 480; break;
     case '720p': shortSide = 720; break;
     case '1080p': shortSide = 1080; break;
+    case '2k': case '1440p': shortSide = 1440; break;
     case '4k': case '2160p': shortSide = 2160; break;
     default: return null;
   }
