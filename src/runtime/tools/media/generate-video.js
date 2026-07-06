@@ -39,6 +39,7 @@ import {
   pickEnvelopeResolution,
   targetDimsForResolutionAspect,
   stripVideoEditList,
+  normalizeVideoForProvider,
 } from './_pad-and-recover.js';
 import { spawn as _spawnForProbe } from 'child_process';
 import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
@@ -194,14 +195,22 @@ export async function _uploadVideoRef(ref, opts = {}) {
   // already trims it back to the original duration so the user never
   // sees the filler.
   let resolved = original;
+  // Normalize to a STANDARD H.264 .mp4 FIRST — iPhone recordings arrive as
+  // QuickTime `.mov`/`.quicktime`, often HEVC and/or rotated, which many
+  // providers reject or mis-handle (the `.quicktime` upload fal bounced).
+  // Lossless remux when the codec is already deliverable, high-quality
+  // re-encode otherwise. Done before the temporal pad so BOTH the pad and the
+  // upload operate on a compliant file. No-op (returns the same path) when the
+  // input is already a standard mp4 or ffmpeg is unavailable.
+  resolved = await normalizeVideoForProvider(resolved);
   if (Number.isFinite(opts.minDurationSec) && opts.minDurationSec > 0) {
     try {
-      const dims = await _probeRefDims(original);
+      const dims = await _probeRefDims(resolved);
       const padOpts = { minDurationMs: opts.minDurationSec * 1000 };
       if (dims && dims.width > 0 && dims.height > 0) {
         padOpts.targetDims = { w: dims.width, h: dims.height };
       }
-      const r = await padIfNeeded(original, 'video', padOpts);
+      const r = await padIfNeeded(resolved, 'video', padOpts);
       if (r?.paddedPath && r.geometry?.needsTemporalPad) {
         channel.log(
           'video',

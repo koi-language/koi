@@ -71,6 +71,124 @@ async function _resolveFfmpeg() {
   }
 }
 
+/** Probe the first video stream as JSON (codec_name, pix_fmt, rotation).
+ *  Returns the stream object or null. */
+function _probeVideoStreamJson(ffprobe, file) {
+  return new Promise((resolve) => {
+    let out = '';
+    let proc;
+    try {
+      proc = spawn(ffprobe, [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_streams', '-of', 'json', file,
+      ]);
+    } catch { return resolve(null); }
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.on('error', () => resolve(null));
+    proc.on('close', () => {
+      try { resolve(JSON.parse(out)?.streams?.[0] || null); }
+      catch { resolve(null); }
+    });
+  });
+}
+
+/** Extract the display rotation (deg) from a probed video stream. Modern
+ *  ffmpeg exposes it as `side_data_list[].rotation` (display matrix, often
+ *  ±90/180); legacy files use `tags.rotate`. Returns 0 when upright. */
+function _rotationFromStream(stream) {
+  try {
+    const sd = Array.isArray(stream?.side_data_list) ? stream.side_data_list : [];
+    for (const s of sd) {
+      const n = typeof s?.rotation === 'number' ? s.rotation
+        : (s?.rotation != null ? parseFloat(s.rotation) : NaN);
+      if (Number.isFinite(n) && n !== 0) return n;
+    }
+    const t = stream?.tags && (stream.tags.rotate ?? stream.tags.ROTATE);
+    if (t != null) { const n = parseFloat(t); if (Number.isFinite(n)) return n; }
+  } catch { /* ignore */ }
+  return 0;
+}
+
+/**
+ * Normalize a local video to a STANDARD delivery format before uploading it
+ * to a provider. iPhone recordings arrive as QuickTime `.mov` / `.quicktime`
+ * containers, frequently HEVC (H.265), often with a rotation display-matrix
+ * (and sometimes 10-bit/HDR). Many fal models only accept plain H.264 `.mp4`
+ * and reject or mis-handle the rest (the `.quicktime` upload fal bounced).
+ *
+ * Strategy — cheapest that yields a compliant file, NEVER a silent downgrade:
+ *   - already H.264 + yuv420p + `.mp4` + upright  → pass through (no work).
+ *   - H.264 + yuv420p + upright, wrong container   → REMUX (`-c copy`,
+ *     lossless, milliseconds) into `.mp4`.
+ *   - anything else (HEVC, 10-bit / 4:2:2 pix_fmt, a rotation matrix, HDR) →
+ *     RE-ENCODE to H.264 high quality (CRF 18 ≈ visually lossless), yuv420p,
+ *     +faststart, baking rotation in so providers that ignore the display
+ *     matrix still get an upright frame.
+ *
+ * Returns a path to a compliant file (the original when already fine, or a
+ * temp `.mp4`). Returns the ORIGINAL on any failure so the caller still
+ * uploads something rather than aborting.
+ */
+export async function normalizeVideoForProvider(inputPath) {
+  try {
+    if (!inputPath || typeof inputPath !== 'string' || !fs.existsSync(inputPath)) return inputPath;
+    const bins = await _resolveFfmpeg();
+    if (!bins?.ffmpeg) return inputPath; // no ffmpeg → can't normalize; upload as-is
+
+    let codec = '', pixFmt = '', rotation = 0;
+    if (bins.ffprobe) {
+      const st = await _probeVideoStreamJson(bins.ffprobe, inputPath);
+      if (st) {
+        codec = String(st.codec_name || '').toLowerCase();
+        pixFmt = String(st.pix_fmt || '').toLowerCase();
+        rotation = _rotationFromStream(st);
+      }
+    }
+    const ext = path.extname(inputPath).toLowerCase();
+    const isMp4 = ext === '.mp4';
+    const isH264 = codec === 'h264' || codec === 'avc1';
+    const is420 = pixFmt.startsWith('yuv420');
+    const hasRotation = Math.abs(rotation) >= 1;
+
+    // Already a compliant delivery file → nothing to do. (Only trust this
+    // when we could actually probe the codec/pixfmt.)
+    if (bins.ffprobe && isMp4 && isH264 && is420 && !hasRotation) return inputPath;
+
+    const outDir = path.join(os.tmpdir(), 'koi-normalized');
+    fs.mkdirSync(outDir, { recursive: true });
+    const stem = crypto.createHash('sha1')
+      .update(`${inputPath}:${fs.statSync(inputPath).mtimeMs}`)
+      .digest('hex').slice(0, 12);
+    const out = path.join(outDir, `${stem}.mp4`);
+    if (fs.existsSync(out) && fs.statSync(out).size > 0) return out; // cached
+
+    // Lossless remux when the codec is already deliverable and only the
+    // container is wrong. Otherwise re-encode to H.264 (visually lossless).
+    const canRemux = bins.ffprobe && isH264 && is420 && !hasRotation;
+    const args = canRemux
+      ? ['-y', '-i', inputPath, '-c', 'copy', '-movflags', '+faststart', out]
+      : ['-y', '-i', inputPath,
+         '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+         '-pix_fmt', 'yuv420p',
+         '-c:a', 'aac', '-b:a', '192k',
+         '-movflags', '+faststart', out];
+
+    const ok = await _runFfmpeg(bins, args);
+    if (ok && fs.existsSync(out) && fs.statSync(out).size > 0) {
+      channel.log('video',
+        `normalized ${path.basename(inputPath)} → ${path.basename(out)} ` +
+        `(${canRemux ? 'remux, lossless' : `re-encode H.264 crf18${hasRotation ? `, rotation ${rotation}° baked` : ''}`}` +
+        `${codec ? `; src codec=${codec || '?'} pix=${pixFmt || '?'}` : ''})`);
+      return out;
+    }
+    channel.log('video', `normalize failed for ${path.basename(inputPath)} — uploading original`);
+    return inputPath;
+  } catch (err) {
+    channel.log('video', `normalizeVideoForProvider error (${err?.message || err}) — uploading original`);
+    return inputPath;
+  }
+}
+
 function _parseDimsFromFfmpegStderr(stderr) {
   // ffmpeg's stderr summary lines look like
   //   "Stream #0:0[0x1](und): Video: h264 (...) 812x456, 30 fps, ..."
