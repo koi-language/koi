@@ -168,18 +168,11 @@ const generateImageAction = {
           vertical:   { type: 'number', description: 'OPTIONAL. Vertical camera elevation in degrees (-30..90). -30 = low angle looking up, 0 = eye level, 90 = bird\'s-eye top-down. Omit when the user did not tilt.' },
           zoom:       { type: 'number', description: 'OPTIONAL. Camera distance / framing (0..10). 0 = wide shot (far), 5 = medium / unchanged, 10 = close-up. Omit when the user did not change distance.' }
         }
-      }
-      // `model` and `excludeProviders` are intentionally NOT declared here.
-      // Model selection is the auto-picker's job — the agent should describe
-      // what it wants (aspectRatio, resolution, referenceImages, label) and
-      // let the client-side router pick the cheapest capable model from the
-      // active catalog. `excludeProviders` is a retry-hint set by the
-      // Coordinator after a BlockedResult; it is forwarded on `action.*` by
-      // playbook-session.js and read in execute() below. Declaring them in
-      // the schema would leak them into `get_tool_info` / AVAILABLE ACTIONS
-      // and invite the agent to invent a slug (e.g. "gemini-3-pro-image-
-      // preview") that the backend catalog may not even have active — a
-      // failure mode that can't happen when the picker is the only chooser.
+      },
+      model:           { type: 'string', description: 'OPTIONAL. Pin a SPECIFIC model slug — it WINS over the auto-picker (execute() honours it). OMIT (or "auto") to let the router auto-select the best model for your params: that is the DEFAULT and the RECOMMENDED choice when you do not know exactly which model to use. Valid slugs are the ones in the per-model catalog at the END of this description — do NOT invent a slug (the gateway hard-errors on unknown ones).' },
+      // `excludeProviders` is intentionally NOT declared here — it is a
+      // retry-hint set by the Coordinator after a BlockedResult, forwarded on
+      // `action.*` by playbook-session.js and read in execute() below.
     },
     required: ['prompt']
   },

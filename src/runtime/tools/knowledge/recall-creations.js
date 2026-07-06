@@ -99,6 +99,49 @@ export default {
     } catch (err) {
       return _err(`failed to read ledger: ${err.message}`);
     }
+
+    // The session ledger only knows creations stamped in THIS session. When a
+    // storyboard scope is given, ALSO recall by the durable link the media
+    // library stores (metadata.sourceStoryboard): sheets rendered in earlier
+    // sessions must still be found.
+    if (storyboard) {
+      try {
+        const { MediaLibrary } = await import('../../state/media-library.js');
+        const lib = MediaLibrary.global();
+        const rows = await lib.list({
+          mediaTypes: kind ? [kind] : undefined,
+          limit: 500,
+          includeHidden: true,
+        });
+        const seen = new Set(creations.map((c) => c.filePath));
+        const pathMod = await import('path');
+        for (const row of rows || []) {
+          const fp = row.file_path || row.filePath;
+          if (!fp || seen.has(fp)) continue;
+          let meta = row.metadata;
+          try { if (typeof meta === 'string') meta = JSON.parse(meta); } catch { meta = null; }
+          const m = meta?.metadata && typeof meta.metadata === 'object' ? meta.metadata : meta;
+          const src = m?.sourceStoryboard;
+          if (typeof src !== 'string' || !src) continue;
+          const id = pathMod.basename(src, '.json');
+          if (id !== storyboard) continue;
+          seen.add(fp);
+          creations.push({
+            kind: row.media_type || row.mediaType || kind || 'image',
+            filePath: fp,
+            storyboard,
+            ts: Date.parse(row.created_at || row.createdAt || '') || 0,
+            source: 'library',
+            // Working artifacts of the panel-fix flow: never a sheet.
+            ...(m?.panelFix === true ? { panelFix: true } : {}),
+            ...(m?.sheetSetId ? { sheetSetId: m.sheetSetId } : {}),
+            ...(m?.storyboardPart != null ? { storyboardPart: m.storyboardPart } : {}),
+          });
+        }
+        creations.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        if (limit && creations.length > limit) creations = creations.slice(0, limit);
+      } catch { /* library unavailable: ledger results stand alone */ }
+    }
     return { success: true, count: creations.length, creations, ...(storyboard ? { storyboard } : {}) };
   },
 };

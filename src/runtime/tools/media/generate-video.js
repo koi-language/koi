@@ -432,7 +432,7 @@ const generateVideoAction = {
       saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in ~/.koi/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
-      model:           { type: 'string',  description: 'Specific model to use (optional — auto-selects if omitted)' },
+      model:           { type: 'string',  description: 'OPTIONAL. Pin a SPECIFIC model slug — it WINS over the auto-picker. OMIT (or "auto") to let the router auto-select the best model for your params: that is the DEFAULT and the RECOMMENDED choice when you do not know exactly which model to use. Valid slugs are the ones in the per-model catalog at the END of this description; pinning one whose adapter rejects your request shape (e.g. an image-to-video slug for a text-only prompt) will fail — auto avoids that.' },
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
@@ -514,23 +514,21 @@ const generateVideoAction = {
       }
     }
 
-    // ── Strip agent-supplied `model` ─────────────────────────────────
-    // The auto-picker (pickVideoModel + the live catalog) is the SOLE
-    // authority for model selection. Agents that pin a slug via
-    // `action.model` bypass the picker and routinely land on a slug
-    // whose adapter rejects the request shape (e.g. forcing
-    // `fal-ai/wan/v2.7/image-to-video` for a text-only prompt with no
-    // image input). Strip it loudly so the user sees the override
-    // happen in the log and the agent eventually stops doing it.
-    // `excludeModels` / `includeModels` / `label` remain the legit
-    // levers for biasing the picker.
+    // ── Honour a caller-supplied `model` (explicit pin WINS) ─────────
+    // Mirrors generate_image: an explicit `model` slug OVERRIDES the
+    // auto-picker and is passed straight to resolveModel below. If the
+    // slug isn't in the active catalog the gateway returns a hard error
+    // (the caller learns) — healthier than silently swapping. Omit, or
+    // `model: 'auto'`, to let the auto-picker drive selection — the
+    // RECOMMENDED path when you don't know exactly which model to use.
+    // NOTE: pinning a model whose adapter rejects your request shape
+    // (e.g. an image-to-video slug for a text-only prompt) will fail —
+    // that's on the caller; the auto-picker avoids that by construction.
     if (action.model && action.model !== 'auto') {
       channel.log(
         'video',
-        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
-        `Use excludeModels / includeModels / label to bias instead.`,
+        `Honoring caller-supplied model="${action.model}" (explicit pin wins over auto-picker).`,
       );
-      action.model = undefined;
     }
 
     // ── Auto-correct misplaced image files in referenceVideos ────────

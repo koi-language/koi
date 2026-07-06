@@ -235,14 +235,22 @@ function _mergeSlivers(runs, prof, medianOverride = null) {
 /**
  * Segment a sheet into CONTENT ISLANDS at FULL resolution (downsampling
  * blurs thin gutters; loops sample x/y stride 2 for speed):
- *   1) greyscale raw buffer; per-scanline MAX-luminance row profile;
- *   2) CONTENT STRIPES: row runs with max >= 20, discarding stripes shorter
- *      than 4% of H (noise slivers); black bands of ANY width separate them;
- *   3) per stripe: per-column max profile WITHIN the stripe; CONTENT ISLANDS
- *      are column runs with max >= 20 wider than 4% of W;
+ *   1) greyscale raw buffer; per-scanline DUAL profile: the FRACTION of
+ *      sampled pixels with luminance >= 24 (classification) plus the raw
+ *      max (sliver-merge band test);
+ *   2) CONTENT STRIPES: a scanline is BACKGROUND when that fraction is
+ *      below 0.4% (essentially black, TOLERATING isolated compression
+ *      ringing next to bright content: a strict max>=20 test let ONE
+ *      bright pixel destroy a whole gutter band and rows merged into 2x2
+ *      blocks); content runs shorter than 4% of H are discarded; black
+ *      bands of ANY width separate stripes;
+ *   3) per stripe: per-column dual profile WITHIN the stripe; CONTENT
+ *      ISLANDS are column runs (same fraction test) wider than 4% of W;
  *   4) panels = islands in reading order (stripes top-to-bottom, islands
  *      left-to-right), each the island's bounding box;
- *   5) sliver merge on both axes (see _mergeSlivers).
+ *   5) sliver merge on both axes (see _mergeSlivers), which keeps testing
+ *      the intervening band's RAW max (>6): ghost-fragment gaps peak well
+ *      below the 24 luminance cut, so the fraction profile can't see them.
  * Returns { W, H, panels: [{left,top,width,height}], stripes }.
  */
 export async function contentIslands({ sharp, sheet }) {
@@ -262,22 +270,34 @@ export async function contentIslands({ sharp, sheet }) {
   const meta = await sharp(sheet).metadata();
   const W = meta.width, H = meta.height;
   const raw = await sharp(sheet).greyscale().raw().toBuffer(); // FULL res
-  const CONTENT = 20;
+  // TOLERANT dark-line test (islands-v2): a scanline is BACKGROUND when
+  // fewer than 0.4% of its sampled pixels reach luminance 24. Isolated
+  // compression-ringing pixels beside bright content (sunset skies, white
+  // robes) no longer destroy a gutter, unlike the old binary max>=20 test.
+  const LUM = 24;
+  const FRAC = 0.004;
 
-  // 1) Row profile (x stride 2; early-out once classification is fixed).
+  // 1) Row profiles (x stride 2): bright-pixel count for classification
+  //    (early-out once the row is provably content) + raw max for the
+  //    sliver-merge band test (background rows complete the scan).
+  const rowSamples = Math.ceil(W / 2);
+  const rowNeed = Math.max(1, Math.ceil(rowSamples * FRAC));
+  const rowContent = new Array(H).fill(0); // 1 = content scanline
   const rowMax = new Array(H).fill(0);
   for (let y = 0; y < H; y++) {
     const off = y * W;
-    let m = 0;
+    let m = 0, cnt = 0;
     for (let x = 0; x < W; x += 2) {
       const v = raw[off + x];
-      if (v > m) { m = v; if (m >= CONTENT) break; }
+      if (v > m) m = v;
+      if (v >= LUM && ++cnt >= rowNeed) break;
     }
+    rowContent[y] = cnt >= rowNeed ? 1 : 0;
     rowMax[y] = m;
   }
 
-  // 2) Content stripes + sliver merge.
-  let stripes = _contentRuns(rowMax, CONTENT).filter((s) => s.end - s.start >= H * 0.04);
+  // 2) Content stripes + sliver merge (band test on the RAW max profile).
+  let stripes = _contentRuns(rowContent, 1).filter((s) => s.end - s.start >= H * 0.04);
   stripes = _mergeSlivers(stripes, rowMax);
 
   // 3+4) Per-stripe islands, reading order. TWO passes: raw islands of every
@@ -287,16 +307,21 @@ export async function contentIslands({ sharp, sheet }) {
   const perStripe = [];
   const allWidths = [];
   for (const s of stripes) {
+    const colSamples = Math.max(1, Math.ceil((s.end - s.start) / 2));
+    const colNeed = Math.max(1, Math.ceil(colSamples * FRAC));
+    const colContent = new Array(W).fill(0);
     const colMax = new Array(W).fill(0);
     for (let x = 0; x < W; x++) {
-      let m = 0;
+      let m = 0, cnt = 0;
       for (let y = s.start; y < s.end; y += 2) {
         const v = raw[y * W + x];
-        if (v > m) { m = v; if (m >= CONTENT) break; }
+        if (v > m) m = v;
+        if (v >= LUM && ++cnt >= colNeed) break;
       }
+      colContent[x] = cnt >= colNeed ? 1 : 0;
       colMax[x] = m;
     }
-    const islands = _contentRuns(colMax, CONTENT).filter((r) => r.end - r.start >= W * 0.04);
+    const islands = _contentRuns(colContent, 1).filter((r) => r.end - r.start >= W * 0.04);
     for (const r of islands) allWidths.push(r.end - r.start);
     perStripe.push({ stripe: s, colMax, islands });
   }
@@ -485,7 +510,7 @@ export function geometryCachePath(sheet) {
 function _readGeometryCache(sheet, st) {
   try {
     const j = JSON.parse(fs.readFileSync(geometryCachePath(sheet), 'utf8'));
-    if (j?.algo !== 'islands-v1') return null;
+    if (j?.algo !== 'islands-v2') return null;
     if (j.mtimeMs !== Math.floor(st.mtimeMs) || j.fileSize !== st.size) return null;
     if (!Array.isArray(j.islands) || !Number.isInteger(j.width) || !Number.isInteger(j.height)) return null;
     return j;
@@ -498,7 +523,7 @@ function _writeGeometryCache(sheet, st, { width, height, islands }) {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const tmp = `${p}.tmp-${Date.now()}`;
     fs.writeFileSync(tmp, JSON.stringify({
-      algo: 'islands-v1',
+      algo: 'islands-v2',
       mtimeMs: Math.floor(st.mtimeMs),
       fileSize: st.size,
       width,

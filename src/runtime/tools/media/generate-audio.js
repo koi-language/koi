@@ -166,7 +166,6 @@ const generateAudioAction = {
     if (mode === 'speech') {
       const text = action.text;
       if (!text) throw new Error('generate_audio: "text" is required for speech mode');
-      if (!action.saveTo) throw new Error('generate_audio: "saveTo" is required for speech mode — specify where to save the audio file');
 
       const voice = voiceOverride || action.voice || 'alloy';
       const outputFormat = action.outputFormat || 'mp3';
@@ -188,14 +187,17 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      // Save to disk
-      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
-      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
-      const requestedSaveTo = path.resolve(action.saveTo);
-      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      // Save to disk. saveTo is OPTIONAL: the ORIGINAL always lands in
+      // ~/.koi/audio (the creations drawer indexes it); when a saveTo IS
+      // given, an extra export COPY is placed there. MCP media tools never
+      // pass saveTo, so REQUIRING it broke every generate_audio call through
+      // the MCP bridge — hence the fallback auto-name here.
+      const requestedSaveTo = action.saveTo ? path.resolve(action.saveTo) : null;
+      const savePath = path.join(os.homedir(), '.koi', 'audio',
+        requestedSaveTo ? path.basename(requestedSaveTo) : `speech-${Date.now()}.${outputFormat}`);
       fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
-      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
+      const exportedTo = requestedSaveTo ? exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' }) : null;
 
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
@@ -241,7 +243,6 @@ const generateAudioAction = {
     if (mode === 'sfx') {
       const prompt = action.prompt || action.text;
       if (!prompt) throw new Error('generate_audio: "prompt" is required for sfx mode');
-      if (!action.saveTo) throw new Error('generate_audio: "saveTo" is required for sfx mode — specify where to save the audio file');
       if (typeof instance.sfx !== 'function') {
         return {
           success: false,
@@ -301,13 +302,15 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
-      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
-      const requestedSaveTo = path.resolve(action.saveTo);
-      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      // saveTo is OPTIONAL: the ORIGINAL always lands in ~/.koi/audio (drawer
+      // indexes it); a saveTo, when given, gets an extra export COPY. MCP
+      // media tools don't pass saveTo, so requiring it broke the MCP path.
+      const requestedSaveTo = action.saveTo ? path.resolve(action.saveTo) : null;
+      const savePath = path.join(os.homedir(), '.koi', 'audio',
+        requestedSaveTo ? path.basename(requestedSaveTo) : `sfx-${Date.now()}.${action.outputFormat || 'mp3'}`);
       fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
-      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
+      const exportedTo = requestedSaveTo ? exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' }) : null;
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
       try {
@@ -379,13 +382,15 @@ const generateAudioAction = {
         ...(_onStatus ? { onStatus: _onStatus } : {}),
       });
 
-      // The ORIGINAL always lands in ~/.koi/audio so the creations drawer
-      // indexes it; the user's saveTo gets a COPY (exportMediaCopy).
-      const requestedSaveTo = path.resolve(action.saveTo);
-      const savePath = path.join(os.homedir(), '.koi', 'audio', path.basename(requestedSaveTo));
+      // saveTo is OPTIONAL: the ORIGINAL always lands in ~/.koi/audio (drawer
+      // indexes it); a saveTo, when given, gets an extra export COPY. MCP
+      // media tools don't pass saveTo, so requiring it broke the MCP path.
+      const requestedSaveTo = action.saveTo ? path.resolve(action.saveTo) : null;
+      const savePath = path.join(os.homedir(), '.koi', 'audio',
+        requestedSaveTo ? path.basename(requestedSaveTo) : `music-${Date.now()}.${outputFormat}`);
       fs.mkdirSync(path.dirname(savePath), { recursive: true });
       fs.writeFileSync(savePath, result.audio);
-      const exportedTo = exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' });
+      const exportedTo = requestedSaveTo ? exportMediaCopy(savePath, requestedSaveTo, { logTag: 'audio' }) : null;
       channel.log('audio', `Saved: ${savePath} (${result.audio.length} bytes)`);
 
       try {
