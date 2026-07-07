@@ -40,6 +40,7 @@ import {
   targetDimsForResolutionAspect,
   stripVideoEditList,
   normalizeVideoForProvider,
+  trimBlackEdges,
 } from './_pad-and-recover.js';
 import { spawn as _spawnForProbe } from 'child_process';
 import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
@@ -1731,6 +1732,20 @@ const generateVideoAction = {
           }
         } catch (err) {
           channel.log('video', `recoverFromPadded failed (keeping padded): ${err.message}`);
+        }
+      }
+      // On an EDIT, some editors return a clip LONGER than the source and
+      // pad the extra time with BLACK (e.g. a 2 s source coming back as 4 s
+      // with a black tail). Strip ONLY that edge-black, never cap by
+      // duration: a genuinely-longer all-content edit is left untouched.
+      if (savedTo && action.kind === 'edit') {
+        try {
+          const deblacked = await trimBlackEdges(savedTo);
+          if (deblacked && deblacked !== savedTo) {
+            savedTo = deblacked;
+          }
+        } catch (err) {
+          channel.log('video', `trimBlackEdges failed (keeping as-is): ${err.message}`);
         }
       }
       // Always strip the mov edit list from the final video. libx264

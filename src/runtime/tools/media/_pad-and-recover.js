@@ -1345,6 +1345,121 @@ export async function recoverFromPadded(filePath, geometry, kind) {
  *   - null when input is missing / not a video / strip fails
  *     (caller keeps the original path)
  */
+/**
+ * Trim BLACK padding off the EDGES of a video (leading and/or trailing
+ * fully-black frames), keeping ALL real content in between. Used on
+ * video-EDIT outputs: some editors return a clip longer than the source,
+ * padding the extra time with black; the user should never see that filler.
+ * This does NOT cap by duration: a genuinely longer edit that is all
+ * content is left untouched; ONLY edge-black is removed. Returns the new
+ * (de-blacked) path, or the original path when there's no edge black.
+ */
+export async function trimBlackEdges(filePath) {
+  if (!filePath || typeof filePath !== 'string' || !fs.existsSync(filePath)) return filePath;
+  const bins = await _resolveFfmpeg();
+  if (!bins?.ffmpeg) return filePath;
+  const totalMs = await _probeDurationMs(filePath);
+  if (!Number.isFinite(totalMs) || totalMs <= 0) return filePath;
+
+  // Detect black intervals. pix_th=0.10 = pixels below ~10% luma count as
+  // black; d=0.05 ignores single-frame flickers. Reported on stderr as
+  // "black_start:X black_end:Y".
+  const intervals = await new Promise((resolve) => {
+    const proc = spawn(bins.ffmpeg, [
+      '-hide_banner', '-i', filePath,
+      '-vf', 'blackdetect=d=0.05:pix_th=0.10',
+      '-an', '-f', 'null', '-',
+    ]);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.stdout.on('data', () => {});
+    proc.on('close', () => {
+      const out = [];
+      const re = /black_start:(\d+(?:\.\d+)?)\s+black_end:(\d+(?:\.\d+)?)/g;
+      let m;
+      while ((m = re.exec(err)) !== null) {
+        out.push({ start: parseFloat(m[1]) * 1000, end: parseFloat(m[2]) * 1000 });
+      }
+      resolve(out);
+    });
+    proc.on('error', () => resolve([]));
+  });
+  if (intervals.length === 0) return filePath;
+
+  const EDGE_EPS = 80; // ms: how close to an edge a black run must sit to count as padding
+  let trimStart = 0;
+  let trimEnd = totalMs;
+  const first = intervals[0];
+  if (first.start <= EDGE_EPS) trimStart = first.end;          // leading black
+  const last = intervals[intervals.length - 1];
+  if (last.end >= totalMs - EDGE_EPS) trimEnd = last.start;    // trailing black
+
+  // No edge black, or trimming would collapse the clip → leave it alone.
+  if (trimStart <= EDGE_EPS && trimEnd >= totalMs - EDGE_EPS) return filePath;
+  if (trimEnd - trimStart < 100) return filePath;
+
+  const dir = _ensureTmpDir();
+  const out = path.join(dir, `${_hash([filePath, String(trimStart | 0), String(trimEnd | 0)])}.deblack.mp4`);
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
+  const ok = await new Promise((resolve) => {
+    const proc = spawn(bins.ffmpeg, [
+      '-hide_banner', '-loglevel', 'error',
+      '-ss', (trimStart / 1000).toFixed(3),
+      '-i', filePath,
+      '-t', ((trimEnd - trimStart) / 1000).toFixed(3),
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+      '-movflags', '+faststart', '-y', out,
+    ]);
+    proc.stderr.on('data', () => {});
+    proc.stdout.on('data', () => {});
+    proc.on('close', (code) => resolve(code === 0));
+    proc.on('error', () => resolve(false));
+  });
+  if (ok && fs.existsSync(out) && fs.statSync(out).size > 0) {
+    channel.log('video',
+      `trimBlackEdges: removed edge black, kept [${(trimStart / 1000).toFixed(2)}s..${(trimEnd / 1000).toFixed(2)}s] of ${(totalMs / 1000).toFixed(2)}s`);
+    return out;
+  }
+  return filePath;
+}
+
+/**
+ * Probe two things in one ffprobe call: whether the video carries B-frames
+ * (has_b_frames > 0) and its color tags. B-frames reorder decode vs
+ * PRESENTATION order, which desyncs every frame-based operation downstream
+ * (shot-cut placement, the exact-frame crop, and the timeline player's
+ * display of a clip's edge frames: the "2 leftover frames of the next shot
+ * in the previous clip" bug). Returns { hasBFrames, primaries, trc, matrix, range }.
+ */
+async function _probeVideoStream(filePath) {
+  const bins = await _resolveFfmpeg();
+  if (!bins?.ffprobe) return { hasBFrames: false };
+  return await new Promise((resolve) => {
+    const proc = spawn(bins.ffprobe, [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=has_b_frames,color_primaries,color_transfer,color_space,color_range',
+      '-of', 'json', filePath,
+    ]);
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr.on('data', () => {});
+    proc.on('close', () => {
+      try {
+        const s = (JSON.parse(out).streams || [])[0] || {};
+        resolve({
+          hasBFrames: Number(s.has_b_frames) > 0,
+          primaries: s.color_primaries && s.color_primaries !== 'unknown' ? s.color_primaries : null,
+          trc: s.color_transfer && s.color_transfer !== 'unknown' ? s.color_transfer : null,
+          matrix: s.color_space && s.color_space !== 'unknown' ? s.color_space : null,
+          range: s.color_range && s.color_range !== 'unknown' ? s.color_range : null,
+        });
+      } catch { resolve({ hasBFrames: false }); }
+    });
+    proc.on('error', () => resolve({ hasBFrames: false }));
+  });
+}
+
 export async function stripVideoEditList(filePath) {
   if (!filePath || typeof filePath !== 'string') return null;
   if (!fs.existsSync(filePath)) return null;
@@ -1356,21 +1471,44 @@ export async function stripVideoEditList(filePath) {
   const stem = path.basename(filePath, path.extname(filePath));
   const out = path.join(dir, `${stem}.noedts.mp4`);
   if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
-  const args = [
-    '-hide_banner', '-loglevel', 'error',
-    '-i', filePath,
-    '-c', 'copy',
-    '-movflags', '+faststart',
-    // See padded-encode notes above — `-use_editlist 0` replaces the
-    // legacy `-movflags -use_edts` which ffmpeg ≥ 7.0 no longer accepts.
-    '-use_editlist', '0',
-    '-y', out,
-  ];
+
+  const probe = await _probeVideoStream(filePath);
+  let args;
+  if (probe.hasBFrames) {
+    // B-frames present → RE-ENCODE without them (`-bf 0`) so decode order ==
+    // presentation order everywhere downstream. Near-lossless (CRF 18) and
+    // color tags are preserved from the source so nothing shifts.
+    args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', filePath,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+      '-bf', '0', '-pix_fmt', 'yuv420p',
+      ...(probe.primaries ? ['-color_primaries', probe.primaries] : []),
+      ...(probe.trc ? ['-color_trc', probe.trc] : []),
+      ...(probe.matrix ? ['-colorspace', probe.matrix] : []),
+      ...(probe.range ? ['-color_range', probe.range] : []),
+      '-c:a', 'copy',
+      '-movflags', '+faststart', '-use_editlist', '0',
+      '-y', out,
+    ];
+  } else {
+    // No B-frames → the cheap re-mux is enough (just strip the edit list).
+    args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', filePath,
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      // See padded-encode notes above: `-use_editlist 0` replaces the
+      // legacy `-movflags -use_edts` which ffmpeg ≥ 7.0 no longer accepts.
+      '-use_editlist', '0',
+      '-y', out,
+    ];
+  }
   const ok = await _runFfmpeg(bins, args);
   if (!ok) {
-    channel.log('pad', `stripVideoEditList: re-mux failed — keeping original (${path.basename(filePath)})`);
+    channel.log('pad', `stripVideoEditList: ${probe.hasBFrames ? 're-encode' : 're-mux'} failed, keeping original (${path.basename(filePath)})`);
     return null;
   }
-  channel.log('pad', `stripVideoEditList: ${path.basename(filePath)} → ${path.basename(out)} (no edts)`);
+  channel.log('pad', `stripVideoEditList: ${path.basename(filePath)} → ${path.basename(out)} (${probe.hasBFrames ? 'no edts + no B-frames' : 'no edts'})`);
   return out;
 }
