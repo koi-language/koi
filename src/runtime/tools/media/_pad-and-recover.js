@@ -135,13 +135,25 @@ export async function normalizeVideoForProvider(inputPath) {
     const bins = await _resolveFfmpeg();
     if (!bins?.ffmpeg) return inputPath; // no ffmpeg → can't normalize; upload as-is
 
-    let codec = '', pixFmt = '', rotation = 0;
+    let codec = '', pixFmt = '', rotation = 0, isHdr = false, colorDesc = '';
     if (bins.ffprobe) {
       const st = await _probeVideoStreamJson(bins.ffprobe, inputPath);
       if (st) {
         codec = String(st.codec_name || '').toLowerCase();
         pixFmt = String(st.pix_fmt || '').toLowerCase();
         rotation = _rotationFromStream(st);
+        // iPhone 4K/selfie records BT.2020 + HLG (arib-std-b67) or PQ
+        // (smpte2084) 10-bit HDR. Truncating those to 8-bit yuv420p WITHOUT
+        // tonemapping bakes washed-out / lavado colours into the mp4 and drops
+        // the transfer tag, so every downstream viewer (timeline filmstrip,
+        // native player, thumbnails) renders it too light. Tonemap to BT.709
+        // SDR on re-encode so the delivery file is correct everywhere.
+        const trc = String(st.color_transfer || '').toLowerCase();
+        const prim = String(st.color_primaries || '').toLowerCase();
+        const space = String(st.color_space || '').toLowerCase();
+        isHdr = trc === 'smpte2084' || trc === 'arib-std-b67' ||
+          prim === 'bt2020' || space === 'bt2020nc' || space === 'bt2020c';
+        if (isHdr) colorDesc = `transfer=${trc || '?'},primaries=${prim || '?'},space=${space || '?'}`;
       }
     }
     const ext = path.extname(inputPath).toLowerCase();
@@ -151,8 +163,9 @@ export async function normalizeVideoForProvider(inputPath) {
     const hasRotation = Math.abs(rotation) >= 1;
 
     // Already a compliant delivery file → nothing to do. (Only trust this
-    // when we could actually probe the codec/pixfmt.)
-    if (bins.ffprobe && isMp4 && isH264 && is420 && !hasRotation) return inputPath;
+    // when we could actually probe the codec/pixfmt.) An HDR source is NEVER
+    // compliant even if it's already h264/420 — it still needs the tonemap.
+    if (bins.ffprobe && isMp4 && isH264 && is420 && !hasRotation && !isHdr) return inputPath;
 
     const outDir = path.join(os.tmpdir(), 'koi-normalized');
     fs.mkdirSync(outDir, { recursive: true });
@@ -164,12 +177,22 @@ export async function normalizeVideoForProvider(inputPath) {
 
     // Lossless remux when the codec is already deliverable and only the
     // container is wrong. Otherwise re-encode to H.264 (visually lossless).
-    const canRemux = bins.ffprobe && isH264 && is420 && !hasRotation;
+    // HDR sources always re-encode (they need the tonemap), never remux.
+    const canRemux = bins.ffprobe && isH264 && is420 && !hasRotation && !isHdr;
+    // HDR → SDR BT.709 tonemap chain (canonical zscale recipe, same as
+    // extract_frame). Applied only when the source is HDR; tags the output
+    // BT.709 so players don't second-guess the (now SDR) pixels.
+    const hdrVf =
+      'zscale=t=linear:npl=100,format=gbrpf32le,' +
+      'zscale=p=bt709,tonemap=tonemap=hable:desat=0,' +
+      'zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
     const args = canRemux
       ? ['-y', '-i', inputPath, '-c', 'copy', '-movflags', '+faststart', out]
       : ['-y', '-i', inputPath,
+         ...(isHdr ? ['-vf', hdrVf] : []),
          '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
          '-pix_fmt', 'yuv420p',
+         ...(isHdr ? ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'] : []),
          '-c:a', 'aac', '-b:a', '192k',
          '-movflags', '+faststart', out];
 
@@ -177,7 +200,7 @@ export async function normalizeVideoForProvider(inputPath) {
     if (ok && fs.existsSync(out) && fs.statSync(out).size > 0) {
       channel.log('video',
         `normalized ${path.basename(inputPath)} → ${path.basename(out)} ` +
-        `(${canRemux ? 'remux, lossless' : `re-encode H.264 crf18${hasRotation ? `, rotation ${rotation}° baked` : ''}`}` +
+        `(${canRemux ? 'remux, lossless' : `re-encode H.264 crf18${hasRotation ? `, rotation ${rotation}° baked` : ''}${isHdr ? `, HDR→BT.709 tonemap (${colorDesc})` : ''}`}` +
         `${codec ? `; src codec=${codec || '?'} pix=${pixFmt || '?'}` : ''})`);
       return out;
     }

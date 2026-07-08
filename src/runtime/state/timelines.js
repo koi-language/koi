@@ -461,9 +461,14 @@ function _normaliseSettings(s = {}) {
   if (markInMs != null && markOutMs != null && markOutMs <= markInMs) {
     markOutMs = null;
   }
-  const out = { videoTracks, audioTracks, pixelsPerSecond, previewSplit, playheadMs };
-  if (markInMs != null) out.markInMs = markInMs;
-  if (markOutMs != null) out.markOutMs = markOutMs;
+  // Preserve pass-through settings the GUI writes (projectWidth/projectHeight/
+  // projectFps, trackHeight, audioTrackHeight, activeVideoTrack/AudioTrack,
+  // vaSplitRatio, …) — the runtime doesn't consume them but MUST round-trip them
+  // so an `update_timeline` from the agent doesn't nuke the GUI's canvas/view
+  // state. Only the fields below get re-validated / clamped.
+  const out = { ...s, videoTracks, audioTracks, pixelsPerSecond, previewSplit, playheadMs };
+  if (markInMs != null) out.markInMs = markInMs; else delete out.markInMs;
+  if (markOutMs != null) out.markOutMs = markOutMs; else delete out.markOutMs;
   // Render settings inherited from the first video clip dropped onto
   // the timeline by `add_clip_to_timeline`. The renderer reads these
   // before falling back to the hard 30 fps / 1920×1080 defaults — so
@@ -482,6 +487,28 @@ function _normalise(state) {
   const clips = Array.isArray(state.clips)
     ? state.clips.map((c) => _validateClip(c, settings))
     : [];
+  // AUTO-ASSIGN the canvas from the FIRST video clip's source dimensions, on
+  // EVERY save — so a timeline always matches its footage (never a 1080×1920
+  // reel squished into a 960×960 square). The agent building the JSON via
+  // update_timeline can't get the aspect ratio wrong: the tool sets it. Writes
+  // BOTH conventions — GUI (projectWidth/projectHeight) and renderer
+  // (width/height) — so the visor and the render agree. A user who truly wants a
+  // different render shape reframes clips (aspect belongs at generation time,
+  // per the skill), not by fighting the canvas.
+  const firstVid = clips.find((c) =>
+    _isVideoTrack(c.track)
+    && typeof c.path === 'string'
+    && !/^(title:|timeline:|ai-|placeholder)/.test(c.path)
+    && Number.isFinite(c.sourceWidthPx) && c.sourceWidthPx > 0
+    && Number.isFinite(c.sourceHeightPx) && c.sourceHeightPx > 0);
+  if (firstVid) {
+    const w = Math.round(firstVid.sourceWidthPx);
+    const h = Math.round(firstVid.sourceHeightPx);
+    settings.projectWidth = w;
+    settings.projectHeight = h;
+    settings.width = w;
+    settings.height = h;
+  }
   return {
     id: state.id,
     name: typeof state.name === 'string' && state.name.trim() ? state.name.trim() : 'Timeline',

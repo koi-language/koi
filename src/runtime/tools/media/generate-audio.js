@@ -33,7 +33,7 @@ const generateAudioAction = {
   bannerKind: 'audio',
   bannerLabel: 'Generando audio',
   bannerIconId: 'generate-audio',
-  description: 'Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. Model is auto-selected from the active catalog — describe what you want (mode, voice, label) and let the picker pick the cheapest capable model. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (required, file path), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (required, file path), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (required, file path), optional "durationSeconds" (ElevenLabs Music ~10..300), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
+  description: 'Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. Model is auto-selected from the active catalog — describe what you want (mode, voice, label) and let the picker pick the cheapest capable model. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "durationSeconds" (ElevenLabs Music ~10..300), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
   thinkingHint: (action) => {
     if (action.mode === 'transcribe') return 'Transcribing audio';
     if (action.mode === 'sfx') return 'Generating sound effect';
@@ -51,7 +51,7 @@ const generateAudioAction = {
       voice:        { type: 'string', description: 'Voice: preset name (alloy, echo, fable, onyx, nova, shimmer for OpenAI; provider-specific names for ElevenLabs / MiniMax) OR a cloned-voice name registered via create_voice. Default: alloy.' },
       outputFormat: { type: 'string', description: 'Audio format: mp3, opus, aac, flac, wav, pcm (default: mp3)' },
       speed:        { type: 'number', description: 'Speed multiplier: 0.25 to 4.0 (default: 1.0)' },
-      saveTo:       { type: 'string', description: 'File path where a COPY of the generated audio is placed (required for speech, sfx and music modes). The ORIGINAL is always kept in ~/.koi/audio/ so the creations drawer finds it: the response `savedTo` is that original and `exportedTo` is the copy at your path.' },
+      saveTo:       { type: 'string', description: 'OPTIONAL file path where a COPY of the generated audio is also placed. The ORIGINAL is ALWAYS kept in ~/.koi/audio/ so the creations drawer finds it (that is the response `savedTo`); pass saveTo only to ALSO drop a named copy at your path (returned as `exportedTo`). Not required in any mode.' },
       emotion:      { type: 'string', description: 'Voice emotion (MiniMax / ElevenLabs only): happy, sad, angry, calm, surprised, disgusted, fearful, neutral.' },
       pitch:        { type: 'number', description: 'Pitch offset in semitones (MiniMax: -12..12). Ignored by OpenAI.' },
       volume:       { type: 'number', description: 'Volume multiplier (MiniMax: 0..10, default 1.0). Ignored by OpenAI.' },
@@ -357,7 +357,9 @@ const generateAudioAction = {
     if (mode === 'music') {
       const prompt = action.prompt || action.text;
       if (!prompt) throw new Error('generate_audio: "prompt" is required for music mode');
-      if (!action.saveTo) throw new Error('generate_audio: "saveTo" is required for music mode — specify where to save the audio file');
+      // saveTo is OPTIONAL (like speech/sfx): the original always lands in
+      // ~/.koi/audio (see below). The MCP path never passes saveTo, so
+      // REQUIRING it here broke every music call through MCP.
       if (typeof instance.music !== 'function') {
         return {
           success: false,
@@ -370,7 +372,7 @@ const generateAudioAction = {
       channel.log(
         'audio',
         `generate_audio (music): ${resolved.provider}/${resolved.model}, format=${outputFormat}, ` +
-        `duration=${action.durationSeconds ?? '-'}s, prompt="${String(prompt).substring(0, 100)}", saveTo=${action.saveTo}`,
+        `duration=${action.durationSeconds ?? '-'}s, prompt="${String(prompt).substring(0, 100)}", saveTo=${action.saveTo || 'default'}`,
       );
 
       const result = await instance.music(prompt, {
