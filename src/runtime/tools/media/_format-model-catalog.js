@@ -1,20 +1,24 @@
 /**
- * Format a per-category, per-model catalog summary block. Used by
+ * Format a per-model catalog as a MARKDOWN TABLE. Used by
  * generate-image / generate-video / generate-audio at import time to
- * append a "Catalog snapshot" section to the tool description, so the
- * agent can see — for the SAME tool call — which models live in each
- * Koi-owned bucket and which labels (if any) bias them.
+ * append a "Catalog" section to the tool description, so the agent can
+ * see — for the SAME tool call — every model it may pick, together with
+ * the Koi-owned CATEGORIES each one carries and any LABELS that bias it.
  *
- * Per-line output is intentionally minimal:
- *   `slug (displayName) [labels: ...] $X/unit`
+ * The agent MUST pick the model itself (`model` is a required parameter):
+ * there is no auto-router any more. The rule the agent follows is
+ * category-matching — pick a slug whose Categories column contains the
+ * bucket for the operation it is performing (generation / editing /
+ * extend / upscaling / background_removal / avatar / tts / sfx / music /
+ * transcribe …). NEVER pick a model that lacks the category for the
+ * operation (e.g. never edit with a generation-only model). The skills
+ * (image-models / video-models / audio-models) explain what each
+ * category is for; this table is the live inventory.
  *
- * No vendor-derived knobs are surfaced (no aspectRatios, resolutions,
- * durations, maxRefImages, frame-control, image-to-video, lipsync,
- * tts/sfx/music/transcribe, ops, etc.). The router picks by category +
- * label + price; the per-slug adapter is the sole authority on what
- * each model physically accepts. If the picker lands on a model that
- * can't handle the request's input shape, the adapter rejects at
- * build-time with a clear error.
+ * Table columns: `Model` | `Categories` | `Labels` | `Price`.
+ * A label glossary follows the table so the agent knows what each label
+ * MEANS (e.g. that "face-consistency" keeps people in ref images looking
+ * identical, not a generic quality knob).
  */
 
 function _labelSlugs(m) {
@@ -26,16 +30,26 @@ function _labelSlugs(m) {
   }).filter(Boolean);
 }
 
-function _modelLine(m) {
+function _categorySlugs(m) {
+  return Array.isArray(m?.categories) && m.categories.length > 0
+    ? m.categories.slice()
+    : ['(uncategorised)'];
+}
+
+// Escape a value for a markdown table cell (pipes would break columns).
+function _cell(s) {
+  return String(s == null ? '' : s).replace(/\|/g, '\\|');
+}
+
+function _tableRow(m) {
   const display = m.displayName && m.displayName !== m.slug ? ` (${m.displayName})` : '';
-  const parts = [];
-  const labels = _labelSlugs(m);
-  if (labels.length) parts.push(`labels: ${labels.join(', ')}`);
-  if (typeof m.pricePerUnit === 'number' && m.pricePerUnit > 0) {
-    parts.push(`$${m.pricePerUnit}/${m.unitType || 'unit'}`);
-  }
-  const tail = parts.length ? ` | ${parts.join(' | ')}` : '';
-  return `      - "${m.slug}"${display}${tail}`;
+  const name = `\`${m.slug}\`${display}`;
+  const cats = _categorySlugs(m).join(', ');
+  const labels = _labelSlugs(m).join(', ') || '—';
+  const price = (typeof m.pricePerUnit === 'number' && m.pricePerUnit > 0)
+    ? `$${m.pricePerUnit}/${m.unitType || 'unit'}`
+    : '—';
+  return `| ${_cell(name)} | ${_cell(cats)} | ${_cell(labels)} | ${_cell(price)} |`;
 }
 
 // Build a single global slug → description glossary from every model's
@@ -61,53 +75,59 @@ function _collectLabelGlossary(models) {
 
 /**
  * @param {Array<object>} models - rows from /gateway/models/{kind}.json
- * @returns {string} a leading-newline section listing every model grouped
- *   by Koi-owned category, or '' when the list is empty.
+ * @returns {string} a leading-newline markdown-table section listing every
+ *   model with its categories + labels + price, or '' when the list is empty.
  */
 export function formatModelCatalog(models) {
   if (!Array.isArray(models) || models.length === 0) return '';
-  const groups = new Map();
-  for (const m of models) {
-    const cats = Array.isArray(m.categories) && m.categories.length > 0
-      ? m.categories
-      : ['(uncategorised)'];
-    for (const cat of cats) {
-      if (!groups.has(cat)) groups.set(cat, []);
-      groups.get(cat).push(m);
-    }
-  }
-  const sortedCats = [...groups.keys()].sort();
-  const sections = sortedCats.map((cat) => {
-    const list = groups.get(cat);
-    const lines = list.map(_modelLine).join('\n');
-    return `  • [${cat}]\n${lines}`;
+
+  // Sort rows by first category, then slug, so models of the same operation
+  // sit together in the table and the agent can scan a bucket at a glance.
+  const rows = models.slice().sort((a, b) => {
+    const ca = _categorySlugs(a)[0] || '';
+    const cb = _categorySlugs(b)[0] || '';
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    return String(a.slug) < String(b.slug) ? -1 : 1;
   });
 
-  // Glossary block — the per-model lines only show the label slug so the
-  // listing stays tight; the agent reads what each label MEANS here. This
-  // is what tells it that "face-consistency" is for keeping people in ref
-  // images looking identical, not just a generic quality knob.
+  const table = [
+    '| Model | Categories | Labels | Price |',
+    '| --- | --- | --- | --- |',
+    ...rows.map(_tableRow),
+  ].join('\n');
+
+  // Glossary block — the table only shows the label slug so it stays tight;
+  // the agent reads what each label MEANS here.
   const glossary = _collectLabelGlossary(models);
   let glossaryBlock = '';
   if (glossary.size > 0) {
     const slugs = [...glossary.keys()].sort();
     const lines = slugs.map((slug) => {
       const desc = glossary.get(slug);
-      return desc ? `  - ${slug} — ${desc}` : `  - ${slug}`;
+      return desc ? `  - \`${slug}\` — ${desc}` : `  - \`${slug}\``;
     }).join('\n');
     glossaryBlock = (
-      '\n\nLabel glossary (use these in the "label" param to bias the picker ' +
-      'toward a specialised model — pick the slug whose description matches ' +
-      'the task; omit when no specialisation is needed):\n' + lines
+      '\n\nLabel glossary — a label marks the content / subject / style a model ' +
+      'is BEST-SUITED for (e.g. `cities` → city photos, `manga` → manga ' +
+      'drawings). If the request matches a model\'s label, PREFER that model ' +
+      'within its category. Labels are context for choosing, NOT an input ' +
+      'parameter:\n' + lines
     );
   }
 
   return (
-    '\n\nActive models in the catalog (the router auto-picks one per request ' +
-    'based on Koi-owned category + label + price; per-model knobs are not ' +
-    'surfaced here — pass your params and the per-slug adapter handles ' +
-    'shape mismatches at execution time with a clear error):\n' +
-    sections.join('\n') +
+    '\n\n## Catalog — pick a model (`model` is REQUIRED)\n' +
+    'This table below IS the authoritative, live model catalog — every model ' +
+    'with its **Categories** and **Labels**. Read it RIGHT HERE to choose; ' +
+    'do NOT grep files, `references/`, or the backend for models / categories ' +
+    '/ labels. You MUST pass `model` with one of the slugs below — there is no ' +
+    'auto-selection. Pick a model whose **Categories** column contains the ' +
+    'bucket for the operation you are doing, and NEVER pick one that lacks ' +
+    'it (e.g. do not edit with a generation-only model, do not upscale with ' +
+    'an editing model). When several models fit, choose on price / labels / ' +
+    'the per-model notes in the matching skill (image-models / video-models ' +
+    '/ audio-models).\n\n' +
+    table +
     glossaryBlock
   );
 }

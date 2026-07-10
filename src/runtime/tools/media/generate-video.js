@@ -442,15 +442,16 @@ const generateVideoAction = {
       saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in ~/.koi/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
-      model:           { type: 'string',  description: 'OPTIONAL. Pin a SPECIFIC model slug — it WINS over the auto-picker. OMIT (or "auto") to let the router auto-select the best model for your params: that is the DEFAULT and the RECOMMENDED choice when you do not know exactly which model to use. Valid slugs are the ones in the per-model catalog at the END of this description; pinning one whose adapter rejects your request shape (e.g. an image-to-video slug for a text-only prompt) will fail — auto avoids that.' },
+      model:           { type: 'string',  description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories column matches your operation AND whose input shape matches your request: text-to-video / image-to-video / reference-to-video → `video_generation` (or `image_to_video`); a v2v transform of an existing clip → `video_editing`; make-longer → `video_extend`; talking-head → `video_avatar`; background removal → `video_background_removal`. NEVER pick a model that lacks the category, and match the input shape (do not pin an image-to-video slug for a text-only prompt, or a text-to-video slug when you pass a startFrame). See the video-models skill for what each category is for and per-model inputs. Omitting this (or passing "auto"/empty) is an error — the tool will refuse. Do NOT invent a slug.' },
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
       preferQuality:   { type: 'boolean', description: 'When true (DEFAULT), the auto-picker prefers MORE EXPENSIVE models on tiebreaks — price is treated as a quality proxy and the user is assumed to want the best result. Set to false ONLY when the user explicitly asks for the cheapest option / a budget run.' },
       kind:            { type: 'string',  enum: ['edit', 'continuation', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. DEFAULT behaviour mirrors `generate_image`: OMIT for plain text-to-video generation; pass `referenceVideos` (without `kind`) and the request automatically routes to `video_editing` (v2v transform — restyle, colour grade, repaint, motion swap; pool = kling-style v2v slugs). The transformation replaces the source content; identity is anchored by the source itself. EXPLICIT VALUES — use ONLY when you want to override the default: "continuation" → opt OUT of editing when the previous clip is being passed in `referenceVideos` purely as a STYLE / IDENTITY carry-over (storyboard-to-video continuity, multi-shot character lock); routes back to `video_generation` so seedance reference-to-video and similar continuation-aware slugs stay in the pool. Use this when the prompt describes a NEW scene that should keep the look of the reference, not a transformation of the reference itself. "edit" → explicit alias for the default v2v editing path; redundant when `referenceVideos` is already present, but accepted for clarity. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
       summary:         { type: 'string',  description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari pulling out of garage — opening shot", "Continuation of shot 2 with rain". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
+      seed:            { type: 'number',  description: 'OPTIONAL. Reproducibility seed — same seed + same prompt ⇒ the same clip on models that support it (Seedance, Veo, WAN, Kling). Use it to lock a look across regenerations / multi-shot continuity. Ignored by models that don\'t expose a seed.' },
     },
-    required: ['prompt']
+    required: ['prompt', 'model']
   },
 
   examples: [
@@ -534,11 +535,22 @@ const generateVideoAction = {
     // NOTE: pinning a model whose adapter rejects your request shape
     // (e.g. an image-to-video slug for a text-only prompt) will fail —
     // that's on the caller; the auto-picker avoids that by construction.
-    if (action.model && action.model !== 'auto') {
-      channel.log(
-        'video',
-        `Honoring caller-supplied model="${action.model}" (explicit pin wins over auto-picker).`,
-      );
+    // `model` is REQUIRED for GENERATION (the agent chooses the slug — no
+    // auto-selection). EXEMPT the server-routed operations (edit / extend /
+    // bg-remove): those dispatch to the configured video editor / matting
+    // model, not an agent-picked one, so requiring a slug there would break
+    // the v2v facade. Everything else (text/image/reference-to-video) must
+    // carry a model.
+    const _serverRoutedVideo = ['edit', 'extend', 'bg-remove'].includes(action.kind);
+    if (!_serverRoutedVideo) {
+      if (typeof action.model !== 'string' || !action.model.trim() || action.model.trim() === 'auto') {
+        return {
+          success: false,
+          error: 'generate_video: "model" is required — pick an exact model slug from the Catalog table in this tool\'s description whose Categories match your operation (video_generation / image_to_video) AND whose input shape matches your request. There is no auto-selection; "auto" and an empty value are not accepted. (Video edit/extend/background-removal are exempt — those route to the configured editor.)',
+        };
+      }
+      action.model = action.model.trim();
+      channel.log('video', `Using agent-chosen model="${action.model}".`);
     }
 
     // ── Auto-correct misplaced image files in referenceVideos ────────
@@ -1470,6 +1482,12 @@ const generateVideoAction = {
       label,
       characterOrientation,
       keepOriginalSound,
+      // Reproducibility seed — forwarded to adapters that support it
+      // (seedance / veo / wan / kling). Same seed + same prompt ⇒ same
+      // clip, which is what character-continuity / storyboard workflows need.
+      seed: (typeof action.seed === 'number' && Number.isFinite(action.seed))
+        ? Math.floor(action.seed)
+        : undefined,
       // Forward auto-picker hints. The router consumes these client-side
       // (see GatewayVideoGen.generate → pickVideoModel) — they never leave
       // the device; the chosen slug is what travels to the backend.
@@ -2910,11 +2928,10 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     delete props.shots;
   }
 
-  if (caps.labels?.length) {
-    props.label = { type: 'string', enum: caps.labels };
-  } else {
-    delete props.label;
-  }
+  // `label` is no longer an INPUT parameter — the agent picks the model
+  // directly; per-model labels are shown in the Catalog table for context
+  // only. Never advertise it on the schema.
+  delete props.label;
 
   // `kind` enum is curated dynamically: each value only appears when
   // at least one model carries the matching `categories` tag.
@@ -2937,7 +2954,10 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
   // rejected at submit time. No field is listed unless at least one active
   // model supports it (e.g. withAudio disappears entirely when the fleet
   // has no audio-capable video model).
-  const fields = ['"prompt" (required) — text description of the desired video'];
+  const fields = [
+    '"prompt" (required) — text description of the desired video',
+    '"model" (required) — the exact model slug to run; YOU choose it from the Catalog table at the end of this description. Match your operation to the model\'s Categories AND its input shape: text/image/reference-to-video → `video_generation` / `image_to_video`; v2v transform → `video_editing`; make-longer → `video_extend`; talking-head → `video_avatar`; background removal → `video_background_removal`. Never pick a model lacking the category, and never pin an image-to-video slug for a text-only prompt (or vice-versa). No auto-selection: omitting it (or "auto") is an error.',
+  ];
 
   if (caps.durations?.length) {
     const list = caps.durations.map((v) => `${v}`).join(', ');
@@ -2989,29 +3009,8 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
       `When present, "shots.length" is the clip count and "numShots" is ignored.`,
     );
   }
-  if (caps.labels?.length) {
-    const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
-    // `other` and `default` are admin placeholders, not semantic choices.
-    // Hiding them from the agent's option list stops the agent from
-    // picking them as a "neutral / no-preference" flag — the router
-    // already treats no-label as "rank by quality" and exposing these
-    // names only makes the agent narrow the pool to a single model that
-    // happens to carry the placeholder tag (real-world bug:
-    // `label: 'other'` filtered the catalog down to kling because kling
-    // was the only model carrying that tag, even though seedance i2v
-    // was cheaper, smaller-payload-friendly, and tagged `default`).
-    const meaningfulLabels = caps.labels.filter(
-      (slug) => slug !== 'other' && slug !== 'default',
-    );
-    if (meaningfulLabels.length > 0) {
-      const lines = meaningfulLabels.map((slug) => {
-        const d = details.find((x) => x && x.slug === slug);
-        const desc = d && d.description ? ` — ${d.description}` : '';
-        return `    • "${slug}"${desc}`;
-      }).join('\n');
-      fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved source image/video, look at them — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result. Omit this field for the default routing.\n${lines}`);
-    }
-  }
+  // `label` is intentionally NOT listed as an input field — the agent picks
+  // the model directly; per-model labels live in the Catalog table below.
   if (caps.anyExtend || caps.anyBgRemove) {
     const parts = ['optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:'];
     if (caps.anyExtend) {
@@ -3026,7 +3025,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
   fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
   fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');
 
-  const header = 'Generate a video from a text prompt. Blocks internally until the provider finishes and returns { success, savedTo, url, error? } — the agent does NOT need a second call. The router auto-picks one model from the active catalog based on your params — see the per-model breakdown at the end of this description for what each option supports. Provider failures (validation, content policy, rate-limit, …) come back as success=false with the verbatim provider error in the `error` field. Pass wait=false to run it as a background koi job (then poll with await_job / get_job_status). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'REQUIRED FIRST: the `video-models` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category + input shape) and how to use each one. Generate a video from a text prompt. Blocks internally until the provider finishes and returns { success, savedTo, url, error? } — the agent does NOT need a second call. YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation and whose input shape matches your request (there is no auto-selection). Provider failures (validation, content policy, rate-limit, …) come back as success=false with the verbatim provider error in the `error` field. Pass wait=false to run it as a background koi job (then poll with await_job / get_job_status). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
   const returns = '\nReturns: { success, provider, model, capabilities, savedTo?, url?, status, shots?, error? }. On success=false, read `error` to see what the provider rejected.';
   const asyncSuffix = ' This tool is async-capable: pass wait=false to kick it off as a background job (returns { jobId }) instead of blocking.';

@@ -33,7 +33,7 @@ const generateAudioAction = {
   bannerKind: 'audio',
   bannerLabel: 'Generando audio',
   bannerIconId: 'generate-audio',
-  description: 'Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. Model is auto-selected from the active catalog — describe what you want (mode, voice, label) and let the picker pick the cheapest capable model. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "durationSeconds" (ElevenLabs Music ~10..300), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
+  description: 'REQUIRED FIRST: the `audio-models` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by mode/category) and how to use each one. Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. YOU MUST choose the model: the "model" param is REQUIRED — pick a slug from the Catalog table at the END of this description whose Categories match your mode (audio_tts for speech, audio_sfx for sound effects/Foley, audio_music for music, audio_transcribe for transcription). There is no auto-selection; omitting model (or passing "auto") is an error. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (provider-clamped, e.g. ElevenLabs 0.5–22), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "durationSeconds" (ElevenLabs Music ~10..300), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
   thinkingHint: (action) => {
     if (action.mode === 'transcribe') return 'Transcribing audio';
     if (action.mode === 'sfx') return 'Generating sound effect';
@@ -65,20 +65,10 @@ const generateAudioAction = {
       // Transcribe mode fields
       audioFile:    { type: 'string', description: 'Path to audio file to transcribe (transcribe mode)' },
       language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' },
-      summary:      { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Narrator opening line in Spanish", "Stone door slam for shot 3". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt / text — usable but less semantic.' }
-      // `model` is intentionally NOT declared here. Model selection is the
-      // auto-picker's job — the agent should describe what it wants
-      // (mode, voice, label) and let the client-side router
-      // (`pickAudioModel` in media-model-router.js) pick the cheapest
-      // capable model from the active backend catalog. Declaring `model`
-      // in the schema would invite the agent to invent a slug ("tts-1",
-      // "whisper-1", "elevenlabs-…") that the catalog may not have
-      // active and bypass quota / fallback logic. Same stance as
-      // generate_image. If callers truly need a forced slug they can
-      // still pass `action.model` programmatically — execute() honours
-      // it — it just isn't advertised to the LLM.
+      summary:      { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Narrator opening line in Spanish", "Stone door slam for shot 3". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt / text — usable but less semantic.' },
+      model:        { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories match your mode: speech/TTS → `audio_tts`; sound effect / Foley → `audio_sfx` (video-conditioned SFX needs an `audio_sfx` model that accepts a videoFile); music → `audio_music`; transcribe → `audio_transcribe`. For a cloned voice (from create_voice) pick the speech model that minted it. NEVER pick a model that lacks the category for your mode. See the audio-models skill for what each category is for. Omitting this (or passing "auto"/empty) is an error — the tool will refuse.' }
     },
-    required: []
+    required: ['model']
   },
 
   examples: [
@@ -96,15 +86,20 @@ const generateAudioAction = {
     const _guard = await requireToolInfoFirst('generate_audio', agent);
     if (_guard) return _guard;
 
-    // Strip agent-supplied `model` — auto-picker drives selection.
-    // See generate-video.js for the full rationale.
-    if (action.model && action.model !== 'auto') {
-      channel.log(
-        'audio',
-        `Stripping agent-supplied model="${action.model}" — auto-picker drives selection. ` +
-        `Use excludeModels / includeModels / label to bias instead.`,
-      );
-      action.model = undefined;
+    // `model` is REQUIRED for GENERATION modes (speech/sfx/music) — the
+    // agent picks the slug (no auto-selection). TRANSCRIBE is exempt: it is
+    // speech-to-text with a single STT model, not a creative model choice,
+    // so forcing a slug there is pure friction.
+    const _audioMode = (action.mode === 'tts' ? 'speech' : action.mode) || 'speech';
+    if (_audioMode !== 'transcribe') {
+      if (typeof action.model !== 'string' || !action.model.trim() || action.model.trim() === 'auto') {
+        return {
+          success: false,
+          error: 'generate_audio: "model" is required for speech/sfx/music — pick an exact model slug from the Catalog table in this tool\'s description whose Categories match your mode (audio_tts for speech, audio_sfx for sound effects/Foley, audio_music for music). There is no auto-selection; "auto" and an empty value are not accepted. (Transcribe is exempt.)',
+        };
+      }
+      action.model = action.model.trim();
+      channel.log('audio', `Using agent-chosen model="${action.model}".`);
     }
 
     // Normalise the gateway's canonical kind names back to this tool's
@@ -131,8 +126,15 @@ const generateAudioAction = {
       if (cloned) {
         voiceOverride = cloned.providerVoiceId;
         // Lock to the cloning model — the cloned voice id only exists
-        // within the provider that minted it.
-        if (!modelOverride && cloned.modelSlug) modelOverride = cloned.modelSlug;
+        // within the provider that minted it, so it OVERRIDES the agent's
+        // pick (a mismatched speech model can't resolve the voiceId).
+        if (cloned.modelSlug && cloned.modelSlug !== modelOverride) {
+          channel.log(
+            'audio',
+            `generate_audio: cloned voice="${action.voice}" locks model=${cloned.modelSlug} (overriding chosen model="${modelOverride}").`,
+          );
+          modelOverride = cloned.modelSlug;
+        }
         channel.log(
           'audio',
           `generate_audio: resolved voice="${action.voice}" → providerVoiceId=${cloned.providerVoiceId} (model=${cloned.modelSlug})`,
@@ -521,22 +523,10 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('audio').then((caps) =>
     delete props.outputFormat;
   }
 
-  if (caps.labels?.length) {
-    const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
-    const lines = caps.labels.map((slug) => {
-      const d = details.find((x) => x && x.slug === slug);
-      const desc = d && d.description ? ` — ${d.description}` : '';
-      return `  • "${slug}"${desc}`;
-    }).join('\n');
-    props.label = {
-      type: 'string',
-      enum: caps.labels,
-      description: `Optional ranking preference. Pick the slug whose description matches the task; the router prefers a model tagged with this label.\n${lines}`,
-    };
-    wrappedAction.description += `\n\nOptional "label" ranking hint:\n${lines}`;
-  } else {
-    delete props.label;
-  }
+  // `label` is no longer an INPUT parameter — the agent picks the model
+  // directly; per-model labels are shown in the Catalog table for context
+  // only. Never advertise it on the schema.
+  delete props.label;
 
   // Append the active-models catalog so the agent can see — for the same
   // tool — which models cover tts, transcribe, sfx, voice_clone, music

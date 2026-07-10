@@ -169,12 +169,12 @@ const generateImageAction = {
           zoom:       { type: 'number', description: 'OPTIONAL. Camera distance / framing (0..10). 0 = wide shot (far), 5 = medium / unchanged, 10 = close-up. Omit when the user did not change distance.' }
         }
       },
-      model:           { type: 'string', description: 'OPTIONAL. Pin a SPECIFIC model slug — it WINS over the auto-picker (execute() honours it). OMIT (or "auto") to let the router auto-select the best model for your params: that is the DEFAULT and the RECOMMENDED choice when you do not know exactly which model to use. Valid slugs are the ones in the per-model catalog at the END of this description — do NOT invent a slug (the gateway hard-errors on unknown ones).' },
+      model:           { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories column contains the bucket for your operation: text-to-image / editing needs `image_generation` or `image_editing` (editing = passing referenceImages), a mask edit needs an `image_editing` model that supports masks, an outpaint/extend needs `image_extend`, an upscale needs `image_upscaling`, a background removal needs `image_background_removal`. NEVER pick a model that lacks the category for what you are doing (e.g. do not edit with a generation-only model). See the image-models skill for what each category is for and per-model parameters. Omitting this (or passing "auto"/empty) is an error — the tool will refuse. Do NOT invent a slug (the gateway hard-errors on unknown ones).' },
       // `excludeProviders` is intentionally NOT declared here — it is a
       // retry-hint set by the Coordinator after a BlockedResult, forwarded on
       // `action.*` by playbook-session.js and read in execute() below.
     },
-    required: ['prompt']
+    required: ['prompt', 'model']
   },
 
   examples: [
@@ -330,12 +330,18 @@ const generateImageAction = {
     //   • Agents that hallucinate slugs will now see real errors. The
     //     correct guidance for the LLM is still: bias with
     //     excludeModels / includeModels / label rather than pinning.
-    if (action.model && action.model !== 'auto') {
-      channel.log(
-        'image',
-        `Honoring caller-supplied model="${action.model}" (explicit pin wins over auto-picker).`,
-      );
+    // `model` is REQUIRED — the agent chooses the slug (there is no
+    // auto-selection any more). Reject a missing / empty / "auto" model
+    // loudly so the caller learns to pick from the catalog table instead
+    // of silently falling back to a picker.
+    if (typeof action.model !== 'string' || !action.model.trim() || action.model.trim() === 'auto') {
+      return {
+        success: false,
+        error: 'generate_image: "model" is required — pick an exact model slug from the Catalog table in this tool\'s description whose Categories match your operation (image_generation / image_editing / image_extend / image_upscaling / image_background_removal). There is no auto-selection; "auto" and an empty value are not accepted.',
+      };
     }
+    action.model = action.model.trim();
+    channel.log('image', `Using agent-chosen model="${action.model}".`);
 
     const prompt = action.prompt;
     if (!prompt) throw new Error('generate_image: "prompt" is required');
@@ -705,7 +711,10 @@ const generateImageAction = {
         const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
         const mediaCaps = await fetchMediaCapabilities('image');
         if (mediaCaps && Array.isArray(mediaCaps.models) && mediaCaps.models.length > 0) {
-          pickedImageModel = peekImageModel(mediaCaps.models, {
+          // The agent pinned an exact slug — adapt inputs against THAT
+          // model's declared constraints, not a re-picked one. Fall back
+          // to the peek heuristic only if the slug isn't in the catalog.
+          pickedImageModel = mediaCaps.models.find((m) => m && m.slug === action.model) || peekImageModel(mediaCaps.models, {
             intent: typeof action.intent === 'string' ? action.intent : (action.operation || ''),
             refsCount: referenceImages.length,
             hasMaskImage: !!action.maskImage,
@@ -1789,17 +1798,22 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
   // to write "use the attached image" in the prose (which the model
   // can't see).
   const refsEnabled = caps.hasRefImageSupport;
-  if (caps.labels?.length) {
-    props.label = { type: 'string', enum: caps.labels };
-  } else {
-    delete props.label;
-  }
+  // `label` is no longer an INPUT parameter — the agent picks the model
+  // directly. Each model's labels are shown in the Catalog table (Labels
+  // column + glossary) for context only. Never advertise `label` on the
+  // schema. (Internal callers may still pass a programmatic label, e.g. the
+  // storyboard visor's `storyboard_card` marker — that path reads
+  // `action.label` directly and is unaffected.)
+  delete props.label;
 
   // Rewrite the tool description IN PLACE, inlining the real values from the
   // catalog. This is the string the agent actually sees in AVAILABLE ACTIONS
   // — so the allowed values must live here, not in schema-property metadata
   // that the renderer does not unfold.
-  const fields = ['"prompt" (required) — text description of the desired image'];
+  const fields = [
+    '"prompt" (required) — text description of the desired image',
+    '"model" (required) — the exact model slug to run; YOU choose it from the Catalog table at the end of this description. Match your operation to the model\'s Categories: text-to-image / edit (edit = passing referenceImages) → `image_generation` / `image_editing`; outpaint/extend → `image_extend`; upscale → `image_upscaling`; background removal → `image_background_removal`. Never pick a model lacking the category for your operation. No auto-selection: omitting it (or "auto") is an error.',
+  ];
 
   {
     const list = props.aspectRatio.enum.map((v) => `"${v}"`).join(', ');
@@ -1816,22 +1830,11 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
     const maxRef = caps.maxRefImages ? ` Max ${caps.maxRefImages}.` : '';
     fields.push(`optional "referenceImages" — array of reference assets. Each item is a string (absolute file path, attachment ID like "att-1", or \`@mention\` handle like "@tom") OR an object \`{ alias, path }\` so the prompt can refer to it by alias.${maxRef} The per-slug adapter validates whether the resolved model accepts refs.`);
   }
-  if (caps.labels?.length) {
-    // Slug list for the enum; descriptions come via labelDetails so the
-    // agent can tell when each label is meant to apply (e.g. face-consistency
-    // is *only* relevant when a ref image contains people you want preserved
-    // exactly — not a generic "quality" knob).
-    const details = Array.isArray(caps.labelDetails) ? caps.labelDetails : [];
-    const lines = caps.labels.map((slug) => {
-      const d = details.find((x) => x && x.slug === slug);
-      const desc = d && d.description ? ` — ${d.description}` : '';
-      return `    • "${slug}"${desc}`;
-    }).join('\n');
-    fields.push(`optional "label" — ranking preference for a domain-tuned variant. Check whether your task — and any involved reference image, look at it — matches one of the slugs below; setting the right label routes to a specialised model and gives a better result.\n${lines}`);
-  }
+  // `label` is intentionally NOT listed as an input field — the agent picks
+  // the model directly; per-model labels live in the Catalog table below.
   fields.push('optional "saveTo" — where to place a COPY: an absolute DIRECTORY (a filename is minted inside it) OR a full FILE path ending in .png/.jpg/.webp (the first image is copied to exactly that path). The original always stays in ~/.koi/images and is returned in images[].savedTo (use THAT for downstream chaining, never fabricate paths); the copy at your saveTo is images[].exportedTo.');
 
-  const header = 'Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). The router auto-picks one model from the active catalog based on your params — see the per-model breakdown at the end of this description for what each option supports. Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'REQUIRED FIRST: the `image-models` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category) and how to use each one. Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation (there is no auto-selection). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
   const refNote = refsEnabled
     ? `
 
