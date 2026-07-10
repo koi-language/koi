@@ -12,7 +12,7 @@
  * extend / upscaling / background_removal / avatar / tts / sfx / music /
  * transcribe …). NEVER pick a model that lacks the category for the
  * operation (e.g. never edit with a generation-only model). The skills
- * (image-models / video-models / audio-models) explain what each
+ * (image-generator / video-generator / audio-generator) explain what each
  * category is for; this table is the live inventory.
  *
  * Table columns: `Model` | `Categories` | `Labels` | `Price`.
@@ -125,8 +125,8 @@ export function formatModelCatalog(models) {
     'bucket for the operation you are doing, and NEVER pick one that lacks ' +
     'it (e.g. do not edit with a generation-only model, do not upscale with ' +
     'an editing model). When several models fit, choose on price / labels / ' +
-    'the per-model notes in the matching skill (image-models / video-models ' +
-    '/ audio-models).\n\n' +
+    'the per-model notes in the matching skill (image-generator / video-generator ' +
+    '/ audio-generator).\n\n' +
     table +
     glossaryBlock
   );

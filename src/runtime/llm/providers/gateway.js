@@ -373,6 +373,27 @@ export async function fetchMediaModelRows(kind) {
   }
 }
 
+/**
+ * Return the ACTIVE media models (rows from fetchMediaModelRows) whose `labels`
+ * include `label`, optionally narrowed to a single `category`. Rows keep the
+ * `{ slug, displayName, categories, labels }` shape. Empty array when nothing
+ * matches (or the catalog is unreachable).
+ *
+ * A label is a koi-owned purpose bucket (e.g. `storyboard_card`) tagged on a
+ * curated model. Programmatic pipelines that must pin a slug — the tool now
+ * REQUIRES `model`, there is no auto-selection — use this to look up the slug
+ * for their label instead of hardcoding it: e.g. the interactive storyboard
+ * visor resolves the `storyboard_card` model before calling generate_image.
+ */
+export async function mediaModelsByLabel(kind, label, category = null) {
+  if (typeof label !== 'string' || !label.trim()) return [];
+  const want = label.trim();
+  const rows = await fetchMediaModelRows(kind);
+  return rows.filter((m) =>
+    Array.isArray(m.labels) && m.labels.includes(want) &&
+    (!category || (Array.isArray(m.categories) && m.categories.includes(category))));
+}
+
 // ── Client-side media model resolver ────────────────────────────────────────
 //
 // Mirrors how text LLMs work: the backend is a dumb proxy that runs whatever
