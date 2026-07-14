@@ -21,6 +21,7 @@ ALWAYS call it (don't paste content into chat instead) when:
 - After generating an image / video → show_result with the path (type is auto-detected).
 - Presenting a webpage as a result → show_result resourceType=url.
 - After assembling a timeline (create_timeline + add_clip_to_timeline) and BEFORE rendering → show_result resourceType=timeline + timelineId (opens the editor to preview/scrub/mute).
+- The user wants a video EDITED and the clip is LONGER THAN 10 SECONDS (an AI edit cannot cover more) → show_result resourceType=video + selectSegment=true, then ASK them in the chat to drag the segment (10 s max) they want modified and WAIT. This works whether the clip is already open in the work area or not. Their picked window comes back to you in the # WORKING AREA block; edit exactly that.
 
 You usually don't need read_file first — if you have the path, call show_result directly. Passing just \`path\` works; resourceType is optional.
 
@@ -53,6 +54,10 @@ Do NOT use for every file path mentioned in passing — only the primary result(
         type: 'string',
         description: 'Optional custom title',
       },
+      selectSegment: {
+        type: 'boolean',
+        description: 'VIDEO only. Open the video with the SEGMENT-SELECTION tool armed, so the user drags a window over the filmstrip to pick which part they want modified. Use it whenever the user asks to EDIT a video that is LONGER than 10 s (an AI video edit cannot cover more than that), and tell them in the chat to pick a segment of at most 10 seconds. Works on a video that is already open too — it just arms the tool on it. The window the user picks then reaches you in the # WORKING AREA block as the selected segment.',
+      },
     },
     required: ['resourceType'],
   },
@@ -60,6 +65,7 @@ Do NOT use for every file path mentioned in passing — only the primary result(
   examples: [
     { type: 'show_result', resourceType: 'image', path: '/tmp/braxil-images/generated-123.png' },
     { type: 'show_result', resourceType: 'video', path: '/Users/me/.koi/videos/video_1234_abc.mp4' },
+    { type: 'show_result', resourceType: 'video', path: '/Users/me/.koi/videos/long_clip.mp4', selectSegment: true },
     { type: 'show_result', resourceType: 'file', path: '/Users/me/project/src/config.ts' },
     { type: 'show_result', resourceType: 'url', url: 'https://example.com/article' },
     { type: 'show_result', resourceType: 'timeline', timelineId: 'tl-abc123' },
@@ -135,8 +141,16 @@ Do NOT use for every file path mentioned in passing — only the primary result(
     }
 
     if (channel.canPresentResources()) {
-      channel.presentResource({ type: resourceType, path: resolvedPath, url, title });
-      return { success: true, shown: resourceType, target: resolvedPath || url };
+      const selectSegment = action.selectSegment === true && resourceType === 'video';
+      channel.presentResource({ type: resourceType, path: resolvedPath, url, title, selectSegment });
+      return {
+        success: true,
+        shown: resourceType,
+        target: resolvedPath || url,
+        ...(selectSegment
+          ? { selectSegment: true, note: 'Segment-selection tool armed. ASK the user to drag the segment they want modified (10 s max) and WAIT for their reply — their selection reaches you in the WORKING AREA block.' }
+          : {}),
+      };
     }
 
     // CLI fallback — mention the resource so user sees it

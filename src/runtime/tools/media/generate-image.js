@@ -127,7 +127,7 @@ const generateImageAction = {
   // ratios, resolutions, labels, max n, ref image support) pulled from the
   // /gateway/models/image.json catalog. Do NOT add specific values here —
   // they would become stale the moment the catalog changes.
-  description: 'Generate an image from a text prompt. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (accepts a plain path array OR objects with {alias, path}; entries that start with `@` resolve as cross-project mention handles via MediaLibrary — e.g. `referenceImages: ["@tom"]` reuses whatever was last tagged `@tom` via tag_media — and the chat input bar already expands `@`-handles the user types into attachments), optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
+  description: 'Generate an image from a text prompt. The `image-generator` skill is the model+parameter contract: it documents, per model, which parameters and values that model accepts (aspect ratios, resolutions, how many reference images). This tool declares no per-model limits — read the skill, do not guess from the schema. In: "prompt" (required), optional "aspectRatio", optional "resolution", optional "n", optional "referenceImages" (accepts a plain path array OR objects with {alias, path}; entries that start with `@` resolve as cross-project mention handles via MediaLibrary — e.g. `referenceImages: ["@tom"]` reuses whatever was last tagged `@tom` via tag_media — and the chat input bar already expands `@`-handles the user types into attachments), optional "saveTo". Returns: { success, provider, model, images: [{ url?, b64?, savedTo? }] }.',
   thinkingHint: 'Generating image',
   permission: 'generate_image',
 
@@ -135,8 +135,8 @@ const generateImageAction = {
     type: 'object',
     properties: {
       prompt:          { type: 'string', description: 'Text description of the desired image. MANDATORY: write the prompt in English regardless of the user\'s language — image models are trained predominantly on English captions and degrade noticeably with non-English prompts. The ONLY exception is text the image itself must literally render (a sign, a label, dialogue in a speech bubble, on-screen UI copy): keep that verbatim in the user\'s language, wrapped in quotes inside the otherwise-English prompt. When you use named reference images, you can refer to them by alias in the prompt (e.g. "Paint the `illustration` onto the `boat`\'s hull, matching `placement_guide`") — far more precise than "FIRST/SECOND/THIRD reference".' },
-      aspectRatio:     { type: 'string', description: 'Aspect ratio — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
-      resolution:      { type: 'string', description: 'Resolution — must be one of the values in the enum (populated at runtime from the backend catalog). Omit to let the backend pick.' },
+      aspectRatio:     { type: 'string', description: 'Aspect ratio. Accepted values are per-model and documented in the `image-generator` skill — read it there. Omit to use the model default.' },
+      resolution:      { type: 'string', description: 'Resolution. Accepted values are per-model and documented in the `image-generator` skill — read it there. Omit to use the model default.' },
       quality:         { type: 'string', enum: ['low', 'medium', 'high', 'auto'], description: 'OPTIONAL. Sampling effort, decoupled from pixel count. Lower quality = faster + cheaper, less polished. Consumed only by models that advertise a sampling-effort knob (see the catalog snapshot — most slugs ignore it). Use "low" for thumbnails / storyboards / quick iteration, "medium" for general work, "high" for finals. "auto" lets the adapter pick. Omit entirely to fall back to the adapter\'s legacy behaviour (which derives quality from `resolution`).' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
       referenceImages: {
@@ -573,7 +573,9 @@ const generateImageAction = {
         prompt,
         refs: _explicitRefs,
         mediaKind: 'image',
-        maxRefs: caps.referenceImages ? (caps.maxReferenceImages || 1) : 0,
+        maxRefs: caps.referenceImages
+          ? (Number.isFinite(caps.maxReferenceImages) ? caps.maxReferenceImages : Infinity)
+          : 0,
       });
       if (_autoRes.added.length > 0 && caps.referenceImages) {
         channel.log(
@@ -629,7 +631,11 @@ const generateImageAction = {
         channel.log('image', `Provider ${resolved.provider}/${resolved.model} does not support reference images — ignoring`);
       } else {
         referenceImages = [];
-        const maxRef = caps.maxReferenceImages || 1;
+        // Unknown capacity = unconstrained. Never trim the agent's refs down to
+        // an invented cap (the old `|| 1` silently threw away every ref but the
+        // first when the catalog said nothing, which is always). Per-model ref
+        // limits live in the `image-generator` skill.
+        const maxRef = Number.isFinite(caps.maxReferenceImages) ? caps.maxReferenceImages : Infinity;
         // Resolve every ref to an absolute path in one shot (handles
         // strings, {alias, path} objects, attachment IDs, and relative
         // paths). All downstream code — sharp decode, library save,
@@ -1359,7 +1365,6 @@ const generateImageAction = {
         model: resolved.model,
         error: errMsg,
         errorType,
-        capabilities: caps,
       };
     }
 
@@ -1447,7 +1452,6 @@ const generateImageAction = {
         model: resolved.model,
         error: 'The image provider returned a blank/black frame (a safety filter likely blocked a borderline prompt). No usable image was produced — retry.',
         diagnostics: ['blank/black frame (provider safety_checker)'],
-        capabilities: caps,
       };
     }
 
@@ -1516,7 +1520,6 @@ const generateImageAction = {
         error: hints.length ? `${baseMsg} (${hints.join(' | ')})` : `${baseMsg}${rawSnippet}`,
         diagnostics: hints.length ? hints : undefined,
         raw: Object.keys(raw).length ? raw : undefined,
-        capabilities: caps,
       };
     }
 
@@ -1718,7 +1721,6 @@ const generateImageAction = {
       // Concrete slug the router picked (e.g. "fal-ai/flux/dev") — the
       // agent sees what actually ran, not the factory-declared "auto".
       model: result?.model || resolved.model,
-      supportedAspectRatios: caps.aspectRatios,
       imageCount: savedImages.length,
       images: savedImages,
       usage: result.usage,
@@ -1778,19 +1780,14 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
     '512p', '720p', '1K', '1080p', '2K', '4K',
   ];
 
-  props.aspectRatio = {
-    type: 'string',
-    enum: caps.aspectRatios?.length ? caps.aspectRatios : CANONICAL_ASPECT_RATIOS,
-  };
-  props.resolution = {
-    type: 'string',
-    enum: caps.resolutions?.length ? caps.resolutions : CANONICAL_RESOLUTIONS,
-  };
-  if (caps.maxImages > 1) {
-    props.n = { type: 'number', minimum: 1, maximum: caps.maxImages };
-  } else {
-    delete props.n;
-  }
+  // NO capability-derived enums or caps. Which aspect ratios / resolutions a
+  // model accepts, and how many images it can emit, is per-model and lives in
+  // the `image-generator` skill — the union of the fleet is true for no single
+  // model, and the catalog ships no capability columns anyway, so any enum here
+  // is invented. Plain types; the provider rejects what it cannot do.
+  props.aspectRatio = { type: 'string' };
+  props.resolution = { type: 'string' };
+  props.n = { type: 'number', minimum: 1 };
   // referenceImages: keep the original schema entry (string OR
   // {alias, path} oneOf) regardless of caps. The per-slug adapter
   // rejects with a clear error when the resolved model doesn't accept
@@ -1815,26 +1812,14 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
     '"model" (required) — the exact model slug to run; YOU choose it from the Catalog table at the end of this description. Match your operation to the model\'s Categories: text-to-image / edit (edit = passing referenceImages) → `image_generation` / `image_editing`; outpaint/extend → `image_extend`; upscale → `image_upscaling`; background removal → `image_background_removal`. Never pick a model lacking the category for your operation. No auto-selection: omitting it (or "auto") is an error.',
   ];
 
-  {
-    const list = props.aspectRatio.enum.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "aspectRatio" — one of: ${list}. Omit to let the backend pick.`);
-  }
-  {
-    const list = props.resolution.enum.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "resolution" — one of: ${list}. Omit to let the backend pick.`);
-  }
-  if (caps.maxImages > 1) {
-    fields.push(`optional "n" — integer 1..${caps.maxImages} (default 1)`);
-  }
-  {
-    const maxRef = caps.maxRefImages ? ` Max ${caps.maxRefImages}.` : '';
-    fields.push(`optional "referenceImages" — array of reference assets. Each item is a string (absolute file path, attachment ID like "att-1", or \`@mention\` handle like "@tom") OR an object \`{ alias, path }\` so the prompt can refer to it by alias.${maxRef} The per-slug adapter validates whether the resolved model accepts refs.`);
-  }
+  fields.push('optional "aspectRatio" / "resolution" — per-model accepted values are documented in the `image-generator` skill; omit to let the model default.');
+  fields.push('optional "n" — how many images to emit (default 1). Whether the model can emit more than one is in the skill.');
+  fields.push('optional "referenceImages" — array of reference assets. Each item is a string (absolute file path, attachment ID like "att-1", or `@mention` handle like "@tom") OR an object `{ alias, path }` so the prompt can refer to it by alias. How many refs the model takes is in the skill: send what it takes, they are NOT trimmed for you.');
   // `label` is intentionally NOT listed as an input field — the agent picks
   // the model directly; per-model labels live in the Catalog table below.
   fields.push('optional "saveTo" — where to place a COPY: an absolute DIRECTORY (a filename is minted inside it) OR a full FILE path ending in .png/.jpg/.webp (the first image is copied to exactly that path). The original always stays in ~/.koi/images and is returned in images[].savedTo (use THAT for downstream chaining, never fabricate paths); the copy at your saveTo is images[].exportedTo.');
 
-  const header = 'REQUIRED FIRST: the `image-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category) and how to use each one. Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation (there is no auto-selection). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'REQUIRED FIRST: the `image-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category) and how to use each one. Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation (there is no auto-selection).\n\nIMPORTANT — this tool declares NO per-model limits: it does not tell you which aspect ratios or resolutions a model accepts, or how many reference images it takes. That lives in the `image-generator` skill, per model — it is the model+parameter contract. Do not infer a limit from this schema, and do not guess: read the skill.';
   const refNote = refsEnabled
     ? `
 

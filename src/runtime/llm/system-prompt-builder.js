@@ -494,6 +494,19 @@ export async function buildWorkingAreaBlock() {
         if (active.type === 'video' && typeof active.playheadMs === 'number') {
           lines.push(`Playhead paused at \`${_formatVideoTs(active.playheadMs)}\` (MM:SS.ms).`);
         }
+        // Segment selection: the user has dragged the segment tool over the
+        // filmstrip (they armed it, or you did with show_result selectSegment
+        // because the clip is longer than an edit can cover). THAT window is
+        // what they mean by "this part" — edit exactly it, never the whole clip.
+        const _seg = active.type === 'video' ? active.selectedSegment : null;
+        if (_seg && typeof _seg.startMs === 'number' && typeof _seg.endMs === 'number') {
+          const _durS = ((_seg.endMs - _seg.startMs) / 1000).toFixed(1);
+          lines.push(
+            `The user has SELECTED the segment \`${_formatVideoTs(_seg.startMs)}\` → \`${_formatVideoTs(_seg.endMs)}\` `
+            + `(${_seg.startMs}ms → ${_seg.endMs}ms, ${_durS}s) with the segment tool. Any edit they ask for applies to THAT segment: `
+            + `cut it out of the source and edit the cut, never the whole clip.`,
+          );
+        }
 
         // Text selection: when the user has highlighted a range in a
         // text-like active doc, that range IS the demonstrative

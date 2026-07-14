@@ -401,7 +401,7 @@ const generateVideoAction = {
   // the real, catalog-driven description is rebuilt at the bottom of this
   // file by the fetchMediaCapabilities('video') block and replaces both
   // the description AND the schema enums in place.
-  description: 'Generate a video from a text prompt. Blocks internally until the video is ready and returns { success, savedTo, url, ... } — no second call is needed. ⚠️ ANIMATING AN EXISTING IMAGE: if the user asks to animate / add motion to a photo they sent OR an image you just generated/edited (e.g. "anima esta foto", "animate this image", "make it move", "anímala N seg"), you MUST pass that exact image\'s path as `startFrame` (image-to-video) — NEVER write a text-only prompt and regenerate, that yields a DIFFERENT person/scene. The image to animate is the most recent one in the conversation (the edited/generated result, or the photo the user attached). Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Reference fields (referenceImages, referenceVideos, startFrame, endFrame) ALL accept `@mention` handles in addition to paths/URLs — e.g. `referenceImages: ["@tom"]` resolves via the cross-project MediaLibrary to whatever tag_media last pinned to `@tom` (most-recent-first when several match). Real parameter enums (aspectRatio, resolution, cameraMovement, durations, maxShots) are populated live from the active model catalog. Pass wait=false to start it as a background koi job and retrieve the result with await_job / get_job_status. To EXTEND or CONTINUE an existing video, call `extract_frame` first to grab the source\'s last (or any) frame and pass its `savedTo` here as `startFrame` — never assume a frame file already exists on disk; if you didn\'t extract it in this turn, it doesn\'t exist.',
+  description: 'Generate a video from a text prompt. Blocks internally until the video is ready and returns { success, savedTo, url, ... } — no second call is needed. ⚠️ ANIMATING AN EXISTING IMAGE: if the user asks to animate / add motion to a photo they sent OR an image you just generated/edited (e.g. "anima esta foto", "animate this image", "make it move", "anímala N seg"), you MUST pass that exact image\'s path as `startFrame` (image-to-video) — NEVER write a text-only prompt and regenerate, that yields a DIFFERENT person/scene. The image to animate is the most recent one in the conversation (the edited/generated result, or the photo the user attached). Supports start/end frames, reference images and video-to-video references, plus optional per-shot overrides for multishot models. Reference fields (referenceImages, referenceVideos, startFrame, endFrame) ALL accept `@mention` handles in addition to paths/URLs — e.g. `referenceImages: ["@tom"]` resolves via the cross-project MediaLibrary to whatever tag_media last pinned to `@tom` (most-recent-first when several match). This tool does NOT declare per-model limits: which parameters and values each model accepts (durations, aspect ratios, resolutions, how many reference images, how many shots per call) is documented per model in the `video-generator` skill — read it there and send what that model takes. Pass wait=false to start it as a background koi job and retrieve the result with await_job / get_job_status. To EXTEND or CONTINUE an existing video, call `extract_frame` first to grab the source\'s last (or any) frame and pass its `savedTo` here as `startFrame` — never assume a frame file already exists on disk; if you didn\'t extract it in this turn, it doesn\'t exist.',
   thinkingHint: 'Generating video',
   permission: 'generate_video',
 
@@ -646,13 +646,18 @@ const generateVideoAction = {
         prompt,
         refs: _refImgs,
         mediaKind: 'image',
-        maxRefs: caps.maxReferenceImages || (caps.referenceImages ? 4 : 0),
+        // Unknown capacity = unconstrained (see _loadReferenceImages).
+        maxRefs: Number.isFinite(caps.maxReferenceImages)
+          ? caps.maxReferenceImages
+          : (caps.referenceImages ? Infinity : 0),
       });
       const _vidRes = await autoAttachMentions({
         prompt,
         refs: _refVids,
         mediaKind: 'video',
-        maxRefs: caps.maxReferenceVideos || (caps.videoToVideo ? 2 : 0),
+        maxRefs: Number.isFinite(caps.maxReferenceVideos)
+          ? caps.maxReferenceVideos
+          : (caps.videoToVideo ? Infinity : 0),
       });
       // Merge resolved (gallery) handles first so the post-attach
       // ref lists are current before we try positional reconciliation.
@@ -1224,14 +1229,17 @@ const generateVideoAction = {
     const globalCamera = _sanitiseCameraMovement(action.cameraMovement, caps, resolved);
 
     // ── Shots: resolve per-shot overrides against the globals ─────────
-    // Only accepted when the selected model advertises multishot AND
-    // caller actually passed a non-empty array.
+    // The shot budget is NOT ours to invent. `maxShots` is honoured only when
+    // the catalog actually states it; unknown (the normal case today) means
+    // unconstrained — we submit what the agent asked for and let the provider
+    // answer. The old `caps.maxShots ?? 1` defaulted UNKNOWN to SINGLE-SHOT,
+    // which silently dropped shots[] on every model in the fleet (Seedance
+    // cuts included). How many shots a model can hold is documented per model
+    // in the `video-generator` skill.
     let shots;
     if (Array.isArray(action.shots) && action.shots.length > 0) {
-      const maxShots = caps.maxShots ?? 1;
-      if (maxShots <= 1) {
-        channel.log('video', `Provider ${resolved.provider}/${resolved.model} is single-shot — ignoring shots[]`);
-      } else if (action.shots.length > maxShots) {
+      const maxShots = Number.isFinite(caps.maxShots) ? caps.maxShots : Infinity;
+      if (action.shots.length > maxShots) {
         return {
           // Pre-flight lint (no charge): too many shots for this model. The
           // agent re-issues with fewer shots, so treat as a validation
@@ -1294,12 +1302,10 @@ const generateVideoAction = {
     // no-op (shots.length is the source of truth).
     let numShots;
     if (!shots && typeof action.numShots === 'number' && action.numShots > 1) {
-      const maxShots = caps.maxShots ?? 1;
-      if (maxShots > 1) {
-        numShots = Math.min(Math.floor(action.numShots), maxShots);
-      } else {
-        channel.log('video', `Provider ${resolved.provider}/${resolved.model} is single-shot — ignoring numShots=${action.numShots}`);
-      }
+      // Same rule as shots[]: clamp only against a maxShots the catalog really
+      // stated. Unknown = unconstrained, never "1".
+      const maxShots = Number.isFinite(caps.maxShots) ? caps.maxShots : Infinity;
+      numShots = Math.min(Math.floor(action.numShots), maxShots);
     }
 
     const refFrame = action.startFrame || action.referenceImage || null;
@@ -2007,7 +2013,10 @@ const generateVideoAction = {
       success: true,
       provider: resolved.provider,
       model: final.model || resolved.model,
-      capabilities: caps,
+      // NO `capabilities` blob. Handing the agent a capability list makes it
+      // "correct" its own plan against numbers we do not actually have — that
+      // is how a 9-ref multi-shot model got downgraded to 4 refs / 1 shot
+      // mid-run. Per-model limits live in the `video-generator` skill.
       id: final.id || submitted.id,
       status: 'completed',
       url: final.url,
@@ -2713,7 +2722,17 @@ async function _loadReferenceImages(pathArr, caps, resolved) {
     channel.log('video', `Provider ${resolved.provider}/${resolved.model} does not support reference images — ignoring`);
     return undefined;
   }
-  const maxRef = caps.maxReferenceImages || 1;
+  // Send every reference the agent chose. We do NOT trim to an invented cap:
+  // `maxReferenceImages` is honoured only when the catalog really states one,
+  // and unknown means unconstrained. Silently dropping refs produced a video
+  // missing subjects the user had asked for, with no error to explain it — a
+  // provider rejection is strictly better than a quiet wrong result. How many
+  // refs each model takes is documented in the `video-generator` skill.
+  const maxRef = Number.isFinite(caps.maxReferenceImages) ? caps.maxReferenceImages : Infinity;
+  const dropped = pathArr.length - Math.min(pathArr.length, maxRef);
+  if (dropped > 0) {
+    channel.log('video', `${resolved.model} caps at ${maxRef} reference images — dropping ${dropped} of ${pathArr.length}`);
+  }
   const out = [];
   for (const filePath of pathArr.slice(0, maxRef)) {
     const resolvedPath = path.resolve(filePath);
@@ -2835,199 +2854,60 @@ const wrappedAction = asyncCapable(generateVideoAction);
 // schema, so the remap can never recover it (Magnific resolution bug).
 wrappedAction._pristineProperties = JSON.parse(JSON.stringify(wrappedAction.schema.properties));
 
-// Fire-and-forget: rewrite the tool schema + description from the backend's
-// active video model set so the agent only ever sees values the catalog can
-// actually serve. Mirrors the pattern in generate-image.js — the description
-// is the string the agent sees in AVAILABLE ACTIONS, so the enums must live
-// there, not just in schema metadata the renderer doesn't unfold.
+// Fire-and-forget: append the CATALOG OF MODELS (which slugs exist, their
+// categories and price) to the description, so the agent can pick `model`.
 //
-// Exposed as `_descriptionReady` so `get_tool_info` can await the rewrite
-// before reading the description (otherwise the first lookup hits the
-// static fallback).
+// It appends NOTHING ELSE. This tool used to also rewrite the schema from the
+// catalog — enum-ing `duration` / `aspectRatio` / `resolution` /
+// `cameraMovement`, capping `numShots` and `shots` by `maxShots`, and deleting
+// whole parameters the "fleet" supposedly lacked. That was wrong twice over:
+//
+//   1. The data was fiction. The backend catalog ships no capability columns,
+//      so those enums came from a hardcoded fallback (4 refs, durations
+//      [4,5,6,8,10,15,20], maxShots 1) that had nothing to do with the model
+//      actually being called. Seedance 2.0 — 9 refs, real multi-shot — was
+//      advertised to the agent as a 4-ref single-shot model, and the agent
+//      believed the tool over the skill doc (rightly: a tool result outranks
+//      a doc) and quietly downgraded the user's work.
+//   2. Even with real data it is the wrong home for it. WHICH PARAMETERS AND
+//      VALUES EACH MODEL ACCEPTS IS THE SKILL'S CONTRACT: `video-generator`
+//      documents it per model, and that is the single source of truth the agent
+//      reads before choosing one. A generic tool schema cannot express
+//      per-model shapes anyway — the union of all models is true for none of
+//      them.
+//
+// So: no enums, no min/max, no maxItems, no capability-driven deletions. The
+// parameters are always present, plainly typed, and the agent sends what the
+// skill says that model takes. A model that rejects a value returns a provider
+// error verbatim — a real error beats a silent invented limit.
+//
+// Exposed as `_descriptionReady` so `get_tool_info` can await the catalog
+// fetch before reading the description.
 wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) => {
   if (!caps) return;
-  const props = wrappedAction.schema.properties;
 
-  if (caps.aspectRatios?.length) {
-    props.aspectRatio = { type: 'string', enum: caps.aspectRatios };
-  } else {
-    delete props.aspectRatio;
-  }
-
-  if (caps.resolutions?.length) {
-    props.resolution = { type: 'string', enum: caps.resolutions };
-  } else {
-    delete props.resolution;
-  }
-
-  if (caps.durations?.length) {
-    props.duration = { type: 'number', enum: caps.durations };
-  }
-
-  const startFrameOk = !!caps.anyImageToVideo;
-  const endFrameOk = !!caps.anyFrameControl;
-  if (!startFrameOk) delete props.startFrame;
-  if (!endFrameOk) delete props.endFrame;
-
-  const refsEnabled = !!caps.hasRefImageSupport;
-  if (refsEnabled) {
-    props.referenceImages = { type: 'array', items: { type: 'string' } };
-  } else {
-    delete props.referenceImages;
-  }
-
-  // referenceVideos gated by anyVideoToVideo — no point surfacing the
-  // field when no active model can actually consume a video input.
-  const videoRefsEnabled = !!caps.anyVideoToVideo;
-  if (videoRefsEnabled) {
-    props.referenceVideos = { type: 'array', items: { type: 'string' } };
-  } else {
-    delete props.referenceVideos;
-  }
-
-  if (!caps.anyAudio) {
-    delete props.withAudio;
-  }
-
-  // Camera movement: surface only when at least one active model advertises
-  // a non-empty cameraMovements CSV. Using an enum keeps the agent from
-  // inventing tokens the backend can't route. When no model advertises any,
-  // we still leave the free-form string so the agent CAN pass one if it
-  // knows about it — the gateway silently drops unknown fields.
-  if (caps.cameraMovements?.length) {
-    props.cameraMovement = { type: 'string', enum: caps.cameraMovements };
-  }
-
-  if (caps.maxShots && caps.maxShots > 1) {
-    props.numShots = { type: 'number', minimum: 1, maximum: caps.maxShots };
-    // Full per-shot schema only surfaces when there's a model that can
-    // actually honour it. Shape mirrors the top-level fields but every
-    // entry is optional (unset entries inherit from the global level in
-    // execute()).
-    const shotItemProps = {
-      prompt:          { type: 'string' },
-      duration:        { type: 'number' },
-      cameraMovement:  caps.cameraMovements?.length
-        ? { type: 'string', enum: caps.cameraMovements }
-        : { type: 'string' },
-    };
-    if (startFrameOk) shotItemProps.startFrame = { type: 'string' };
-    if (endFrameOk)   shotItemProps.endFrame   = { type: 'string' };
-    if (refsEnabled)  shotItemProps.referenceImages = { type: 'array', items: { type: 'string' } };
-    if (videoRefsEnabled) shotItemProps.referenceVideos = { type: 'array', items: { type: 'string' } };
-    if (caps.aspectRatios?.length) {
-      shotItemProps.aspectRatio = { type: 'string', enum: caps.aspectRatios };
-    }
-    props.shots = {
-      type: 'array',
-      maxItems: caps.maxShots,
-      items: { type: 'object', properties: shotItemProps },
-    };
-  } else {
-    delete props.numShots;
-    delete props.shots;
-  }
-
-  // `label` is no longer an INPUT parameter — the agent picks the model
-  // directly; per-model labels are shown in the Catalog table for context
-  // only. Never advertise it on the schema.
-  delete props.label;
-
-  // `kind` enum is curated dynamically: each value only appears when
-  // at least one model carries the matching `categories` tag.
-  // Without a backing model the parameter would just dead-end the
-  // picker, so we trim absent values from the enum (and drop the
-  // field altogether when neither bucket has a model).
-  {
-    const kinds = [];
-    if (caps.anyExtend) kinds.push('extend');
-    if (caps.anyBgRemove) kinds.push('bg-remove');
-    if (kinds.length === 0) {
-      delete props.kind;
-    } else {
-      props.kind = { ...props.kind, enum: kinds };
-    }
-  }
-
-  // Build the human-readable field list the agent actually reads. Values
-  // come from the live catalog — anything outside the enums will be
-  // rejected at submit time. No field is listed unless at least one active
-  // model supports it (e.g. withAudio disappears entirely when the fleet
-  // has no audio-capable video model).
   const fields = [
     '"prompt" (required) — text description of the desired video',
     '"model" (required) — the exact model slug to run; YOU choose it from the Catalog table at the end of this description. Match your operation to the model\'s Categories AND its input shape: text/image/reference-to-video → `video_generation` / `image_to_video`; v2v transform → `video_editing`; make-longer → `video_extend`; talking-head → `video_avatar`; background removal → `video_background_removal`. Never pick a model lacking the category, and never pin an image-to-video slug for a text-only prompt (or vice-versa). No auto-selection: omitting it (or "auto") is an error.',
+    'optional "duration" — length in seconds. Which lengths the model accepts is in the `video-generator` skill; omit to use the model default.',
+    'optional "aspectRatio" / "resolution" — per-model accepted values are in the `video-generator` skill; omit to let the model default.',
+    'optional "quality" — one of: "auto", "low", "medium", "high". Omit to use "auto".',
+    'optional "startFrame" — absolute file path to the LITERAL first frame (image-to-video).',
+    'optional "endFrame" — absolute file path to the LITERAL last frame (frame-control models).',
+    'optional "referenceImages" — array of absolute file paths for style / subject / identity guidance. How many the model takes is in the skill: send what it takes, they are NOT trimmed for you.',
+    'optional "referenceVideos" — array of local video paths (mp4/mov/webm) or https URLs. Local files are uploaded automatically. Use for video-to-video (restyle, continuation, motion transfer).',
+    'optional "withAudio" — boolean; generate an audio track (SFX/dialogue/voiceover/ambient) alongside the video. DEFAULT true — pass false ONLY for a deliberately silent clip. Does NOT control background music.',
+    'optional "cameraMovement" — camera/shot type. Omit for free composition.',
+    'optional "numShots" — number of independent clips to emit in one call (multishot). Omit for a single shot. Ignored when "shots" is present.',
+    'optional "shots" — array of per-shot overrides: {prompt?, duration?, cameraMovement?, startFrame?, endFrame?, referenceImages?, referenceVideos?, aspectRatio?}. Any field omitted inherits from the top level. When present, "shots.length" is the clip count and "numShots" is ignored. Whether a model cuts inside one generation, and how many shots it holds, is in the `video-generator` skill (and, for Seedance, its own skill).',
+    'optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:\n  • "extend" — CONTINUE / EXTEND / make-longer an existing video (`video_extend` bucket). Combine with referenceVideos=[<source>] (or startFrame=<last frame>).\n  • "bg-remove" — strip the background out of the input video, returning a transparent-background MP4 (`video_background_removal` bucket). Pass referenceVideos=[<source>].\nOmit for fresh generations / restyles / regular edits.',
+    'optional "saveTo" — absolute directory path where a COPY of the final video is placed. The original always stays in ~/.koi/videos/.',
+    'optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.',
   ];
 
-  if (caps.durations?.length) {
-    const list = caps.durations.map((v) => `${v}`).join(', ');
-    fields.push(`optional "duration" — number of seconds. One of: ${list}. Omit to let the backend pick a default.`);
-  } else {
-    fields.push('optional "duration" — number of seconds (provider-dependent; typical: 4, 5, 6, 8, 10). Omit to use the provider default.');
-  }
-
-  if (caps.aspectRatios?.length) {
-    const list = caps.aspectRatios.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "aspectRatio" — one of: ${list}. Omit to let the backend pick.`);
-  }
-  if (caps.resolutions?.length) {
-    const list = caps.resolutions.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "resolution" — one of: ${list}. Omit to let the backend pick.`);
-  }
-  fields.push('optional "quality" — one of: "auto", "low", "medium", "high". Omit to use "auto".');
-
-  if (startFrameOk) {
-    fields.push('optional "startFrame" — absolute file path to the first frame image (image-to-video).');
-  }
-  if (endFrameOk) {
-    fields.push('optional "endFrame" — absolute file path to the last frame image (requires a model with frame-control).');
-  }
-  if (refsEnabled) {
-    fields.push('optional "referenceImages" — array of absolute file paths for style / subject guidance.');
-  }
-  if (videoRefsEnabled) {
-    fields.push('optional "referenceVideos" — array of local video file paths (mp4/mov/webm) OR https URLs. Local files are uploaded to the gateway automatically. Use this for video-to-video (style transfer, continuation, restyle).');
-  }
-  if (caps.anyAudio) {
-    fields.push('optional "withAudio" — boolean; generate an audio track (SFX/dialogue/voiceover/ambient) alongside the video. DEFAULT true — pass false ONLY for a deliberately silent clip. Does NOT control background music.');
-  }
-  if (caps.cameraMovements?.length) {
-    const list = caps.cameraMovements.map((v) => `"${v}"`).join(', ');
-    fields.push(`optional "cameraMovement" — camera/shot type, one of: ${list}. Omit for free composition.`);
-  }
-  if (caps.maxShots && caps.maxShots > 1) {
-    fields.push(`optional "numShots" — number of independent clips to emit in one call (1..${caps.maxShots}). Omit for a single shot. Ignored when "shots" is present.`);
-    const shotKeys = ['prompt?', 'duration?', 'cameraMovement?'];
-    if (startFrameOk) shotKeys.push('startFrame?');
-    if (endFrameOk) shotKeys.push('endFrame?');
-    if (refsEnabled) shotKeys.push('referenceImages?');
-    if (videoRefsEnabled) shotKeys.push('referenceVideos?');
-    if (caps.aspectRatios?.length) shotKeys.push('aspectRatio?');
-    fields.push(
-      `optional "shots" — array of per-shot overrides (up to ${caps.maxShots}): ` +
-      `{${shotKeys.join(', ')}}. Any field omitted inherits from the top-level. ` +
-      `When present, "shots.length" is the clip count and "numShots" is ignored.`,
-    );
-  }
-  // `label` is intentionally NOT listed as an input field — the agent picks
-  // the model directly; per-model labels live in the Catalog table below.
-  if (caps.anyExtend || caps.anyBgRemove) {
-    const parts = ['optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:'];
-    if (caps.anyExtend) {
-      parts.push('  • "extend" — CONTINUE / EXTEND / make-longer an existing video (`video_extend` bucket). Combine with referenceVideos=[<source>] (or startFrame=<last frame>).');
-    }
-    if (caps.anyBgRemove) {
-      parts.push('  • "bg-remove" — strip the background out of the input video, returning a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Pass referenceVideos=[<source>].');
-    }
-    parts.push('Omit for fresh generations / restyles / regular edits.');
-    fields.push(parts.join('\n'));
-  }
-  fields.push('optional "saveTo" — absolute directory path where the final video will be saved. Defaults to ~/.koi/videos/.');
-  fields.push('optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.');
-
-  const header = 'REQUIRED FIRST: the `video-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category + input shape) and how to use each one. Generate a video from a text prompt. Blocks internally until the provider finishes and returns { success, savedTo, url, error? } — the agent does NOT need a second call. YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation and whose input shape matches your request (there is no auto-selection). Provider failures (validation, content policy, rate-limit, …) come back as success=false with the verbatim provider error in the `error` field. Pass wait=false to run it as a background koi job (then poll with await_job / get_job_status). Every parameter and its allowed values are listed below (values are pulled live from the active model catalog — anything outside the enum will be rejected).';
+  const header = 'REQUIRED FIRST: the `video-generator` skill MUST be active before you use this tool — if it is not, activate it now. It is the model+parameter contract: it tells you which model to pick (by category + input shape) and EXACTLY which parameters and values that model accepts. Generate a video from a text prompt. Blocks internally until the provider finishes and returns { success, savedTo, url, error? } — the agent does NOT need a second call. YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation and whose input shape matches your request (there is no auto-selection). Provider failures (validation, content policy, rate-limit, …) come back as success=false with the verbatim provider error in the `error` field. Pass wait=false to run it as a background koi job (then poll with await_job / get_job_status).\n\nIMPORTANT — this tool declares NO per-model limits: it does not tell you how many reference images a model takes, which durations it allows, or how many shots it can cut in one call. That lives in the `video-generator` skill, per model. Do not infer a limit from this schema, and do not treat the absence of one as an invitation to guess: read the skill.';
   const fieldsBlock = '\n' + fields.map((f) => `  - ${f}`).join('\n');
-  const returns = '\nReturns: { success, provider, model, capabilities, savedTo?, url?, status, shots?, error? }. On success=false, read `error` to see what the provider rejected.';
+  const returns = '\nReturns: { success, provider, model, savedTo?, url?, status, shots?, error? }. On success=false, read `error` to see what the provider rejected.';
   const asyncSuffix = ' This tool is async-capable: pass wait=false to kick it off as a background job (returns { jobId }) instead of blocking.';
   const catalog = formatModelCatalog(caps.models);
   wrappedAction.description = header + fieldsBlock + returns + catalog + asyncSuffix;

@@ -699,30 +699,23 @@ export class GatewayImageGen extends BaseImageGen {
 
   get providerName() { return 'koi-gateway'; }
 
+  // UNKNOWN ≠ ZERO, and unknown ≠ some number we made up. The backend catalog
+  // ships no capability columns today, so every field below is `undefined`
+  // unless the catalog actually said something. `undefined` means "unconstrained":
+  // callers must NOT clamp, snap or enumerate on it. The per-model parameter
+  // contract lives in the `image-generator` / `video-generator` skill docs, which
+  // are the single source of truth the agent reads before choosing a model.
   get capabilities() {
-    const mc = _getMediaCaps(this.model);
-    if (mc) {
-      return {
-        referenceImages: mc.referenceImages ?? false,
-        maxReferenceImages: mc.maxRefImages ?? 0,
-        edit: mc.edit ?? false,
-        aspectRatios: mc.aspectRatios || ['1:1'],
-        resolutions: mc.resolutions || ['medium'],
-        qualities: mc.qualities || ['auto'],
-        maxN: mc.maxN ?? 1,
-        outputFormats: mc.outputFormats || ['png'],
-      };
-    }
-    // Fallback: generous defaults (gateway supports anything the backend does)
+    const mc = _getMediaCaps(this.model) || {};
     return {
-      referenceImages: true,
-      maxReferenceImages: 14,
-      edit: true,
-      aspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'],
-      resolutions: ['low', 'medium', 'high', 'ultra'],
-      qualities: ['auto', 'low', 'medium', 'high'],
-      maxN: 4,
-      outputFormats: ['png', 'webp', 'jpeg', 'b64_json'],
+      referenceImages: mc.referenceImages ?? true,
+      maxReferenceImages: mc.maxRefImages ?? undefined,
+      edit: mc.edit ?? true,
+      aspectRatios: mc.aspectRatios || undefined,
+      resolutions: mc.resolutions || undefined,
+      qualities: mc.qualities || undefined,
+      maxN: mc.maxN ?? undefined,
+      outputFormats: mc.outputFormats || undefined,
     };
   }
 
@@ -1772,42 +1765,37 @@ export class GatewayVideoGen extends BaseVideoGen {
 
   get providerName() { return 'koi-gateway'; }
 
+  // UNKNOWN ≠ ZERO, and unknown ≠ some number we made up.
+  //
+  // This getter used to answer with invented numbers whenever the catalog had
+  // nothing to say — and since the backend catalog ships NO capability columns
+  // at all (every `constraints` is null), that fallback answered for EVERY
+  // model. Seedance 2.0 reference-to-video, which takes up to 9 refs and does
+  // real multi-shot, was reported to the agent as `maxReferenceImages: 4`,
+  // `durations: [4,5,6,8,10,15,20]`, `maxShots: 1`. The agent believed the tool
+  // over the skill doc (correctly — a tool result outranks a doc) and silently
+  // downgraded the user's work.
+  //
+  // So: report only what the catalog actually knows. `undefined` = unconstrained;
+  // callers must NOT clamp, snap, enumerate or reject on it. The per-model
+  // parameter contract lives in the `video-generator` skill doc.
   get capabilities() {
-    const mc = _getMediaCaps(this.model);
-    if (mc) {
-      return {
-        startFrame: mc.startFrame ?? false,
-        endFrame: mc.endFrame ?? false,
-        referenceImages: mc.referenceImages ?? false,
-        maxReferenceImages: mc.maxRefImages ?? 0,
-        withAudio: mc.withAudio ?? false,
-        aspectRatios: mc.aspectRatios || ['16:9'],
-        resolutions: mc.resolutions || ['720p'],
-        qualities: mc.qualities || ['auto'],
-        durations: mc.durations || [5],
-        maxDuration: mc.maxDuration ?? 5,
-        cameraMovements: mc.cameraMovements || [],
-        maxShots: mc.maxShots ?? 1,
-      };
-    }
-    // Fallback: generous defaults (model='auto' — the real picker lives
-    // in media-model-router.js, so claim broad support here and let the
-    // router pick the right specialist based on refs actually provided).
+    const mc = _getMediaCaps(this.model) || {};
     return {
-      startFrame: true,
-      endFrame: true,
-      referenceImages: true,
-      maxReferenceImages: 4,
-      imageToVideo: true,
-      videoToVideo: true,
-      withAudio: true,
-      aspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4'],
-      resolutions: ['480p', '720p', '1080p', '4k'],
-      qualities: ['auto', 'low', 'medium', 'high'],
-      durations: [4, 5, 6, 8, 10, 15, 20],
-      maxDuration: 20,
-      cameraMovements: [],
-      maxShots: 1,
+      startFrame: mc.startFrame ?? true,
+      endFrame: mc.endFrame ?? true,
+      referenceImages: mc.referenceImages ?? true,
+      maxReferenceImages: mc.maxRefImages ?? undefined,
+      imageToVideo: mc.imageToVideo ?? true,
+      videoToVideo: mc.videoToVideo ?? true,
+      withAudio: mc.withAudio ?? true,
+      aspectRatios: mc.aspectRatios || undefined,
+      resolutions: mc.resolutions || undefined,
+      qualities: mc.qualities || undefined,
+      durations: mc.durations || undefined,
+      maxDuration: mc.maxDuration ?? undefined,
+      cameraMovements: mc.cameraMovements || undefined,
+      maxShots: mc.maxShots ?? undefined,
     };
   }
 
