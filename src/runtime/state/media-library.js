@@ -623,6 +623,35 @@ export class MediaLibrary {
    * @param {number} [opts.limit=100]
    * @param {number} [opts.offset=0]
    */
+  /**
+   * CHEAP change-detector for the GUI's poller: how many rows there are and the
+   * newest `created_at`, without materialising (or serialising) a single item.
+   *
+   * The GUI used to poll the FULL library (limit 20000) every 8 s just to notice
+   * a new creation: the engine pulled every row out of LanceDB, serialised it,
+   * and the GUI decoded + parsed + re-sorted the lot ON ITS UI THREAD — measured
+   * at ~200 ms of frozen UI, every 8 s, forever. Now it polls this instead and
+   * only asks for the real list when the fingerprint moves.
+   */
+  async revision() {
+    const table = await this._ensureTable();
+    let count = 0;
+    try {
+      count = await table.countRows();
+    } catch {
+      count = -1;
+    }
+    let latest = '';
+    try {
+      const rows = await table.query().select(['created_at']).limit(10000).toArray();
+      for (const r of rows) {
+        const c = r.created_at || '';
+        if (c > latest) latest = c;
+      }
+    } catch { /* leave latest empty — count alone still detects adds/removes */ }
+    return { count, latest };
+  }
+
   async list({ favorite, mediaType, mediaTypes, category, limit = 100, offset = 0, includeHidden = false } = {}) {
     // LanceDB is the single source of truth — no fallbacks, no disk scanning.
     const table = await this._ensureTable();
