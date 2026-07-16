@@ -78,6 +78,10 @@ const upscaleImageAction = {
         type: 'object',
         description: 'Free-form pass-through bag for model-specific options the provider-neutral contract doesn\'t expose (e.g. Topaz "model" variant, "texture", "subjectDetection", "denoise"). Keys are forwarded verbatim to the underlying Fal model — use only when you know which provider will handle the call.',
       },
+      metadata: {
+        type: 'object',
+        description: 'Optional metadata persisted with the saved upscale. Pass `{ "visible": false }` to keep the result HIDDEN from the creations drawer / gallery (the media library filters `visible !== false`) — use for throwaway intermediate upscales (e.g. panel crops prepped for a 4K video render).',
+      },
     },
     required: ['image'],
   },
@@ -290,6 +294,12 @@ const upscaleImageAction = {
       for (const img of saved) {
         if (img.savedTo) {
           await saveGeneratedImage(img.savedTo, {
+            // Caller passthrough FIRST so `metadata: { visible: false }` reaches
+            // the library (hidden from the creations drawer) — the fixed fields
+            // below still win over any prompt/model the caller put in metadata.
+            ...(action.metadata && typeof action.metadata === 'object' && !Array.isArray(action.metadata)
+              ? action.metadata
+              : {}),
             prompt: action.prompt || null,
             model: result.model,
             provider: resolved.provider,
