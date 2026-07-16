@@ -170,6 +170,7 @@ const generateImageAction = {
         }
       },
       model:           { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories column contains the bucket for your operation: text-to-image / editing needs `image_generation` or `image_editing` (editing = passing referenceImages), a mask edit needs an `image_editing` model that supports masks, an outpaint/extend needs `image_extend`, an upscale needs `image_upscaling`, a background removal needs `image_background_removal`. NEVER pick a model that lacks the category for what you are doing (e.g. do not edit with a generation-only model). See the image-generator skill for what each category is for and per-model parameters. Omitting this (or passing "auto"/empty) is an error — the tool will refuse. Do NOT invent a slug (the gateway hard-errors on unknown ones).' },
+      extraParams:     { type: 'object', description: 'OPTIONAL. Model-specific parameters this tool does NOT expose as first-class fields — an escape hatch for per-model knobs. Use the EXACT provider field name as the key (snake_case, as in the model\'s API), value as its API expects, e.g. `{ "output_quality": 90 }`. Which extra params each model accepts is documented per model in the `image-generator` skill; only send ones listed there. Keys travel verbatim to the provider; unknown keys are ignored. Does NOT override first-class params — use those directly.' },
       // `excludeProviders` is intentionally NOT declared here — it is a
       // retry-hint set by the Coordinator after a BlockedResult, forwarded on
       // `action.*` by playbook-session.js and read in execute() below.
@@ -1177,6 +1178,9 @@ const generateImageAction = {
       outputFormat: action.outputFormat || (action.saveTo ? 'png' : 'b64_json'),
       referenceImages,
     };
+    // Model-specific escape hatch (see generate-video / video-generator skill).
+    const _extra = action.extraParams || action.extra_params;
+    if (_extra && typeof _extra === 'object') genOpts.extraParams = _extra;
     if (effectiveAspect) genOpts.aspectRatio = effectiveAspect;
     if (effectiveResolution) genOpts.resolution = effectiveResolution;
     if (action.n && action.n > 1) genOpts.n = action.n;

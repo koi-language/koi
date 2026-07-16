@@ -98,7 +98,8 @@ const generateAudioAction = {
       audioFile:    { type: 'string', description: 'Path to the file to transcribe (transcribe mode) — an audio OR a video file. If it is a video, its audio stream is extracted automatically, so you can pass the source clip directly.' },
       language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' },
       summary:      { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Narrator opening line in Spanish", "Stone door slam for shot 3". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt / text — usable but less semantic.' },
-      model:        { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories match your mode: speech/TTS → `audio_tts`; sound effect / Foley → `audio_sfx` (video-conditioned SFX needs an `audio_sfx` model that accepts a videoFile); music → `audio_music`; transcribe → `audio_transcribe`. For a cloned voice (from create_voice) pick the speech model that minted it. NEVER pick a model that lacks the category for your mode. See the audio-generator skill for what each category is for. Omitting this (or passing "auto"/empty) is an error — the tool will refuse.' }
+      model:        { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories match your mode: speech/TTS → `audio_tts`; sound effect / Foley → `audio_sfx` (video-conditioned SFX needs an `audio_sfx` model that accepts a videoFile); music → `audio_music`; transcribe → `audio_transcribe`. For a cloned voice (from create_voice) pick the speech model that minted it. NEVER pick a model that lacks the category for your mode. See the audio-generator skill for what each category is for. Omitting this (or passing "auto"/empty) is an error — the tool will refuse.' },
+      extraParams:  { type: 'object', description: 'OPTIONAL. Model-specific parameters this tool does NOT expose as first-class fields — an escape hatch for per-model knobs. Use the EXACT provider field name as the key (snake_case, as in the model\'s API), value as its API expects. Which extra params each model accepts is documented per model in the `audio-generator` skill; only send ones listed there. Keys travel verbatim to the provider; unknown keys are ignored. Does NOT override first-class params. Speech/sfx/music only (not transcribe).' }
     },
     required: ['model']
   },
@@ -208,6 +209,7 @@ const generateAudioAction = {
       channel.log('audio', `generate_audio (speech): ${resolved.provider}/${resolved.model}, voice=${voice}, format=${outputFormat}, speed=${speed}, chars=${text.length}, text="${(action.text || '').substring(0, 100)}...", saveTo=${action.saveTo || 'default'}`);
 
       const result = await instance.speech(text, {
+        ...(action.extraParams || action.extra_params ? { extraParams: action.extraParams || action.extra_params } : {}),
         voice,
         outputFormat,
         speed,
@@ -325,6 +327,7 @@ const generateAudioAction = {
       );
 
       const result = await instance.sfx(prompt, {
+        ...(action.extraParams || action.extra_params ? { extraParams: action.extraParams || action.extra_params } : {}),
         outputFormat,
         ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
         ...(typeof action.promptInfluence === 'number' ? { promptInfluence: action.promptInfluence } : {}),
@@ -410,6 +413,7 @@ const generateAudioAction = {
       );
 
       const result = await instance.music(prompt, {
+        ...(action.extraParams || action.extra_params ? { extraParams: action.extraParams || action.extra_params } : {}),
         outputFormat,
         ...(typeof action.durationSeconds === 'number' ? { durationSeconds: action.durationSeconds } : {}),
         ...(typeof action.seed === 'number' ? { seed: action.seed } : {}),

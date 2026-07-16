@@ -450,6 +450,7 @@ const generateVideoAction = {
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
       summary:         { type: 'string',  description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari pulling out of garage — opening shot", "Continuation of shot 2 with rain". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
       seed:            { type: 'number',  description: 'OPTIONAL. Reproducibility seed — same seed + same prompt ⇒ the same clip on models that support it (Seedance, Veo, WAN, Kling). Use it to lock a look across regenerations / multi-shot continuity. Ignored by models that don\'t expose a seed.' },
+      extraParams:     { type: 'object',  description: 'OPTIONAL. Model-specific parameters this tool does NOT expose as first-class fields — an escape hatch for per-model knobs (e.g. Seedance `bitrate_mode`). Use the EXACT provider field name as the key (snake_case, as in the model\'s API), value as its API expects: e.g. `{ "bitrate_mode": "..." }`. Which extra params each model accepts is documented per model in the `video-generator` skill (`references/models.md`); only send ones listed there. Keys travel verbatim to the provider; unknown keys are ignored. Does NOT override the first-class params (duration/resolution/aspectRatio/…) — use those directly.' },
     },
     required: ['prompt', 'model']
   },
@@ -1505,6 +1506,11 @@ const generateVideoAction = {
       // `extend` routes to the curated `video_extend` category bucket
       // in pickVideoModel (see media-model-router.js).
       kind: action.kind,
+      // Model-specific escape hatch: keys the tool doesn't expose as
+      // first-class params (e.g. Seedance `bitrate_mode`). Spread verbatim
+      // into the gateway payload → backend adapter → fal input. Documented
+      // per model in the video-generator skill; fal ignores unknown keys.
+      extraParams: action.extraParams || action.extra_params,
     });
 
     // Build the generation-params record once — used both for the

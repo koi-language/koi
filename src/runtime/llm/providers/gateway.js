@@ -888,6 +888,12 @@ export class GatewayImageGen extends BaseImageGen {
         }
       }
 
+      // Model-specific escape hatch: forward as a NESTED object (backend adapter
+      // merges it into the fal input; top-level unknown keys would be dropped).
+      if (opts.extraParams && typeof opts.extraParams === 'object' && !Array.isArray(opts.extraParams)) {
+        payload.extra_params = opts.extraParams;
+      }
+
       // Submit + poll. The sync `/media/image/generate` endpoint exists for
       // fast slugs, but Railway's edge proxy ~100s timeout cuts long calls
       // (gpt-image-2 with refs) before fal returns — using the queue path
@@ -1238,6 +1244,11 @@ export class GatewayAudioGen extends BaseAudioGen {
    *             durationMs?: number, creditsCost?, providerRequestId? }
    */
   async _submitAndPollAudio(kind, body, opts = {}) {
+    // Model-specific escape hatch: forward as a NESTED object (backend adapter
+    // merges it into the provider input; top-level unknown keys would be dropped).
+    if (opts.extraParams && typeof opts.extraParams === 'object' && !Array.isArray(opts.extraParams)) {
+      body.extra_params = opts.extraParams;
+    }
     const submitRes = await fetch(`${getGatewayBase()}/media/audio/${kind}/submit`, {
       method: 'POST',
       headers: getAuthHeaders(),
@@ -1379,6 +1390,7 @@ export class GatewayAudioGen extends BaseAudioGen {
     const result = await this._submitAndPollAudio('speech', body, {
       onStatus: opts.onStatus,
       abortSignal: opts.abortSignal,
+      extraParams: opts.extraParams,
     });
     const ret = {
       audio: result.buffer,
@@ -1582,6 +1594,7 @@ export class GatewayAudioGen extends BaseAudioGen {
     const result = await this._submitAndPollAudio('sfx', body, {
       onStatus: opts.onStatus,
       abortSignal: opts.abortSignal,
+      extraParams: opts.extraParams,
     });
     const ret = {
       audio: result.buffer,
@@ -1633,6 +1646,7 @@ export class GatewayAudioGen extends BaseAudioGen {
     const result = await this._submitAndPollAudio('music', body, {
       onStatus: opts.onStatus,
       abortSignal: opts.abortSignal,
+      extraParams: opts.extraParams,
     });
     const ret = {
       audio: result.buffer,
@@ -2080,6 +2094,15 @@ export class GatewayVideoGen extends BaseVideoGen {
         }
         return shotPayload;
       });
+    }
+
+    // Model-specific escape hatch: forward caller extra params the tool doesn't
+    // expose as first-class fields (e.g. Seedance `bitrate_mode`) as a NESTED
+    // object. The backend adapter merges it into the fal input (adapters build
+    // an explicit whitelist, so top-level unknown keys would be dropped — it
+    // must arrive as its own field). Keys are the exact fal field names.
+    if (opts.extraParams && typeof opts.extraParams === 'object' && !Array.isArray(opts.extraParams)) {
+      payload.extra_params = opts.extraParams;
     }
 
       try {
