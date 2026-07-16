@@ -5,7 +5,7 @@
  *   1. pattern  — regex grep across file contents
  *   2. glob     — file name matching with glob patterns
  *   3. query    — BM25 ranked full-text search (inverted index, 1-min cache)
- *   4. semantic — hierarchical code search via SemanticIndex + LanceDB
+ *   4. semantic — hierarchical code search via SemanticIndex + SQLite
  *   5. symbols  — AST-based symbol resolution via tree-sitter
  *   6. impact   — dependency graph analysis (import graph + symbol refs)
  *

@@ -284,6 +284,7 @@ function _aggregateVideo(models) {
     hasEditing:         cats.has('video_editing'),
     hasExtend:          cats.has('video_extend'),
     hasAvatar:          cats.has('video_avatar'),
+    hasLipsync:         cats.has('video_lipsync'),
     hasBackgroundRemove: cats.has('video_background_removal'),
   };
 }
@@ -2327,6 +2328,107 @@ export class GatewayVideoGen extends BaseVideoGen {
     if (!submitRes.ok) {
       const body = await submitRes.text().catch(() => '');
       throw new Error(`Gateway avatar error (${submitRes.status}): ${body}`);
+    }
+    const data = await submitRes.json();
+    return {
+      id: data.id,
+      status: _mapGatewayVideoStatus(data.status),
+      model: data.model || resolvedModel,
+      provider: 'koi-gateway',
+    };
+  }
+
+  /** Re-lipsync an EXISTING video to a new audio track (dub / re-voice a
+   *  clip). Same three steps as generateAvatar, but the primary input is a
+   *  VIDEO, not a still image:
+   *    1. Pick the cheapest lipsync-capable model via pickVideoModel
+   *       (req.kind = 'lipsync'; the source video counts as one videoRef and
+   *       the audio as hasAudioUrl, so the `requires:['referenceVideos',
+   *       'audioUrl']` filter keeps veed/lipsync/v2 in the running).
+   *    2. Upload audio + video bytes to fal storage via /uploads/audio and
+   *       /uploads/video → URLs.
+   *    3. POST canonical {model, video_url, audio_url} to
+   *       /media/video/lipsync; backend resolves the veed adapter and queues.
+   *
+   *  Returns the same composite jobId shape as the other video paths, so
+   *  `await_video_generation` polls it without a new code path. */
+  async generateLipsync(videoBuffer, audioBuffer, opts = {}) {
+    if (!Buffer.isBuffer(videoBuffer)) {
+      throw new Error('generateLipsync: videoBuffer must be a Buffer');
+    }
+    if (!Buffer.isBuffer(audioBuffer)) {
+      throw new Error('generateLipsync: audioBuffer must be a Buffer');
+    }
+    const resolvedModel = await _resolveMediaModel('video', this.model, opts, (models, req) =>
+      import('./media-model-router.js').then(({ pickVideoModel, MediaModelRoutingError }) => {
+        try {
+          return pickVideoModel(models, req);
+        } catch (e) {
+          if (e instanceof MediaModelRoutingError) throw _toNoMatchError(e);
+          throw e;
+        }
+      }),
+      // The source video is present as one videoRef and the audio as
+      // hasAudioUrl, so the router's `_filterByRequires` keeps models whose
+      // contract is `["referenceVideos","audioUrl"]` (veed/lipsync/v2).
+      {
+        kind: 'lipsync',
+        label: opts.label,
+        videoRefsCount: 1,
+        hasAudioUrl: true,
+      },
+    );
+
+    // Upload audio.
+    const audioFilename = opts.audioFilename || 'audio.mp3';
+    const audioMime = opts.audioMimeType || _audioMimeFromFilename(audioFilename);
+    const aHeaders = { ...getAuthHeaders() };
+    delete aHeaders['content-type'];
+    delete aHeaders['Content-Type'];
+    aHeaders['Content-Type'] = audioMime;
+    const audioRes = await fetch(
+      `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(audioFilename)}`,
+      { method: 'POST', headers: aHeaders, body: audioBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
+    );
+    await throwIfQuotaExceeded(audioRes);
+    if (!audioRes.ok) {
+      const body = await audioRes.text().catch(() => '');
+      throw new Error(`Gateway audio upload error (${audioRes.status}): ${body}`);
+    }
+    const { url: audioUrl } = await audioRes.json();
+
+    // Upload the source video via /uploads/video (fal-storage wrapper).
+    const videoFilename = opts.videoFilename || 'source.mp4';
+    const vHeaders = { ...getAuthHeaders() };
+    delete vHeaders['content-type'];
+    delete vHeaders['Content-Type'];
+    vHeaders['Content-Type'] = opts.videoMimeType || 'video/mp4';
+    const vidRes = await fetch(
+      `${getGatewayBase()}/uploads/video?filename=${encodeURIComponent(videoFilename)}`,
+      { method: 'POST', headers: vHeaders, body: videoBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
+    );
+    await throwIfQuotaExceeded(vidRes);
+    if (!vidRes.ok) {
+      const body = await vidRes.text().catch(() => '');
+      throw new Error(`Gateway video upload error (${vidRes.status}): ${body}`);
+    }
+    const { url: videoUrl } = await vidRes.json();
+
+    // Submit the lipsync job.
+    const submitRes = await fetch(`${getGatewayBase()}/media/video/lipsync`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        model: resolvedModel,
+        video_url: videoUrl,
+        audio_url: audioUrl,
+      }),
+      signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
+    });
+    await throwIfQuotaExceeded(submitRes);
+    if (!submitRes.ok) {
+      const body = await submitRes.text().catch(() => '');
+      throw new Error(`Gateway lipsync error (${submitRes.status}): ${body}`);
     }
     const data = await submitRes.json();
     return {

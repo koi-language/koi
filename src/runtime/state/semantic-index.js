@@ -6,13 +6,13 @@
  *   2. Describe functions via LLM (batches of 10)
  *   3. Describe classes via LLM (fed with method descriptions)
  *   4. Describe file via LLM (fed with class + function descriptions)
- *   5. Embed descriptions → store in LanceDB (3 tables: files, classes, functions)
+ *   5. Embed descriptions → store in SQLite (3 tables: files, classes, functions)
  *
  * Incremental: SHA-256 content hash manifest skips unchanged files.
- * Storage: LanceDB (embedded, serverless) at .koi/cache/semantic-index/
+ * Storage: SQLite (embedded, serverless) at .koi/cache/semantic-index/
  *
  * Search: In-memory cosine similarity on a cached snapshot of the index.
- * LanceDB is ONLY used for writes (build) and one-time cache loading.
+ * SQLite is ONLY used for writes (build) and one-time cache loading.
  * This avoids native-binding deadlocks and allows fully parallel searches.
  */
 
@@ -33,7 +33,7 @@ const FILE_PARALLEL_BATCH = 5; // Index this many files concurrently
 
 export class SemanticIndex {
   /**
-   * @param {string} cacheDir - Directory for LanceDB + manifest (e.g. .koi/cache/semantic-index)
+   * @param {string} cacheDir - Directory for SQLite + manifest (e.g. .koi/cache/semantic-index)
    * @param {import('../llm/llm-provider.js').LLMProvider} llmProvider
    */
   constructor(cacheDir, llmProvider) {
@@ -47,7 +47,7 @@ export class SemanticIndex {
     this._ready = false;
     this._building = false;
 
-    // In-memory search cache — loaded once from LanceDB, then all searches are pure JS.
+    // In-memory search cache — loaded once from SQLite, then all searches are pure JS.
     this._cache = null;       // { files: Row[], classes: Row[], functions: Row[] }
     this._cachePromise = null; // guards concurrent _loadCache calls
   }
@@ -81,7 +81,7 @@ export class SemanticIndex {
 
       // Discover files from main project + dependency directories (all in one index)
       // manifestKey = key for incremental hash check (dep:name/... for deps, relPath for main)
-      // indexPath = path stored in LanceDB file_path column — ALWAYS absolute so agents can read_file directly
+      // indexPath = path stored in SQLite file_path column — ALWAYS absolute so agents can read_file directly
       const fileEntries = []; // { absPath, manifestKey, indexPath }
       const mainFiles = this._discoverFiles(projectDir);
       for (const f of mainFiles) {
@@ -130,7 +130,7 @@ export class SemanticIndex {
       if (onProgress) onProgress(processed, total);
       channel.log('semantic-index', `${toIndex.length} files need indexing, ${skipped} up-to-date`);
 
-      // Pre-create LanceDB tables to avoid race conditions in parallel indexing
+      // Pre-create SQLite tables to avoid race conditions in parallel indexing
       if (toIndex.length > 0) {
         await this._ensureFilesTable();
         await this._ensureFunctionsTable();
@@ -233,7 +233,7 @@ export class SemanticIndex {
 
   /**
    * Search the semantic index using in-memory cosine similarity.
-   * Fully parallel-safe — no LanceDB access during search.
+   * Fully parallel-safe — no SQLite access during search.
    */
   async search(queryEmbedding, opts = {}) {
     if (this._building) {
@@ -241,7 +241,7 @@ export class SemanticIndex {
       return [];
     }
 
-    // Ensure cache is loaded (one-time from LanceDB, then pure memory)
+    // Ensure cache is loaded (one-time from SQLite, then pure memory)
     if (!this._cache) {
       await this._ensureCacheLoaded();
       if (!this._cache) {
@@ -256,7 +256,7 @@ export class SemanticIndex {
       ? [type === 'file' ? 'files' : type === 'class' ? 'classes' : 'functions']
       : ['files', 'classes', 'functions'];
 
-    // Validate cache health — if all vectors are empty, force reload from LanceDB
+    // Validate cache health — if all vectors are empty, force reload from SQLite
     const _totalRows = (this._cache.files?.length || 0) + (this._cache.classes?.length || 0) + (this._cache.functions?.length || 0);
     if (_totalRows > 0 && !this._cacheValidated) {
       let _hasVectors = false;
@@ -321,12 +321,12 @@ export class SemanticIndex {
 
   /**
    * Check if the index has data and is ready for search.
-   * Uses manifest (filesystem) — NEVER touches LanceDB to avoid deadlocks.
+   * Uses manifest (filesystem) — NEVER touches SQLite to avoid deadlocks.
    */
   isReady() {
     if (this._ready) return true;
     if (this._cache) return true;
-    // Check manifest on disk — no LanceDB call
+    // Check manifest on disk — no SQLite call
     this._loadManifest();
     return this._manifest && Object.keys(this._manifest).length > 0;
   }
@@ -402,7 +402,7 @@ export class SemanticIndex {
   // ─── Cache Management ──────────────────────────────────────────────
 
   /**
-   * Ensure the cache is loaded from LanceDB (one-time).
+   * Ensure the cache is loaded from SQLite (one-time).
    * Safe to call from background tasks or before parallel searches.
    * Uses a promise guard to prevent multiple concurrent loads.
    */
@@ -429,8 +429,8 @@ export class SemanticIndex {
   }
 
   /**
-   * Load all rows from LanceDB into memory. Called once after build
-   * or on first search. After this, LanceDB is not touched for reads.
+   * Load all rows from SQLite into memory. Called once after build
+   * or on first search. After this, SQLite is not touched for reads.
    */
   async _loadCacheFromDb(force = false) {
     if (!force && this._building) {
@@ -518,10 +518,9 @@ export class SemanticIndex {
   async _ensureDb() {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
-    // Migrated off @lancedb/lancedb to a SQLite-backed adapter. Storage layout
-    // is preserved (one dir under cacheDir holding a single index.sqlite),
-    // schema is auto-derived from sample rows, vector search is in-process JS
-    // cosine. See state/_sqlite-vector-adapter.js for the contract.
+    // SQLite-backed vector adapter: one dir under cacheDir holding a single
+    // index.sqlite, schema auto-derived from sample rows, vector search is
+    // in-process JS cosine. See state/_sqlite-vector-adapter.js for the contract.
     this._dbPromise = (async () => {
       const { connect } = await import('./_sqlite-vector-adapter.js');
       const dbPath = path.join(this.cacheDir, 'vector-cache');
@@ -582,7 +581,7 @@ export class SemanticIndex {
       if (raw._version !== SemanticIndex.MANIFEST_VERSION) {
         channel.log('semantic-index', `Manifest version mismatch (${raw._version || 1} → ${SemanticIndex.MANIFEST_VERSION}) — clearing index for re-build`);
         this._manifest = {};
-        // Also drop LanceDB tables so stale relative paths are removed
+        // Also drop SQLite tables so stale relative paths are removed
         this._dropAllTables().catch(() => {});
       } else {
         this._manifest = raw;
@@ -987,7 +986,7 @@ function zeroVector() {
 
 /**
  * Cosine similarity between two vectors. Returns value in [-1, 1].
- * Used for in-memory search instead of LanceDB vectorSearch.
+ * Used for in-memory search instead of SQLite vectorSearch.
  */
 function cosineSimilarity(a, b) {
   let dot = 0, magA = 0, magB = 0;

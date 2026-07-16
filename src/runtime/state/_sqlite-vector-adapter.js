@@ -1,11 +1,13 @@
 /**
- * SQLite-backed adapter that mimics the slice of @lancedb/lancedb's API used
- * by semantic-index.js and media-library.js. Lets us drop the LanceDB
- * dependency without rewriting either consumer.
+ * SQLite-backed vector store. Exposes the small `connect / openTable /
+ * createTable / query / add / update` API that semantic-index.js and
+ * media-library.js are written against, so both consumers use SQLite with no
+ * rewrite. (This adapter replaced an earlier embedded vector DB; the API shape
+ * it emulates is why the method names read the way they do.)
  *
  * Storage:
- *   - One SQLite file per "database" (LanceDB.connect(dbPath) → file).
- *   - One SQLite table per LanceDB table.
+ *   - One SQLite file per "database" (connect(dbPath) → file).
+ *   - One SQLite table per logical table.
  *   - Schema is derived from the sample row passed to createTable():
  *       string  → TEXT
  *       number  → REAL
@@ -44,10 +46,10 @@ const Database = (typeof process.pkg !== 'undefined' && process.env.KOI_EXTRACTE
 
 /**
  * Open (or create) a SQLite-backed vector "database" at the given path.
- * Mimics @lancedb/lancedb's `connect(dbPath)` entry point.
+ * The `connect(dbPath)` entry point the consumers are written against.
  */
 export async function connect(dbPath) {
-  // LanceDB accepts a directory; we use a single sqlite file inside it so the
+  // The API accepts a directory; we use a single sqlite file inside it so the
   // existing layout (one dir per index) is preserved. Callers can rm -rf the
   // dir to wipe the index.
   mkdirSync(dbPath, { recursive: true });
@@ -62,7 +64,7 @@ class SqliteVectorDB {
     this._dbFile = dbFile;
     this._db = new Database(dbFile);
     this._db.pragma('journal_mode = WAL');
-    // LanceDB callers write WHERE clauses with double-quoted string literals
+    // Callers write WHERE clauses with double-quoted string literals
     // (`id = "abc"`). Stock SQLite rejects DQS in DML/DQL since it expects
     // those to be identifiers. Either pragma below permits the legacy form;
     // safe because we control the SQL — no untrusted input is ever quoted
@@ -75,7 +77,7 @@ class SqliteVectorDB {
     // row, and keeps only a bounded top-k sorter — so we never pull the
     // whole table into the JS heap (the old path did `SELECT *` + JS cosine
     // over every row). Returns a DISTANCE (lower = closer): `1 - cosine`,
-    // matching the `_distance` contract LanceDB exposed. `deterministic`
+    // matching the `_distance` contract the old API exposed. `deterministic`
     // lets SQLite skip re-evaluating identical argument pairs.
     this._db.function('cosine_distance', { deterministic: true }, _cosineDistanceBlobs);
     this._tables = new Map();
@@ -177,13 +179,13 @@ class SqliteTable {
   }
 
   /**
-   * Update rows matching `where`. Mimics the two LanceDB shapes used by
+   * Update rows matching `where`. Mimics the two update shapes used by
    * media-library.js:
    *   1) `update({ col: val, ... }, { where: "..." })`        ← legacy 2-arg
    *   2) `update({ values: { col: val }, where: "..." })`     ← explicit 1-arg
    * Values are bound via SQLite parameters (no SQL splicing), so JSON blobs
    * and strings with quotes are safe — that's the whole reason the consumer
-   * had to use the explicit shape on LanceDB.
+   * had to use the explicit shape before.
    */
   async update(arg1, arg2) {
     let values, where;
@@ -252,6 +254,14 @@ class SqliteTable {
    *  table schema. */
   async rawScalar(sql, params = []) {
     return this._db.prepare(sql).get(...params);
+  }
+
+  /** Total row count. Cheap change-detector for pollers (e.g. the GUI's
+   *  media-library revision probe) that only need to know "did anything get
+   *  added/removed?" without materialising every row. */
+  async countRows() {
+    const r = this._db.prepare(`SELECT COUNT(*) AS n FROM ${_qid(this._name)}`).get();
+    return Number(r?.n ?? 0);
   }
 
   /** Safely-quoted table identifier, for callers building raw SQL. */
@@ -362,7 +372,7 @@ class SqliteSearchBuilder {
     const rows = this._table._db.prepare(sql).all(queryBlob);
     // `_decodeRow` only emits schema columns, so the computed `_distance`
     // column is dropped there — re-attach it from the raw row to preserve
-    // the LanceDB `_distance` contract (lower = closer).
+    // the `_distance` contract (lower = closer).
     return rows.map((r) => {
       const out = this._table._decodeRow(r);
       out._distance = typeof r._distance === 'number' ? r._distance : 1;
@@ -500,7 +510,7 @@ function _qid(name) {
 }
 
 /**
- * LanceDB callers freely use double-quoted string literals inside WHERE
+ * Callers freely use double-quoted string literals inside WHERE
  * clauses (`id = "abc"`). Stock SQLite treats those as identifiers and
  * errors. We rewrite them to single-quoted, escaping internal single
  * quotes by doubling them (SQL standard).

@@ -2,7 +2,7 @@
  * Media Library — Global persistent storage for ALL user-visible assets:
  * images, videos, audio, voice samples, AND timelines.
  *
- * Uses LanceDB at ~/.koi/media-library/ to store media with:
+ * Uses SQLite at ~/.koi/media-library/ to store media with:
  *   - Binary data on disk; the row carries the path
  *   - Metadata (mime_type, filename, width, height, created_at, favorite,
  *     `categories[]` — multivalued user-visible tags / collections)
@@ -21,12 +21,12 @@
  *   - 'unknown'   — fallback when the extension doesn't match
  *
  * Categories: multi-valued tags. `categories[]` is stored inside
- * `metadata_json` for now (so schema doesn't need a LanceDB column
+ * `metadata_json` for now (so schema doesn't need a SQLite column
  * migration). The drawer surfaces them as collection chips:
  * `galleryListCategories()` returns the union, `addCategory(id, cat)` /
  * `removeCategory(id, cat)` mutate one row's tag set, and
  * `list({ category })` filters by a single tag. When we move to cloud
- * sync we'll promote this to a real LanceDB column for fast SQL filters.
+ * sync we'll promote this to a real SQLite column for fast SQL filters.
  *
  * Deduplication: content hash (SHA-256) prevents storing the same file
  * twice. For timelines / voices (whose content evolves over time at a
@@ -188,9 +188,8 @@ export class MediaLibrary {
   async _ensureDb() {
     if (this._db) return;
     if (this._dbPromise) return this._dbPromise;
-    // Migrated off @lancedb/lancedb to a SQLite-backed adapter (same one
-    // semantic-index uses). Storage layout is preserved (same DB_DIR/lancedb
-    // path), schema is auto-derived from the seed row in _ensureTable.
+    // SQLite-backed vector adapter (the same one semantic-index uses).
+    // Schema is auto-derived from the seed row in _ensureTable.
     this._dbPromise = (async () => {
       const { connect } = await import('./_sqlite-vector-adapter.js');
       fs.mkdirSync(DB_DIR, { recursive: true });
@@ -449,7 +448,7 @@ export class MediaLibrary {
     // "source: reference" entry because list() keeps the newest per hash.
     //
     // Historically this used `table.search(zeroVec).where(...)` which is
-    // unreliable — LanceDB's vector search + where can return empty when
+    // unreliable — SQLite's vector search + where can return empty when
     // the stored embedding is the zero placeholder. `table.filter()` is
     // purely metadata-driven and always sees the row.
     const escHash = String(hash).replace(/'/g, "''");
@@ -618,7 +617,7 @@ export class MediaLibrary {
    *   (e.g. ['image','video','timeline'] for the "Latest" drawer tab)
    * @param {string} [opts.category] - Multi-valued tag filter (drawer
    *   collection chip). In-memory match against `metadata.categories`
-   *   because LanceDB doesn't natively index JSON arrays — fast enough
+   *   because SQLite doesn't natively index JSON arrays — fast enough
    *   for the catalog sizes we expect (low thousands).
    * @param {number} [opts.limit=100]
    * @param {number} [opts.offset=0]
@@ -628,7 +627,7 @@ export class MediaLibrary {
    * newest `created_at`, without materialising (or serialising) a single item.
    *
    * The GUI used to poll the FULL library (limit 20000) every 8 s just to notice
-   * a new creation: the engine pulled every row out of LanceDB, serialised it,
+   * a new creation: the engine pulled every row out of SQLite, serialised it,
    * and the GUI decoded + parsed + re-sorted the lot ON ITS UI THREAD — measured
    * at ~200 ms of frozen UI, every 8 s, forever. Now it polls this instead and
    * only asks for the real list when the fingerprint moves.
@@ -643,17 +642,22 @@ export class MediaLibrary {
     }
     let latest = '';
     try {
-      const rows = await table.query().select(['created_at']).limit(10000).toArray();
-      for (const r of rows) {
-        const c = r.created_at || '';
-        if (c > latest) latest = c;
-      }
+      // Newest row only — `orderBy(...).limit(1)` is pushed down to SQLite, so
+      // this reads ONE row, not the whole table. (An earlier version used a
+      // non-existent `.select()` on the adapter, which threw — leaving the
+      // probe permanently broken so the drawer never noticed new creations.)
+      const rows = await table
+        .query()
+        .orderBy('created_at', 'desc')
+        .limit(1)
+        .toArray();
+      if (rows.length > 0) latest = rows[0].created_at || '';
     } catch { /* leave latest empty — count alone still detects adds/removes */ }
     return { count, latest };
   }
 
   async list({ favorite, mediaType, mediaTypes, category, limit = 100, offset = 0, includeHidden = false } = {}) {
-    // LanceDB is the single source of truth — no fallbacks, no disk scanning.
+    // SQLite is the single source of truth — no fallbacks, no disk scanning.
     const table = await this._ensureTable();
 
     const conditions = [];
@@ -814,7 +818,7 @@ export class MediaLibrary {
   }
 
   /**
-   * Remove duplicate entries from LanceDB (keeps newest per content_hash).
+   * Remove duplicate entries from SQLite (keeps newest per content_hash).
    * Called on startup or manually.
    */
   async deduplicate() {
@@ -869,10 +873,10 @@ export class MediaLibrary {
     const val = favorite ? '1' : '0';
     const escId = String(id).replace(/'/g, "''");
     try {
-      // LanceDB update() expects SQL expression strings as values, not JS
+      // SQLite update() expects SQL expression strings as values, not JS
       // numbers, AND the where clause goes inside the options object — not
-      // via a `.where().execute()` chain (that API doesn't exist on the
-      // installed lancedb). For `favorite` the value `'1'` / `'0'` IS a
+      // via a `.where().execute()` chain (that shape doesn't exist on the
+      // adapter). For `favorite` the value `'1'` / `'0'` IS a
       // valid SQL literal so the default 2-arg shape works.
       await table.update({ favorite: val }, { where: `id = '${escId}'` });
     } catch (e) {
@@ -1033,7 +1037,7 @@ export class MediaLibrary {
       const meta = rows[0].metadata_json ? JSON.parse(rows[0].metadata_json) : {};
       meta.categories = _normaliseCategories(categories);
       const escId = String(id).replace(/'/g, "''");
-      // LanceDB has two `update` shapes:
+      // SQLite has two `update` shapes:
       //   - the "default" 2-arg form maps each value through toSQL on the
       //     way down — except when neither `values` nor `valuesSql` is set,
       //     in which case the values are spliced into SQL **as raw
@@ -1127,7 +1131,7 @@ export class MediaLibrary {
     const table = await this._ensureTable();
     let rows;
     try {
-      // No SQL filter on JSON-embedded `mention` — LanceDB can't index
+      // No SQL filter on JSON-embedded `mention` — SQLite can't index
       // into metadata_json. Pull the catalog in one shot (low thousands)
       // and filter in JS, identical to how `list({category})` works.
       rows = await table.query().limit(10000).toArray();

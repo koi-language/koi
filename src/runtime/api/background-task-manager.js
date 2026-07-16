@@ -137,7 +137,7 @@ class BackgroundTaskManager {
   }
 
   /**
-   * Helper: start semantic code indexing using SemanticIndex + LanceDB.
+   * Helper: start semantic code indexing using SemanticIndex + SQLite.
    * @param {string} projectDir - Project root directory
    * @param {import('../llm/llm-provider.js').LLMProvider} llmProvider
    */

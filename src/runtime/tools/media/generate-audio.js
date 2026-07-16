@@ -27,13 +27,45 @@ import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
 
+// Container extensions we treat as VIDEO for transcription: Whisper wants
+// audio, so a video's audio stream is extracted before upload.
+const _TRANSCRIBE_VIDEO_EXTS = ['.mov', '.mp4', '.webm', '.mkv', '.avi', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv'];
+
+// Extract the audio stream of a video into a small temp file (mono 16 kHz AAC —
+// what Whisper-class ASR wants) so the SOURCE VIDEO can be transcribed directly.
+// Returns the temp path; the caller unlinks it. Uses the bundled/pinned ffmpeg.
+async function _extractAudioForTranscribe(videoPath) {
+  const { ensureFfmpeg } = await import('../../media/ffmpeg-installer.js');
+  const { spawn } = await import('child_process');
+  const bins = await ensureFfmpeg();
+  const out = path.join(
+    os.tmpdir(),
+    `koi-transcribe-${path.basename(videoPath, path.extname(videoPath)).replace(/[^A-Za-z0-9_-]/g, '')}-${Date.now()}.m4a`,
+  );
+  await new Promise((resolve, reject) => {
+    const proc = spawn(bins.ffmpeg, [
+      '-hide_banner', '-y', '-i', videoPath,
+      '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac',
+      out,
+    ]);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg audio extraction failed (exit ${code}): ${err.slice(-400)}`));
+    });
+  });
+  return out;
+}
+
 const generateAudioAction = {
   type: 'generate_audio',
   intent: 'generate_audio',
   bannerKind: 'audio',
   bannerLabel: 'Generando audio',
   bannerIconId: 'generate-audio',
-  description: 'REQUIRED FIRST: the `audio-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by mode/category) and how to use each one. Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. YOU MUST choose the model: the "model" param is REQUIRED — pick a slug from the Catalog table at the END of this description whose Categories match your mode (audio_tts for speech, audio_sfx for sound effects/Foley, audio_music for music, audio_transcribe for transcription). There is no auto-selection; omitting model (or passing "auto") is an error. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required, path to audio file), optional "language" (ISO code). For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (per-model range: see the `audio-generator` skill), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "durationSeconds" (per-model range: see the `audio-generator` skill), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text } for transcribe.',
+  description: 'REQUIRED FIRST: the `audio-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by mode/category) and how to use each one. Generate speech, transcribe audio, synthesise a sound effect, OR generate a music track. YOU MUST choose the model: the "model" param is REQUIRED — pick a slug from the Catalog table at the END of this description whose Categories match your mode (audio_tts for speech, audio_sfx for sound effects/Foley, audio_music for music, audio_transcribe for transcription). There is no auto-selection; omitting model (or passing "auto") is an error. Four modes: "speech" (alias "tts") converts text to audio (TTS); "transcribe" converts audio file to text (STT); "sfx" generates a sound effect / Foley / ambient clip from a free-form prompt — pass "videoFile" to land on a video-conditioned model (see catalog snapshot — picker routes to a slug that supports video conditioning when one is active) that synchronises the SFX to the visible action; "music" generates a music track / score / backing — text-only, NO video conditioning, use this when the user explicitly asks for music / soundtrack / score. Fields for speech mode: "text" (required), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "voice" (preset name OR cloned-voice name from create_voice), optional "outputFormat" (mp3|opus|aac|flac|wav|pcm), optional "speed" (0.25-4.0), optional "language" (ISO-639-1 — improves quality on multilingual providers like MiniMax), optional "emotion" (provider-dependent: happy / sad / angry / calm / surprised / disgusted / fearful / neutral), optional "pitch" / "volume" voice-acting knobs (provider-dependent — ignored by OpenAI). For transcribe mode: "mode" must be "transcribe", "audioFile" (required — path to an audio OR video file; a video\'s audio is extracted automatically, so pass the source clip directly), optional "language" (ISO code). Returns TIMESTAMPED segments (see below) — use them to cut precisely. For sfx mode: "mode" must be "sfx", "prompt" (required — describe the sound), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "videoFile" (path — enables video-conditioned model), optional "durationSeconds" (per-model range: see the `audio-generator` skill), optional "promptInfluence" (0..1, ElevenLabs only), optional "outputFormat", optional "seed". For music mode: "mode" must be "music", "prompt" (required — describe mood / genre / instrumentation / structure), "saveTo" (OPTIONAL, file path — omit to save only in ~/.koi/audio), optional "durationSeconds" (per-model range: see the `audio-generator` skill), optional "outputFormat", optional "seed". Returns: { success, savedTo, format, fileSize } for speech / sfx / music; { success, text, segments, language } for transcribe — `segments` is a timestamped list `[{ start, end, text }]` (seconds) when the ASR provides it (Whisper/Wizper do). Use `segments` to place edits ON the pauses between phrases (never mid-word); the flat `text` alone loses the timing.',
   thinkingHint: (action) => {
     if (action.mode === 'transcribe') return 'Transcribing audio';
     if (action.mode === 'sfx') return 'Generating sound effect';
@@ -63,7 +95,7 @@ const generateAudioAction = {
       seed:         { type: 'number', description: 'Optional reproducibility seed (sfx mode).' },
       videoFile:    { type: 'string', description: 'Optional path to a reference video (sfx mode). When provided, the router picks a video-conditioned model (e.g. mmaudio-v2) that synchronises the generated SFX / Foley to the visible action — preferred when adding audio to a silent video. The video is uploaded to fal storage automatically. Omit for prompt-only SFX (faster / cheaper).' },
       // Transcribe mode fields
-      audioFile:    { type: 'string', description: 'Path to audio file to transcribe (transcribe mode)' },
+      audioFile:    { type: 'string', description: 'Path to the file to transcribe (transcribe mode) — an audio OR a video file. If it is a video, its audio stream is extracted automatically, so you can pass the source clip directly.' },
       language:     { type: 'string', description: 'ISO-639-1 language code. Speech mode: enables MiniMax language_boost ("es" → Spanish, etc.) and helps multilingual TTS pick the right pronunciation. Transcribe mode: hint for the STT model (Whisper auto-detects when omitted).' },
       summary:      { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Narrator opening line in Spanish", "Stone door slam for shot 3". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt / text — usable but less semantic.' },
       model:        { type: 'string', description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories match your mode: speech/TTS → `audio_tts`; sound effect / Foley → `audio_sfx` (video-conditioned SFX needs an `audio_sfx` model that accepts a videoFile); music → `audio_music`; transcribe → `audio_transcribe`. For a cloned voice (from create_voice) pick the speech model that minted it. NEVER pick a model that lacks the category for your mode. See the audio-generator skill for what each category is for. Omitting this (or passing "auto"/empty) is an error — the tool will refuse.' }
@@ -432,30 +464,51 @@ const generateAudioAction = {
 
     // ── Transcribe mode (STT) ─────────────────────────────────────────
     if (mode === 'transcribe') {
-      const audioFile = action.audioFile;
-      if (!audioFile) throw new Error('generate_audio: "audioFile" is required for transcribe mode');
+      // Accept an audio OR a video file (agents pass the source clip directly).
+      const inputFile = action.audioFile || action.videoFile;
+      if (!inputFile) throw new Error('generate_audio: "audioFile" is required for transcribe mode (an audio or video path)');
 
-      const resolvedPath = path.resolve(audioFile);
+      const resolvedPath = path.resolve(inputFile);
       if (!fs.existsSync(resolvedPath)) {
-        return { success: false, error: `Audio file not found: ${audioFile}` };
+        return { success: false, error: `File not found: ${inputFile}` };
       }
 
-      channel.log('audio', `generate_audio (transcribe): ${resolved.provider}, file=${resolvedPath}`);
+      // A video → extract its audio stream first (Whisper wants audio bytes).
+      const isVideo = _TRANSCRIBE_VIDEO_EXTS.includes(path.extname(resolvedPath).toLowerCase());
+      let transcribeSrc = resolvedPath;
+      let tmpAudio = null;
+      if (isVideo) {
+        channel.log('audio', `generate_audio (transcribe): extracting audio from video ${path.basename(resolvedPath)}`);
+        tmpAudio = await _extractAudioForTranscribe(resolvedPath);
+        transcribeSrc = tmpAudio;
+      }
 
-      const audioData = fs.createReadStream(resolvedPath);
-      const result = await instance.transcribe(audioData, {
-        language: action.language,
-      });
+      channel.log('audio', `generate_audio (transcribe): ${resolved.provider}, file=${path.basename(transcribeSrc)}`);
 
-      return {
-        success: true,
-        provider: resolved.provider,
-        model: 'whisper-1',
-        mode: 'transcribe',
-        text: result.text,
-        segments: result.segments,
-        usage: result.usage,
-      };
+      try {
+        // Pass a BUFFER (not a stream): the gateway rejects non-Buffer input.
+        const audioBuf = fs.readFileSync(transcribeSrc);
+        const result = await instance.transcribe(audioBuf, {
+          language: action.language,
+          sampleFilename: path.basename(transcribeSrc),
+        });
+
+        return {
+          success: true,
+          provider: resolved.provider,
+          model: result.model || resolved.model,
+          mode: 'transcribe',
+          text: result.text,
+          // Timestamped segments [{ start, end, text }] when the ASR returns
+          // them (Whisper/Wizper do) — this is what makes precise, on-the-pause
+          // cutting possible instead of eyeballing.
+          segments: result.segments,
+          language: result.language,
+          usage: result.usage,
+        };
+      } finally {
+        if (tmpAudio) { try { fs.unlinkSync(tmpAudio); } catch { /* best-effort temp cleanup */ } }
+      }
     }
 
     throw new Error(`generate_audio: unknown mode "${mode}" — use "speech", "transcribe", "sfx", or "music"`);

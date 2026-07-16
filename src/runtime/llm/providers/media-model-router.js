@@ -117,6 +117,9 @@ export function wantedCategoryFor(mediaKind, req = {}) {
     const kind = req.kind || '';
     const hasVideoRefs = (req.videoRefsCount || 0) > 0;
     return kind === 'avatar' ? 'video_avatar'
+      // lipsync BEFORE the hasVideoRefs→editing fallthrough: it passes a
+      // source video (videoRefsCount>0) but is its own bucket, not editing.
+      : kind === 'lipsync' ? 'video_lipsync'
       : kind === 'extend' ? 'video_extend'
       : (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal'
       : kind === 'continuation' ? 'video_generation'

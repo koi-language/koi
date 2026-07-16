@@ -94,7 +94,7 @@ export class EmbeddingProvider {
   /**
    * Returns the embedding vector dimension for the active embedding provider.
    * OpenAI text-embedding-3-small = 1536, Gemini text-embedding-004 = 768.
-   * Used by ContextMemory to initialize LanceDB with the correct schema.
+   * Used by ContextMemory to initialize SQLite with the correct schema.
    */
   getEmbeddingDim() {
     if (process.env.KOI_AUTH_TOKEN) return 1536; // gateway uses text-embedding-3-small

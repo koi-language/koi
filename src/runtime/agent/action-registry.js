@@ -308,6 +308,7 @@ class ActionRegistry {
       'generate_video',
       'generate_audio',
       'generate_avatar_video',
+      'lipsync_video',
       'background_removal',
       'upscale_image',
       'outpaint_image',

@@ -1503,7 +1503,7 @@ export class Agent {
       : (this.amnesia ? null : this.contextMemoryState);
     if (process.env.KOI_DEBUG_LLM) {
       const entryCount = memoryState?.entries?.length || 0;
-      console.error(`[Agent:${this.name}] 🧠 Memory check: amnesia=${this.amnesia}, entries=${entryCount}, latent=LanceDB`);
+      console.error(`[Agent:${this.name}] 🧠 Memory check: amnesia=${this.amnesia}, entries=${entryCount}, latent=SQLite`);
     }
 
     // If a compose-based playbookFn is provided, create a resolver that re-evaluates
@@ -4831,7 +4831,7 @@ export class Agent {
 
   /**
    * Start background semantic indexing (fire-and-forget).
-   * Uses BackgroundTaskManager + SemanticIndex + LanceDB.
+   * Uses BackgroundTaskManager + SemanticIndex + SQLite.
    * @private
    */
   async _startBackgroundIndexing() {

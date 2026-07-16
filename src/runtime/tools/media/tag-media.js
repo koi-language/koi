@@ -13,7 +13,7 @@
  * has named something, that handle becomes the stable identity across
  * generations, edits, swaps and re-renders.
  *
- * Mentions live in `metadata_json.mention` on the LanceDB row. They are
+ * Mentions live in `metadata_json.mention` on the SQLite row. They are
  * lowercase-normalised + leading-`@` stripped at write time, matching
  * the GUI's autocomplete contract.
  *
@@ -62,7 +62,7 @@ export default {
     'mediaType is detected from the extension (image / video / audio / ' +
     'document — anything text-readable becomes `document`).\n\n' +
     'Inputs: `mediaPath` (absolute path to the file — preferred) OR ' +
-    '`mediaId` (LanceDB row id, useful when you already have it from a ' +
+    '`mediaId` (SQLite row id, useful when you already have it from a ' +
     'previous tool result). `mention` (the bare handle, with or without ' +
     'a leading `@` — case-insensitive). Pass `mention: ""` to CLEAR ' +
     'an existing mention. Optional `summary` — one short sentence ' +
@@ -90,7 +90,7 @@ export default {
       mediaId: {
         type: 'string',
         description:
-          'LanceDB row id of the media item, when known (e.g. carried ' +
+          'SQLite row id of the media item, when known (e.g. carried ' +
           'over from a previous `recall_image` result). Either this OR ' +
           '`mediaPath` is required; `mediaPath` wins if both are set.',
       },
@@ -155,7 +155,7 @@ export default {
         error:
           'tag_media: media library is not available in this session. ' +
           'Mentions can only be pinned when the runtime has a writable ' +
-          'LanceDB at `~/.koi/media-library`.',
+          'SQLite at `~/.koi/media-library`.',
       };
     }
 
