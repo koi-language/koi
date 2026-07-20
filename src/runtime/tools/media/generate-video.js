@@ -804,7 +804,7 @@ const generateVideoAction = {
     }
 
     // ── Guard: prompt cites positional refs that aren't attached ─────
-    // The positional convention (defined by this tool + the visual-panels
+    // The positional convention (defined by this tool + the keyframes
     // skills) is that the prompt body cites `Image 1`, `Image 2`, `Video 1` …
     // and the matching files ride in referenceImages / referenceVideos in that
     // order (position 1 = Image 1). When the agent writes those citations but

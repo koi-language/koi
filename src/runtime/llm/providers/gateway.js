@@ -133,6 +133,11 @@ export function getAuthHeaders() {
   };
 }
 
+// NOTE: 401 recovery (refresh → retry, or re-show login) is handled ONCE for
+// EVERY backend call by the global fetch interceptor installed in each koi-cli
+// process (auth-fetch-interceptor.js). gateway.js just uses plain `fetch`; do
+// NOT re-add per-endpoint 401 handling here.
+
 // ── Per-request stall timeouts for media calls ──────────────────────────────
 // A fetch whose only signal is the caller's (often undefined) abortSignal
 // NEVER settles when the TCP connection stalls mid-request — no rejection, no

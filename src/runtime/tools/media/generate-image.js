@@ -286,12 +286,12 @@ const generateImageAction = {
     // Visual-storyboard provenance guard.
     //
     // When the agent calls us with `label: "visual_storyboard"` (the
-    // route the `visual-panels` skill uses), the produced PNG is
+    // route the `keyframes` skill uses), the produced PNG is
     // expected to carry a metadata link back to where it came from —
     // either `sourceStoryboard` (path to the interactive storyboard
     // JSON) or `storyboardOrigin: "idea"` (explicit declaration that
     // there's no JSON, the sheet was built from a raw prompt). Without
-    // ONE of those, the downstream `visual-panels-to-video` skill
+    // ONE of those, the downstream `keyframes-to-video` skill
     // can't re-attach the source JSON when rendering the final video,
     // and (reported bug) the agent falls back to disk-searching the
     // storyboards folder and confabulating which JSON "matches" the
@@ -304,8 +304,8 @@ const generateImageAction = {
         const msg =
           'generate_image was called with `label: "visual_storyboard"` but ' +
           '`metadata.sourceStoryboard` is missing AND `metadata.storyboardOrigin` ' +
-          'is not "idea". The visual-panels skill REQUIRES one of those so ' +
-          'the downstream `visual-panels-to-video` skill can re-attach the ' +
+          'is not "idea". The keyframes skill REQUIRES one of those so ' +
+          'the downstream `keyframes-to-video` skill can re-attach the ' +
           'source storyboard JSON (or know there is none). Pass `metadata: ' +
           '{ sourceStoryboard: "<abs-path>", storyboardPart: K, storyboardParts: ' +
           'K_total, storyboardShotIds: [...] }` when the sheet derives from an ' +
@@ -781,7 +781,7 @@ const generateImageAction = {
     // hand-wrote a position (correct or wrong), we strip it first
     // and re-write the authoritative one. Skills should write
     // positional references as "IMAGE N" inline (see the
-    // visual-panels SKILL); the backtick-alias auto-annotation
+    // keyframes SKILL); the backtick-alias auto-annotation
     // here is a safety net for skills that still emit aliases.
     let effectivePrompt = prompt;
     if (_refAliases.some((a) => a && a.length > 0)) {
@@ -882,7 +882,7 @@ const generateImageAction = {
           // EXCEPTION — when the caller passed an explicit output dim
           // (`resolution` OR `targetSize{width,height}`), the agent is
           // NOT editing the base ref's canvas: they want a fresh
-          // generation at the requested size (e.g. a visual-panels
+          // generation at the requested size (e.g. a keyframes
           // sheet at 4K that just happens to use the base ref as
           // identity input, or an outpaint where the caller pre-computed
           // the target canvas). Setting targetSize to the padded ref
@@ -1730,7 +1730,7 @@ const generateImageAction = {
       usage: result.usage,
       // Non-fatal contract violations surface here. Currently used by the
       // `visual_storyboard` label to flag missing source-JSON metadata —
-      // the call succeeded but the downstream `visual-panels-to-video`
+      // the call succeeded but the downstream `keyframes-to-video`
       // link is broken (see _warnings collection at the top of execute()).
       ...(_warnings.length > 0 ? { warnings: _warnings } : {}),
     };
