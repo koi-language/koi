@@ -487,6 +487,21 @@ export function selectAutoModel(taskType, difficulty, availableProviders, { requ
       if (capDiff !== 0) return capDiff;
       return a.totalCost - b.totalCost;
     }
+    // VIDEO understanding is perception-hard, and the FAST/cheap tiers
+    // (e.g. *-flash) do NOT truly attend to the frames — with a clip in hand
+    // they confidently CONFABULATE a plausible-but-wrong description from the
+    // surrounding text (reported: ask_video described a blonde woman on a sea
+    // coast for a clip that actually showed a dark-haired woman in a Paris
+    // suite, and the agent then trashed a correct render on that false read).
+    // The catalog rates those flash tiers as high as the pro tier on
+    // code/reasoning, so neither cost-first NOR capability-first separates them
+    // — both keep picking the cheaper flash. For video we therefore prefer the
+    // MOST THOROUGH model: lowest `speed` rating (the pro tier), regardless of
+    // price. Name-agnostic — driven by the speed metric, not a model id.
+    if (requiresVideo) {
+      const speedDiff = (a.speed || 30) - (b.speed || 30); // ascending → slower/more thorough first
+      if (speedDiff !== 0) return speedDiff;
+    }
     // Qualifying pool: cheapest capable model wins.
     const costDiff = a.totalCost - b.totalCost;
     if (Math.abs(costDiff) > 0.0001) return costDiff;
