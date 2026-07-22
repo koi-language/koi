@@ -1108,6 +1108,27 @@ export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
       c.aiState.lastChatId = chatId;
     }
     c.path = mediaPath;
+    // ⚠️ RESET THE SOURCE WINDOW — the generated file is a STANDALONE render
+    // that starts at 0, so any offset/dimensions inherited from the previous
+    // source are now meaningless and actively harmful.
+    //
+    // Reported bug ("al darle a play se queda congelada la imagen al llegar al
+    // nuevo clip", 100% reproducible): a clip trimmed out of a longer source
+    // (e.g. sourceInMs 3250 + durationMs 3892 = the tail of a 7142 ms take) got
+    // its `path` swapped to the freshly rendered edit — a 3752 ms file that
+    // starts at 0 — while `sourceInMs` stayed 3250. The player then seeked
+    // 3250 ms into a 3752 ms file, leaving ~500 ms of real content for a
+    // 3892 ms clip, and froze on the last frame for the remaining ~3.4 s.
+    //
+    // The GUI's own handler (`_onAiGenerationResult` in video_timeline_tab.dart)
+    // already did exactly this; the engine-side path (agent → this tool) did
+    // not, which is why it only happened when the EDIT was driven from chat.
+    // Zeroing the dims/total forces the GUI's `_probeMedia` to re-read the real
+    // values from the new file instead of trusting the old source's.
+    c.sourceInMs = 0;
+    c.sourceTotalMs = 0;
+    c.sourceWidthPx = 0;
+    c.sourceHeightPx = 0;
     return state;
   });
 }
