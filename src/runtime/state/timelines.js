@@ -232,23 +232,37 @@ function _validateTitleProps(props) {
 // and the macOS native player (BraxilTimelinePlayer.swift) read the
 // same JSON shape, so this validator only checks types — does NOT
 // resort, since the GUI/player handle ordering.
-function _validateVolumePoints(pts, clipDurationMs) {
+function _validateVolumePoints(pts, clipDurationMs, { lenient = false } = {}) {
   if (pts == null) return null;
   if (!Array.isArray(pts)) throw new Error('clip.volumePoints must be an array');
   const out = [];
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
     if (!p || typeof p !== 'object') {
+      if (lenient) continue;
       throw new Error(`clip.volumePoints[${i}] must be an object`);
     }
     const t = Number(p.t);
     const v = Number(p.v);
     if (!Number.isFinite(t) || t < 0 || t > clipDurationMs) {
+      if (lenient && Number.isFinite(t)) {
+        // Out-of-range survivor of an old split/trim that didn't
+        // re-time the curve. Keep the envelope instead of failing the
+        // whole save: clamp into range (hold-ends semantics make the
+        // clamped point equivalent inside the clip).
+        out.push({ t: Math.round(Math.min(Math.max(t, 0), clipDurationMs)), v: Math.min(Math.max(v, 0), 2) });
+        continue;
+      }
+      if (lenient) continue;
       throw new Error(
         `clip.volumePoints[${i}].t must be in [0, ${clipDurationMs}] (got ${p.t})`,
       );
     }
     if (!Number.isFinite(v) || v < 0 || v > 2) {
+      if (lenient) {
+        if (Number.isFinite(v)) out.push({ t: Math.round(t), v: Math.min(Math.max(v, 0), 2) });
+        continue;
+      }
       throw new Error(
         `clip.volumePoints[${i}].v must be in [0, 2] linear gain (got ${p.v})`,
       );
@@ -358,9 +372,13 @@ function _validateClip(c, settings) {
   }
   // Audio-clip volume automation curve. Same round-trip discipline as
   // titleProps — without explicit pass-through, any unrelated mutator
-  // would strip the agent's keyframes on the next save.
+  // would strip the agent's keyframes on the next save. Lenient here:
+  // this is the round-trip of ALREADY-STORED state, and legacy files
+  // hold points an old split/trim left beyond the clip edge — a throw
+  // would fail the WHOLE save for a curve detail. (set_clip_volume,
+  // the write path for NEW curves, stays strict.)
   if (_isAudioTrack(track)) {
-    const vps = _validateVolumePoints(c.volumePoints, dur);
+    const vps = _validateVolumePoints(c.volumePoints, dur, { lenient: true });
     if (vps && vps.length > 0) out.volumePoints = vps;
   }
   // Pass-through for GUI-only fields. The engine doesn't need to
@@ -1052,7 +1070,37 @@ export function updateClip(id, clipId, changes) {
       if (typeof changes.path !== 'string' || !changes.path) {
         throw new Error('updateClip.path must be a non-empty string');
       }
-      c.path = changes.path;
+      if (changes.path !== c.path) {
+        const ai = c.aiState && typeof c.aiState === 'object' ? c.aiState : null;
+        // AI-version toggle awareness. Reported bug: original → AI → original
+        // via chat lost the take's time mark and left the probe data of the
+        // OTHER file on the clip (sourceInMs 5166 into a 3090 ms render), so
+        // the GUI read the clip as trimmed past its source and painted the
+        // striped "AI Extend" placeholder.
+        //
+        // 1) Leaving the ORIGINAL: capture where in the source the take is
+        //    cut, so flipping back can restore it. Never lose the mark.
+        if (ai && c.path === ai.placeholderPath) {
+          ai.placeholderSourceInMs = Number.isFinite(c.sourceInMs) ? c.sourceInMs : 0;
+        }
+        c.path = changes.path;
+        // 2) Entering a known version: restore its source window. A rendered
+        //    file is standalone and starts at 0; the original resumes at the
+        //    saved mark. Any other replacement keeps sourceInMs (the caller
+        //    may be swapping in an equivalent-length variant) and fixes it
+        //    with trim_clip if needed.
+        if (ai && changes.path === ai.placeholderPath) {
+          c.sourceInMs = Number.isFinite(ai.placeholderSourceInMs) ? ai.placeholderSourceInMs : 0;
+        } else if (ai && changes.path === ai.lastRenderedPath) {
+          c.sourceInMs = 0;
+        }
+        // 3) Probe data (total duration + pixel dims) belongs to the file
+        //    that just left `path`: zero it so the GUI re-probes the new one
+        //    instead of judging the clip against the wrong source length.
+        c.sourceTotalMs = 0;
+        c.sourceWidthPx = 0;
+        c.sourceHeightPx = 0;
+      }
     }
     if ('offsetX' in changes) {
       if (!Number.isFinite(changes.offsetX)) throw new Error('updateClip.offsetX must be a number');
@@ -1102,6 +1150,12 @@ export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
     const prevPath = c.path;
     if (!c.aiState || typeof c.aiState !== 'object') {
       c.aiState = { placeholderPath: prevPath };
+    }
+    // Capture the take's time mark while the clip still shows the ORIGINAL:
+    // the swap below zeroes sourceInMs (renders start at 0), and without the
+    // mark a later "show me the original again" lands at the wrong second.
+    if (c.path === c.aiState.placeholderPath) {
+      c.aiState.placeholderSourceInMs = Number.isFinite(c.sourceInMs) ? c.sourceInMs : 0;
     }
     c.aiState.lastRenderedPath = mediaPath;
     if (typeof chatId === 'string' && chatId) {

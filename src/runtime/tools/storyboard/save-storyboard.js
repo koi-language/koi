@@ -264,6 +264,61 @@ function _normStrList(v) {
   return out.length > 0 ? out : undefined;
 }
 
+// Editorial diff vs the previous on-disk doc — exact string compares on the
+// fields the visor's render hash consumes. Surfaced in the save RESULT so an
+// update that meant to touch one panel but silently re-worded others
+// (round-trip drift) is caught immediately: every listed field re-renders
+// that panel's sketch, and a root-field change re-renders the WHOLE board.
+function _editorialDiff(existing, out) {
+  if (!existing) return null;
+  const sameJson = (a, b) =>
+    JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  const root = [];
+  for (const k of ['synopsis', 'characters', 'lighting', 'stylePrompt']) {
+    if ((existing[k] || '') !== (out[k] || '')) root.push(k);
+  }
+  if (!sameJson(existing.continuity, out.continuity)) root.push('continuity');
+  const prevShotById = new Map();
+  const prevSceneByShotId = new Map();
+  if (Array.isArray(existing.scenes)) {
+    for (const sc of existing.scenes) {
+      for (const sh of (Array.isArray(sc?.shots) ? sc.shots : [])) {
+        if (sh && _isStr(sh.id)) {
+          prevShotById.set(sh.id, sh);
+          prevSceneByShotId.set(sh.id, sc);
+        }
+      }
+    }
+  }
+  const shots = [];
+  for (const sc of out.scenes) {
+    for (const sh of sc.shots) {
+      const prev = prevShotById.get(sh.id);
+      if (!prev) { shots.push(`${sh.id}(new)`); continue; }
+      const fields = [];
+      for (const k of ['shot', 'movement', 'action', 'dialogue', 'sfx', 'music']) {
+        if ((prev[k] || '') !== (sh[k] || '')) fields.push(k);
+      }
+      if (!sameJson(prev.continuity, sh.continuity)) fields.push('continuity');
+      // Scene-level fields also feed every member shot's render prompt.
+      const prevSc = prevSceneByShotId.get(sh.id);
+      if (prevSc) {
+        for (const k of ['location', 'notes', 'synopsis']) {
+          if ((prevSc[k] || '') !== (sc[k] || '')) fields.push(`scene.${k}`);
+        }
+      }
+      if (fields.length) shots.push(`${sh.id}(${fields.join(',')})`);
+    }
+  }
+  if (!root.length && !shots.length) return null;
+  return { root, shots };
+}
+
+// Shared with update-storyboard.js (the patch-based edit tool): same
+// validation, same normalization, same editorial diff — one formula,
+// two entry points.
+export { _validate, _normalize, _editorialDiff, _isStr, _isObj };
+
 function _normalize(sb, existing) {
   // Carry forward the original createdAt across saves so the
   // MediaLibrary "Latest" ordering stays anchored to when the
@@ -296,6 +351,21 @@ function _normalize(sb, existing) {
     for (const sh of sc.shots) {
       _shotCount += 1;
       if (Number.isFinite(sh.duration)) _totalDuration += sh.duration;
+    }
+  }
+  // GUI-private per-shot fields (underscore-prefixed, e.g. `_regenerateNonce`,
+  // which pins a shot's REGENERATED sketch in the visor's render cache) are
+  // not part of the agent's call shape, so they never arrive in `sb`. Carry
+  // them forward from the on-disk doc by shot id — without this, every agent
+  // re-save strips them and reopening the storyboard falls back to each
+  // panel's FIRST rendered sketch.
+  const _existingShotById = new Map();
+  if (existing && Array.isArray(existing.scenes)) {
+    for (const sc of existing.scenes) {
+      if (!Array.isArray(sc?.shots)) continue;
+      for (const sh of sc.shots) {
+        if (sh && _isStr(sh.id)) _existingShotById.set(sh.id, sh);
+      }
     }
   }
   const out = {
@@ -360,6 +430,18 @@ function _normalize(sb, existing) {
           if (sh.noCutBefore === true) shotOut.noCutBefore = true;
           const shotRefs = _normRefs(sh.references);
           if (shotRefs) shotOut.references = shotRefs;
+          // Underscore carry-forward (see _existingShotById above). Incoming
+          // values first (a get→save round-trip may echo them), then disk
+          // wins: the GUI is the only writer of these and disk is freshest.
+          for (const k of Object.keys(sh)) {
+            if (k.startsWith('_')) shotOut[k] = sh[k];
+          }
+          const _prev = _existingShotById.get(sh.id);
+          if (_prev) {
+            for (const k of Object.keys(_prev)) {
+              if (k.startsWith('_')) shotOut[k] = _prev[k];
+            }
+          }
           return shotOut;
         }),
       };
@@ -392,7 +474,9 @@ export default {
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',
   instructions:
     'save_storyboard REPLACES write_file for ~/.koi/storyboards/*.json — never hand-serialize the JSON via write_file (quote escaping is a structural minefield; this tool sidesteps it by accepting the object directly). ' +
-    'Update flow: read_file the existing JSON, mutate the parsed object in memory (add/remove/reorder scenes or shots, edit any field), then save_storyboard with the whole mutated object. The tool detects the file exists and preserves createdAt. ' +
+    'SCOPE: use save_storyboard to CREATE a storyboard or to RESTRUCTURE one (add/remove/reorder scenes or shots, renumber, change ids). For CONTENT edits — changing field values on existing scenes/shots or root fields — use update_storyboard instead: it patches only the named fields, so it is faster and cannot accidentally re-word (and thus re-render) untouched panels. ' +
+    'Restructure flow: read_file the existing JSON, mutate the parsed object in memory, then save_storyboard with the whole mutated object. The tool detects the file exists and preserves createdAt. ' +
+    'VERBATIM RULE (critical): on an UPDATE, every field you are NOT deliberately changing must be sent back CHARACTER-FOR-CHARACTER as read — never re-word, re-translate, abbreviate/expand, or "tidy" it (e.g. do not turn "Wide shot, eye level" into "Wide shot"). The visor re-renders a panel\'s sketch whenever ANY of its editorial fields (shot / movement / action / continuity / scene fields) changes, and re-renders EVERY panel when a root field (synopsis / characters / lighting / continuity / stylePrompt) changes — so accidental re-wording of untouched fields nukes the user\'s reviewed sketches and re-renders the whole board. The save result reports exactly which fields changed vs the previous save: verify that list matches your INTENDED edit, and if it lists anything you did not mean to touch, re-save restoring those fields verbatim. ' +
     'After a CREATE, call show_result with resourceType "file" and the returned path so the GUI opens the storyboard tab. After an UPDATE, the visor picks up the change automatically — no show_result needed.',
   thinkingHint: (action) => `Saving storyboard ${action?.storyboard?.id || ''}`.trim(),
   permission: 'write',
@@ -523,6 +607,7 @@ export default {
       `${shotCount} shot${shotCount === 1 ? '' : 's'})` +
       `${collisionRenamedFrom ? ` [id "${collisionRenamedFrom}" was taken → saved as "${normalized.id}" to avoid overwriting it]` : ''}.`);
 
+    const drift = _editorialDiff(existing, normalized);
     return {
       success: true,
       path: filePath,
@@ -530,6 +615,12 @@ export default {
       created: !existed,
       sceneCount,
       shotCount,
+      ...(drift
+        ? { editorialChanges: {
+              ...(drift.root.length ? { root: drift.root } : {}),
+              ...(drift.shots.length ? { shots: drift.shots } : {}),
+              note: 'Every field listed here changed vs the previous save and WILL re-render that panel\'s sketch (root fields re-render EVERY panel). If this list contains fields you did not INTEND to edit, you re-worded them on the round-trip — re-save restoring those fields verbatim from the previous content BEFORE the visor re-renders.' } }
+        : {}),
       ...(collisionRenamedFrom
         ? { renamedFrom: collisionRenamedFrom,
             note: `The id "${collisionRenamedFrom}" already existed, so this NEW storyboard was saved as "${normalized.id}" to avoid overwriting the existing one. Use this id from now on.` }

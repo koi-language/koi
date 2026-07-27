@@ -15,6 +15,8 @@ export default {
   intent: 'update_timeline',
   description:
     'Replace a timeline\'s entire state with the provided JSON. Atomic. ' +
+    'LAST RESORT — for edits, ALWAYS prefer the surgical per-clip tools instead (update_clip, trim_clip, move_clip, remove_clip, add_clip_to_timeline, set_clip_volume, set_clip_transition, add_track, remove_track, update_title): they patch only what changed, cost a fraction of the tokens, and cannot accidentally drop or re-word untouched clips on the round-trip. ' +
+    'Use this full replace ONLY when generating a fresh edit from scratch, importing an external timeline, or restoring a prior state wholesale. ' +
     'state must include "settings" and "clips" (id is taken from the URL param, not from state). ' +
     'Returns: { success, timeline } with the normalised result.',
   thinkingHint: 'Updating timeline',

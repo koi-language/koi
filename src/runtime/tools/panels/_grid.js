@@ -176,50 +176,6 @@ function _trimCellToContent(raw, targetW, cell) {
 // hint/snap grid below survives only as the FALLBACK for implausible
 // segmentations (legacy sheets keep working through their metadata).
 
-/** Max of prof over [a,b). */
-function _bandMax(prof, a, b) {
-  let m = 0;
-  for (let i = a; i < b; i++) if (prof[i] > m) m = prof[i];
-  return m;
-}
-
-/** SLIVER MERGE: dark panel content can contain full-width near-black lines
- *  that split a stripe/island. Iteratively merge a run into its neighbour
- *  ACROSS the intervening band when the run's size < 40% of the median run
- *  size AND the band's max luminance > 6: real gutters in NEW sheets are pure
- *  #000000 (max 0), content noise bands are never pure 0. When both bands
- *  qualify, merge across the brighter (most content-like) one.
- *  [medianOverride] pins the sliver test to a SHEET-WIDE median: within one
- *  stripe made only of ghost fragments (blacked-out cell residue), the local
- *  median IS a fragment and nothing would ever qualify as a sliver. */
-function _mergeSlivers(runs, prof, medianOverride = null) {
-  let cur = runs.slice();
-  let changed = true;
-  while (changed && cur.length > 1) {
-    changed = false;
-    const sizes = cur.map((r) => r.end - r.start).sort((a, b) => a - b);
-    const median = medianOverride ?? sizes[Math.floor(sizes.length / 2)];
-    for (let i = 0; i < cur.length; i++) {
-      if (cur[i].end - cur[i].start >= median * 0.4) continue;
-      let mergeWith = null, bestBand = 6;
-      if (i > 0) {
-        const bm = _bandMax(prof, cur[i - 1].end, cur[i].start);
-        if (bm > bestBand) { bestBand = bm; mergeWith = i - 1; }
-      }
-      if (i < cur.length - 1) {
-        const bm = _bandMax(prof, cur[i].end, cur[i + 1].start);
-        if (bm > bestBand) { bestBand = bm; mergeWith = i + 1; }
-      }
-      if (mergeWith == null) continue;
-      const a = Math.min(i, mergeWith), b = Math.max(i, mergeWith);
-      cur.splice(a, 2, { start: cur[a].start, end: cur[b].end });
-      changed = true;
-      break; // restart the pass: the median moved
-    }
-  }
-  return cur;
-}
-
 /**
  * Segment a sheet into CONTENT ISLANDS at FULL resolution (downsampling
  * blurs thin gutters; loops sample x/y stride 2 for speed).
@@ -249,11 +205,23 @@ function _mergeSlivers(runs, prof, medianOverride = null) {
  *     0.99/0.97); dark-content hairlines always have weak flanks
  *     (measured <= 0.45) and internal pencil-sketch divides are far too
  *     impure (f17 0.73+) with weak flanks (0.34), so neither splits.
- * Islands = maximal non-separator spans >= 4% of the extent (stripes on
- * rows; per-stripe islands on columns), in reading order, each its
- * bounding span; impure-dark panel edges stay INSIDE their island (no
- * shaved dark borders). Sliver merge (see _mergeSlivers) remains the
- * final safety net on both axes, band-tested on the RAW max profile.
+ *
+ * islands-v5 rebuilds the geometry on top of that per-line classifier as a
+ * CUT-LINE GRID (user's law): the sheet is a grid whose cut lines always
+ * cross it fully, top-to-bottom or left-to-right, at ARBITRARY (never
+ * uniform) spacings. A vertical line is an x-interval that is separator in
+ * EVERY row lane AND in the full-height global lane; horizontal lines are
+ * symmetric over the column lanes + the full-width global lane. This is
+ * what lets a mostly-black panel keep its cell: its own boundaries are
+ * invisible locally, but the lines agreed on by every other lane still
+ * cross it, while a dark band inside one panel never crosses the whole
+ * grid, so it can never split anything. Cells = rows x columns; a cell
+ * with content evidence is a panel spanning its FULL cell; a pure-black
+ * cell (deleted panel, trailing filler) is dropped. A row may carry its
+ * own extra vertical gutters (row-major strip layouts, e.g. 3+2 with a
+ * panoramic row): see the level-2 subdivision inside contentIslands.
+ * Sliver spans merge across residue bands only, never across a pure drawn
+ * line (see mergeSliverSpans).
  * Returns { W, H, panels: [{left,top,width,height}], stripes }.
  */
 const _LUM_PURE = 17;   // purity luminance (line p95 <= 16 when <= 5% reach it)
@@ -272,7 +240,7 @@ function _armNeeds(n) {
 }
 
 /**
- * Classify separator scanlines for one axis (islands-v4).
+ * Classify separator scanlines for one axis (shared by v4/v5).
  * [cls]: per-line class (2 content, 1 impure-dark, 0 pure-dark);
  * [f24]: per-line fraction of samples >= 24; [extent] = axis length.
  * Returns a boolean mask: true = separator line.
@@ -355,57 +323,178 @@ export async function contentIslands({ sharp, sheet }) {
     return { cls, f24: c24 / n, max: m };
   };
 
-  // 1) Row profiles (x stride 2).
-  const nRow = Math.ceil(W / 2);
-  const rowNeeds = _armNeeds(nRow);
-  const rowCls = new Array(H).fill(0);
-  const rowF24 = new Array(H).fill(0);
-  const rowMax = new Array(H).fill(0);
-  for (let y = 0; y < H; y++) {
-    const off = y * W;
-    const p = _profileLine((i) => raw[off + i * 2], nRow, rowNeeds);
-    rowCls[y] = p.cls; rowF24[y] = p.f24; rowMax[y] = p.max;
-  }
-
-  // 2) Row separators -> stripes (+ sliver merge on the RAW max profile).
-  const rowSep = _separatorMask(rowCls, rowF24, H);
-  let stripes = _islandSpans(rowSep).filter((s) => s.end - s.start >= H * 0.04);
-  stripes = _mergeSlivers(stripes, rowMax);
-
-  // 3+4) Per-stripe column separators -> islands, reading order. TWO
-  // passes: raw islands of every stripe first, so the sliver merge can
-  // use the SHEET-WIDE median island width (a stripe holding only ghost
-  // fragments of a blacked-out cell has no full-size island of its own
-  // to anchor the local median).
-  const perStripe = [];
-  const allWidths = [];
-  for (const s of stripes) {
-    const nCol = Math.max(1, Math.ceil((s.end - s.start) / 2));
-    const colNeeds = _armNeeds(nCol);
-    const colCls = new Array(W).fill(0);
-    const colF24 = new Array(W).fill(0);
-    const colMax = new Array(W).fill(0);
+  // Profile ONE AXIS restricted to a band of the cross axis (stride 2):
+  // per-position class (2 content / 1 impure / 0 pure) + separator mask.
+  const profileCols = (lo, hi) => {
+    const n = Math.max(1, Math.ceil((hi - lo) / 2));
+    const needs = _armNeeds(n);
+    const cls = new Array(W).fill(0);
+    const f24 = new Array(W).fill(0);
+    const max = new Array(W).fill(0);
     for (let x = 0; x < W; x++) {
-      const p = _profileLine((i) => raw[(s.start + i * 2) * W + x], nCol, colNeeds);
-      colCls[x] = p.cls; colF24[x] = p.f24; colMax[x] = p.max;
+      const p = _profileLine((i) => raw[(lo + i * 2) * W + x], n, needs);
+      cls[x] = p.cls; f24[x] = p.f24; max[x] = p.max;
     }
-    const colSep = _separatorMask(colCls, colF24, W);
-    const islands = _islandSpans(colSep).filter((r) => r.end - r.start >= W * 0.04);
-    for (const r of islands) allWidths.push(r.end - r.start);
-    perStripe.push({ stripe: s, colMax, islands });
-  }
-  allWidths.sort((a, b) => a - b);
-  const globalMedian = allWidths.length ? allWidths[Math.floor(allWidths.length / 2)] : null;
+    return { cls, max, sep: _separatorMask(cls, f24, W) };
+  };
+  const profileRows = (lo, hi) => {
+    const n = Math.max(1, Math.ceil((hi - lo) / 2));
+    const needs = _armNeeds(n);
+    const cls = new Array(H).fill(0);
+    const f24 = new Array(H).fill(0);
+    const max = new Array(H).fill(0);
+    for (let y = 0; y < H; y++) {
+      const off = y * W + lo;
+      const p = _profileLine((i) => raw[off + i * 2], n, needs);
+      cls[y] = p.cls; f24[y] = p.f24; max[y] = p.max;
+    }
+    return { cls, max, sep: _separatorMask(cls, f24, H) };
+  };
 
-  const panels = [];
-  for (const { stripe: s, colMax, islands } of perStripe) {
-    const merged = _mergeSlivers(islands, colMax, globalMedian);
-    for (const isl of merged) {
-      panels.push({ left: isl.start, top: s.start, width: isl.end - isl.start, height: s.end - s.start });
+  // SLIVER SPANS after the AND: a dark band can still forge a cut line when
+  // it happens to cross EVERY lane (all panels dark at the same height). A
+  // real drawn line is pure black; a forged one carries residue. Merge a
+  // span < 40% of the median size into its neighbour ACROSS such a residue
+  // band, but NEVER across a band containing a pure run (>= 4 scanlines
+  // with raw max <= 6): that pure run is a genuine drawn line, and jumping
+  // it is exactly how dark panels used to get glued to their neighbours.
+  const mergeSliverSpans = (spans, maxProf) => {
+    const crossable = (a, b) => {
+      let run = 0, impure = false;
+      for (let k = a; k < b; k++) {
+        if (maxProf[k] <= 6) { run++; if (run >= 4) return false; } else { run = 0; impure = true; }
+      }
+      return impure;
+    };
+    const cur = spans.slice();
+    let changed = true;
+    while (changed && cur.length > 1) {
+      changed = false;
+      const sizes = cur.map((r) => r.end - r.start).sort((a, b) => a - b);
+      const median = sizes[Math.floor(sizes.length / 2)];
+      for (let i = 0; i < cur.length; i++) {
+        if (cur[i].end - cur[i].start >= median * 0.4) continue;
+        let mergeWith = null;
+        if (i > 0 && crossable(cur[i - 1].end, cur[i].start)) mergeWith = i - 1;
+        else if (i < cur.length - 1 && crossable(cur[i].end, cur[i + 1].start)) mergeWith = i + 1;
+        if (mergeWith == null) continue;
+        const a = Math.min(i, mergeWith), b = Math.max(i, mergeWith);
+        cur.splice(a, 2, { start: cur[a].start, end: cur[b].end });
+        changed = true;
+        break;
+      }
     }
+    return cur;
+  };
+
+  // Content evidence over [a,b) of a class array: some genuinely bright
+  // scanlines, or a sustained impure-dark region (a dark but real panel).
+  // Pure-black cells (deleted panels, trailing filler) have neither.
+  const evidence = (cls, a, b) => {
+    let c2 = 0, c1 = 0;
+    const n = Math.max(1, b - a);
+    for (let i = a; i < b; i++) {
+      if (cls[i] === 2) c2++;
+      else if (cls[i] === 1) c1++;
+    }
+    return c2 / n >= 0.01 || c1 / n >= 0.25;
+  };
+
+  // 1) Provisional stripes from the GLOBAL row mask: the lanes for the
+  // vertical-line AND. Over-splitting is harmless here (both halves of a
+  // falsely split row still agree on the vertical lines), and without a
+  // sliver merge nothing ever glues lanes across a real line.
+  const g = profileRows(0, W);
+  const stripes0 = _islandSpans(g.sep).filter((s) => s.end - s.start >= H * 0.04);
+  const lanes = stripes0.length ? stripes0 : [{ start: 0, end: H }];
+
+  // 2) VERTICAL CUT LINES: x positions that are separator in EVERY lane
+  // AND in the full-height global mask (the "all lanes together" lane). The
+  // sheet's cut lines always cross the whole grid, so a dark band that
+  // fails to be a separator in even one stripe (or whose aggregate carries
+  // content) is panel imagery, not a line.
+  const colMasks = lanes.map((s) => profileCols(s.start, s.end));
+  const gCols = profileCols(0, H);
+  colMasks.push(gCols);
+  const vSep = new Array(W).fill(true);
+  for (let x = 0; x < W; x++) {
+    for (const m of colMasks) if (!m.sep[x]) { vSep[x] = false; break; }
   }
+  const columns = mergeSliverSpans(
+    _islandSpans(vSep).filter((r) => r.end - r.start >= W * 0.04), gCols.max);
+
+  // 3) HORIZONTAL CUT LINES: y positions that are separator in EVERY
+  // column AND in the full-width global mask. A band that is dark across
+  // one column but carries content in another (a coincidentally dark
+  // stretch of a dark panel) never crosses the whole grid, so it is not a
+  // line: this is what keeps a row of all-dark panels in one piece. The
+  // global lane symmetrically kills a band that looks dark inside every
+  // margin-diluted column but whose aggregate content is plainly visible.
+  const rowMasks = (columns.length ? columns : [{ start: 0, end: W }]).map((c) => profileRows(c.start, c.end));
+  rowMasks.push(g);
+  const hSep = new Array(H).fill(true);
+  for (let y = 0; y < H; y++) {
+    for (const m of rowMasks) if (!m.sep[y]) { hSep[y] = false; break; }
+  }
+  const rows = mergeSliverSpans(
+    _islandSpans(hSep).filter((r) => r.end - r.start >= H * 0.04), g.max);
+
+  // 4) CELLS = rows x columns (each row/column keeps its own extent: the
+  // grid's spacing is arbitrary, never uniform fractions). A cell with
+  // content evidence is a panel spanning its FULL cell (the cell IS the
+  // panel; interior black is part of the image). LEVEL-2 SUBDIVISION, X
+  // ONLY: sheets are ROW-MAJOR strips, so a row may carry its own extra
+  // vertical gutters (a 3+2 layout whose extra gutter does not cross the
+  // panoramic row), but a horizontal band confined to one column is never
+  // a line (it is dark imagery, e.g. a thin shadow crossing one dark
+  // panel). A THIN separator run (a real drawn gutter, <= ~1.5% of the
+  // axis) strictly inside a cell splits it ONLY when EVERY resulting
+  // sub-cell reads as a real panel: content evidence, >= 4% of the sheet
+  // width, and a plausible panel aspect (width / row height >= 0.45; no
+  // real panel is narrower than 9:16). A thin dark edge inside a photo (a
+  // doorframe, a pillar) fails those tests, so it never splits; wide dark
+  // regions never split (dark imagery); a side without content never
+  // splits (black stage margins).
+  const subCells = (cls, sep, a, b, extent, cellH) => {
+    const whole = () => (evidence(cls, a, b) ? [{ start: a, end: b }] : []);
+    const thinMax = Math.max(6, Math.round(extent * 0.015));
+    const cuts = [];
+    let s = -1;
+    for (let i = a; i <= b; i++) {
+      const on = i < b && sep[i];
+      if (on && s < 0) s = i;
+      if (!on && s >= 0) {
+        const w = i - s;
+        if (s > a && i < b && w >= 4 && w <= thinMax) cuts.push({ s, e: i });
+        s = -1;
+      }
+    }
+    if (!cuts.length) return whole();
+    const bounds = [a];
+    for (const c of cuts) { bounds.push(c.s, c.e); }
+    bounds.push(b);
+    const spans = [];
+    for (let i = 0; i < bounds.length; i += 2) spans.push({ start: bounds[i], end: bounds[i + 1] });
+    if (spans.length < 2) return whole();
+    const valid = (sp) => sp.end - sp.start >= extent * 0.04
+      && (sp.end - sp.start) / cellH >= 0.45
+      && evidence(cls, sp.start, sp.end);
+    if (!spans.every(valid)) return whole();
+    return spans;
+  };
+
+  const rowColMasks = rows.map((r) => profileCols(r.start, r.end));
+  const panels = [];
+  rows.forEach((r, ri) => {
+    const cm = rowColMasks[ri];
+    for (const c of (columns.length ? columns : [{ start: 0, end: W }])) {
+      for (const xs of subCells(cm.cls, cm.sep, c.start, c.end, W, r.end - r.start)) {
+        panels.push({ left: xs.start, top: r.start, width: xs.end - xs.start, height: r.end - r.start });
+      }
+    }
+  });
   if (st) _writeGeometryCache(sheet, st, { width: W, height: H, islands: panels });
-  return { W, H, panels, stripes: stripes.length, cached: false };
+  return { W, H, panels, stripes: rows.length, cached: false };
 }
 
 export async function snappedPanelRect({ sharp, sheet, panel, cols = null, rows = null, inset = null }) {
@@ -579,7 +668,7 @@ export function geometryCachePath(sheet) {
 function _readGeometryCache(sheet, st) {
   try {
     const j = JSON.parse(fs.readFileSync(geometryCachePath(sheet), 'utf8'));
-    if (j?.algo !== 'islands-v4') return null;
+    if (j?.algo !== 'islands-v5') return null;
     if (j.mtimeMs !== Math.floor(st.mtimeMs) || j.fileSize !== st.size) return null;
     if (!Array.isArray(j.islands) || !Number.isInteger(j.width) || !Number.isInteger(j.height)) return null;
     return j;
@@ -592,7 +681,7 @@ function _writeGeometryCache(sheet, st, { width, height, islands }) {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const tmp = `${p}.tmp-${Date.now()}`;
     fs.writeFileSync(tmp, JSON.stringify({
-      algo: 'islands-v4',
+      algo: 'islands-v5',
       mtimeMs: Math.floor(st.mtimeMs),
       fileSize: st.size,
       width,
