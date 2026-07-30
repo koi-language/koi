@@ -68,6 +68,24 @@ export function findVoiceByName(name) {
   return null;
 }
 
+/** Look up an entry by any identifier the agent might plausibly pass as
+ *  `voice`: the display name, our local id (the `voiceId` create_voice
+ *  returns), or the provider's own voice id (`providerVoiceId`). Cloning
+ *  returns several ids and the agent can't know which one generate_audio
+ *  keys on, so we accept all of them (name-match first — the documented
+ *  path). Returns null when nothing matches (built-in presets fall
+ *  through unchanged). */
+export function findVoice(ref) {
+  if (typeof ref !== 'string' || !ref.trim()) return null;
+  const byName = findVoiceByName(ref);
+  if (byName) return byName;
+  const target = ref.trim();
+  for (const e of listVoices()) {
+    if (e.id === target || e.providerVoiceId === target) return e;
+  }
+  return null;
+}
+
 /** Append (or replace, by id) a voice entry. Atomic write via tmp+rename
  *  so a crash mid-write doesn't corrupt the registry. */
 export function saveVoice(entry) {

@@ -18,7 +18,7 @@
 
 import { resolve as resolveModel } from '../../llm/providers/factory.js';
 import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
-import { findVoiceByName } from '../../state/voice-registry.js';
+import { findVoice } from '../../state/voice-registry.js';
 import { _uploadVideoRef } from './generate-video.js';
 import { exportMediaCopy } from './util/export-copy.js';
 
@@ -26,6 +26,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { channel } from '../../io/channel.js';
+
+// The provider namespace of a model slug = everything up to the last
+// segment: `fal-ai/minimax/voice-clone` and `fal-ai/minimax/speech-2.8-hd`
+// share `fal-ai/minimax`. Used to tell whether a cloned voice (minted by
+// one provider model) can be spoken by the agent's chosen TTS model.
+function _providerNamespace(slug) {
+  if (typeof slug !== 'string' || !slug.includes('/')) return null;
+  return slug.trim().split('/').slice(0, -1).join('/') || null;
+}
 
 // Container extensions we treat as VIDEO for transcription: Whisper wants
 // audio, so a video's audio stream is extracted before upload.
@@ -145,32 +154,40 @@ const generateAudioAction = {
 
     const clients = agent?.llmProvider?.getClients?.() || {};
 
-    // Resolve `voice` against the local registry: when the agent passes
-    // voice="MyVoice" and that name exists in ~/.koi/voices/voices.json,
-    // we lock the model slug to whatever cloned the voice (so we hit the
-    // same provider) and substitute the provider's actual voiceId before
-    // reaching the TTS call. Built-in voices like "alloy" / "nova" /
-    // "echo" pass through unchanged because they don't match a registry
-    // entry.
+    // Resolve `voice` against the local registry: when the agent passes a
+    // cloned voice (by name, our local id, OR the provider's own voice id)
+    // we substitute the provider's actual voiceId before the TTS call.
+    // Built-in presets ("alloy"/"nova"/"Wise_Woman"/…) don't match a
+    // registry entry and pass through unchanged.
+    //
+    // Model handling: a provider voiceId is PROVIDER-scoped (any of that
+    // provider's TTS models can speak it), NOT model-scoped. The slug that
+    // MINTED the clone is a *voice-clone* model, which is NOT a TTS model —
+    // locking the TTS call to it makes the gateway reject the request
+    // ("not in audio_tts"). So we KEEP the agent's chosen TTS model as long
+    // as it lives under the same provider namespace as the voice; we only
+    // step in (with a clear error) when the agent picked a TTS model from a
+    // DIFFERENT provider, where the voiceId simply won't resolve.
     let voiceOverride = null;
-    let modelOverride = action.model;
+    const modelOverride = action.model;
     if (mode === 'speech' && typeof action.voice === 'string' && action.voice.trim()) {
-      const cloned = findVoiceByName(action.voice);
+      const cloned = findVoice(action.voice);
       if (cloned) {
         voiceOverride = cloned.providerVoiceId;
-        // Lock to the cloning model — the cloned voice id only exists
-        // within the provider that minted it, so it OVERRIDES the agent's
-        // pick (a mismatched speech model can't resolve the voiceId).
-        if (cloned.modelSlug && cloned.modelSlug !== modelOverride) {
-          channel.log(
-            'audio',
-            `generate_audio: cloned voice="${action.voice}" locks model=${cloned.modelSlug} (overriding chosen model="${modelOverride}").`,
-          );
-          modelOverride = cloned.modelSlug;
+        const voiceNs = _providerNamespace(cloned.modelSlug);
+        const modelNs = _providerNamespace(modelOverride);
+        if (voiceNs && modelNs && voiceNs !== modelNs) {
+          return {
+            success: false,
+            error:
+              `The cloned voice "${cloned.name}" was minted by provider "${voiceNs}"; its voice id only ` +
+              `resolves within that provider. Pick a TTS (audio_tts) model under "${voiceNs}" for the ` +
+              `"model" param and retry (you chose "${modelOverride}").`,
+          };
         }
         channel.log(
           'audio',
-          `generate_audio: resolved voice="${action.voice}" → providerVoiceId=${cloned.providerVoiceId} (model=${cloned.modelSlug})`,
+          `generate_audio: resolved voice="${action.voice}" → providerVoiceId=${cloned.providerVoiceId} (keeping TTS model="${modelOverride}")`,
         );
       }
     }
