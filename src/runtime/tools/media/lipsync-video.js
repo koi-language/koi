@@ -13,7 +13,7 @@
  *   - audioFile (required): file path to the new audio track.
  *   - optional saveTo / label / timeoutMs / pollIntervalMs.
  *
- * Same flow as generate_avatar_video: kicks off the provider job, polls
+ * Same flow as generate_video: kicks off the provider job, polls
  * internally until terminal, downloads the URL, saves to the media library,
  * and returns the final result. Pass `wait: false` to run as a background koi
  * job and use await_job / get_job_status to retrieve it.
@@ -39,7 +39,7 @@ const lipsyncVideoAction = {
   bannerLabel: 'Sincronizando labios',
   bannerIconId: 'generate-video',
   description:
-    'Lip-sync an EXISTING video to a new audio track: re-articulates the on-screen mouth so the person appears to speak the given audio, preserving everything else (framing, motion, background, dimensions, length). Use to dub / re-voice a clip you already have — NOT to animate a still photo (that is generate_avatar_video). Blocks internally until the video is ready and returns { success, savedTo, url, error? } — no second call is needed. Pass wait=false to run as a background koi job (use await_job / get_job_status).\n' +
+    'Lip-sync an EXISTING video to a new audio track: re-articulates the on-screen mouth so the person appears to speak the given audio, preserving everything else (framing, motion, background, dimensions, length). Use to dub / re-voice a clip you already have — NOT to animate a still photo (that is generate_video in avatar mode: startFrame + audioFile + a video_avatar model). Blocks internally until the video is ready and returns { success, savedTo, url, error? } — no second call is needed. Pass wait=false to run as a background koi job (use await_job / get_job_status).\n' +
     '\n' +
     'Required:\n' +
     '  - "video": absolute file path to the source clip whose lips get re-synced.\n' +

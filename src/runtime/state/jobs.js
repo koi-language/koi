@@ -42,7 +42,7 @@ const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 const MEDIA_FILE_JOB_TYPES = new Set([
   'generate_image', 'generate_video', 'generate_audio',
   'outpaint_image', 'upscale_image', 'background_removal',
-  'generate_avatar_video', 'extract_frame',
+  'extract_frame',
 ]);
 
 /** True when a media-tool result carries an actual output artifact. */

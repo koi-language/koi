@@ -76,7 +76,13 @@ const _CATEGORY_ALIASES = {
   image_extend: ['outpaint', 'outpainting', 'extend'],
   image_editing: ['edit', 'editing', 'inpaint', 'inpainting'],
   image_generation: ['generate', 'text-to-image'],
-  video_avatar: ['avatar', 'lipsync'],
+  video_avatar: ['avatar'],
+  // Lip-sync is its OWN bucket (video + audio → resync an existing clip),
+  // not avatar (still image + audio → talking head). Kept separate so the
+  // panel's Lip-sync pin and `wantedCategoryFor(..., {kind:'lipsync'})` both
+  // resolve to models actually tagged for lip-sync (veed/lipsync/v2), never
+  // an avatar-only model that needs a still frame.
+  video_lipsync: ['lipsync'],
   video_extend: ['video-extend'],
   video_background_removal: ['video-background-removal'],
   video_editing: ['video-edit', 'video-to-video'],
@@ -86,6 +92,37 @@ const _bucketSynonyms = (cat) => {
   const aliases = _CATEGORY_ALIASES[cat] || [];
   return [cat, ...aliases];
 };
+
+// Reverse of _CATEGORY_ALIASES: legacy/short form → canonical bucket. Built
+// once. The router itself matches alias-aware via _inCategory, but consumers
+// that do a RAW `.includes(category)` (the GUI model picker, getActiveModels-
+// ByLabel) need the rows normalised to the canonical form or they miss every
+// row still tagged with a short form (`sfx`, `text-to-video`, …).
+const _CANONICAL_OF = (() => {
+  const m = new Map();
+  for (const [canon, aliases] of Object.entries(_CATEGORY_ALIASES)) {
+    for (const a of aliases) m.set(a, canon);
+  }
+  return m;
+})();
+
+/** Map one category slug (canonical OR legacy short form) to its canonical
+ *  bucket. Unknown slugs pass through unchanged. */
+export function canonicalCategory(cat) {
+  if (typeof cat !== 'string') return cat;
+  return _CANONICAL_OF.get(cat) || cat;
+}
+
+/** Canonicalise + de-dupe a categories[] array. */
+export function canonicalizeCategories(cats) {
+  if (!Array.isArray(cats)) return [];
+  const out = [];
+  for (const c of cats) {
+    const canon = canonicalCategory(c);
+    if (canon && !out.includes(canon)) out.push(canon);
+  }
+  return out;
+}
 const _inCategory = (m, cat) => {
   const cats = _modelCategories(m);
   for (const syn of _bucketSynonyms(cat)) {

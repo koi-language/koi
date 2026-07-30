@@ -364,12 +364,19 @@ export async function fetchMediaModelRows(kind) {
     if (!res.ok) return [];
     const models = await res.json();
     if (!Array.isArray(models)) return [];
+    // Normalise categories to their canonical bucket. Catalog rows may still
+    // carry the legacy short forms (`sfx`, `text-to-video`, `avatar`, …); the
+    // router picks alias-aware, but consumers of THIS function (the GUI model
+    // picker, getActiveModelsByLabel) do a raw `.includes(category)` and would
+    // otherwise miss every short-form row — the cause of empty per-operation
+    // dropdowns in the chat-options panel.
+    const { canonicalizeCategories } = await import('./media-model-router.js');
     return models
       .filter((m) => m && typeof m.slug === 'string' && m.pricePerUnit != null)
       .map((m) => ({
         slug: m.slug,
         displayName: typeof m.displayName === 'string' ? m.displayName : '',
-        categories: Array.isArray(m.categories) ? m.categories : [],
+        categories: canonicalizeCategories(Array.isArray(m.categories) ? m.categories : []),
         labels: Array.isArray(m.labels)
           ? m.labels.map((l) => (typeof l === 'string' ? l : l && l.slug)).filter(Boolean)
           : [],

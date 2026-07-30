@@ -982,7 +982,7 @@ export default {
     // rate, …) so the agent can reason about the file without ever
     // touching the raw bytes. If the agent needs the actual content
     // (transcription, lipsync driving, …) it should call the dedicated
-    // tool (generate_audio mode=transcribe, generate_avatar_video, …).
+    // tool (generate_audio mode=transcribe, generate_video avatar mode, …).
     if (_AUDIO_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
       const stat = fs.statSync(resolvedPath);
       const ext = path.extname(resolvedPath).slice(1).toLowerCase();
@@ -1045,7 +1045,7 @@ export default {
         sizeKb,
         modified: stat.mtime.toISOString(),
         ..._metaFields,
-        hint: 'Audio could not be attached natively (too large or no audio-capable model). To get its content, call transcribe_audio with this path. To drive an avatar video, pass the path to generate_avatar_video.',
+        hint: 'Audio could not be attached natively (too large or no audio-capable model). To get its content, call transcribe_audio with this path. To drive an avatar video, pass the path as audioFile to generate_video (avatar mode).',
       };
     }
 

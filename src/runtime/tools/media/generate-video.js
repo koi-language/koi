@@ -442,6 +442,7 @@ const generateVideoAction = {
       saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in ~/.koi/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
+      audioFile:       { type: 'string',  description: 'ABSOLUTE path to a DRIVING AUDIO track — its presence switches the call to AVATAR mode: the output is a talking-head performance of the face photo speaking this audio (clip length follows the audio). Pair it with `startFrame` = the face photo and a `model` carrying the `video_avatar` category (see the Catalog). `prompt` becomes an optional scene/style hint (English; several avatar models ignore it). Do NOT pass audioFile for any non-avatar generation — soundtrack/SFX come from `withAudio`, and dubbing an existing VIDEO is `lipsync_video`.' },
       model:           { type: 'string',  description: 'REQUIRED. The exact model slug to run — YOU choose it; there is no auto-selection. Pick a slug from the Catalog table at the END of this description whose Categories column matches your operation AND whose input shape matches your request: text-to-video / image-to-video / reference-to-video → `video_generation` (or `image_to_video`); a v2v transform of an existing clip → `video_editing`; make-longer → `video_extend`; talking-head → `video_avatar`; background removal → `video_background_removal`. NEVER pick a model that lacks the category, and match the input shape (do not pin an image-to-video slug for a text-only prompt, or a text-to-video slug when you pass a startFrame). See the video-generator skill for what each category is for and per-model inputs. Omitting this (or passing "auto"/empty) is an error — the tool will refuse. Do NOT invent a slug.' },
       excludeModels:   { type: 'array',   items: { type: 'string' }, description: 'Slugs to skip on the next auto-pick. CRITICAL: pass the FULL MODEL SLUG (e.g. "bytedance/seedance-2.0/image-to-video"), NOT a provider/family name like "fal-ai", "google", or "openai" — provider names will silently match nothing because the router compares against slugs. There is NO `excludeProviders` parameter for video; do not invent one. Workflow: when a previous call returned `success:false`, copy the slug from that response\'s `model` field verbatim into this array, then retry. The router will skip those slugs and pick the next best candidate from the same category.' },
       includeModels:   { type: 'array',   items: { type: 'string' }, description: 'Whitelist: when set (non-empty), the auto-picker considers ONLY these slugs and ignores every other model in the catalog. Pass FULL slugs (e.g. "fal-ai/veo3.1/first-last-frame-to-video") — provider/family names match nothing. Use when the user explicitly says "use this model / try with X / only use Y". Combines with excludeModels (the whitelist is reduced by the blacklist). If the resulting set is empty after both filters and the regular category/capability checks, the call fails with no_model_matches.' },
@@ -452,7 +453,7 @@ const generateVideoAction = {
       seed:            { type: 'number',  description: 'OPTIONAL. Reproducibility seed — same seed + same prompt ⇒ the same clip on models that support it (Seedance, Veo, WAN, Kling). Use it to lock a look across regenerations / multi-shot continuity. Ignored by models that don\'t expose a seed.' },
       extraParams:     { type: 'object',  description: 'OPTIONAL. Model-specific parameters this tool does NOT expose as first-class fields — an escape hatch for per-model knobs (e.g. Seedance `bitrate_mode`). Use the EXACT provider field name as the key (snake_case, as in the model\'s API), value as its API expects: e.g. `{ "bitrate_mode": "..." }`. Which extra params each model accepts is documented per model in the `video-generator` skill (`references/models.md`); only send ones listed there. Keys travel verbatim to the provider; unknown keys are ignored. Does NOT override the first-class params (duration/resolution/aspectRatio/…) — use those directly.' },
     },
-    required: ['prompt', 'model']
+    required: ['model']
   },
 
   examples: [
@@ -479,7 +480,9 @@ const generateVideoAction = {
         { prompt: 'Rocket liftoff — tracking up', cameraMovement: 'pan_up', duration: 5 },
       ],
     },
-    { intent: 'generate_video', prompt: 'Cinematic sunset timelapse', duration: 6, saveTo: '/Users/me/project/assets' }
+    { intent: 'generate_video', prompt: 'Cinematic sunset timelapse', duration: 6, saveTo: '/Users/me/project/assets' },
+    // AVATAR mode — face photo + driving audio + a video_avatar-category model.
+    { intent: 'generate_video', model: 'fal-ai/bytedance/omnihuman/v1.5', startFrame: '/Users/me/portraits/anita.jpg', audioFile: '/Users/me/voiceovers/intro.mp3' }
   ],
 
   async execute(action, agent) {
@@ -554,6 +557,22 @@ const generateVideoAction = {
       channel.log('video', `Using agent-chosen model="${action.model}".`);
     }
 
+    // ── AVATAR MODE (unified generate_avatar_video) ──────────────────
+    // A driving `audioFile` switches the call to the avatar flow: the
+    // face photo rides in `startFrame`, the REQUIRED `model` must carry
+    // the `video_avatar` category (the gateway validates the pin), and
+    // the rest of this function (reference plumbing, shots, multishot)
+    // does not apply. The old standalone `generate_avatar_video` tool
+    // was folded in here — one tool, one MCP surface, model always
+    // agent-chosen like every other generation.
+    if (action.audioFile) {
+      const { runAvatarFlow } = await import('./_avatar-flow.js');
+      return runAvatarFlow(
+        { ...action, image: action.startFrame || action.image },
+        agent,
+      );
+    }
+
     // ── Auto-correct misplaced image files in referenceVideos ────────
     // `referenceVideos` is for MP4/MOV/WebM/AVI/M4V URLs or paths.
     // Agents frequently confuse it with `referenceImages` / `startFrame`
@@ -602,7 +621,7 @@ const generateVideoAction = {
     }
 
     const prompt = action.prompt;
-    if (!prompt) throw new Error('generate_video: "prompt" is required');
+    if (!prompt && !action.audioFile) throw new Error('generate_video: "prompt" is required (optional only in avatar mode, i.e. with "audioFile").');
 
     const clients = agent?.llmProvider?.getClients?.() || {};
 
@@ -2893,7 +2912,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
   if (!caps) return;
 
   const fields = [
-    '"prompt" (required) — text description of the desired video',
+    '"prompt" (required, except in avatar mode) — text description of the desired video',
     '"model" (required) — the exact model slug to run; YOU choose it from the Catalog table at the end of this description. Match your operation to the model\'s Categories AND its input shape: text/image/reference-to-video → `video_generation` / `image_to_video`; v2v transform → `video_editing`; make-longer → `video_extend`; talking-head → `video_avatar`; background removal → `video_background_removal`. Never pick a model lacking the category, and never pin an image-to-video slug for a text-only prompt (or vice-versa). No auto-selection: omitting it (or "auto") is an error.',
     'optional "duration" — length in seconds. Which lengths the model accepts is in the `video-generator` skill; omit to use the model default.',
     'optional "aspectRatio" / "resolution" — per-model accepted values are in the `video-generator` skill; omit to let the model default.',
@@ -2902,6 +2921,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     'optional "endFrame" — absolute file path to the LITERAL last frame (frame-control models).',
     'optional "referenceImages" — array of absolute file paths for style / subject / identity guidance. How many the model takes is in the skill: send what it takes, they are NOT trimmed for you.',
     'optional "referenceVideos" — array of local video paths (mp4/mov/webm) or https URLs. Local files are uploaded automatically. Use for video-to-video (restyle, continuation, motion transfer).',
+    'optional "audioFile" — ABSOLUTE path to a driving audio track. Presence switches to AVATAR mode: `startFrame` = the face photo, `model` = a `video_avatar`-category slug, and the output is that photo speaking the audio (length follows the audio; `prompt` optional). Dubbing an existing VIDEO is `lipsync_video`, not this.',
     'optional "withAudio" — boolean; generate an audio track (SFX/dialogue/voiceover/ambient) alongside the video. DEFAULT true — pass false ONLY for a deliberately silent clip. Does NOT control background music.',
     'optional "cameraMovement" — camera/shot type. Omit for free composition.',
     'optional "numShots" — number of independent clips to emit in one call (multishot). Omit for a single shot. Ignored when "shots" is present.',

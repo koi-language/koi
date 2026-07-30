@@ -169,11 +169,13 @@ const generateAudioAction = {
     // step in (with a clear error) when the agent picked a TTS model from a
     // DIFFERENT provider, where the voiceId simply won't resolve.
     let voiceOverride = null;
+    let voiceDisplay = null; // friendly cloned-voice NAME for metadata (never the provider id)
     const modelOverride = action.model;
     if (mode === 'speech' && typeof action.voice === 'string' && action.voice.trim()) {
       const cloned = findVoice(action.voice);
       if (cloned) {
         voiceOverride = cloned.providerVoiceId;
+        voiceDisplay = cloned.name;
         const voiceNs = _providerNamespace(cloned.modelSlug);
         const modelNs = _providerNamespace(modelOverride);
         if (voiceNs && modelNs && voiceNs !== modelNs) {
@@ -258,9 +260,14 @@ const generateAudioAction = {
         const { saveGeneratedAudio } = await import('../../state/media-library.js');
         await saveGeneratedAudio(savePath, {
           mode: 'speech',
+          // The spoken TEXT is the one and only content field — no `prompt`
+          // mirror (it painted the same paragraph twice in the Info panel).
           text,
-          prompt: text,
-          voice,
+          // Friendly voice for the panel: the cloned voice's registered NAME
+          // (what the user asked for), never the provider's opaque id — that
+          // one travels separately as providerVoiceId.
+          voice: voiceDisplay || voice,
+          ...(voiceOverride ? { providerVoiceId: voiceOverride } : {}),
           outputFormat: result.format || outputFormat,
           speed,
           ...(action.language ? { language: action.language } : {}),
