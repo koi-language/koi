@@ -157,6 +157,7 @@ const createVoiceAction = {
     const ttsSlug = (await _findTtsSlugForProvider(cloneSlug)) || cloneSlug;
 
     let previewPath;
+    let previewCreditsCost;
     let previewLang = (action.language || '').trim().toLowerCase() || undefined;
     try {
       if (!previewLang && typeof instance.transcribe === 'function') {
@@ -185,6 +186,7 @@ const createVoiceAction = {
           const p = path.join(dir, 'preview.mp3');
           fs.writeFileSync(p, tts.audio);
           previewPath = p;
+          if (typeof tts.creditsCost === 'number') previewCreditsCost = tts.creditsCost;
           channel.log('audio', `create_voice: spoken preview rendered (lang=${previewLang || 'en'}) → ${p}`);
         }
       }
@@ -192,11 +194,21 @@ const createVoiceAction = {
       channel.log('audio', `create_voice: spoken preview failed (${err.message}); using the source sample as the voice preview`);
     }
 
+    // Total cost of the create_voice op = the clone itself + the spoken
+    // preview render (both stamped by the gateway when signed in). Stored on
+    // the entry so the drawer's Info panel shows what the voice cost.
+    const totalCreditsCost =
+      (typeof result.creditsCost === 'number' || typeof previewCreditsCost === 'number')
+        ? (result.creditsCost || 0) + (previewCreditsCost || 0)
+        : undefined;
+
     const entry = {
       id: localId,
       name,
       providerVoiceId: result.voiceId,
       provider: result.provider || resolved.provider,
+      ...(typeof totalCreditsCost === 'number' ? { creditsCost: totalCreditsCost } : {}),
+      ...(typeof result.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
       // Store the TTS model the voice is SPOKEN with (same provider as the
       // clone), NOT the voice-clone model — generate_audio needs a TTS slug
       // to sanity-check the agent's model choice against.
@@ -240,6 +252,8 @@ const createVoiceAction = {
       provider: entry.provider,
       model: entry.modelSlug,
       sampleSavedTo: entry.samplePath,
+      ...(typeof totalCreditsCost === 'number' ? { creditsCost: totalCreditsCost } : {}),
+      ...(typeof result.providerRequestId === 'string' ? { providerRequestId: result.providerRequestId } : {}),
     };
   },
 };

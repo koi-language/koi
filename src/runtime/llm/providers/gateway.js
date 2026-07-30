@@ -1743,6 +1743,10 @@ export class GatewayAudioGen extends BaseAudioGen {
       name: data.name,
       sampleUrl: data.sampleUrl || sampleUrl,
       provider: _voiceCloneProviderFromSlug(data.model || resolvedModel),
+      // Cost/telemetry the backend stamps on the clone (USD × 100). Was being
+      // dropped here, so the cloned-voice creation showed no cost in the UI.
+      ...(typeof data.creditsCost === 'number' ? { creditsCost: data.creditsCost } : {}),
+      ...(typeof data.providerRequestId === 'string' ? { providerRequestId: data.providerRequestId } : {}),
     };
   }
 }

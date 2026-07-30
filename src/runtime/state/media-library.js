@@ -1769,6 +1769,11 @@ export async function saveVoiceEntry(filePath, voice, llmProvider, opts = {}) {
     modelSlug: model,
     language: voice?.language || null,
     note: voice?.description || '',
+    // Cost of the clone (clone call + spoken preview) so the Info panel shows
+    // what the voice cost — mirrors the creditsCost/providerRequestId that
+    // generated audio/image/video rows carry.
+    ...(typeof voice?.creditsCost === 'number' ? { creditsCost: voice.creditsCost } : {}),
+    ...(typeof voice?.providerRequestId === 'string' ? { providerRequestId: voice.providerRequestId } : {}),
   };
   return lib.save({
     filePath,
