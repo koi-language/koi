@@ -1775,6 +1775,18 @@ export async function saveVoiceEntry(filePath, voice, llmProvider, opts = {}) {
     ...(typeof voice?.creditsCost === 'number' ? { creditsCost: voice.creditsCost } : {}),
     ...(typeof voice?.providerRequestId === 'string' ? { providerRequestId: voice.providerRequestId } : {}),
   };
+  // Preserve the voice's REAL clone time. Without this, the idempotent
+  // migration in `_migrateLegacyArtefacts` (runs on every table open) and each
+  // re-mirror re-save this row with created_at = now, floating every voice to
+  // the top of "Latest creations" on every restart. Prefer the registry's
+  // stored `createdAt`, then the sample file's mtime; only then let `save()`
+  // fall back to now (a brand-new voice with neither).
+  let createdAt = (typeof voice?.createdAt === 'string' && voice.createdAt)
+    ? voice.createdAt
+    : '';
+  if (!createdAt) {
+    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* save() falls back to now */ }
+  }
   return lib.save({
     filePath,
     mediaType: 'voice',
@@ -1782,6 +1794,7 @@ export async function saveVoiceEntry(filePath, voice, llmProvider, opts = {}) {
     description,
     embedding,
     replaceByPath: true,
+    createdAt: createdAt || undefined,
     summary: opts.summary,
   });
 }

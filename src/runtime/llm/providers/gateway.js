@@ -347,9 +347,12 @@ export async function fetchMediaCapabilities(kind) {
 }
 
 /**
- * Fetch the RAW active media model rows for a kind — a lean projection
- * { slug, displayName, categories, labels } per active model (price != null,
- * mirroring the router's active filter). Unlike fetchMediaCapabilities (which
+ * Fetch the RAW media model rows for a kind — a lean projection
+ * { slug, displayName, categories, labels } per row the backend returns (the
+ * backend already scopes `/models/{kind}.json` to active models; we no longer
+ * additionally drop rows with a null `pricePerUnit`, so a freshly-added model
+ * still surfaces in the chat-options picker before its price is curated).
+ * Unlike fetchMediaCapabilities (which
  * aggregates capability columns), this preserves per-model identity so callers
  * can bind catalog slugs to an external provider's model ids (e.g. the MCP media
  * mapper mapping `fal-ai/nano-banana-pro/edit` → Magnific `imagen-nano-banana-2`).
@@ -372,7 +375,7 @@ export async function fetchMediaModelRows(kind) {
     // dropdowns in the chat-options panel.
     const { canonicalizeCategories } = await import('./media-model-router.js');
     return models
-      .filter((m) => m && typeof m.slug === 'string' && m.pricePerUnit != null)
+      .filter((m) => m && typeof m.slug === 'string')
       .map((m) => ({
         slug: m.slug,
         displayName: typeof m.displayName === 'string' ? m.displayName : '',
