@@ -133,6 +133,27 @@ export async function runAvatarFlow(action, agent) {
 
   // Cost consent handled up front by the media banner wrapper.
 
+  // Native per-model escape hatch. The tool field is `extraParams` (the old
+  // `action.extra` name never existed on the schema — that's why extra params
+  // silently never reached avatar models). If a LOCAL mask image path rides in
+  // `extraParams.mask_url` (OmniHuman's subject selector: white = speaks), read
+  // it here so the gateway can upload it to fal storage and swap in the URL — a
+  // raw local path would 400 upstream.
+  let extraParams = action.extraParams || action.extra_params || undefined;
+  let maskBuffer = null;
+  let maskFilename = null;
+  if (extraParams && typeof extraParams.mask_url === 'string' && !/^https?:\/\//i.test(extraParams.mask_url)) {
+    try {
+      const _mp = path.resolve(extraParams.mask_url);
+      if (fs.existsSync(_mp)) {
+        maskBuffer = fs.readFileSync(_mp);
+        maskFilename = path.basename(_mp);
+        extraParams = { ...extraParams };
+        delete extraParams.mask_url; // gateway re-adds it as a fal URL post-upload
+      }
+    } catch { /* leave mask_url as-is; gateway forwards it verbatim */ }
+  }
+
   reportProgress?.(0.02, 'Submitting to provider…');
   let submitted;
   try {
@@ -143,7 +164,9 @@ export async function runAvatarFlow(action, agent) {
       aspectRatio: action.aspectRatio,
       seed: action.seed,
       label: action.label,
-      extra: action.extra,
+      extraParams,
+      maskBuffer,
+      maskFilename,
     });
   } catch (err) {
     return { success: false, provider: resolved.provider, error: err.message || String(err) };

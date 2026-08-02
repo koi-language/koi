@@ -379,6 +379,11 @@ export async function fetchMediaModelRows(kind) {
       .map((m) => ({
         slug: m.slug,
         displayName: typeof m.displayName === 'string' ? m.displayName : '',
+        // Vendor/brand (the `provider` DB column — required, e.g. 'minimax',
+        // 'bytedance', 'google'). The chat-options picker shows it in front of
+        // the display name so the maker is always visible, since many media
+        // rows curated their displayName WITHOUT the brand.
+        provider: typeof m.provider === 'string' ? m.provider : '',
         categories: canonicalizeCategories(Array.isArray(m.categories) ? m.categories : []),
         labels: Array.isArray(m.labels)
           ? m.labels.map((l) => (typeof l === 'string' ? l : l && l.slug)).filter(Boolean)
@@ -2352,6 +2357,33 @@ export class GatewayVideoGen extends BaseVideoGen {
     }
     const { url: imageUrl } = await imgRes.json();
 
+    // Optional mask (OmniHuman subject selector). Uploaded like the image — via
+    // /uploads/video (a plain fal-storage wrapper, any mime) — then handed to
+    // the model through extra_params.mask_url so it reaches the fal input via
+    // the backend's mergeExtraParams (the adapter doesn't set mask_url itself).
+    let extraParams = (opts.extraParams && typeof opts.extraParams === 'object' && !Array.isArray(opts.extraParams))
+      ? { ...opts.extraParams }
+      : undefined;
+    if (Buffer.isBuffer(opts.maskBuffer)) {
+      const maskFilename = opts.maskFilename || 'mask.png';
+      const maskMime = _imageMimeFromFilename(maskFilename);
+      const mHeaders = { ...getAuthHeaders() };
+      delete mHeaders['content-type'];
+      delete mHeaders['Content-Type'];
+      mHeaders['Content-Type'] = maskMime;
+      const maskRes = await fetch(
+        `${getGatewayBase()}/uploads/video?filename=${encodeURIComponent(maskFilename)}`,
+        { method: 'POST', headers: mHeaders, body: opts.maskBuffer, signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS) },
+      );
+      await throwIfQuotaExceeded(maskRes);
+      if (!maskRes.ok) {
+        const body = await maskRes.text().catch(() => '');
+        throw new Error(`Gateway mask upload error (${maskRes.status}): ${body}`);
+      }
+      const { url: maskUrl } = await maskRes.json();
+      extraParams = { ...(extraParams || {}), mask_url: maskUrl };
+    }
+
     // Submit the avatar job.
     const submitRes = await fetch(`${getGatewayBase()}/media/video/avatar`, {
       method: 'POST',
@@ -2363,6 +2395,7 @@ export class GatewayVideoGen extends BaseVideoGen {
         ...(opts.prompt ? { prompt: opts.prompt } : {}),
         ...(opts.aspectRatio ? { aspect_ratio: opts.aspectRatio } : {}),
         ...(typeof opts.seed === 'number' ? { seed: opts.seed } : {}),
+        ...(extraParams && Object.keys(extraParams).length ? { extra_params: extraParams } : {}),
       }),
       signal: _stallSignal(opts.abortSignal, _MEDIA_SUBMIT_TIMEOUT_MS),
     });
