@@ -52,9 +52,28 @@ function _validate(ch) {
   if (ch.id !== undefined && (!_isStr(ch.id) || !_KEBAB_RE.test(ch.id))) {
     return `"id" (when provided) must be a kebab-case string (lowercase letters/digits/hyphens). Got ${JSON.stringify(ch.id)}.`;
   }
-  for (const k of ['handle', 'description', 'backstory', 'voiceId']) {
+  for (const k of ['handle', 'description', 'backstory', 'voiceId', 'sheet', 'ttsModel', 'sex', 'build']) {
     if (ch[k] !== undefined && ch[k] !== null && !_isStr(ch[k])) {
       return `"${k}" (when provided) must be a string. Got ${typeof ch[k]}.`;
+    }
+  }
+  // Physical attributes exposed as controls in the visor. `age` in years,
+  // `height` in cm, `weight` in kg. Optional numbers. `sex` and `build`
+  // (complexion) are short canonical strings.
+  for (const k of ['age', 'height', 'weight']) {
+    if (ch[k] !== undefined && ch[k] !== null &&
+        !(typeof ch[k] === 'number' && Number.isFinite(ch[k]))) {
+      const unit = k === 'age' ? 'years' : k === 'height' ? 'centimetres' : 'kilograms';
+      return `"${k}" (when provided) must be a number (${unit}).`;
+    }
+  }
+  // `sheetCells` is the detected cell geometry of the turnaround `sheet`
+  // (a black-band grid): an array of normalized { x, y, w, h } rects in
+  // reading order (row-major). Optional; when present each entry is an object
+  // of finite numbers in 0..1.
+  if (ch.sheetCells !== undefined && ch.sheetCells !== null) {
+    if (!Array.isArray(ch.sheetCells)) {
+      return '"sheetCells" (when provided) must be an array of { x, y, w, h } normalized rects.';
     }
   }
   // `handle` is a BARE @mention without the leading @ (e.g. "jason").
@@ -95,6 +114,23 @@ function _normHandle(v) {
   return h.length > 0 ? h : null;
 }
 
+// Turnaround-sheet cell geometry: an array of normalized { x, y, w, h } rects
+// (each in 0..1, relative to the sheet image), in reading order — row 0 is the
+// full-body row, row 1 the face row. Produced by the black-band detector when
+// the sheet is generated. Kept only when every entry is well-formed.
+function _normSheetCells(v) {
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const c of v) {
+    if (!_isObj(c)) continue;
+    const x = Number(c.x); const y = Number(c.y);
+    const w = Number(c.w); const h = Number(c.h);
+    if (![x, y, w, h].every(Number.isFinite)) continue;
+    out.push({ x, y, w, h });
+  }
+  return out.length ? out : null;
+}
+
 function _normalize(ch, existing) {
   // Carry forward the original createdAt across saves so the MediaLibrary
   // "Latest" ordering stays anchored to when the character was first
@@ -110,8 +146,23 @@ function _normalize(ch, existing) {
     handle: _normHandle(ch.handle),
     description: _isStr(ch.description) ? ch.description : '',
     backstory: _isStr(ch.backstory) ? ch.backstory : '',
+    // Physical attributes (controls in the visor). sex/build are short
+    // canonical strings (e.g. "female", "athletic"); age=years, height=cm,
+    // weight=kg.
+    sex: (_isStr(ch.sex) && ch.sex.trim()) ? ch.sex.trim() : null,
+    age: (typeof ch.age === 'number' && Number.isFinite(ch.age)) ? ch.age : null,
+    height: (typeof ch.height === 'number' && Number.isFinite(ch.height)) ? ch.height : null,
+    weight: (typeof ch.weight === 'number' && Number.isFinite(ch.weight)) ? ch.weight : null,
+    build: (_isStr(ch.build) && ch.build.trim()) ? ch.build.trim() : null,
     photos: _normPhotos(ch.photos),
+    // Generated turnaround sheet (a 4-col x 2-row grid of the character) + the
+    // detected cell geometry the visor crops into the rotating card view.
+    sheet: (_isStr(ch.sheet) && ch.sheet.trim()) ? ch.sheet.trim() : null,
+    sheetCells: _normSheetCells(ch.sheetCells),
     voiceId: (_isStr(ch.voiceId) && ch.voiceId.trim()) ? ch.voiceId.trim() : null,
+    // TTS model slug to synthesize this character's voice with (provider-scoped
+    // to the voice); null = let the audio pipeline pick a default.
+    ttsModel: (_isStr(ch.ttsModel) && ch.ttsModel.trim()) ? ch.ttsModel.trim() : null,
     createdAt,
     updatedAt: now,
   };
@@ -124,13 +175,16 @@ export default {
     'Write a reusable CHARACTER entity to ~/.koi/characters/<id>.json with STRUCTURED args (the character as an OBJECT, not a JSON string). ' +
     'A character is a persisted, reusable identity (a person, mascot, spokesperson…) the user can reference across storyboards, image/video prompts and audio. ' +
     'Use for BOTH creating new characters and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
-    'Call shape: { character: { id?, name, handle?, description?, backstory?, photos?, voiceId? } }. ' +
+    'Call shape: { character: { id?, name, handle?, description?, backstory?, sex?, age?, height?, weight?, build?, photos?, voiceId?, sheet?, sheetCells?, ttsModel? } }. '
+    + 'Physical attributes surfaced as controls in the visor (all OPTIONAL): character.sex (short canonical string, e.g. "female" / "male" / "nonbinary"), character.age (years, number), character.height (cm, number), character.weight (kg, number), character.build (complexion, short canonical string, e.g. "slim" / "average" / "athletic" / "muscular" / "heavy"). ' +
     'Required: character.name (non-empty). ' +
     'character.id is OPTIONAL — a kebab-case slug that MUST match the on-disk filename; when omitted it is derived from the name. ' +
     'character.handle is the BARE @mention WITHOUT the leading "@" (e.g. "jason") — when set together with at least one photo, the first photo is registered under `@handle` so `@handle` resolves in prompts. ' +
     'character.description and character.backstory are optional strings (backstory = the character\'s history). ' +
     'character.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, the bytes are never copied; photos[0] is the hero image the drawer shows. ' +
-    'character.voiceId is an OPTIONAL string: a voice-registry id ("voice-...") or a voice display name. ' +
+    'character.voiceId is an OPTIONAL string: a voice-registry id ("voice-...") or a voice display name. character.ttsModel is an OPTIONAL TTS model slug to speak this character with (provider-scoped to the voice). ' +
+    'When you CREATE a character, ASSIGN A FITTING VOICE: call list_voices (default provider ElevenLabs) and pick a preset whose gender matches the character\'s sex, then set voiceId to that preset name and ttsModel to the model slug — a character with no voice cannot speak in a video. ' +
+    'character.sheet is an OPTIONAL absolute path to a generated TURNAROUND sheet (a 4-col x 2-row grid of the character) and character.sheetCells its detected normalized cell rects — usually set by the generate_character_sheet tool, not by hand. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved from the existing file or set to now, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, character:<normalized> } on success, or { success:false, error } with the exact invalid field on validation failure.',
   instructions:

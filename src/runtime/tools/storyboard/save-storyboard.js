@@ -89,9 +89,31 @@ function _validate(sb) {
   if (!_isStr(sb.synopsis) || !sb.synopsis.trim()) {
     return '"synopsis" is REQUIRED and must be a non-empty string: the story PREMISE/logic, in the user\'s language — who wants what, what is or isn\'t reachable, and why the ending lands (1–3 sentences). It is injected into EVERY shot\'s image prompt so the renders never contradict the story (e.g. "the Pepsi button is mounted high, out of reach — that is why he stacks cans to climb"). Author it from the storyboard you just built and call save_storyboard again. The ONLY exception is a bare, unconnected shot list with no narrative — extremely rare.';
   }
-  for (const k of ['characters', 'lighting', 'stylePrompt']) {
+  for (const k of ['lighting', 'stylePrompt']) {
     if (sb[k] !== undefined && !_isStr(sb[k])) {
       return `"${k}" (when provided) must be a string. Got ${typeof sb[k]}.`;
+    }
+  }
+  // `characters` is the recurring-cast ROSTER. Preferred shape is a structured
+  // array of { name, description?, characterId? } so the visor can render each
+  // cast member as its own clickable row that opens a character card. A legacy
+  // free-text roster STRING is still accepted (old storyboards) and preserved
+  // verbatim — we never parse it back into entries.
+  if (sb.characters !== undefined && !_isStr(sb.characters)) {
+    if (!Array.isArray(sb.characters)) {
+      return '"characters" (when provided) must be EITHER a free-text roster string OR an array of { name, description?, characterId? } objects.';
+    }
+    for (let ci = 0; ci < sb.characters.length; ci++) {
+      const c = sb.characters[ci];
+      if (!_isObj(c)) return `characters[${ci}] must be an object { name, description?, characterId? }.`;
+      if (!_isStr(c.name) || !c.name.trim()) {
+        return `characters[${ci}].name must be a non-empty string — the cast label/name (e.g. "MAESTRO").`;
+      }
+      for (const k of ['description', 'characterId']) {
+        if (c[k] !== undefined && !_isStr(c[k])) {
+          return `characters[${ci}].${k} (when provided) must be a string.`;
+        }
+      }
     }
   }
   // `continuity` is the CONTINUITY LOCK: a list of absolute, story-wide
@@ -274,8 +296,17 @@ function _editorialDiff(existing, out) {
   const sameJson = (a, b) =>
     JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   const root = [];
-  for (const k of ['synopsis', 'characters', 'lighting', 'stylePrompt']) {
+  for (const k of ['synopsis', 'lighting', 'stylePrompt']) {
     if ((existing[k] || '') !== (out[k] || '')) root.push(k);
+  }
+  // `characters` may be a string (legacy roster) or an array (structured cast).
+  // Treat undefined / '' / [] as the same "no cast" so an old board doesn't
+  // whole-board re-render on its first save under the new model.
+  const _emptyCast = (x) =>
+    x === undefined || x === '' || (Array.isArray(x) && x.length === 0);
+  if (!(_emptyCast(existing.characters) && _emptyCast(out.characters)) &&
+      !sameJson(existing.characters, out.characters)) {
+    root.push('characters');
   }
   if (!sameJson(existing.continuity, out.continuity)) root.push('continuity');
   const prevShotById = new Map();
@@ -318,6 +349,28 @@ function _editorialDiff(existing, out) {
 // validation, same normalization, same editorial diff — one formula,
 // two entry points.
 export { _validate, _normalize, _editorialDiff, _isStr, _isObj };
+
+// Normalize the recurring-cast roster. Preferred shape is a structured array
+// of { name, description?, characterId? }; a legacy free-text string is kept
+// verbatim (old storyboards — never parsed). Anything else / absent → '' so the
+// on-disk shape stays stable for boards that never authored a cast.
+function _normCharacters(v) {
+  if (Array.isArray(v)) {
+    const out = [];
+    for (const c of v) {
+      if (!_isObj(c)) continue;
+      const name = _isStr(c.name) ? c.name.trim() : '';
+      if (!name) continue;
+      const entry = { name };
+      if (_isStr(c.description) && c.description.trim()) entry.description = c.description.trim();
+      if (_isStr(c.characterId) && c.characterId.trim()) entry.characterId = c.characterId.trim();
+      out.push(entry);
+    }
+    return out;
+  }
+  if (_isStr(v)) return v;
+  return '';
+}
 
 function _normalize(sb, existing) {
   // Carry forward the original createdAt across saves so the
@@ -383,7 +436,7 @@ function _normalize(sb, existing) {
     // STORY PREMISE into every shot prompt — dropping it here was the bug that
     // made renders contradict the story even though the agent authored it.
     synopsis: sb.synopsis.trim(),
-    characters: _isStr(sb.characters) ? sb.characters : '',
+    characters: _normCharacters(sb.characters),
     lighting: _isStr(sb.lighting) ? sb.lighting : '',
     stylePrompt: _isStr(sb.stylePrompt) ? sb.stylePrompt : '',
     scenes: sb.scenes.map((sc) => {
@@ -469,6 +522,7 @@ export default {
     'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.aspect (one of 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9), storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
     'storyboard.continuity is an OPTIONAL (strongly recommended for any narrative with physical/spatial logic) array of strings — the CONTINUITY LOCK: absolute, story-wide invariants every panel must obey and never contradict or "fix" (e.g. ["The Pepsi button stays mounted high, above the child\'s reach until he climbs", "Never make the child taller or lower the button", "The cans he stacks as a step stay intact — never crushed"]). Injected verbatim into EVERY shot\'s render prompt as hard constraints; this is how you stop the renderer from silently making the unreachable reachable or breaking an object that must stay whole. ' +
     'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, sequential across ALL scenes — EXCEPT a continuation shot, which REPEATS the previous shot\'s number; see noCutBefore), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. shot.noCutBefore is an OPTIONAL boolean: when true this shot is a CONTINUATION of the previous one — one continuous take, the camera keeps moving and there is NO cut between them. A continuation shares the previous shot\'s number (do not increment) and the video pipeline renders the glued shots as a SINGLE clip; NEVER set it on the first shot. Use it to author a longer moving shot as several precise sub-takes (more descriptive than one vague panel). shot.continuity is an OPTIONAL but high-value OBJECT { characters, objects, place } — the continuity-table ROW for THIS exact panel, in the user\'s language. "characters" = who is in frame and their state (position, pose, what they wear/hold, expression — e.g. "Misma mujer, mismo abrigo negro y peinado; de pie junto a la puerta"); "objects" = the state of every key prop/scenery in frame (e.g. "Linterna en la mano derecha; puerta roja cerrada"); "place" = WHERE this exact panel physically happens — the concrete location the frame is set in, restated for THIS shot so the render never drifts out of it even on a tight close-up (e.g. "Bajo el agua, en una calle de la piscina, entre dos corcheras"; "Interior del coche, asiento del conductor, de noche"). Fill `place` on EVERY shot of a scene with a strong setting (so close-ups still read as being there, not in a void); fill characters/objects whenever a non-default state holds. The compositor composes all three into CURRENT PANEL STATE / SHOT LOCATION so the render shows this exact state AND is set in this exact place instead of resetting to a default, jumping ahead, or rendering a neutral/wrong background — AND the columns, read top-to-bottom across all shots, ARE the continuity table the user reviews. (Legacy: an old free-text shot.state string is still accepted and auto-migrated into continuity.characters.) dialogue/sfx/music are optional strings. ' +
+    'storyboard.characters is the OPTIONAL recurring-cast ROSTER. Prefer the STRUCTURED array shape: [{ name, description?, characterId? }] — one entry per recurring character, name = the SHORT_UPPERCASE label reused verbatim in shot action/dialogue (e.g. "MAESTRO"), description = a one-line silhouette/wardrobe note (no faces), characterId = the id of a saved character document (~/.koi/characters/<id>.json) when this cast member is backed by one, so the visor can open its card. The visor renders each entry as a clickable row. A legacy free-text roster string is still accepted and preserved verbatim (never parsed), but new/edited storyboards should emit the array. ' +
     'references is an OPTIONAL array of strings (each entry is an `@handle` or absolute file path) that can sit at the storyboard root, on a scene, or on a single shot — the downstream visual renderer collects all three levels per panel. Preserve whatever references the agent passes (or the user added via the visor); never drop them on a round-trip read→mutate→save. ' +
     'Auto-set by the tool: version=1, updatedAt=now (UTC ISO), createdAt preserved from existing file or set to now, seed defaulted to a random integer when omitted. ' +
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',

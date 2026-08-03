@@ -247,6 +247,26 @@ export default {
       return { success: false, error: 'storyboard_image_prompt: stylePreamble is required' };
     }
 
+    // Accept the storyboard's structured cast (an array of { name, description })
+    // as well as a legacy roster string: flatten the array into the same
+    // "- NAME: desc" roster the compositor expects. The GUI already flattens,
+    // but an agent may call this tool directly with the array shape.
+    if (Array.isArray(action.characters)) {
+      action = {
+        ...action,
+        characters: action.characters
+          .map((c) => {
+            if (!c || typeof c !== 'object') return '';
+            const name = typeof c.name === 'string' ? c.name.trim() : '';
+            if (!name) return '';
+            const desc = typeof c.description === 'string' ? c.description.trim() : '';
+            return desc ? `- ${name}: ${desc}` : `- ${name}`;
+          })
+          .filter(Boolean)
+          .join('\n'),
+      };
+    }
+
     // Pack non-empty fields. Schema v6 input keys: stylePreamble +
     // characters + lighting + shot + movement + action + dialogue,
     // plus the optional `referencedCharacters` list that switches

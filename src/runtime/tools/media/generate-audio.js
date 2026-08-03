@@ -123,10 +123,14 @@ const generateAudioAction = {
   ],
 
   async execute(action, agent) {
-    // Guard — see generate-image.js for rationale.
-    const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
-    const _guard = await requireToolInfoFirst('generate_audio', agent);
-    if (_guard) return _guard;
+    // Guard — see generate-image.js for rationale. `_internalDelegate` bypasses
+    // it (a trusted non-agent caller like the GUI's voice preview, which builds
+    // a schema-correct call itself), mirroring generate-image.
+    if (action._internalDelegate !== true) {
+      const { requireToolInfoFirst } = await import('../_require-tool-info-first.js');
+      const _guard = await requireToolInfoFirst('generate_audio', agent);
+      if (_guard) return _guard;
+    }
 
     // `model` is REQUIRED for GENERATION modes (speech/sfx/music) — the
     // agent picks the slug (no auto-selection). TRANSCRIBE is exempt: it is
