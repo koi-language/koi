@@ -24,8 +24,7 @@ import { channel } from '../../io/channel.js';
 import { readCharacter } from '../../state/character-registry.js';
 import { contentIslands } from '../panels/_grid.js';
 import generateImage from '../media/generate-image.js';
-import { fetchMediaCapabilities } from '../../llm/providers/gateway.js';
-import { peekImageModel } from '../../llm/providers/media-model-router.js';
+import { mediaModelsByLabel } from '../../llm/providers/gateway.js';
 
 function _err(msg) { return { success: false, error: `generate_character_sheet: ${msg}` }; }
 function _isStr(v) { return typeof v === 'string'; }
@@ -78,10 +77,11 @@ export default {
   type: 'generate_character_sheet',
   intent: 'generate_character_sheet',
   description:
+    'REQUIRED FIRST: activate the `characters` skill — it documents the character JSON and the voice flow. ' +
     'Generate a character TURNAROUND SHEET: one image with a 4-columns x 2-rows grid (top row = 4 full-body views front/left/right/back; bottom row = 4 face portraits) of the SAME character, drawn with thick pure-black gutter bars, then auto-detect the 8 cell rectangles. ' +
     'Inputs: a DESCRIPTION and/or one or more reference PHOTOS of the character (either is enough; both is best). When only `characterId` is given, the description + photos are read from that saved character. ' +
     'Call shape: { description?, photos?: [absolute paths], characterId?, model?, aspectRatio? }. ' +
-    'model is OPTIONAL — omit it to auto-pick a reference-capable image model; pass a slug to pin one. ' +
+    'model DEFAULTS to the catalog model tagged with the `characters` label (else GPT Image 2 — edit variant when photos are given). Do NOT override it unless the user asks. ' +
     'Returns: { success, sheet: <absolute path to the generated sheet>, sheetCells: [{x,y,w,h} normalized, row-major], cols: 4, rows: 2, model, attached }. ' +
     'When a characterId is passed, the sheet is AUTOMATICALLY attached to that character (sheet + sheetCells saved onto its doc) — no follow-up save_character needed. Without a characterId, attach it yourself with save_character { id, sheet, sheetCells }.',
   thinkingHint: () => 'Generating character turnaround sheet',
@@ -125,19 +125,27 @@ export default {
     // Resolve a reference-capable image model. A pinned slug wins; otherwise
     // auto-pick from the live catalog (refsCount > 0 → the image-editing bucket,
     // where reference/identity models live).
+    // MODEL: the catalog model tagged with the `characters` label; else default
+    // to GPT Image 2 (the EDIT variant when we have reference photos, else base
+    // text-to-image). An explicit `model` overrides both. (Seedance video does
+    // its OWN Seedream conversion of the sheet, so the sheet model is free to be
+    // the best character/identity model — GPT Image 2.)
     let model = (_isStr(action?.model) && action.model.trim() && action.model.trim() !== 'auto')
       ? action.model.trim()
       : null;
     if (!model) {
       try {
-        const caps = await fetchMediaCapabilities('image');
-        const picked = peekImageModel(caps?.models || [], { refsCount: photos.length });
-        model = picked?.slug || null;
+        const rows = await mediaModelsByLabel('image', 'characters');
+        if (Array.isArray(rows) && rows.length && _isStr(rows[0]?.slug)) {
+          model = rows[0].slug;
+        }
       } catch (e) {
-        channel.log('generate_character_sheet', `model auto-resolve failed: ${e.message}`);
+        channel.log('generate_character_sheet', `label 'characters' resolve failed: ${e.message}`);
       }
     }
-    if (!model) return _err('could not resolve an image model — pass an explicit "model" slug.');
+    if (!model) {
+      model = photos.length ? 'openai/gpt-image-2/edit' : 'openai/gpt-image-2';
+    }
 
     const aspectRatio = (_isStr(action?.aspectRatio) && action.aspectRatio.trim())
       ? action.aspectRatio.trim()
@@ -151,6 +159,7 @@ export default {
       model,
       aspectRatio,
       resolution: 'high',
+      quality: 'high',
       outputFormat: 'png',
       _internalDelegate: true,
       label: 'character_sheet',

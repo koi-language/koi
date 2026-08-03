@@ -394,7 +394,11 @@ export class MediaLibrary {
     // creaciones ni en el cajón").
     if (visible === undefined) {
       const base = path.basename(filePath);
-      if (base.startsWith('braxil-annotation-')) {
+      // Auto-hide throwaway generative-input artefacts: annotation snapshots
+      // (`braxil-annotation-*`) and the character card's voice-preview clips
+      // (`koi-voice-preview-*`) — neither belongs in the creations drawer.
+      if (base.startsWith('braxil-annotation-') ||
+          base.startsWith('koi-voice-preview-')) {
         visible = false;
       } else {
         visible = true;

@@ -172,6 +172,7 @@ export default {
   type: 'save_character',
   intent: 'save_character',
   description:
+    'REQUIRED FIRST: activate the `characters` skill before creating or editing a character — it is the full contract (the character JSON schema and every field, the REQUIRED Seedream 5 Pro model for the turnaround sheet, and the voice-assignment flow). ' +
     'Write a reusable CHARACTER entity to ~/.koi/characters/<id>.json with STRUCTURED args (the character as an OBJECT, not a JSON string). ' +
     'A character is a persisted, reusable identity (a person, mascot, spokesperson…) the user can reference across storyboards, image/video prompts and audio. ' +
     'Use for BOTH creating new characters and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
