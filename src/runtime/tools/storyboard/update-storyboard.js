@@ -40,7 +40,10 @@ const SCENE_FIELDS = new Set([
   'title', 'location', 'notes', 'synopsis', 'references',
 ]);
 const SHOT_FIELDS = new Set([
-  'duration', 'shot', 'movement', 'action', 'dialogue', 'sfx', 'music',
+  // v7: `camera` (was `movement`), + `composition` + per-shot `lighting`.
+  // `movement` kept as an accepted legacy alias (read as `camera` downstream).
+  'duration', 'shot', 'camera', 'composition', 'lighting', 'movement',
+  'action', 'dialogue', 'sfx', 'music',
   'continuity', 'state', 'noCutBefore', 'references',
 ]);
 
@@ -69,7 +72,7 @@ export default {
     'Call shape: { id, set?: {…root fields…}, scenes?: [{ id, set: {…} }], shots?: [{ id, set: {…} }] }. ' +
     'Root set fields: name, aspect, synopsis, characters, lighting, stylePrompt, continuity (array of strings), references, seed. ' +
     'Scene set fields: title, location, notes, synopsis, references. ' +
-    'Shot set fields: duration, shot, movement, action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
+    'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
     'Set a field to null to remove it. ' +
     'NOT for structure: adding/removing/reordering scenes or shots, renumbering, or changing ids — use save_storyboard (full document) for those. ' +
     'Returns { success, path, id, editorialChanges, affectedPanels } where affectedPanels lists the shot ids whose sketch will re-render ' +
@@ -97,7 +100,7 @@ export default {
       },
       shots: {
         type: 'array',
-        description: 'Shot-level patches: [{ id, set: { duration?, shot?, movement?, action?, dialogue?, sfx?, music?, continuity?, noCutBefore?, references? } }].',
+        description: 'Shot-level patches: [{ id, set: { duration?, shot?, camera?, composition?, lighting?, action?, dialogue?, sfx?, music?, continuity?, noCutBefore?, references? } }].',
         items: { type: 'object' },
       },
       summary: { type: 'string', description: 'One-line ledger blurb (optional).' },
@@ -212,7 +215,7 @@ export default {
       // duration change the document but never the drawing, so they
       // don't count as re-renders.
       const rerenders = (f) =>
-        ['shot', 'movement', 'action', 'continuity', 'state'].includes(f) ||
+        ['shot', 'camera', 'movement', 'composition', 'lighting', 'action', 'continuity', 'state'].includes(f) ||
         f.startsWith('scene.');
       for (const sc of normalized.scenes) {
         const shots = sc.shots;

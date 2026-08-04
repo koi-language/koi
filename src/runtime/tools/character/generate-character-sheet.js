@@ -73,6 +73,68 @@ function _evenGrid(cols, rows) {
   return out;
 }
 
+// Maximal runs along an axis where the near-black fraction stays BELOW the
+// gutter threshold T (i.e. a real cell), each at least `minFrac` of the extent
+// wide (rejects thin slivers). Returns [[start,end), …].
+function _contentBands(prof, extent, T, minFrac) {
+  const bands = [];
+  let s = -1;
+  for (let i = 0; i < extent; i++) {
+    if (prof[i] < T) { if (s < 0) s = i; }
+    else if (s >= 0) { if (i - s >= minFrac * extent) bands.push([s, i]); s = -1; }
+  }
+  if (s >= 0 && extent - s >= minFrac * extent) bands.push([s, extent]);
+  return bands;
+}
+
+// Sweep the gutter threshold high→low and take the FIRST that yields EXACTLY
+// nCells content bands. Robust to UNEQUAL spacing (a tall full-body row + a
+// short portrait row) and to the sheet's pure-black top/bottom margins (which
+// read as gutters and are excluded from the cells). Null when unreadable.
+function _axisCells(prof, extent, nCells, minFrac) {
+  for (let T = 0.9; T >= 0.4; T -= 0.02) {
+    const b = _contentBands(prof, extent, T, minFrac);
+    if (b.length === nCells) return b;
+  }
+  return null;
+}
+
+/**
+ * Line-based cell detector for a cols×rows turnaround sheet. It does NOT assume
+ * equal spacing: it finds the actual CUT LINES (each crosses the sheet edge to
+ * edge) from the per-column / per-row near-black fraction, then builds the cell
+ * matrix between them. So a taller body row and a shorter portrait row are each
+ * cropped correctly, and the black margins never bleed into a cell (the even
+ * split did both wrong). Returns cols×rows normalized { x, y, w, h } cells,
+ * row-major, or null when the grid can't be read cleanly.
+ */
+async function _detectSheetCells(sharp, sheet, cols, rows) {
+  const { data, info } = await sharp(sheet).greyscale().raw().toBuffer({ resolveWithObject: true });
+  const W = info.width, H = info.height, ch = info.channels;
+  if (!(W > 0) || !(H > 0)) return null;
+  const DARK = 45; // pixel value ≤ this ≈ the pure-black gutter/margin
+  const colDark = new Float64Array(W);
+  const rowDark = new Float64Array(H);
+  for (let y = 0; y < H; y++) {
+    const base = y * W * ch;
+    for (let x = 0; x < W; x++) {
+      if (data[base + x * ch] <= DARK) { colDark[x] += 1; rowDark[y] += 1; }
+    }
+  }
+  for (let x = 0; x < W; x++) colDark[x] /= H;
+  for (let y = 0; y < H; y++) rowDark[y] /= W;
+  const cx = _axisCells(colDark, W, cols, 0.08);
+  const ry = _axisCells(rowDark, H, rows, 0.08);
+  if (!cx || !ry) return null;
+  const cells = [];
+  for (const [y0, y1] of ry) {
+    for (const [x0, x1] of cx) {
+      cells.push({ x: x0 / W, y: y0 / H, w: (x1 - x0) / W, h: (y1 - y0) / H });
+    }
+  }
+  return cells;
+}
+
 export default {
   type: 'generate_character_sheet',
   intent: 'generate_character_sheet',
@@ -81,7 +143,7 @@ export default {
     'Generate a character TURNAROUND SHEET: one image with a 4-columns x 2-rows grid (top row = 4 full-body views front/left/right/back; bottom row = 4 face portraits) of the SAME character, drawn with thick pure-black gutter bars, then auto-detect the 8 cell rectangles. ' +
     'Inputs: a DESCRIPTION and/or one or more reference PHOTOS of the character (either is enough; both is best). When only `characterId` is given, the description + photos are read from that saved character. ' +
     'Call shape: { description?, photos?: [absolute paths], characterId?, model?, aspectRatio? }. ' +
-    'model DEFAULTS to the catalog model tagged with the `characters` label (else GPT Image 2 — edit variant when photos are given). Do NOT override it unless the user asks. ' +
+    'model AUTO-SELECTS by whether the character has reference photos: WITH photos (a real person) → the `characters`-label identity model (else GPT Image 2 edit); NO photos (a 100% invented character) → the `characters-synthetic`-label model (Seedream text-to-image, so the turnaround is Seedance-native — passes the reference-to-video likeness filter with no laundering), else base GPT Image 2. Do NOT override `model` unless the user asks. ' +
     'Returns: { success, sheet: <absolute path to the generated sheet>, sheetCells: [{x,y,w,h} normalized, row-major], cols: 4, rows: 2, model, attached }. ' +
     'When a characterId is passed, the sheet is AUTOMATICALLY attached to that character (sheet + sheetCells saved onto its doc) — no follow-up save_character needed. Without a characterId, attach it yourself with save_character { id, sheet, sheetCells }.',
   thinkingHint: () => 'Generating character turnaround sheet',
@@ -133,7 +195,30 @@ export default {
     let model = (_isStr(action?.model) && action.model.trim() && action.model.trim() !== 'auto')
       ? action.model.trim()
       : null;
-    if (!model) {
+    // NO reference photo → the character is 100% INVENTED. Render its turnaround
+    // with the SEEDANCE-NATIVE model (Seedream text-to-image): a synthesised
+    // face clears the reference-to-video likeness filter with NO later
+    // laundering pass, so an invented character is Seedance-ready from birth.
+    // Resolved via the catalog label `characters-synthetic` (never a hardcoded
+    // slug — tag the Seedream TEXT-TO-IMAGE model with it). Untagged → falls
+    // through to the plain text-to-image fallback below.
+    if (!model && photos.length === 0) {
+      try {
+        const rows = await mediaModelsByLabel('image', 'characters-synthetic');
+        if (Array.isArray(rows) && rows.length && _isStr(rows[0]?.slug)) {
+          model = rows[0].slug;
+        }
+      } catch (e) {
+        channel.log('generate_character_sheet', `label 'characters-synthetic' resolve failed: ${e.message}`);
+      }
+    }
+    // The `characters` label tags REFERENCE/identity models — image-EDITING
+    // variants (e.g. bytedance/seedream/v5/pro/edit) that REQUIRE an input
+    // image. With NO reference photo there is nothing to edit, so calling that
+    // model with an empty `referenceImages` fails instantly ("Error generating
+    // image", 0 s). Only use the label-resolved model when we actually have a
+    // photo; otherwise fall through to a text-to-image model below.
+    if (!model && photos.length) {
       try {
         const rows = await mediaModelsByLabel('image', 'characters');
         if (Array.isArray(rows) && rows.length && _isStr(rows[0]?.slug)) {
@@ -158,7 +243,8 @@ export default {
       prompt: _buildSheetPrompt(description),
       model,
       aspectRatio,
-      resolution: 'high',
+      // The turnaround sheet renders at 2K (2048). User decision: 2K is enough.
+      resolution: '2k',
       quality: 'high',
       outputFormat: 'png',
       _internalDelegate: true,
@@ -181,20 +267,25 @@ export default {
     const sheet = img?.exportedTo || img?.savedTo;
     if (!sheet) return _err('generation returned no image path.');
 
-    // Detect the 8 cells from the black gutter bars. Fall back to an even 4x2
-    // split when detection doesn't yield a clean, expected grid.
+    // Detect the 8 cells from the black gutter bars using the LINE-BASED grid
+    // detector (finds the real cut lines; handles unequal body/portrait row
+    // heights and the black margins — an even 4x2 split cropped the face wrong).
+    // Falls back to the generic island detector, then to an even split.
     let sheetCells = null;
     try {
       const sharp = (await import('sharp')).default;
-      const det = await contentIslands({ sharp, sheet });
-      if (det && det.panels && det.panels.length === 8) {
-        sheetCells = _normalizeCells(det.panels, det.W, det.H);
-      } else {
-        channel.log('generate_character_sheet',
-          `cut-line detection found ${det?.panels?.length ?? 0} cells (expected 8) — using an even 4x2 split.`);
+      sheetCells = await _detectSheetCells(sharp, sheet, 4, 2);
+      if (!sheetCells) {
+        const det = await contentIslands({ sharp, sheet });
+        if (det && det.panels && det.panels.length === 8) {
+          sheetCells = _normalizeCells(det.panels, det.W, det.H);
+        } else {
+          channel.log('generate_character_sheet',
+            `line/island detection didn't yield 8 cells (islands=${det?.panels?.length ?? 0}) — using an even 4x2 split.`);
+        }
       }
     } catch (e) {
-      channel.log('generate_character_sheet', `cut-line detection failed: ${e.message} — using an even 4x2 split.`);
+      channel.log('generate_character_sheet', `cell detection failed: ${e.message} — using an even 4x2 split.`);
     }
     if (!sheetCells) sheetCells = _evenGrid(4, 2);
 

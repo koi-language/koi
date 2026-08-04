@@ -4,7 +4,7 @@
  *
  * Replaces the previous "build the full JSON in memory + write_file"
  * flow. The LLM passes the storyboard as an OBJECT (not a JSON
- * string), this tool validates it against the v6 schema, and
+ * string), this tool validates it against the v7 schema, and
  * `JSON.stringify` does the serialization — so quote-escaping is no
  * longer the LLM's responsibility. That fixes the class of bugs where
  * a `dialogue: "..."líneas"..."` value breaks the file and the GUI
@@ -35,30 +35,9 @@ const _VALID_ASPECTS = new Set([
   '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9',
 ]);
 
-// Shot-type presets — the EXACT set the GUI visor offers in its shot
-// picker. The GUI is the single source of truth (`kShotPresets` in
-// storyboard_prompt.dart); it passes the list to the engine at spawn time
-// via the env var KOI_SHOT_PRESETS (a JSON array of the full preset labels).
-// So when the user grows that list, the agent sees the new values here
-// automatically — nothing is hardcoded in the agent/skill. When the env is
-// absent (CLI / no GUI), the `shot` field stays unconstrained (old free-text
-// behaviour), so non-GUI storyboards never break.
-function _loadShotPresets() {
-  try {
-    const raw = process.env.KOI_SHOT_PRESETS;
-    if (!raw) return null;
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr) && arr.length > 0 && arr.every((s) => typeof s === 'string')) {
-      return arr;
-    }
-  } catch { /* malformed → treat as absent */ }
-  return null;
-}
-const _shotSlug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
-const _SHOT_PRESETS = _loadShotPresets();
-const _SHOT_PRESET_SLUGS = _SHOT_PRESETS
-  ? new Set(_SHOT_PRESETS.map((p) => _shotSlug(p)))
-  : null;
+// `shot` is FREE TEXT — there is no preset whitelist. Cinematography (which
+// framing / angle / camera / composition / light each shot gets) is authored
+// by `cinematic-video-prompt-engineer`, not chosen by the user from a menu.
 
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -68,7 +47,7 @@ function _isStr(v) { return typeof v === 'string'; }
 function _isObj(v) { return v && typeof v === 'object' && !Array.isArray(v); }
 
 function _validate(sb) {
-  if (!_isObj(sb)) return 'storyboard must be an object with at least { id, name, aspect, scenes }.';
+  if (!_isObj(sb)) return 'storyboard must be an object with at least { id, name, scenes }.';
 
   if (!_isStr(sb.id) || !_KEBAB_RE.test(sb.id)) {
     return `"id" must be a kebab-case string (lowercase letters/digits/hyphens). Got ${JSON.stringify(sb.id)}.`;
@@ -76,8 +55,12 @@ function _validate(sb) {
   if (!_isStr(sb.name) || !sb.name.trim()) {
     return '"name" must be a non-empty string.';
   }
-  if (!_isStr(sb.aspect) || !_VALID_ASPECTS.has(sb.aspect)) {
-    return `"aspect" must be one of ${[..._VALID_ASPECTS].join(', ')}. Got ${JSON.stringify(sb.aspect)}.`;
+  // `aspect` is NOT a storyboard property — the storyboard is FORMAT-AGNOSTIC
+  // (one storyboard → videos in many formats; aspect/format is chosen ONLY at
+  // video-generation time). NEVER require it. Accept it if present (validate),
+  // but a missing aspect is fine and gets a neutral default on write.
+  if (sb.aspect !== undefined && (!_isStr(sb.aspect) || !_VALID_ASPECTS.has(sb.aspect))) {
+    return `"aspect" is OPTIONAL (omit it — aspect belongs to the VIDEO, not the storyboard). When provided it must be one of ${[..._VALID_ASPECTS].join(', ')}. Got ${JSON.stringify(sb.aspect)}.`;
   }
   if (sb.seed !== undefined && !Number.isInteger(sb.seed)) {
     return '"seed" (when provided) must be an integer.';
@@ -95,24 +78,29 @@ function _validate(sb) {
     }
   }
   // `characters` is the recurring-cast ROSTER. Preferred shape is a structured
-  // array of { name, description?, characterId? } so the visor can render each
-  // cast member as its own clickable row that opens a character card. A legacy
-  // free-text roster STRING is still accepted (old storyboards) and preserved
-  // verbatim — we never parse it back into entries.
+  // array of { name, description?, sex?, age?, characterId? } so the visor can
+  // render each cast member as its own clickable row that opens a character
+  // card, and so `sex`/`age` propagate to a `save_character` card when one is
+  // created from a roster member. A legacy free-text roster STRING is still
+  // accepted (old storyboards) and preserved verbatim — never parsed back.
   if (sb.characters !== undefined && !_isStr(sb.characters)) {
     if (!Array.isArray(sb.characters)) {
-      return '"characters" (when provided) must be EITHER a free-text roster string OR an array of { name, description?, characterId? } objects.';
+      return '"characters" (when provided) must be EITHER a free-text roster string OR an array of { name, description?, sex?, age?, characterId? } objects.';
     }
     for (let ci = 0; ci < sb.characters.length; ci++) {
       const c = sb.characters[ci];
-      if (!_isObj(c)) return `characters[${ci}] must be an object { name, description?, characterId? }.`;
+      if (!_isObj(c)) return `characters[${ci}] must be an object { name, description?, sex?, age?, characterId? }.`;
       if (!_isStr(c.name) || !c.name.trim()) {
         return `characters[${ci}].name must be a non-empty string — the cast label/name (e.g. "MAESTRO").`;
       }
-      for (const k of ['description', 'characterId']) {
+      for (const k of ['description', 'sex', 'characterId']) {
         if (c[k] !== undefined && !_isStr(c[k])) {
           return `characters[${ci}].${k} (when provided) must be a string.`;
         }
+      }
+      // `age` is a number (years) so it maps straight to a character card's `age`.
+      if (c.age !== undefined && !(typeof c.age === 'number' && Number.isFinite(c.age))) {
+        return `characters[${ci}].age (when provided) must be a number (years).`;
       }
     }
   }
@@ -171,19 +159,18 @@ function _validate(sb) {
         return `${tag}.duration must be a positive number (seconds, e.g. 3.0 — not "3s").`;
       }
       if (!_isStr(sh.shot)) return `${tag}.shot must be a string (e.g. "MCU low angle").`;
-      // The shot type MUST be one of the presets the app currently offers —
-      // the agent does NOT get to invent or combine arbitrary framings/angles
-      // (e.g. "Medium long shot, high angle" is not a real preset and renders
-      // without a thumbnail in the visor). Enforced only when the GUI supplied
-      // the live list via KOI_SHOT_PRESETS.
-      if (_SHOT_PRESET_SLUGS && !_SHOT_PRESET_SLUGS.has(_shotSlug(sh.shot))) {
-        return `${tag}.shot ${JSON.stringify(sh.shot)} is not one of the available shot presets. ` +
-          `It MUST be EXACTLY one of (copy ONE verbatim): ${_SHOT_PRESETS.map((p) => `"${p}"`).join(', ')}. ` +
-          `Pick the closest available preset — do NOT invent or combine framings/angles.`;
-      }
-      if (!_isStr(sh.movement)) return `${tag}.movement must be a string (e.g. "Static", "Dolly in").`;
+      // `shot` is FREE TEXT (framing: shot-size + angle). No preset whitelist:
+      // cinematography (framing/angle/camera/composition/light) is authored by
+      // `cinematic-video-prompt-engineer`, never picked by the user from a menu.
       if (!_isStr(sh.action)) return `${tag}.action must be a string.`;
-      for (const k of ['dialogue', 'sfx', 'music', 'location', 'notes', 'state']) {
+      // v7 per-shot cinematography (all optional free text):
+      //   `camera`      — camera work: movement + lens/focal + speed + focus.
+      //                   (was `movement`; `movement` still accepted as a legacy
+      //                   alias and migrated to `camera` on write.)
+      //   `composition` — in-frame layout: lead room, thirds, depth, screen
+      //                   position, screen-direction / 180-axis / eyeline.
+      //   `lighting`    — light for THIS shot (refines the storyboard-level one).
+      for (const k of ['camera', 'movement', 'composition', 'lighting', 'dialogue', 'sfx', 'music', 'location', 'notes', 'state']) {
         if (sh[k] !== undefined && !_isStr(sh[k])) {
           return `${tag}.${k} (when provided) must be a string.`;
         }
@@ -327,7 +314,7 @@ function _editorialDiff(existing, out) {
       const prev = prevShotById.get(sh.id);
       if (!prev) { shots.push(`${sh.id}(new)`); continue; }
       const fields = [];
-      for (const k of ['shot', 'movement', 'action', 'dialogue', 'sfx', 'music']) {
+      for (const k of ['shot', 'camera', 'composition', 'lighting', 'action', 'dialogue', 'sfx', 'music']) {
         if ((prev[k] || '') !== (sh[k] || '')) fields.push(k);
       }
       if (!sameJson(prev.continuity, sh.continuity)) fields.push('continuity');
@@ -351,9 +338,10 @@ function _editorialDiff(existing, out) {
 export { _validate, _normalize, _editorialDiff, _isStr, _isObj };
 
 // Normalize the recurring-cast roster. Preferred shape is a structured array
-// of { name, description?, characterId? }; a legacy free-text string is kept
-// verbatim (old storyboards — never parsed). Anything else / absent → '' so the
-// on-disk shape stays stable for boards that never authored a cast.
+// of { name, description?, sex?, age?, characterId? }; a legacy free-text string
+// is kept verbatim (old storyboards — never parsed). Anything else / absent → ''
+// so the on-disk shape stays stable for boards that never authored a cast.
+// `sex`/`age` are carried so they can seed a character card built from a member.
 function _normCharacters(v) {
   if (Array.isArray(v)) {
     const out = [];
@@ -363,6 +351,8 @@ function _normCharacters(v) {
       if (!name) continue;
       const entry = { name };
       if (_isStr(c.description) && c.description.trim()) entry.description = c.description.trim();
+      if (_isStr(c.sex) && c.sex.trim()) entry.sex = c.sex.trim();
+      if (typeof c.age === 'number' && Number.isFinite(c.age)) entry.age = c.age;
       if (_isStr(c.characterId) && c.characterId.trim()) entry.characterId = c.characterId.trim();
       out.push(entry);
     }
@@ -427,7 +417,10 @@ function _normalize(sb, existing) {
     version: 1,
     createdAt,
     updatedAt: now,
-    aspect: sb.aspect,
+    // Storyboard is format-agnostic; `aspect` is only the neutral reading
+    // surface for the pencil-sketch panels (the VIDEO format is chosen later).
+    // Never authored by the agent — default it silently when absent.
+    aspect: _VALID_ASPECTS.has(sb.aspect) ? sb.aspect : '16:9',
     shotCount: _shotCount,
     totalDurationSeconds: Math.round(_totalDuration * 10) / 10,
     seed,
@@ -452,10 +445,16 @@ function _normalize(sb, existing) {
             number: sh.number,
             duration: sh.duration,
             shot: sh.shot,
-            movement: sh.movement,
+            // v7: `camera` (was `movement`) — accept the legacy `movement`
+            // alias and migrate it to `camera` on write so old storyboards
+            // round-trip without losing their camera note.
+            camera: _isStr(sh.camera) ? sh.camera : (_isStr(sh.movement) ? sh.movement : ''),
             action: sh.action,
           };
-          for (const k of ['dialogue', 'sfx', 'music']) {
+          // v7 per-shot cinematography (persist only when non-empty):
+          //   composition — in-frame layout + screen direction / 180 / eyeline.
+          //   lighting    — light for THIS shot (refines the storyboard-level one).
+          for (const k of ['composition', 'lighting', 'dialogue', 'sfx', 'music']) {
             if (_isStr(sh[k]) && sh[k].trim()) shotOut[k] = sh[k];
           }
           // Continuity-table cell: { characters, objects, place }. Structured
@@ -518,11 +517,12 @@ export default {
   description:
     'Write a storyboard document to ~/.koi/storyboards/<id>.json with STRUCTURED args (the storyboard as an OBJECT, not a JSON string). ' +
     'Use to CREATE a storyboard, or to RESTRUCTURE an existing one (add/remove/reorder scenes or shots, renumber, change ids) — same call shape; the tool detects new-vs-existing and preserves createdAt. For CONTENT edits (changing field values on existing scenes/shots or root fields) use update_storyboard instead — it patches only what changed, so it never rewrites the whole document or re-renders untouched panels. ' +
-    'Call shape: { storyboard: { id, name, aspect, synopsis, continuity?, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, movement, action, noCutBefore?, continuity?, dialogue?, sfx?, music?, references? }] }] } }. ' +
-    'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.aspect (one of 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9), storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
+    'Call shape: { storyboard: { id, name, synopsis, continuity?, seed?, characters?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, camera, action, composition?, lighting?, noCutBefore?, continuity?, dialogue?, sfx?, music?, references? }] }] } }. ' +
+    'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
+    'DO NOT author storyboard.aspect: the storyboard is FORMAT-AGNOSTIC — one storyboard becomes videos in MANY formats, and aspect/format is chosen ONLY at video-generation time. It is optional and defaults silently; never ask the user about format at storyboard time. ' +
     'storyboard.continuity is an OPTIONAL (strongly recommended for any narrative with physical/spatial logic) array of strings — the CONTINUITY LOCK: absolute, story-wide invariants every panel must obey and never contradict or "fix" (e.g. ["The Pepsi button stays mounted high, above the child\'s reach until he climbs", "Never make the child taller or lower the button", "The cans he stacks as a step stay intact — never crushed"]). Injected verbatim into EVERY shot\'s render prompt as hard constraints; this is how you stop the renderer from silently making the unreachable reachable or breaking an object that must stay whole. ' +
-    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, sequential across ALL scenes — EXCEPT a continuation shot, which REPEATS the previous shot\'s number; see noCutBefore), duration (number of seconds, e.g. 3.0 — not "3s"), shot (e.g. "MCU low angle"), movement (e.g. "Static" / "Dolly in"), action. shot.noCutBefore is an OPTIONAL boolean: when true this shot is a CONTINUATION of the previous one — one continuous take, the camera keeps moving and there is NO cut between them. A continuation shares the previous shot\'s number (do not increment) and the video pipeline renders the glued shots as a SINGLE clip; NEVER set it on the first shot. Use it to author a longer moving shot as several precise sub-takes (more descriptive than one vague panel). shot.continuity is an OPTIONAL but high-value OBJECT { characters, objects, place } — the continuity-table ROW for THIS exact panel, in the user\'s language. "characters" = who is in frame and their state (position, pose, what they wear/hold, expression — e.g. "Misma mujer, mismo abrigo negro y peinado; de pie junto a la puerta"); "objects" = the state of every key prop/scenery in frame (e.g. "Linterna en la mano derecha; puerta roja cerrada"); "place" = WHERE this exact panel physically happens — the concrete location the frame is set in, restated for THIS shot so the render never drifts out of it even on a tight close-up (e.g. "Bajo el agua, en una calle de la piscina, entre dos corcheras"; "Interior del coche, asiento del conductor, de noche"). Fill `place` on EVERY shot of a scene with a strong setting (so close-ups still read as being there, not in a void); fill characters/objects whenever a non-default state holds. The compositor composes all three into CURRENT PANEL STATE / SHOT LOCATION so the render shows this exact state AND is set in this exact place instead of resetting to a default, jumping ahead, or rendering a neutral/wrong background — AND the columns, read top-to-bottom across all shots, ARE the continuity table the user reviews. (Legacy: an old free-text shot.state string is still accepted and auto-migrated into continuity.characters.) dialogue/sfx/music are optional strings. ' +
-    'storyboard.characters is the OPTIONAL recurring-cast ROSTER. Prefer the STRUCTURED array shape: [{ name, description?, characterId? }] — one entry per recurring character, name = the SHORT_UPPERCASE label reused verbatim in shot action/dialogue (e.g. "MAESTRO"), description = a one-line silhouette/wardrobe note (no faces), characterId = the id of a saved character document (~/.koi/characters/<id>.json) when this cast member is backed by one, so the visor can open its card. The visor renders each entry as a clickable row. A legacy free-text roster string is still accepted and preserved verbatim (never parsed), but new/edited storyboards should emit the array. ' +
+    'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, sequential across ALL scenes — EXCEPT a continuation shot, which REPEATS the previous shot\'s number; see noCutBefore), duration (number of seconds, e.g. 3.0 — not "3s"), shot (FREE TEXT: framing = shot-size + angle, e.g. "MCU low angle"), camera (FREE TEXT: camera work — movement + lens/focal + speed + focus, e.g. "Dolly in, 50mm, slow push"), action. shot.noCutBefore is an OPTIONAL boolean: when true this shot is a CONTINUATION of the previous one — one continuous take, the camera keeps moving and there is NO cut between them. A continuation shares the previous shot\'s number (do not increment) and the video pipeline renders the glued shots as a SINGLE clip; NEVER set it on the first shot. Use it to author a longer moving shot as several precise sub-takes (more descriptive than one vague panel). shot.continuity is an OPTIONAL but high-value OBJECT { characters, objects, place } — the continuity-table ROW for THIS exact panel, in the user\'s language. "characters" = who is in frame and their state (position, pose, what they wear/hold, expression — e.g. "Misma mujer, mismo abrigo negro y peinado; de pie junto a la puerta"); "objects" = the state of every key prop/scenery in frame (e.g. "Linterna en la mano derecha; puerta roja cerrada"); "place" = WHERE this exact panel physically happens — the concrete location the frame is set in, restated for THIS shot so the render never drifts out of it even on a tight close-up (e.g. "Bajo el agua, en una calle de la piscina, entre dos corcheras"; "Interior del coche, asiento del conductor, de noche"). Fill `place` on EVERY shot of a scene with a strong setting (so close-ups still read as being there, not in a void); fill characters/objects whenever a non-default state holds. The compositor composes all three into CURRENT PANEL STATE / SHOT LOCATION so the render shows this exact state AND is set in this exact place instead of resetting to a default, jumping ahead, or rendering a neutral/wrong background — AND the columns, read top-to-bottom across all shots, ARE the continuity table the user reviews. (Legacy: an old free-text shot.state string is still accepted and auto-migrated into continuity.characters.) composition (in-frame layout: lead room, thirds, depth, screen position, screen-direction / 180-axis / eyeline) and lighting (light for THIS shot, refining the storyboard-level lighting) are OPTIONAL free-text strings — the cinematography (shot/camera/composition/lighting) is authored by cinematic-video-prompt-engineer, never picked from a menu. dialogue/sfx/music are optional strings. ' +
+    'storyboard.characters is the OPTIONAL recurring-cast ROSTER. Prefer the STRUCTURED array shape: [{ name, description?, sex?, age?, characterId? }] — one entry per recurring character, name = the SHORT_UPPERCASE label reused verbatim in shot action/dialogue (e.g. "MAESTRO"), description = a one-line silhouette/wardrobe note (no faces), sex = canonical string (female|male|nonbinary|other), age = number (years), characterId = the id of a saved character document (~/.koi/characters/<id>.json) when this cast member is backed by one, so the visor can open its card. FILL sex + age whenever the story tells you them — they seed the same fields on a character card created from this member. The visor renders each entry as a clickable row. A legacy free-text roster string is still accepted and preserved verbatim (never parsed), but new/edited storyboards should emit the array. ' +
     'references is an OPTIONAL array of strings (each entry is an `@handle` or absolute file path) that can sit at the storyboard root, on a scene, or on a single shot — the downstream visual renderer collects all three levels per panel. Preserve whatever references the agent passes (or the user added via the visor); never drop them on a round-trip read→mutate→save. ' +
     'Auto-set by the tool: version=1, updatedAt=now (UTC ISO), createdAt preserved from existing file or set to now, seed defaulted to a random integer when omitted. ' +
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',
@@ -530,7 +530,7 @@ export default {
     'save_storyboard REPLACES write_file for ~/.koi/storyboards/*.json — never hand-serialize the JSON via write_file (quote escaping is a structural minefield; this tool sidesteps it by accepting the object directly). ' +
     'SCOPE: use save_storyboard to CREATE a storyboard or to RESTRUCTURE one (add/remove/reorder scenes or shots, renumber, change ids). For CONTENT edits — changing field values on existing scenes/shots or root fields — use update_storyboard instead: it patches only the named fields, so it is faster and cannot accidentally re-word (and thus re-render) untouched panels. ' +
     'Restructure flow: read_file the existing JSON, mutate the parsed object in memory, then save_storyboard with the whole mutated object. The tool detects the file exists and preserves createdAt. ' +
-    'VERBATIM RULE (critical): on an UPDATE, every field you are NOT deliberately changing must be sent back CHARACTER-FOR-CHARACTER as read — never re-word, re-translate, abbreviate/expand, or "tidy" it (e.g. do not turn "Wide shot, eye level" into "Wide shot"). The visor re-renders a panel\'s sketch whenever ANY of its editorial fields (shot / movement / action / continuity / scene fields) changes, and re-renders EVERY panel when a root field (synopsis / characters / lighting / continuity / stylePrompt) changes — so accidental re-wording of untouched fields nukes the user\'s reviewed sketches and re-renders the whole board. The save result reports exactly which fields changed vs the previous save: verify that list matches your INTENDED edit, and if it lists anything you did not mean to touch, re-save restoring those fields verbatim. ' +
+    'VERBATIM RULE (critical): on an UPDATE, every field you are NOT deliberately changing must be sent back CHARACTER-FOR-CHARACTER as read — never re-word, re-translate, abbreviate/expand, or "tidy" it (e.g. do not turn "Wide shot, eye level" into "Wide shot"). The visor re-renders a panel\'s sketch whenever ANY of its editorial fields (shot / camera / composition / lighting / action / continuity / scene fields) changes, and re-renders EVERY panel when a root field (synopsis / characters / lighting / continuity / stylePrompt) changes — so accidental re-wording of untouched fields nukes the user\'s reviewed sketches and re-renders the whole board. The save result reports exactly which fields changed vs the previous save: verify that list matches your INTENDED edit, and if it lists anything you did not mean to touch, re-save restoring those fields verbatim. ' +
     'After a CREATE, call show_result with resourceType "file" and the returned path so the GUI opens the storyboard tab. After an UPDATE, the visor picks up the change automatically — no show_result needed.',
   thinkingHint: (action) => `Saving storyboard ${action?.storyboard?.id || ''}`.trim(),
   permission: 'write',
@@ -540,7 +540,7 @@ export default {
     properties: {
       storyboard: {
         type: 'object',
-        description: 'Full storyboard object (v6 schema). See description for required fields.',
+        description: 'Full storyboard object (v7 schema). See description for required fields.',
       },
       summary: { type: 'string', description: 'OPTIONAL. One-line "what is this storyboard for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Duelo bajo la Tormenta — full storyboard", "Product demo intro storyboard, vertical 9:16". Keep it short and self-evident; the agent is the one who will read it back later. Only attached on the FIRST save of a given storyboard id; subsequent edits do not overwrite it. When omitted, the ledger falls back to the storyboard\'s description.' },
     },
@@ -551,7 +551,7 @@ export default {
     const sb = action?.storyboard;
     if (!_isObj(sb)) {
       return _err('"storyboard" is required and must be an object. ' +
-        'Call shape: { intent: "save_storyboard", storyboard: { id, name, aspect, scenes: [...] } }.');
+        'Call shape: { intent: "save_storyboard", storyboard: { id, name, scenes: [...] } }.');
     }
 
     const validationError = _validate(sb);

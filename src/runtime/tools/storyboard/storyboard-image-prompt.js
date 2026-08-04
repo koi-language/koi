@@ -3,12 +3,13 @@
  * exact English paragraph the storyboard visor sends to fal for
  * image generation.
  *
- * Schema (v5 inputs):
+ * Schema (v7 inputs):
  *   stylePreamble (required) — verbatim pencil-sketch preamble.
  *   characters    (optional) — storyboard-level recurring cast.
- *   lighting      (optional) — storyboard-level lighting design.
- *   shot          (optional) — shot type + angle.
- *   movement      (optional) — camera movement.
+ *   lighting      (optional) — effective lighting for THIS shot (per-shot override || storyboard-level).
+ *   shot          (optional) — framing: shot-size + angle (free text).
+ *   camera        (optional) — camera work: movement + lens/focal + speed + focus (was `movement`).
+ *   composition   (optional) — in-frame layout: lead room, thirds, depth, screen position, screen-direction / 180 / eyeline.
  *   action        (optional) — what is happening in the frame.
  *   dialogue      (optional) — quoted spoken lines / voice-over.
  *
@@ -139,7 +140,8 @@ BUILDING THE PHRASE
      • NEVER write "the X of the reference image" / "the referenced picture" — there is no reference image; describe X inline.
    - **Mood / emotional beat** can be woven in where it matters: "gazing off-frame lost in memory", "quiet and nostalgic".
    - Detail the SUBJECT's identity (build, hair, clothing, colour, material, shape — whatever is in-frame). But AVOID render-finish adjectives that push photorealism ("glossy", "ultra-detailed", "hyper-realistic", "8k", "photorealistic", "cinematic render", "lifelike"). The output is still a pencil sketch — detail the SUBJECT's identity, not the render quality.
-   - If \`movement\` is non-trivial (not "Static"), weave it naturally INTO the action clause — e.g. "...as the camera dollies in", "...as the camera pans across the room". Do NOT add a separate "arrow indicating ..." segment.
+   - If \`camera\` is non-trivial (not "Static"), weave it naturally INTO the action clause — e.g. "...as the camera dollies in", "...as the camera pans across the room". \`camera\` may also carry lens / speed / focus (e.g. "50mm", "slow-motion", "rack focus to the foreground") — translate those into the visible frame (a shallow-focus blur, a tighter compression) rather than writing the technical term. Do NOT add a separate "arrow indicating ..." segment.
+   - If \`composition\` is present, honour it in HOW the frame is laid out — lead/looking room, rule-of-thirds placement, foreground/background depth, where the subject sits in the frame, and which way they face (screen direction). Bake it into the spatial description; do not name the composition rule.
    - If \`dialogue\` is non-empty, hint at the speaker's expression instead of quoting the line — "a tear on his cheek as he speaks softly" tells the model the emotional state without trying to render unreadable text.
    - **Draw EVERYTHING with visible pencil strokes, and say so concretely, element by element.** A storyboard thumbnail is drawn in a few minutes with a graphite pencil: every line is a visible hand-drawn stroke and every bit of tone is built from pencil hatching over bare white paper — never a smooth or solid fill. This applies to the PEOPLE just as much as the objects: describe each figure as loose broken contour strokes, the FACE as just a few marks that read the expression (never a finished portrait), and the CLOTHING's folds and the figure's shadow as quick scribbled hatching, not smooth shading. Then, when the frame contains a COMPLEX or MECHANICAL object (a car, a weapon, a machine, a screen, an ornate building), the image model's instinct is to render THAT as a clean, detailed product illustration dropped onto the doodle — so head it off in the prose: describe the object by its essential rough SILHOUETTE and a couple of defining shapes ONLY, and state it stays no cleaner, darker or more detailed than the people. Do it CONCRETELY for each actual element, the way you'd brief a rushing artist — e.g. for the figure "a broad man drawn in a few loose pencil strokes, his face just two or three marks, the jacket folds hatched not filled" and for the object "a boxy off-road SUV suggested only by its rough scribbled silhouette, plain circle wheels and an open roll cage, no panel lines or mechanical detail, no cleaner than the man". Keep light as untouched white paper and shadow as loose hatching. These concrete, per-element pencil instructions (see examples G and H) are what stop the model from over-finishing anything and breaking the hand-drawn look.
 
@@ -181,7 +183,7 @@ HARD CONSTRAINTS
 - NEVER write the cinematography term as a drawing instruction ("an extreme close-up of …", "a wide shot of …", "a POV shot of …", "a medium long shot of …"). The image model ignores those labels. Instead describe WHAT FILLS THE FRAME at that framing (the eyes, the face, the full figure, the view through the windshield) — see the framing table in BUILDING THE PHRASE. Imagine the picture the camera captures and describe THAT.
 - NEVER emit a label (HERO_A, EL_ANCIANO, DOG_A, …). Expand it to an inline description of the traits visible at this framing.
 - NEVER write "the X of the reference image", "the referenced picture", or anything implying an attached photo exists. There are NO reference images — every subject is described inline from the \`characters\` roster, scoped to what's visible in the frame.
-- NEVER emit "arrow indicating ...", "shot description at the bottom", "speech bubble", or any other panel-annotation tag. Movement and dialogue go INTO the action clause as prose, not as separate trailing tags.
+- NEVER emit "arrow indicating ...", "shot description at the bottom", "speech bubble", or any other panel-annotation tag. Camera work and dialogue go INTO the action clause as prose, not as separate trailing tags.
 - NEVER emit markdown (no #, *, -, lists).
 - NEVER wrap with "Prompt:", "Output:", "Here's the brief:".
 - NEVER explain, summarise, or add a closing note BEYOND the mandatory closing anchor.
@@ -204,9 +206,10 @@ export default {
     properties: {
       stylePreamble: { type: 'string' },
       characters: { type: 'string' },
-      lighting: { type: 'string' },
-      shot: { type: 'string' },
-      movement: { type: 'string' },
+      lighting: { type: 'string' },   // effective lighting for THIS shot (per-shot override || storyboard-level)
+      shot: { type: 'string' },       // framing: shot-size + angle (free text)
+      camera: { type: 'string' },     // camera work: movement + lens/focal + speed + focus (was `movement`)
+      composition: { type: 'string' },// in-frame layout: lead room, thirds, depth, screen position, screen-direction / 180 / eyeline
       action: { type: 'string' },
       dialogue: { type: 'string' },
       // When the visor will pass a character reference image to the
@@ -267,17 +270,23 @@ export default {
       };
     }
 
-    // Pack non-empty fields. Schema v6 input keys: stylePreamble +
-    // characters + lighting + shot + movement + action + dialogue,
-    // plus the optional `referencedCharacters` list that switches
-    // the compositor into "the X of the referenced picture" mode.
+    // v7: `camera` replaces `movement`; accept the legacy `movement` alias.
+    if (typeof action.camera !== 'string' && typeof action.movement === 'string') {
+      action = { ...action, camera: action.movement };
+    }
+
+    // Pack non-empty fields. Schema v7 input keys: stylePreamble +
+    // characters + lighting + shot + camera + composition + action +
+    // dialogue, plus the optional `referencedCharacters` list that
+    // switches the compositor into "the X of the referenced picture" mode.
     const fields = {};
     for (const key of [
       'stylePreamble',
       'characters',
       'lighting',
       'shot',
-      'movement',
+      'camera',
+      'composition',
       'action',
       'dialogue',
       'sceneContext',
