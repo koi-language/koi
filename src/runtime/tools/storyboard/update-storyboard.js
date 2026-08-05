@@ -33,11 +33,11 @@ function _err(error) { return { success: false, error }; }
 // else in a `set` is rejected by name so the agent learns the boundary
 // instead of silently losing the edit.
 const ROOT_FIELDS = new Set([
-  'name', 'aspect', 'synopsis', 'characters', 'lighting', 'stylePrompt',
+  'name', 'aspect', 'synopsis', 'characters', 'locations', 'lighting', 'stylePrompt',
   'continuity', 'references', 'seed',
 ]);
 const SCENE_FIELDS = new Set([
-  'title', 'location', 'notes', 'synopsis', 'references',
+  'title', 'location', 'locationIds', 'locationId', 'notes', 'synopsis', 'references',
 ]);
 const SHOT_FIELDS = new Set([
   // v7: `camera` (was `movement`), + `composition` + per-shot `lighting`.
@@ -70,8 +70,8 @@ export default {
     'every other byte of the document is preserved verbatim on disk, so ONLY the panels your edit actually touches re-render their sketch. ' +
     'ALWAYS prefer this over save_storyboard for content edits: it is faster (no full-document round-trip) and cannot accidentally re-word untouched fields. ' +
     'Call shape: { id, set?: {…root fields…}, scenes?: [{ id, set: {…} }], shots?: [{ id, set: {…} }] }. ' +
-    'Root set fields: name, aspect, synopsis, characters, lighting, stylePrompt, continuity (array of strings), references, seed. ' +
-    'Scene set fields: title, location, notes, synopsis, references. ' +
+    'Root set fields: name, aspect, synopsis, characters (recurring-cast roster array), locations (reusable-SET roster: array of { name, description?, locationId? }), lighting, stylePrompt, continuity (array of strings), references, seed. ' +
+    'Scene set fields: title, location (free-text place), locationIds (array of saved location-card ids — a scene can span several sets), notes, synopsis, references. ' +
     'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
     'Set a field to null to remove it. ' +
     'NOT for structure: adding/removing/reordering scenes or shots, renumbering, or changing ids — use save_storyboard (full document) for those. ' +
@@ -95,7 +95,7 @@ export default {
       set: { type: 'object', description: 'Root-level field changes (only the fields being changed).' },
       scenes: {
         type: 'array',
-        description: 'Scene-level patches: [{ id, set: { title?, location?, notes?, synopsis?, references? } }].',
+        description: 'Scene-level patches: [{ id, set: { title?, location?, locationId?, notes?, synopsis?, references? } }].',
         items: { type: 'object' },
       },
       shots: {

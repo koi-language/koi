@@ -337,6 +337,33 @@ export class MediaLibrary {
     if (characters > 0) {
       process.stderr.write(`[MediaLibrary] migration: indexed ${characters} character(s)\n`);
     }
+
+    // Locations / sets: same model as characters. Scan ~/.koi/locations/*.json
+    // and index each so existing locations become first-class gallery rows.
+    // Idempotent — `saveLocationEntry` upserts by path.
+    let locations = 0;
+    const locDir = path.join(os.homedir(), '.koi', 'locations');
+    if (fs.existsSync(locDir)) {
+      try {
+        const { saveLocationEntry } = await import('./media-library.js');
+        for (const f of fs.readdirSync(locDir)) {
+          if (!f.endsWith('.json')) continue;
+          const fp = path.join(locDir, f);
+          try {
+            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            await saveLocationEntry(fp, body, null);
+            locations++;
+          } catch (e) {
+            process.stderr.write(`[MediaLibrary] migrate location ${f} skipped: ${e.message}\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[MediaLibrary] migrate locations skipped: ${e.message}\n`);
+      }
+    }
+    if (locations > 0) {
+      process.stderr.write(`[MediaLibrary] migration: indexed ${locations} location(s)\n`);
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
@@ -1734,6 +1761,58 @@ export async function saveCharacterEntry(filePath, character, llmProvider, opts 
   return lib.save({
     filePath,
     mediaType: 'character',
+    metadata,
+    description,
+    embedding,
+    replaceByPath: true,
+    createdAt,
+    summary: opts.summary,
+  });
+}
+
+/**
+ * Save (or upsert) a LOCATION / set entry — points at the location JSON at
+ * `~/.koi/locations/<id>.json`. The SET analog of saveCharacterEntry: the JSON
+ * file is authoritative, the DB row indexes it as a first-class creation.
+ *
+ * @param {string} filePath - Absolute path to the location JSON.
+ * @param {Object} location - Parsed location JSON (normalized shape).
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
+ */
+export async function saveLocationEntry(filePath, location, llmProvider, opts = {}) {
+  const lib = MediaLibrary.global();
+  const name = location?.name || path.basename(filePath, '.json');
+  const photos = Array.isArray(location?.photos) ? location.photos : [];
+  const photoCount = photos.length;
+  const hasPlate = !!location?.plate;
+  const description =
+    `Location "${name}" — ${photoCount} photo${photoCount === 1 ? '' : 's'}` +
+    `${hasPlate ? ', plate: yes' : ''}.`;
+  let embedding = null;
+  if (llmProvider) {
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
+  }
+  const metadata = {
+    source: 'location',
+    locationId: location?.id,
+    name,
+    handle: location?.handle || null,
+    photoCount,
+    plate: location?.plate || null,
+    locationType: location?.locationType || null,
+    updatedAt: location?.updatedAt || null,
+  };
+  let createdAt = (typeof location?.createdAt === 'string' && location.createdAt)
+    ? location.createdAt
+    : (typeof location?.updatedAt === 'string' && location.updatedAt)
+        ? location.updatedAt
+        : null;
+  if (!createdAt) {
+    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to now */ }
+  }
+  return lib.save({
+    filePath,
+    mediaType: 'location',
     metadata,
     description,
     embedding,
