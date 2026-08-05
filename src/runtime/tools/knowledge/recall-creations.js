@@ -23,6 +23,7 @@ import { readCreations } from '../../state/creations-ledger.js';
 
 const _VALID_KINDS = new Set([
   'image', 'video', 'audio', 'timeline', 'storyboard', 'voice', 'document',
+  'character', 'location',
 ]);
 
 function _err(msg) { return { success: false, error: `recall_creations: ${msg}` }; }
@@ -51,7 +52,7 @@ export default {
     properties: {
       kind: {
         type: 'string',
-        enum: ['image', 'video', 'audio', 'timeline', 'storyboard', 'voice', 'document'],
+        enum: ['image', 'video', 'audio', 'timeline', 'storyboard', 'voice', 'document', 'character', 'location'],
         description:
           'OPTIONAL. Filter by media kind. Mirrors `media_type` in MediaLibrary. Omit to get every kind.',
       },

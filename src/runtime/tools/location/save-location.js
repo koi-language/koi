@@ -59,6 +59,13 @@ function _validate(loc) {
       return '"photos" (when provided) must be an array of absolute file paths (strings). photos[0] is the hero image.';
     }
   }
+  if (loc.plateCells !== undefined && loc.plateCells !== null) {
+    if (!Array.isArray(loc.plateCells) ||
+        loc.plateCells.some((c) => !c || typeof c !== 'object' ||
+          !['x', 'y', 'w', 'h'].every((k) => typeof c[k] === 'number'))) {
+      return '"plateCells" (when provided) must be an array of { x, y, w, h } numbers (normalized 0..1 cell rects of the views sheet).';
+    }
+  }
   return null;
 }
 
@@ -116,9 +123,15 @@ function _normalize(loc, existing) {
     lighting: (_isStr(loc.lighting) && loc.lighting.trim()) ? loc.lighting.trim() : null,
     tags: _normTags(loc.tags),
     photos: _normPhotos(loc.photos),
-    // Generated establishing PLATE (a clean wide of the empty location) that
-    // locks the world's look across every clip. Set by generate_location_plate.
+    // Generated VIEWS SHEET (4x2: 5 camera views + 3 detail close-ups of the
+    // empty location) that locks the world's look across every clip. Set by
+    // generate_location_plate; `plateCells` are the 8 detected cell rects the
+    // visor slices it by.
     plate: (_isStr(loc.plate) && loc.plate.trim()) ? loc.plate.trim() : null,
+    plateCells: Array.isArray(loc.plateCells) ? loc.plateCells : null,
+    // The top-down spatial layout (floor plan) the plate was rendered from —
+    // persisted so the plate can be re-rendered / edited consistently later.
+    layout: (loc.layout && typeof loc.layout === 'object' && !Array.isArray(loc.layout)) ? loc.layout : null,
     createdAt,
     updatedAt: now,
   };
