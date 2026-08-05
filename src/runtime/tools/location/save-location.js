@@ -41,7 +41,7 @@ function _validate(loc) {
   if (loc.id !== undefined && (!_isStr(loc.id) || !_KEBAB_RE.test(loc.id))) {
     return `"id" (when provided) must be a kebab-case string (lowercase letters/digits/hyphens). Got ${JSON.stringify(loc.id)}.`;
   }
-  for (const k of ['handle', 'description', 'locationType', 'timeOfDay', 'palette', 'lighting', 'plate']) {
+  for (const k of ['handle', 'description', 'locationType', 'timeOfDay', 'palette', 'lighting', 'plate', 'plateRear']) {
     if (loc[k] !== undefined && loc[k] !== null && !_isStr(loc[k])) {
       return `"${k}" (when provided) must be a string. Got ${typeof loc[k]}.`;
     }
@@ -123,14 +123,15 @@ function _normalize(loc, existing) {
     lighting: (_isStr(loc.lighting) && loc.lighting.trim()) ? loc.lighting.trim() : null,
     tags: _normTags(loc.tags),
     photos: _normPhotos(loc.photos),
-    // Generated VIEWS SHEET (4x2: 5 camera views + 3 detail close-ups of the
-    // empty location) that locks the world's look across every clip. Set by
-    // generate_location_plate; `plateCells` are the 8 detected cell rects the
-    // visor slices it by.
+    // The two establishing views of the empty location that lock the world's
+    // look across every clip. `plate` = FRONT view; `plateRear` = the reverse
+    // (180°) view generated FROM the front (attached as reference). Both set by
+    // generate_location_plate, in two agent-authored steps.
     plate: (_isStr(loc.plate) && loc.plate.trim()) ? loc.plate.trim() : null,
+    plateRear: (_isStr(loc.plateRear) && loc.plateRear.trim()) ? loc.plateRear.trim() : null,
+    // Legacy: single-sheet cell rects / floor-plan layout (no longer produced;
+    // preserved so old docs round-trip without dropping the fields).
     plateCells: Array.isArray(loc.plateCells) ? loc.plateCells : null,
-    // The top-down spatial layout (floor plan) the plate was rendered from —
-    // persisted so the plate can be re-rendered / edited consistently later.
     layout: (loc.layout && typeof loc.layout === 'object' && !Array.isArray(loc.layout)) ? loc.layout : null,
     createdAt,
     updatedAt: now,
@@ -150,7 +151,7 @@ export default {
     'Required: location.name (non-empty). location.id is OPTIONAL — a kebab-case slug that MUST match the on-disk filename; when omitted it is derived from the name. ' +
     'location.handle is the BARE @mention WITHOUT the leading "@" (e.g. "comedor") — when set together with at least one photo, the first photo is registered under `@handle` so `@handle` resolves in prompts. ' +
     'location.description is what the place looks like. location.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, bytes never copied; photos[0] is the hero image. ' +
-    'location.plate is an OPTIONAL absolute path to the generated establishing plate — usually set by generate_location_plate, not by hand. ' +
+    'location.plate / location.plateRear are OPTIONAL absolute paths to the two generated establishing views (plate = FRONT, plateRear = the reverse 180° view) — usually set by generate_location_plate, not by hand. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, location:<normalized> } on success, or { success:false, error } with the exact invalid field on failure.',
   instructions:
