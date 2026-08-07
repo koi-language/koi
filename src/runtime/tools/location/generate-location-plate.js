@@ -4,22 +4,23 @@
  *
  * This tool NEVER writes the prompt itself — no templates, no internal LLM call.
  * The real agent authors a PRECISE description of the location and passes it as
- * `prompt`. The plate is built in TWO agent-driven steps (see the `locations`
- * skill):
- *   1. FRONT: agent writes a faithful, element-by-element FRONT description →
- *      generate_location_plate { view:'front', prompt } → saved as `plate`.
- *   2. REAR: agent writes a reverse-shot (180°) description AND attaches the
- *      FRONT image as reference → generate_location_plate { view:'rear', prompt,
- *      referenceImages:[<front path>] } → saved as `plateRear`. Referencing the
- *      FRONT is what keeps the reverse view the SAME room (not a re-invented one).
- * For an EXTERIOR that front/rear can't capture, the agent can also author LEFT
- * and RIGHT views the same way.
+ * `prompt`.
+ *
+ * ONE call = ONE view, and **only FRONT is part of creating a location**:
+ *   • FRONT (`view:'front'` → `plate`): the agent writes a faithful,
+ *     element-by-element description of the empty place. This is the mandatory
+ *     anchor — the SET analog of a character turnaround.
+ *   • REAR / LEFT / RIGHT (→ `plateRear` / `plateLeft` / `plateRight`): OPTIONAL
+ *     extra angles, generated only when the story actually needs them or the
+ *     user asks. Each MUST attach the FRONT via `referenceImages` — that is what
+ *     keeps the view the SAME place instead of a re-invented one.
+ * Generating rear as a routine second step is NOT the flow: a location with just
+ * a front view is complete.
  *
  * A plate carries no face, so there is no likeness-filter laundering.
  *
- * With a `locationId` the generated view is attached to that location doc
- * (`plate` for front, `plateRear` for rear); without one the caller attaches it
- * with save_location.
+ * With a `locationId` the generated view is attached to its matching field on
+ * that location doc; without one the caller attaches it with save_location.
  */
 
 import { channel } from '../../io/channel.js';
@@ -28,6 +29,16 @@ import generateImage from '../media/generate-image.js';
 import { mediaModelsByLabel } from '../../llm/providers/gateway.js';
 
 function _err(msg) { return { success: false, error: `generate_location_plate: ${msg}` }; }
+
+/** The location field each view is persisted into. Every view owns its own
+ *  slot — the earlier "front → plate, everything else → plateRear" rule made
+ *  a LEFT view silently overwrite the REAR one. */
+const _FIELD_BY_VIEW = {
+  front: 'plate',
+  rear:  'plateRear',
+  left:  'plateLeft',
+  right: 'plateRight',
+};
 function _isStr(v) { return typeof v === 'string'; }
 
 // Normalize referenceImages: accept a plain path array OR [{alias, path}].
@@ -51,9 +62,8 @@ export default {
   description:
     'REQUIRED FIRST: activate the `locations` skill — it documents the 2-step plate procedure and the location JSON. ' +
     'Generate ONE establishing VIEW of a location (the SET analog of a character turnaround). YOU author the prompt — this tool never writes it. Build the plate in TWO steps: ' +
-    '(1) FRONT — write a PRECISE, faithful description of the empty location naming EVERY element it has (every piece of furniture, TV, clock, tiling, beams, doors, windows, lamps, the exact palette and light), call { view:"front", prompt, locationId } → saved as `plate`. ' +
-    '(2) REAR — write a reverse-shot (camera 180° opposite; the FRONT back wall / window now BEHIND the camera, not visible) description AND attach the FRONT image via `referenceImages:[<front plate path>]` so the reverse view is the SAME room, call { view:"rear", prompt, referenceImages, locationId } → saved as `plateRear`. ' +
-    'For an EXTERIOR front/rear cannot capture, also author { view:"left" } and { view:"right" } the same way. ' +
+    'FRONT is the ONLY view a new location needs — write a PRECISE, faithful description of the empty location naming EVERY element it has (every piece of furniture, TV, clock, tiling, beams, doors, windows, lamps, the exact palette and light), call { view:"front", prompt, locationId } → saved as `plate`. ' +
+    'REAR / LEFT / RIGHT are OPTIONAL extra views — generate one ONLY when the story actually needs that angle or the user asks for it, never as a routine second step. Each saves to its OWN field (`plateRear` / `plateLeft` / `plateRight`) and MUST attach the FRONT image via `referenceImages:[<front plate path>]` so it stays the SAME place. REAR = camera 180° opposite (the FRONT back wall / window now BEHIND the camera, not visible). ' +
     'Call shape: { view?: "front"|"rear"|"left"|"right" (default front), prompt (REQUIRED, you author it), referenceImages?: [absolute paths], locationId?, photos?: [absolute paths], model?, aspectRatio? }. ' +
     'model AUTO-SELECTS: explicit slug wins; else the `locations`-label model; else GPT Image 2 (the /edit variant whenever reference images are given — the REAR always references the FRONT). ' +
     'Returns: { success, view, plate|plateRear: <absolute path>, model, locationId?, attached? }. With a locationId the view is attached automatically (no follow-up save_location); without one, attach it with save_location { id, plate } or { id, plateRear }.',
@@ -63,10 +73,10 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      view: { type: 'string', description: 'Which view this call renders: "front" (default), "rear", "left" or "right". "front" saves to `plate`; the rest save to `plateRear` (rear) or are returned for the caller to place. The REAR/LEFT/RIGHT should attach the FRONT via referenceImages.' },
+      view: { type: 'string', description: 'Which view this call renders: "front" (default), "rear", "left" or "right". Each saves to its own field: front → `plate`, rear → `plateRear`, left → `plateLeft`, right → `plateRight`. Only FRONT is needed for a new location; the others are optional extra angles, and each MUST attach the FRONT via referenceImages so it stays the same place.' },
       prompt: { type: 'string', description: 'REQUIRED. The full image prompt YOU authored for THIS view — a precise, faithful, element-by-element description of the empty location. This tool NEVER writes the prompt itself.' },
       referenceImages: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute paths used as reference. For the REAR/LEFT/RIGHT views, pass the FRONT plate path here so the view stays the SAME room. Any reference forces an image-editing model.' },
-      locationId: { type: 'string', description: 'OPTIONAL id of a saved location (~/.koi/locations/<id>.json). The generated view is attached to it (plate for front, plateRear otherwise).' },
+      locationId: { type: 'string', description: 'OPTIONAL id of a saved location (~/.koi/locations/<id>.json). The generated view is attached to its matching field (front → plate, rear → plateRear, left → plateLeft, right → plateRight).' },
       photos: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute paths to reference photos of the real place, added as references.' },
       model: { type: 'string', description: 'OPTIONAL image model slug. Omit to auto-pick.' },
       aspectRatio: { type: 'string', description: 'OPTIONAL aspect ratio. Defaults to 16:9 (a wide establishing view).' },
@@ -146,9 +156,10 @@ export default {
     const platePath = img?.exportedTo || img?.savedTo;
     if (!platePath) return _err('generation returned no image path.');
 
-    // Which location field this view fills: front → plate, everything else →
-    // plateRear (the reverse / secondary establishing view).
-    const field = view === 'front' ? 'plate' : 'plateRear';
+    // Which location field this view fills. Each view owns its OWN field:
+    // folding left/right into `plateRear` (the old behaviour) meant
+    // generating a side view silently OVERWROTE the reverse shot.
+    const field = _FIELD_BY_VIEW[view] || 'plate';
 
     // ATTACH to the location when we have an id (best-effort — the GUI's action
     // call can time out on a multi-minute render, so persist here too).

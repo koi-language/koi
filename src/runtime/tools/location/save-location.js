@@ -41,7 +41,7 @@ function _validate(loc) {
   if (loc.id !== undefined && (!_isStr(loc.id) || !_KEBAB_RE.test(loc.id))) {
     return `"id" (when provided) must be a kebab-case string (lowercase letters/digits/hyphens). Got ${JSON.stringify(loc.id)}.`;
   }
-  for (const k of ['handle', 'description', 'locationType', 'timeOfDay', 'palette', 'lighting', 'plate', 'plateRear']) {
+  for (const k of ['handle', 'description', 'locationType', 'timeOfDay', 'palette', 'lighting', 'plate', 'plateRear', 'plateLeft', 'plateRight']) {
     if (loc[k] !== undefined && loc[k] !== null && !_isStr(loc[k])) {
       return `"${k}" (when provided) must be a string. Got ${typeof loc[k]}.`;
     }
@@ -57,6 +57,11 @@ function _validate(loc) {
   if (loc.photos !== undefined) {
     if (!Array.isArray(loc.photos) || loc.photos.some((p) => !_isStr(p))) {
       return '"photos" (when provided) must be an array of absolute file paths (strings). photos[0] is the hero image.';
+    }
+  }
+  if (loc.details !== undefined && loc.details !== null) {
+    if (!Array.isArray(loc.details) || loc.details.some((p) => !_isStr(p))) {
+      return '"details" (when provided) must be an array of absolute file paths (strings) — close-ups / detail shots of the place.';
     }
   }
   if (loc.plateCells !== undefined && loc.plateCells !== null) {
@@ -123,12 +128,19 @@ function _normalize(loc, existing) {
     lighting: (_isStr(loc.lighting) && loc.lighting.trim()) ? loc.lighting.trim() : null,
     tags: _normTags(loc.tags),
     photos: _normPhotos(loc.photos),
-    // The two establishing views of the empty location that lock the world's
-    // look across every clip. `plate` = FRONT view; `plateRear` = the reverse
-    // (180°) view generated FROM the front (attached as reference). Both set by
-    // generate_location_plate, in two agent-authored steps.
+    // The establishing views of the empty location that lock the world's look
+    // across every clip. `plate` = FRONT, the ONLY one a location needs; the
+    // other three are OPTIONAL extra angles, each generated FROM the front (it
+    // is attached as reference) or assigned by the user. Each view owns its own
+    // field so one never overwrites another.
     plate: (_isStr(loc.plate) && loc.plate.trim()) ? loc.plate.trim() : null,
     plateRear: (_isStr(loc.plateRear) && loc.plateRear.trim()) ? loc.plateRear.trim() : null,
+    plateLeft: (_isStr(loc.plateLeft) && loc.plateLeft.trim()) ? loc.plateLeft.trim() : null,
+    plateRight: (_isStr(loc.plateRight) && loc.plateRight.trim()) ? loc.plateRight.trim() : null,
+    // DETAIL shots: close-ups of the place (a sign, a scale, a corner) the user
+    // uploaded or assigned. Pointers only, like `photos`. Distinct from
+    // `photos`, which are the INPUT reference photos that DEFINE the location.
+    details: _normPhotos(loc.details),
     // Legacy: single-sheet cell rects / floor-plan layout (no longer produced;
     // preserved so old docs round-trip without dropping the fields).
     plateCells: Array.isArray(loc.plateCells) ? loc.plateCells : null,
@@ -151,7 +163,8 @@ export default {
     'Required: location.name (non-empty). location.id is OPTIONAL — a kebab-case slug that MUST match the on-disk filename; when omitted it is derived from the name. ' +
     'location.handle is the BARE @mention WITHOUT the leading "@" (e.g. "comedor") — when set together with at least one photo, the first photo is registered under `@handle` so `@handle` resolves in prompts. ' +
     'location.description is what the place looks like. location.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, bytes never copied; photos[0] is the hero image. ' +
-    'location.plate / location.plateRear are OPTIONAL absolute paths to the two generated establishing views (plate = FRONT, plateRear = the reverse 180° view) — usually set by generate_location_plate, not by hand. ' +
+    'location.plate is the FRONT establishing view — the only one a location needs. location.plateRear / plateLeft / plateRight are OPTIONAL extra angles, generated only when the story needs them or the user asks. All four are usually set by generate_location_plate, not by hand. ' +
+    'location.details is an OPTIONAL array of ABSOLUTE paths to close-up / detail shots of the place (pointers only) — distinct from location.photos, which are the INPUT reference photos that DEFINE the location. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, location:<normalized> } on success, or { success:false, error } with the exact invalid field on failure.',
   instructions:
