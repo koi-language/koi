@@ -30,6 +30,7 @@
 //   feature is purely additive.
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 function _sessionDir() {
@@ -82,6 +83,12 @@ export async function recordCreation(entry) {
     summary: entry.summary || '',
     filePath: entry.filePath || '',
     storyboard: entry.storyboard || '',
+    // Optional finer-grained linkage (from generation metadata): which scene
+    // and shot(s) of that storyboard the creation covers. Consumed by the
+    // GUI's project browser to nest generations under their scene. Empty
+    // when the generation wasn't tagged.
+    scene: entry.scene || '',
+    shot: entry.shot || '',
     ts: typeof entry.ts === 'number' ? entry.ts : Date.now(),
   }) + '\n';
   try {
@@ -90,6 +97,17 @@ export async function recordCreation(entry) {
   } catch {
     // Best-effort: failing the ledger must not fail the save.
   }
+  // GLOBAL cross-session index (~/.koi/creations-index.jsonl): same line,
+  // home-based like every other artefact store the GUI reads directly
+  // (storyboards/characters/locations). The session ledger stays the
+  // authority for per-session recall; this copy exists so the GUI's
+  // project browser can list a storyboard's generations across ALL
+  // sessions without knowing any engine project root. Append-only,
+  // best-effort, never blocks the save.
+  try {
+    const globalFp = path.join(os.homedir(), '.koi', 'creations-index.jsonl');
+    await fs.promises.appendFile(globalFp, line, 'utf8');
+  } catch { /* best-effort */ }
 }
 
 /**

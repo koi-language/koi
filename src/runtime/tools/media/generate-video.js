@@ -260,6 +260,52 @@ export async function _uploadVideoRef(ref, opts = {}) {
   }
 }
 
+/** Upload a local AUDIO file to the gateway (fal storage) and return its
+ *  hosted URL. URL inputs pass through unchanged. Used for `referenceAudio`
+ *  (the sound-continuity bed of the previous clip): the Seedance
+ *  reference-to-video adapters accept reference audio (`audio_urls`) — the
+ *  backend maps payload `audio_url` → CanonicalVideoRequest.audioUrl and
+ *  the adapter wraps it. Mirrors _uploadVideoRef byte-for-byte, minus the
+ *  temporal pad (no duration floor on audio refs). Returns null (and logs)
+ *  on failure so the generation continues without the reference. */
+async function _uploadAudioRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (/^https?:\/\//i.test(ref)) return ref; // already a URL
+  const resolved = path.resolve(ref);
+  if (!fs.existsSync(resolved)) {
+    channel.log('video', `reference audio not found: ${resolved}`);
+    return null;
+  }
+  try {
+    const buf = fs.readFileSync(resolved);
+    // application/octet-stream — same rationale as /uploads/video: it's
+    // the raw-binary parser the backend registers; the real mime is
+    // sniffed from the filename query param.
+    const url = `${getGatewayBase()}/uploads/audio?filename=${encodeURIComponent(path.basename(resolved))}`;
+    const headers = { ...getAuthHeaders() };
+    delete headers['content-type'];
+    delete headers['Content-Type'];
+    headers['Content-Type'] = 'application/octet-stream';
+    const t0 = Date.now();
+    const res = await fetch(url, { method: 'POST', headers, body: buf });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      channel.log('video', `reference audio upload failed (${res.status}): ${body.slice(0, 200)}`);
+      return null;
+    }
+    const json = await res.json();
+    channel.log(
+      'video',
+      `reference audio uploaded: ${path.basename(resolved)} (${Math.round(buf.length / 1024)}KB) ` +
+      `in ${Date.now() - t0}ms → ${(json.url || '').slice(0, 80)}`,
+    );
+    return json.url || null;
+  } catch (err) {
+    channel.log('video', `reference audio upload threw: ${err.message}`);
+    return null;
+  }
+}
+
 /**
  * Download a finished video URL to disk. Shared helper used by
  * generate_video (for synchronous completions) and await_video_generation
@@ -417,6 +463,7 @@ const generateVideoAction = {
       endFrame:        { type: 'string',  description: 'LITERAL last frame of the output video — the exact image the generated video must END on. Same semantics as `startFrame` (literal, not stylistic). **Pair it with `startFrame` whenever the user asks to animate FROM one image TO another** — e.g. "first frame = this photo, last frame = that photo", "make a video that starts with A and ends with B", "transition from this image to that one". In that case pass `startFrame` = the first image AND `endFrame` = the second; the model interpolates between them. Do NOT collapse such a request into a text-only prompt with no frames — the two images ARE the request. Also accepts a `@mention` handle.' },
       referenceImages: { type: 'array',   description: 'Visual REFERENCES — style sheets, storyboards, character designs, mood boards, subject photos — that the model may use as guidance for look/composition/identity but NOT as the literal first frame. Use this whenever the image is "what the result should LOOK like or RESEMBLE", never "what frame 1 must be". For a storyboard or multi-panel sheet, list every panel here. Routes to multi-image reference-to-video models when available; if the catalog only has image-to-video slugs the call will fail rather than silently treating the first reference as a start frame. Accepts file paths, attachment IDs (att-N), or `@mention` handles (e.g. "@tom"); `@`-handles resolve via MediaLibrary against whatever tag_media last pinned to that handle, most-recent-first when several match — same model the chat input bar uses.', items: { type: 'string' } },
       referenceVideos: { type: 'array',   description: 'Video REFERENCES for style/motion/continuation guidance — NOT a literal frame source. EDITING/EXTENDING an existing video: the source video ITSELF is the ONLY reference; NEVER re-attach the images that video was originally generated from (its metadata sourceImages/referenceImages): that rebuilds a DIFFERENT take instead of modifying the one the user has. Local video paths, https URLs, or `@mention` handles. Local paths are uploaded to the gateway transparently; `@name` resolves via MediaLibrary the same way as referenceImages. Only honored when the selected model advertises videoToVideo.', items: { type: 'string' } },
+      referenceAudio:  { type: 'string',  description: 'AUDIO reference (path or URL to an mp3/wav) the model composes the new clip\'s soundscape from — e.g. the PREVIOUS clip\'s extracted audio so the diegetic bed CONTINUES seamlessly across a clip chain. Only consumed by models whose card lists reference audio (Seedance reference-to-video family); other models ignore it. Local paths are uploaded transparently. This is NOT the avatar driving track — that is `audioFile`; and it is NOT the output soundtrack (that is `withAudio` + the prompt\'s audio notes): the model LISTENS to this as guidance.' },
       withAudio:       { type: 'boolean', description: 'Generate an audio track (SFX, dialogue, voiceover, ambient) alongside the video. DEFAULT: true — videos come back WITH sound unless you explicitly pass false. Only set false for a deliberately silent clip. NOTE: this does NOT control background music; excluding music is done via the prompt text, not by silencing the whole clip.' },
       cameraMovement:  { type: 'string',  description: 'Camera movement / shot type, e.g. "static", "pan_left", "zoom_in", "dolly_in", "orbit_right". Provider-dependent — unknown values are ignored.' },
       characterOrientation: { type: 'string', enum: ['image', 'video'], description: 'Only consumed by models that perform pose / motion transfer from a reference video onto a still character (see the catalog snapshot — the label slug for this family lives in the per-model labels list, alongside its glossary entry). "image" preserves the still photo\'s character pose/orientation while inheriting motion from the reference video (default — natural for "make my character do that"); "video" reorients the character to match the reference video\'s pose (use for dance / body-mimicry where the reference body shape is the target). Ignored by every other model.' },
@@ -1179,10 +1226,24 @@ const generateVideoAction = {
     globalStartFrame      = await _adaptFrameToConstraints(globalStartFrame, pickedVideoModelObj, 'startFrame');
     globalEndFrame        = await _adaptFrameToConstraints(globalEndFrame, pickedVideoModelObj, 'endFrame');
     globalReferenceImages = await _adaptFramesToConstraints(globalReferenceImages, pickedVideoModelObj, 'referenceImages');
+    // Heavy refs → fal-storage URLs instead of inline base64 (413 guard —
+    // see _offloadHeavyReferenceImages). Runs AFTER constraint adaptation
+    // so the uploaded bytes are the final ones.
+    globalReferenceImages = await _offloadHeavyReferenceImages(globalReferenceImages);
 
     // Videos are uploaded (not inlined) — see _uploadVideoRef above.
     // Padded variants flow through transparently.
     const globalReferenceVideos = await _resolveReferenceVideos(paddedRefVideos, caps, resolved);
+
+    // Reference AUDIO (the sound-continuity bed, e.g. the previous clip's
+    // extracted mp3). Consumed only by models whose card lists reference
+    // audio (Seedance reference-to-video family — their adapter wraps it
+    // into fal `audio_urls`); other adapters never read the field, so
+    // passing it is always safe. Local paths upload via /uploads/audio.
+    let globalReferenceAudio = null;
+    if (typeof action.referenceAudio === 'string' && action.referenceAudio.trim()) {
+      globalReferenceAudio = await _uploadAudioRef(action.referenceAudio.trim());
+    }
 
     // Audio is ON by default — a generated video keeps its scene sound (SFX,
     // dialogue, voiceover, ambient) unless the caller EXPLICITLY opts out with
@@ -1501,6 +1562,7 @@ const generateVideoAction = {
       endFrame: globalEndFrame,
       referenceImages: globalReferenceImages,
       referenceVideos: globalReferenceVideos,
+      referenceAudio: globalReferenceAudio || undefined,
       withAudio: withAudio && caps.withAudio,
       cameraMovement: globalCamera,
       numShots,
@@ -2772,6 +2834,48 @@ async function _loadReferenceImages(pathArr, caps, resolved) {
     out.push({ data, mimeType: normalized.mimeType });
   }
   return out;
+}
+
+/** Inline base64 reference images travel inside the gateway JSON body,
+ *  which has a hard size cap — 7+ laundered Seedream PNGs (2-4 MB each)
+ *  tripped HTTP 413 ("payload demasiado grande") on Seedance 2.5's
+ *  big-cap reference sets. Any ref whose bytes exceed the threshold is
+ *  uploaded to fal storage instead (via /uploads/video, which accepts
+ *  any mime — see the backend route's own comment) and travels as a
+ *  URL string: the backend canonicalizer passes string entries through
+ *  and the adapters' uploadRefs handles URLs natively. Small refs stay
+ *  inline (no extra round-trip). An upload failure keeps the inline
+ *  blob — the generation still runs; worst case the 413 surfaces as
+ *  before. */
+const _INLINE_REF_MAX_BYTES = 600 * 1024;
+async function _offloadHeavyReferenceImages(frames) {
+  if (!Array.isArray(frames) || frames.length === 0) return frames;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    if (!f || f._error || typeof f === 'string' || !f.data) continue;
+    if (f.data.length <= _INLINE_REF_MAX_BYTES) continue;
+    try {
+      const ext = ((f.mimeType || 'image/png').split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '');
+      const url = `${getGatewayBase()}/uploads/video?filename=${encodeURIComponent(`video-ref-${Date.now()}-${i}.${ext}`)}`;
+      const headers = { ...getAuthHeaders() };
+      delete headers['content-type'];
+      delete headers['Content-Type'];
+      headers['Content-Type'] = 'application/octet-stream';
+      const res = await fetch(url, { method: 'POST', headers, body: f.data });
+      if (!res.ok) {
+        channel.log('video', `heavy reference upload failed (${res.status}) — keeping it inline`);
+        continue;
+      }
+      const json = await res.json();
+      if (json?.url) {
+        channel.log('video', `heavy reference offloaded to storage (${Math.round(f.data.length / 1024)}KB → URL)`);
+        frames[i] = json.url;
+      }
+    } catch (err) {
+      channel.log('video', `heavy reference upload threw (${err?.message || err}) — keeping it inline`);
+    }
+  }
+  return frames;
 }
 
 /** Adapt a single loaded frame against the picked model's declared

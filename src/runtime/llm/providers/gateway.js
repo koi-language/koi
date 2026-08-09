@@ -2068,10 +2068,18 @@ export class GatewayVideoGen extends BaseVideoGen {
       };
     }
     if (opts.referenceImages?.length) {
-      payload.reference_images = opts.referenceImages.map(ref => ({
-        data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
-        mime_type: ref.mimeType || 'image/png',
-      }));
+      // String entries are ALREADY hosted URLs (heavy refs offloaded to fal
+      // storage by the client — see _offloadHeavyReferenceImages): pass them
+      // through; the backend canonicalizer and the adapters' uploadRefs both
+      // handle URL strings natively. Blobs inline as base64 as before.
+      payload.reference_images = opts.referenceImages.map(ref => (
+        typeof ref === 'string'
+          ? ref
+          : {
+              data: typeof ref.data === 'string' ? ref.data : ref.data.toString('base64'),
+              mime_type: ref.mimeType || 'image/png',
+            }
+      ));
     }
     // referenceVideos are ALREADY URLs at this point — the client
     // uploaded them to the gateway via /uploads/video before calling
@@ -2080,6 +2088,13 @@ export class GatewayVideoGen extends BaseVideoGen {
     // video_urls) when building the fal input.
     if (Array.isArray(opts.referenceVideos) && opts.referenceVideos.length > 0) {
       payload.reference_videos = opts.referenceVideos.slice();
+    }
+    // Reference AUDIO — already a hosted URL (uploaded via /uploads/audio).
+    // The backend maps `audio_url` → CanonicalVideoRequest.audioUrl; only
+    // adapters that support reference audio (Seedance reference-to-video)
+    // consume it, wrapping it into fal `audio_urls`.
+    if (typeof opts.referenceAudio === 'string' && /^https?:\/\//i.test(opts.referenceAudio)) {
+      payload.audio_url = opts.referenceAudio;
     }
     // Per-shot overrides. Each entry mirrors the top-level fields;
     // binary media (frames, ref images) is base64-encoded here, ref

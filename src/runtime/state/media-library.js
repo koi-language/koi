@@ -584,12 +584,18 @@ export class MediaLibrary {
         } else if (resolvedType === 'storyboard' && metadata && typeof metadata.id === 'string') {
           storyboard = metadata.id;
         }
+        // Scene/shot linkage (same metadata contract as the storyboard link):
+        // lets the GUI's project browser nest a generation under its scene.
+        const _scene = (metadata && (metadata.sceneId || metadata.scene)) || '';
+        const _shot = (metadata && (metadata.shotId || metadata.shot || (Array.isArray(metadata.shotIds) ? metadata.shotIds.join(',') : ''))) || '';
         recordCreation({
           id,
           kind: resolvedType,
           summary: resolvedSummary,
           filePath,
           storyboard,
+          scene: typeof _scene === 'string' ? _scene : String(_scene),
+          shot: typeof _shot === 'string' ? _shot : String(_shot),
         });
       } catch { /* ledger import failure must never block a save */ }
     }
