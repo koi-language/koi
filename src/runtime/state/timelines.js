@@ -527,7 +527,7 @@ function _normalise(state) {
     settings.width = w;
     settings.height = h;
   }
-  return {
+  const out = {
     id: state.id,
     name: typeof state.name === 'string' && state.name.trim() ? state.name.trim() : 'Timeline',
     version: SCHEMA_VERSION,
@@ -536,6 +536,18 @@ function _normalise(state) {
     settings,
     clips,
   };
+  // Preserve the story link ACROSS every save: a story can own many timelines,
+  // so the association lives on the timeline (timeline → storyboardId), not on
+  // the storyboard. Without carrying it here every update_timeline would strip
+  // it (same latent bug that drops `summary`), orphaning the timeline from its
+  // story. Same for the agent-supplied summary — round-trip it too.
+  if (typeof state.storyboardId === 'string' && state.storyboardId.trim()) {
+    out.storyboardId = state.storyboardId.trim();
+  }
+  if (typeof state.summary === 'string' && state.summary.trim()) {
+    out.summary = state.summary.trim();
+  }
+  return out;
 }
 
 // ── IO ───────────────────────────────────────────────────────────────
@@ -611,11 +623,11 @@ async function _mirrorToMediaLibrary(filePath, state) {
  * `state` argument that follows the JSON schema documented at the top
  * of this file (id and timestamps are filled in for you).
  */
-export function createTimeline({ name, settings, clips, state, summary } = {}) {
+export function createTimeline({ name, settings, clips, state, summary, storyboardId } = {}) {
   const id = _newId();
   let toWrite;
   if (state && typeof state === 'object') {
-    toWrite = _normalise({ ...state, id, name: name || state.name });
+    toWrite = _normalise({ ...state, id, name: name || state.name, storyboardId: storyboardId || state.storyboardId });
     toWrite.createdAt = _now();
   } else {
     toWrite = _normalise({
@@ -623,6 +635,7 @@ export function createTimeline({ name, settings, clips, state, summary } = {}) {
       name: name || 'Timeline',
       settings,
       clips: clips || [],
+      storyboardId,
     });
   }
   // Stamp the agent-supplied "what is this timeline for" onto the

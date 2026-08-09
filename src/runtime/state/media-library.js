@@ -1640,6 +1640,12 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider, opts = 
     videoTracks: timeline?.settings?.videoTracks ?? 0,
     audioTracks: timeline?.settings?.audioTracks ?? 0,
     updatedAt: timeline?.updatedAt || null,
+    // Story link (timeline → storyboardId): a story owns many timelines, so
+    // the association lives here. Surfaced in the index so the GUI can group
+    // timelines under their storyboard without reading each JSON.
+    ...(typeof timeline?.storyboardId === 'string' && timeline.storyboardId.trim()
+      ? { storyboardId: timeline.storyboardId.trim() }
+      : {}),
   };
   return lib.save({
     filePath,
