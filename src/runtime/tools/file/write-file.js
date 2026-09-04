@@ -173,6 +173,17 @@ export default {
     }
 
     fs.writeFileSync(resolvedPath, newContent, 'utf8');
+    // Same guard as edit_file: a storyboard written as text is allowed, but it
+    // must still parse and hold its invariants — otherwise the previous bytes
+    // are restored and the caller is told why.
+    try {
+      const { isStoryboardPath, validateStoryboardWrite } =
+        await import('../storyboard/_post-write-guard.js');
+      if (isStoryboardPath(resolvedPath)) {
+        const v = await validateStoryboardWrite(resolvedPath, oldContent ?? null);
+        if (!v.ok) return { success: false, error: `write_file: ${v.error}` };
+      }
+    } catch { /* guard unavailable → the plain write stands */ }
     if (sessionTracker) sessionTracker.trackFile(resolvedPath, oldContent);
     // Schedule background re-indexing after file changes
     try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}

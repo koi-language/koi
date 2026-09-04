@@ -74,7 +74,9 @@ export default {
     'Scene set fields: title, location (free-text place), locationIds (array of saved location-card ids — a scene can span several sets), notes, synopsis, references. ' +
     'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
     'Set a field to null to remove it. ' +
-    'NOT for structure: adding/removing/reordering scenes or shots, renumbering, or changing ids — use save_storyboard (full document) for those. ' +
+    'STRUCTURE TOO: `addShots` / `removeShots` / `moveShots` insert, delete and reorder shots by id — renumbering across the whole document is done FOR you. '
+    + 'So a normal script iteration (reword a line, add a shot, drop one, move one) NEVER needs the full document. '
+    + 'save_storyboard (full document) is only for CREATING a storyboard, or for scene-level restructuring (adding/removing/reordering whole SCENES) and id changes. ' +
     'Returns { success, path, id, editorialChanges, affectedPanels } where affectedPanels lists the shot ids whose sketch will re-render ' +
     '("ALL" when a root field changed — root fields feed every panel\'s prompt). ' +
     'Render-cost awareness: a root-field or scene-field edit re-renders many panels; an `action` edit also re-renders the FOLLOWING shots ' +
@@ -103,6 +105,21 @@ export default {
         description: 'Shot-level patches: [{ id, set: { duration?, shot?, camera?, composition?, lighting?, action?, dialogue?, sfx?, music?, continuity?, noCutBefore?, references? } }].',
         items: { type: 'object' },
       },
+      addShots: {
+        type: 'array',
+        description: 'INSERT shots: [{ shot: {…full shot fields…}, afterShotId?: "sh3" | sceneId?: "sc1", index?: n }]. Say WHERE with `afterShotId` (right after that shot) or `sceneId` (+ optional `index`, default = end of scene). `shot.id` is minted when omitted, and every `number` in the document is renumbered for you.',
+        items: { type: 'object' },
+      },
+      removeShots: {
+        type: 'array',
+        description: 'DELETE shots by id: ["sh4", "sh5"]. Renumbering is automatic. Refuses to empty a scene.',
+        items: { type: 'string' },
+      },
+      moveShots: {
+        type: 'array',
+        description: 'REORDER / re-home shots: [{ id: "sh7", afterShotId?: "sh2" | sceneId?: "sc2", index?: n }]. Renumbering is automatic.',
+        items: { type: 'object' },
+      },
       summary: { type: 'string', description: 'One-line ledger blurb (optional).' },
     },
     required: ['id'],
@@ -127,8 +144,18 @@ export default {
     const hasRoot = _isObj(action.set) && Object.keys(action.set).length > 0;
     const scenePatches = Array.isArray(action.scenes) ? action.scenes : [];
     const shotPatches = Array.isArray(action.shots) ? action.shots : [];
-    if (!hasRoot && !scenePatches.length && !shotPatches.length) {
-      return _err('Empty patch: provide `set`, `scenes` or `shots` with the fields to change.');
+    // STRUCTURAL ops — the reason this tool used to lose to save_storyboard.
+    // "Add a shot here", "drop shot 3", "move this one earlier" are the most
+    // common script edits there are, and without them the agent had to re-send
+    // the WHOLE document (measured: 26k-37k chars vs ~1k for a patch), which
+    // is what made editing a script feel so slow.
+    const addShots = Array.isArray(action.addShots) ? action.addShots : [];
+    const removeShots = Array.isArray(action.removeShots) ? action.removeShots : [];
+    const moveShots = Array.isArray(action.moveShots) ? action.moveShots : [];
+    const hasStructural =
+      addShots.length || removeShots.length || moveShots.length;
+    if (!hasRoot && !scenePatches.length && !shotPatches.length && !hasStructural) {
+      return _err('Empty patch: provide `set`, `scenes`, `shots`, `addShots`, `removeShots` or `moveShots`.');
     }
 
     // Deep-copy so a failed validation leaves the on-disk doc untouched.
@@ -170,6 +197,105 @@ export default {
       if (e) return _err(e);
     }
 
+    // ── STRUCTURAL OPS, applied after the field patches ───────────────
+    // Order matters: remove → move → add, so an add positioned "after X"
+    // still resolves when X is being moved in the same call, and a removed
+    // shot can't be an anchor.
+    const _sceneOf = (doc, shotId) =>
+      (Array.isArray(doc.scenes) ? doc.scenes : []).find((sc) =>
+        (Array.isArray(sc?.shots) ? sc.shots : []).some((sh) => sh?.id === shotId));
+
+    for (const rid of removeShots) {
+      if (!_isStr(rid)) return _err('removeShots[] entries must be shot ids (strings).');
+      const sc = _sceneOf(patched, rid);
+      if (!sc) return _err(`removeShots: no shot with id "${rid}".`);
+      sc.shots = sc.shots.filter((sh) => sh?.id !== rid);
+      if (sc.shots.length === 0) {
+        return _err(
+          `removeShots: "${rid}" is the last shot of scene "${sc.id}" — removing it would leave an empty scene. `
+          + 'Remove the whole scene with save_storyboard, or add a replacement shot in the same call.');
+      }
+    }
+
+    for (const mv of moveShots) {
+      if (!_isObj(mv) || !_isStr(mv.id)) {
+        return _err('moveShots[] entries must be { id, afterShotId? , sceneId?, index? }.');
+      }
+      const from = _sceneOf(patched, mv.id);
+      if (!from) return _err(`moveShots: no shot with id "${mv.id}".`);
+      const shot = from.shots.find((sh) => sh?.id === mv.id);
+      from.shots = from.shots.filter((sh) => sh?.id !== mv.id);
+      let target = from;
+      let at = from.shots.length;
+      if (_isStr(mv.afterShotId)) {
+        target = _sceneOf(patched, mv.afterShotId);
+        if (!target) return _err(`moveShots: anchor shot "${mv.afterShotId}" not found.`);
+        at = target.shots.findIndex((sh) => sh?.id === mv.afterShotId) + 1;
+      } else if (_isStr(mv.sceneId)) {
+        target = (patched.scenes || []).find((sc) => sc?.id === mv.sceneId);
+        if (!target) return _err(`moveShots: scene "${mv.sceneId}" not found.`);
+        at = Number.isInteger(mv.index) ? Math.max(0, Math.min(mv.index, target.shots.length)) : target.shots.length;
+      } else if (Number.isInteger(mv.index)) {
+        at = Math.max(0, Math.min(mv.index, from.shots.length));
+      }
+      target.shots.splice(at, 0, shot);
+      if (from.shots.length === 0) {
+        return _err(`moveShots: moving "${mv.id}" would leave scene "${from.id}" empty.`);
+      }
+    }
+
+    const _mintedShotIds = [];
+    for (const add of addShots) {
+      if (!_isObj(add) || !_isObj(add.shot)) {
+        return _err('addShots[] entries must be { shot: {…}, afterShotId? | sceneId? , index? }.');
+      }
+      const shot = { ...add.shot };
+      if (!_isStr(shot.id) || !shot.id.trim()) {
+        // Mint a non-colliding id so the caller never has to know what is taken.
+        const taken = new Set();
+        for (const sc of (patched.scenes || [])) {
+          for (const sh of (Array.isArray(sc?.shots) ? sc.shots : [])) taken.add(sh?.id);
+        }
+        let n = taken.size + 1;
+        while (taken.has(`sh${n}`)) n += 1;
+        shot.id = `sh${n}`;
+      }
+      let target = null;
+      let at = 0;
+      if (_isStr(add.afterShotId)) {
+        target = _sceneOf(patched, add.afterShotId);
+        if (!target) return _err(`addShots: anchor shot "${add.afterShotId}" not found.`);
+        at = target.shots.findIndex((sh) => sh?.id === add.afterShotId) + 1;
+      } else if (_isStr(add.sceneId)) {
+        target = (patched.scenes || []).find((sc) => sc?.id === add.sceneId);
+        if (!target) return _err(`addShots: scene "${add.sceneId}" not found.`);
+        at = Number.isInteger(add.index) ? Math.max(0, Math.min(add.index, target.shots.length)) : target.shots.length;
+      } else {
+        return _err('addShots: say WHERE — pass `afterShotId` (insert right after that shot) or `sceneId` (+ optional `index`).');
+      }
+      target.shots.splice(at, 0, shot);
+      _mintedShotIds.push(shot.id);
+    }
+
+    // RENUMBER every shot across the whole document. `number` must run
+    // sequentially from 1, and a `noCutBefore` shot SHARES the number of the
+    // shot it continues — the same rule save_storyboard validates. Doing it
+    // here is why the caller never has to send the renumbering itself.
+    if (hasStructural) {
+      let n = 0;
+      let first = true;
+      for (const sc of (Array.isArray(patched.scenes) ? patched.scenes : [])) {
+        for (const sh of (Array.isArray(sc?.shots) ? sc.shots : [])) {
+          if (!_isObj(sh)) continue;
+          const cont = sh.noCutBefore === true && !first;
+          // The first shot of the document can never continue a previous one.
+          if (first && sh.noCutBefore === true) sh.noCutBefore = false;
+          sh.number = cont ? n : ++n;
+          first = false;
+        }
+      }
+    }
+
     const validationError = _validate(patched);
     if (validationError) {
       return _err(`Patch would make the storyboard invalid: ${validationError} Nothing was written.`);
@@ -201,7 +327,15 @@ export default {
     // to the last 6 preceding actions).
     const drift = _editorialDiff(existing, normalized);
     let affectedPanels = [];
-    if (drift?.root?.length) {
+    // A REMOVE or a MOVE shifts every following panel's continuity context
+    // (each prompt quotes the preceding actions), so the honest answer there
+    // is "all of them". A pure INSERT only adds its own new panel — the
+    // field-diff below can't see it, since it matches shots by id.
+    const _structuralAll = removeShots.length > 0 || moveShots.length > 0;
+    // Ids as actually inserted (the tool mints one when the caller omits it),
+    // not as the caller wrote them.
+    const _addedIds = _mintedShotIds;
+    if (drift?.root?.length || _structuralAll) {
       affectedPanels = 'ALL';
     } else if (drift) {
       const affected = new Set();
@@ -241,7 +375,13 @@ export default {
       path: filePath,
       id: normalized.id,
       ...(drift ? { editorialChanges: drift } : {}),
-      affectedPanels,
+      // Newly inserted panels always render — fold them in (they cannot show
+      // up in a field diff, which matches shots by id).
+      affectedPanels: affectedPanels === 'ALL'
+        ? 'ALL'
+        : [...new Set([...(affectedPanels || []), ..._addedIds])],
+      ...(_addedIds.length ? { addedShots: _addedIds } : {}),
+      ...(removeShots.length ? { removedShots: [...removeShots] } : {}),
       note: affectedPanels === 'ALL'
         ? 'A root field changed — EVERY panel\'s sketch will re-render. If that was not intended, re-patch restoring the field verbatim.'
         : affectedPanels.length

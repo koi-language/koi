@@ -111,6 +111,10 @@ const outpaintImageAction = {
         type: 'string',
         description: 'Optional guidance for what the new margins should contain (e.g. "continue the ocean and horizon", "add more forest canopy"). Prepended to an auto-built outpainting instruction. Max ~1024 chars. MANDATORY: write the prompt in English regardless of the user\'s language — outpaint models are trained on English captions. The ONLY exception is text that must literally appear in the extended canvas (a sign, a label), which stays in the user\'s language wrapped in quotes inside the otherwise-English prompt.',
       },
+      model: {
+        type: 'string',
+        description: 'Optional exact model slug to outpaint with (must be an `image_extend` model in the catalog, e.g. "fal-ai/flux-2-pro/outpaint"). Omit to let the tool pick the catalog\'s extension model for you.',
+      },
       outputFormat: {
         type: 'string',
         description: 'Output image format — png (default, lossless), jpeg, or webp.',
@@ -202,12 +206,18 @@ const outpaintImageAction = {
     // the request shape we're about to send, and read constraints
     // off the picked model.
     let pickedModel = null;
+    const pinnedModel = (typeof action.model === 'string' && action.model.trim() && action.model.trim() !== 'auto')
+      ? action.model.trim()
+      : null;
     try {
       const { fetchMediaCapabilities } = await import('../../llm/providers/gateway.js');
       const { peekImageModel } = await import('../../llm/providers/media-model-router.js');
       const caps = await fetchMediaCapabilities('image');
       if (caps && Array.isArray(caps.models) && caps.models.length > 0) {
-        pickedModel = peekImageModel(caps.models, {
+        // A pinned slug owns the constraint lookup too — clamping against
+        // the peeked model while dispatching to a different one would size
+        // the canvas for the wrong caps.
+        pickedModel = (pinnedModel && caps.models.find((m) => m && m.slug === pinnedModel)) || peekImageModel(caps.models, {
           intent: 'outpaint',
           refsCount: 1,
           hasMaskImage: true,
@@ -217,6 +227,24 @@ const outpaintImageAction = {
         }) || null;
       }
     } catch { /* no peek → no restrictions to honour */ }
+
+    // generate_image REQUIRES an explicit `model` (there is no auto-picker
+    // any more), so the delegation has to carry one. The agent may pin an
+    // `image_extend` slug; otherwise we reuse the slug the peek above
+    // already resolved for the constraint lookup — that IS the model the
+    // old auto-picker would have dispatched to. Without this the nested
+    // call dies on "generate_image: \"model\" is required" and outpaint
+    // looks broken from the outside.
+    const delegateModel = pinnedModel || pickedModel?.slug || null;
+    if (!delegateModel) {
+      return {
+        success: false,
+        operation: 'outpaint',
+        error: 'outpaint_image: could not resolve an image-extension model from the catalog. '
+          + 'Pass an explicit `model` (an `image_extend` slug, e.g. "fal-ai/flux-2-pro/outpaint"), or sign in so the media catalog is available.',
+      };
+    }
+
     const { clampOutputDims } = await import('../../llm/providers/_constraints.js');
     // The helper logs `[detect] <slug>.output exceeds <cap>` when it
     // fires. The tool below adds the post-resize log line so the
@@ -397,6 +425,7 @@ const outpaintImageAction = {
       // and never actually generates — surfaces as
       // {success:true, tool:'generate_image', documentation:'...'}.
       _internalDelegate: true,
+      model: delegateModel,
       prompt: effectivePrompt,
       // `intent` routes the picker to the `image_extend` bucket (see
       // media-model-router.js:pickImageModel). The `operation` keys

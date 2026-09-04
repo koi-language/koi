@@ -542,6 +542,16 @@ const generateVideoAction = {
     const _guard = await requireToolInfoFirst('generate_video', agent);
     if (_guard) return _guard;
 
+    // NOTE — there is deliberately NO "cinematic skill must be active" gate here.
+    // One was added and REVERTED the same day: it read `agent.state.skills`,
+    // which only koi's own `activate_skill` tool writes. Over MCP (the main
+    // path — Claude Code's Skill tool) that state is never populated, so the
+    // check saw "(none)" no matter how many times the skill was really active
+    // and blocked EVERY render. A guard that cannot observe the thing it
+    // guards must not block: it fails closed on false negatives.
+    // If this is ever re-attempted, the precondition is a skill-state signal
+    // that is true on BOTH paths (runtime and MCP) — not `agent.state.skills`.
+
     // ── Read-before-use guard ────────────────────────────────────────
     // You may NOT animate / reference a LOCAL image you haven't `read_file`'d
     // first this session — read_file is how you actually LOOK at the image

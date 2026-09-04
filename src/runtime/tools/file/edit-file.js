@@ -481,6 +481,19 @@ export default {
     }
 
     fs.writeFileSync(resolvedPath, newContent, 'utf8');
+    // A STORYBOARD edited as text is fine — it is a JSON file like any other,
+    // and for some edits (a rename across every shot) a text replace beats a
+    // structured patch. What must not happen is leaving the visor with a
+    // document it cannot render, so the guard re-parses + re-validates right
+    // here and RESTORES the previous bytes if the edit broke it.
+    try {
+      const { isStoryboardPath, validateStoryboardWrite } =
+        await import('../storyboard/_post-write-guard.js');
+      if (isStoryboardPath(resolvedPath)) {
+        const v = await validateStoryboardWrite(resolvedPath, content);
+        if (!v.ok) return { success: false, error: `edit_file: ${v.error}` };
+      }
+    } catch { /* guard unavailable → the plain write stands */ }
     if (sessionTracker) sessionTracker.trackFile(resolvedPath, content);
     // Schedule background re-indexing after file changes
     try { const { backgroundTaskManager } = await import('../../api/background-task-manager.js'); backgroundTaskManager.scheduleReindex(); } catch {}

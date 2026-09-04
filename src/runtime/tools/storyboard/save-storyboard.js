@@ -620,6 +620,10 @@ export default {
         type: 'object',
         description: 'Full storyboard object (v7 schema). See description for required fields.',
       },
+      allowFullRewrite: {
+        type: 'boolean',
+        description: 'OPTIONAL escape hatch. A CONTENT-only save (structure unchanged) is REJECTED and must be re-sent as an `update_storyboard` patch — a full document costs ~10x the payload and makes every panel a re-render candidate. Set true ONLY for a genuine mass rewrite touching most of the document.',
+      },
       summary: { type: 'string', description: 'OPTIONAL. One-line "what is this storyboard for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Duelo bajo la Tormenta — full storyboard", "Product demo intro storyboard, vertical 9:16". Keep it short and self-evident; the agent is the one who will read it back later. Only attached on the FIRST save of a given storyboard id; subsequent edits do not overwrite it. When omitted, the ledger falls back to the storyboard\'s description.' },
     },
     required: ['storyboard'],
@@ -679,6 +683,89 @@ export default {
     // ONLY when a file exists at this id AND none of those hold (a genuinely
     // DIFFERENT storyboard whose name coincidentally slugged to a taken id) do
     // we auto-uniquify, so we never silently clobber an unrelated storyboard.
+    // ── CONTENT-ONLY REWRITE GUARD ────────────────────────────────────
+    // A content edit must go through `update_storyboard` (a patch), not
+    // through a full re-send of the document. This is not a style
+    // preference: a full save re-emits the WHOLE storyboard token by token
+    // — measured at 26k–37k characters on a 16-shot piece, versus 0.2k–4k
+    // for the equivalent patch. That generation time IS the "cambiar el
+    // guion tarda muchísimo" the user reports, and prose the model retypes
+    // is prose it can silently reword.
+    //
+    // So: when the document already exists and this save changes NOTHING
+    // STRUCTURAL (same scenes, same shots, same ids, same order), refuse
+    // and hand back the exact patch to send instead. Structural edits
+    // (add/remove/reorder/renumber) still belong here and pass through.
+    if (existing && action?.allowFullRewrite !== true) {
+      const _structure = (doc) => (Array.isArray(doc?.scenes) ? doc.scenes : [])
+        .map((sc) => `${sc?.id}:${(Array.isArray(sc?.shots) ? sc.shots : [])
+          .map((sh) => sh?.id).join(',')}`)
+        .join('|');
+      if (_structure(existing) === _structure(sb)) {
+        const changed = [];
+        const _diffFields = (a, b, label) => {
+          const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+          for (const k of keys) {
+            if (k === 'scenes' || k === 'updatedAt' || k === 'version') continue;
+            const av = JSON.stringify(a?.[k] ?? null);
+            const bv = JSON.stringify(b?.[k] ?? null);
+            if (av !== bv) changed.push(`${label}${k}`);
+          }
+        };
+        _diffFields(existing, sb, '');
+        const _byId = (doc) => {
+          const sc = new Map(); const sh = new Map();
+          for (const s0 of (Array.isArray(doc?.scenes) ? doc.scenes : [])) {
+            sc.set(s0?.id, s0);
+            for (const s1 of (Array.isArray(s0?.shots) ? s0.shots : [])) sh.set(s1?.id, s1);
+          }
+          return { sc, sh };
+        };
+        const A = _byId(existing); const B = _byId(sb);
+        for (const [id, s1] of B.sc) {
+          const a1 = A.sc.get(id) || {};
+          const keys = new Set([...Object.keys(a1), ...Object.keys(s1 || {})]);
+          for (const k of keys) {
+            if (k === 'shots') continue;
+            if (JSON.stringify(a1?.[k] ?? null) !== JSON.stringify(s1?.[k] ?? null)) {
+              changed.push(`scene ${id}.${k}`);
+            }
+          }
+        }
+        for (const [id, s1] of B.sh) {
+          const a1 = A.sh.get(id) || {};
+          const keys = new Set([...Object.keys(a1), ...Object.keys(s1 || {})]);
+          for (const k of keys) {
+            if (JSON.stringify(a1?.[k] ?? null) !== JSON.stringify(s1?.[k] ?? null)) {
+              changed.push(`shot ${id}.${k}`);
+            }
+          }
+        }
+        if (changed.length === 0) {
+          return {
+            success: true,
+            path: filePath,
+            id: sb.id,
+            unchanged: true,
+            message: 'No change: the document you sent is byte-identical to the one on disk. Nothing was written and no panel re-rendered.',
+          };
+        }
+        const list = changed.slice(0, 40).join(', ')
+          + (changed.length > 40 ? `, …(+${changed.length - 40} more)` : '');
+        return _err(
+          'CONTENT-ONLY edit sent as a full document. Nothing was written. '
+          + 'Re-send it as a PATCH with `update_storyboard` — same result, a fraction of the payload, '
+          + 'and only the touched panels re-render.\n'
+          + `Fields that actually changed (${changed.length}): ${list}\n`
+          + 'Call shape: update_storyboard { id: "' + sb.id + '", set?: {…root fields…}, '
+          + 'scenes?: [{ id, set: {…} }], shots?: [{ id, set: {…} }] } — send ONLY those fields.\n'
+          + 'This guard only fires when the STRUCTURE is unchanged (same scenes, same shots, same ids, same order); '
+          + 'adding, removing, reordering or renumbering still belongs to save_storyboard. '
+          + 'For a genuine mass rewrite touching most of the document, pass `allowFullRewrite: true`.',
+        );
+      }
+    }
+
     const isUpdateIntent = _isStr(sb.createdAt) && !!sb.createdAt.trim();
     const _sameStoryboard = existing != null && (
       isUpdateIntent ||
