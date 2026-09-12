@@ -137,7 +137,7 @@ const generateImageAction = {
       prompt:          { type: 'string', description: 'Text description of the desired image. MANDATORY: write the prompt in English regardless of the user\'s language — image models are trained predominantly on English captions and degrade noticeably with non-English prompts. The ONLY exception is text the image itself must literally render (a sign, a label, dialogue in a speech bubble, on-screen UI copy): keep that verbatim in the user\'s language, wrapped in quotes inside the otherwise-English prompt. When you use named reference images, you can refer to them by alias in the prompt (e.g. "Paint the `illustration` onto the `boat`\'s hull, matching `placement_guide`") — far more precise than "FIRST/SECOND/THIRD reference".' },
       aspectRatio:     { type: 'string', description: 'Aspect ratio. Accepted values are per-model and documented in the `image-generator` skill — read it there. Omit to use the model default.' },
       resolution:      { type: 'string', description: 'Resolution. Accepted values are per-model and documented in the `image-generator` skill — read it there. Omit to use the model default.' },
-      quality:         { type: 'string', enum: ['low', 'medium', 'high', 'auto'], description: 'OPTIONAL. Sampling effort, decoupled from pixel count. Lower quality = faster + cheaper, less polished. Consumed only by models that advertise a sampling-effort knob (see the catalog snapshot — most slugs ignore it). Use "low" for thumbnails / storyboards / quick iteration, "medium" for general work, "high" for finals. "auto" lets the adapter pick. Omit entirely to fall back to the adapter\'s legacy behaviour (which derives quality from `resolution`).' },
+      quality:         { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'auto'], description: 'OPTIONAL. Sampling effort, decoupled from pixel count. Lower quality = faster + cheaper, less polished. Consumed only by models that advertise a sampling-effort knob (see the catalog snapshot — most slugs ignore it). Use "low" for thumbnails / storyboards / quick iteration, "medium" for general work, "high" for finals. "xhigh" / "max" add fine detail at much higher latency and cost, only on models whose card lists them. "auto" lets the adapter pick. Omit entirely to fall back to the adapter\'s legacy behaviour (which derives quality from `resolution`).' },
       n:               { type: 'number', description: 'Number of images to generate (default: 1)' },
       referenceImages: {
         type: 'array',
@@ -1187,12 +1187,12 @@ const generateImageAction = {
     if (action.label) genOpts.label = action.label;
     // Forward `quality` to the gateway — sampling-effort knob,
     // decoupled from `resolution` (pixel count). Currently consumed
-    // by openai/gpt-image-2(-edit); other slugs ignore it. Used by
-    // the storyboard visor to render small thumbnails at LOW
-    // sampling effort without dragging pixel count down too.
+    // by the openai/gpt-image-2 and gpt-image-2.5 families; other slugs
+    // ignore it. Used by the storyboard visor to render small thumbnails
+    // at LOW sampling effort without dragging pixel count down too.
     if (typeof action.quality === 'string') {
       const q = action.quality.toLowerCase();
-      if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') {
+      if (q === 'low' || q === 'medium' || q === 'high' || q === 'xhigh' || q === 'max' || q === 'auto') {
         genOpts.quality = q;
       }
     }

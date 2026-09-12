@@ -838,13 +838,13 @@ export class GatewayImageGen extends BaseImageGen {
       // resolution/quality are passed through to the Fal model as-is.
       if (opts.resolution) payload.resolution = opts.resolution;
       // Quality knob — separate from resolution (pixel count). Used by
-      // openai/gpt-image-2(-edit); fal slugs that don't expose an
-      // equivalent ignore it. Forwarded only when the caller set it
+      // the openai/gpt-image-2 and gpt-image-2.5 families; fal slugs that
+      // don't expose an equivalent ignore it. Forwarded only when the caller set it
       // explicitly so unset → adapter falls back to deriving quality
       // from resolution (legacy behaviour).
       if (typeof opts.quality === 'string') {
         const q = opts.quality.toLowerCase();
-        if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') {
+        if (q === 'low' || q === 'medium' || q === 'high' || q === 'xhigh' || q === 'max' || q === 'auto') {
           payload.quality = q;
         }
       }
