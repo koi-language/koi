@@ -3013,6 +3013,32 @@ import { formatModelCatalog } from './_format-model-catalog.js';
 // Wrap FIRST so the catalog refresh below mutates the registered object.
 // asyncCapable spreads a fresh schema/description, so any in-place edit to
 // the source `generateVideoAction` would land on a copy nobody reads.
+// A take generated from a 3D previz reference goes onto its clips by itself
+// (prepare_scene3d_video recorded which ones): the agent reviewing the take and
+// then forgetting assign_scene3d_take left the timeline on the old version.
+// Wrapped BEFORE asyncCapable so background (wait:false) jobs do it too.
+const _generateVideoRaw = generateVideoAction.execute;
+generateVideoAction.execute = async function (action, agent) {
+  const refs = Array.isArray(action?.referenceVideos) ? [...action.referenceVideos] : [];
+  const r = await _generateVideoRaw.call(this, action, agent);
+  if (!r?.success || !refs.length) return r;
+  try {
+    const { pendingTakeFor } = await import('../scene3d/_pending-takes.js');
+    const take = pendingTakeFor(refs);
+    const media = r.savedTo || (Array.isArray(r.artifacts) ? r.artifacts[0] : null);
+    if (take && typeof media === 'string') {
+      const assign = (await import('../scene3d/assign-scene3d-take.js')).default;
+      const a = await assign.execute({ timelineId: take.timelineId, clipIds: take.clipIds, mediaPath: media });
+      r.scene3dTake = a?.success
+        ? { assigned: true, timelineId: take.timelineId, clipIds: take.clipIds, note: 'Already placed on its 3D clips — do not call assign_scene3d_take again for this take.' }
+        : { assigned: false, error: a?.error || 'assign failed', note: 'Call assign_scene3d_take yourself.' };
+    }
+  } catch (e) {
+    r.scene3dTake = { assigned: false, error: e.message, note: 'Call assign_scene3d_take yourself.' };
+  }
+  return r;
+};
+
 const wrappedAction = asyncCapable(generateVideoAction);
 
 // Pristine knob vocabulary, snapshotted BEFORE the capability rewrite below

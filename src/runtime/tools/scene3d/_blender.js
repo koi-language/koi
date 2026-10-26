@@ -371,6 +371,16 @@ const _MAX_PARALLEL = Math.max(2, Math.min(4, Math.floor(os.cpus().length / 3)))
 let _active = 0;
 const _waiters = [];
 
+let _heavyTail = Promise.resolve();
+/** One heavy render at a time: resolves with its release once it is its turn. */
+function _heavySlot() {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const prev = _heavyTail;
+  _heavyTail = prev.then(() => held);
+  return prev.then(() => release);
+}
+
 async function _slot() {
   if (_active < _MAX_PARALLEL) { _active += 1; return; }
   await new Promise((r) => _waiters.push(r));
@@ -388,13 +398,21 @@ function _release() {
  * (`--scene`, `--shot`, `--out`, …). Resolves with the tail of the log;
  * rejects with the Python traceback when the script fails.
  */
-export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000 } = {}) {
+export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000, heavy = false } = {}) {
   const { bin } = await ensureBlender({ onProgress });
   const script = builderScriptPath();
+  // Long renders (video bakes) go one at a time: several Blenders rendering
+  // whole clips at once saturate the GPU the live previz and the app's own
+  // UI draw on, and everything froze for half a minute.
+  const releaseHeavy = heavy ? await _heavySlot() : null;
   await _slot();
   try {
     return await new Promise((resolve, reject) => {
-      const p = spawn(bin, ['-b', '--factory-startup', '-noaudio', '--python-exit-code', '1', '-P', script, '--', ...args], {
+      const argv = ['-b', '--factory-startup', '-noaudio', '--python-exit-code', '1', '-P', script, '--', ...args];
+      // macOS: utility QoS — the scheduler (CPU, I/O, GPU queue) serves the
+      // interactive app first; a plain nice only lowers CPU priority.
+      const bg = process.platform === 'darwin' && fs.existsSync('/usr/sbin/taskpolicy');
+      const p = spawn(bg ? '/usr/sbin/taskpolicy' : bin, bg ? ['-c', 'utility', bin, ...argv] : argv, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       // Renders run behind the live previz: never steal its time slices.
@@ -441,5 +459,6 @@ export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 
     });
   } finally {
     _release();
+    releaseHeavy?.();
   }
 }

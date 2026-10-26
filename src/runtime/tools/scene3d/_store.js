@@ -418,6 +418,7 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
             await runBuilder(['--scene', snap, '--jobs', jf, '--pass', pass, '--style', st, ...sz], {
               onProgress: (_p, label) => label && onProgress?.(null, label),
               onShotDone,
+              heavy: video, // whole clips: one at a time (see runBuilder)
             });
           } catch (e) {
             for (const j of chunk) failedBatch.set(j.shot, e.message);
@@ -511,7 +512,8 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height 
   const h = height ? Math.round(height / 2) * 2 : 0;
   const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h])).digest('hex').slice(0, 10);
   const out = path.join(dir, `${sh.id}-${key}-bake-${Math.round(fromMs)}-${Math.round(toMs)}.mp4`);
-  if (_exists(out)) return out;
+  // Kept beside the bake: who the camera sees and where (bakeInFrame).
+  if (_exists(out) && _exists(`${out}.inframe.json`)) return out;
   if (_bakes.has(out)) return _bakes.get(out);
   const run = (async () => {
     const snap = path.join(dir, `.snapshot-bake-${process.pid}-${key}.json`);
@@ -520,9 +522,8 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height 
     fs.writeFileSync(jf, JSON.stringify([{ shot: sh.id, out: `${out}.part.mp4`, fromMs, toMs }]), 'utf8');
     try {
       await runBuilder(['--scene', snap, '--jobs', jf, '--pass', 'beauty', '--style', st, '--samples', '8',
-        ...(w && h ? ['--width', String(w), '--height', String(h)] : [])]);
+        ...(w && h ? ['--width', String(w), '--height', String(h)] : [])], { heavy: true });
       fs.renameSync(`${out}.part.mp4`, out);
-      fs.rmSync(`${out}.inframe.json`, { force: true });
       return out;
     } finally {
       fs.rmSync(snap, { force: true });
@@ -531,6 +532,12 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height 
   })().finally(() => _bakes.delete(out));
   _bakes.set(out, run);
   return run;
+}
+
+/** Who a bake's camera sees and where on screen: { characters: [{id, name,
+ *  x (0 left … 1 right), share (of the frame height), frames, of}], props }. */
+export function bakeInFrame(bakePath) {
+  try { return JSON.parse(fs.readFileSync(`${bakePath}.inframe.json`, 'utf8')); } catch { return null; }
 }
 
 /** Drop render files no shot points at any more (keeps the newest 2 per shot

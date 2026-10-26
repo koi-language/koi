@@ -24,12 +24,13 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
-import { readScene, bakeWindow, isLivePath, storyboardPath, renderDir } from './_store.js';
+import { readScene, bakeWindow, bakeInFrame, isLivePath, storyboardPath, renderDir } from './_store.js';
 import { sceneSpatialRefs } from './_previz-sync.js';
 import { getTimeline } from '../../state/timelines.js';
 import { readCharacter } from '../../state/character-registry.js';
 import { resolveTimelineId } from '../timeline/_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
+import { notePendingTake } from './_pending-takes.js';
 
 /** The model 3D clips are generated with (user decision: Seedance 2.5). */
 export const SCENE3D_VIDEO_MODEL = 'bytedance/seedance-2.5/us/reference-to-video';
@@ -70,6 +71,66 @@ function _characterRefs(scene, shot, sb) {
     if (imgs.length) out.push({ character: card.name || c.name, images: imgs.slice(0, 2) });
   }
   return out;
+}
+
+// The previz tints when a character has no colour of its own (same order as
+// the builder's CHAR_PALETTE).
+const _PALETTE = ['#c0694a', '#4a7cc0', '#6aa05a', '#b58a3c', '#8a5ab0', '#4aa6a0'];
+
+/** A coarse colour word for a previz tint (the grey figures differ only by it). */
+function _colourWord(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+  if (!m) return 'grey';
+  const n = parseInt(m[1], 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => v / 255);
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  if (d < 0.08) return l > 0.6 ? 'white' : l < 0.3 ? 'dark grey' : 'grey';
+  let h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  h = (h * 60 + 360) % 360;
+  if (h < 20 || h >= 330) return 'red-pink';
+  if (h < 45) return 'orange';
+  if (h < 70) return 'yellow';
+  if (h < 160) return 'green';
+  if (h < 195) return 'teal';
+  if (h < 255) return 'blue';
+  if (h < 290) return 'purple';
+  return 'pink';
+}
+
+/** How each character looks in the grey previz: its tint and height. */
+function _castKey(scene) {
+  return (scene.characters || []).map((c, i) => ({
+    id: c.id,
+    name: c.name || c.id,
+    previz: `${_colourWord(c.color || _PALETTE[i % _PALETTE.length])} figure, ${Number(c.height || 1.75).toFixed(2)} m tall`,
+  }));
+}
+
+/** Who the reference shows in a shot and where, read off its bake. */
+function _onScreen(bake, key) {
+  const inf = bake ? bakeInFrame(bake) : null;
+  if (!Array.isArray(inf?.characters)) return undefined;
+  // Near a border the figure is only partly in frame: say so, or the prompt
+  // turns "right foreground" into someone filling half the shot (it hid the
+  // children in a take).
+  const side = (x) => (x < 0.1 ? 'left edge, partly out of frame' : x > 0.9 ? 'right edge, partly out of frame'
+    : x < 0.36 ? 'left' : x > 0.64 ? 'right' : 'centre');
+  return inf.characters
+    .filter((c) => c.frames > 0 && c.share >= 0.05)
+    .sort((a, b) => a.x - b.x)
+    .map((c) => {
+      const xs = Array.isArray(c.xs) ? c.xs : [c.x];
+      const moves = side(xs[0]) !== side(xs[xs.length - 1]);
+      return {
+        name: c.name,
+        previz: key.find((k) => k.id === c.id)?.previz,
+        screen: moves ? `${side(xs[0])} → ${side(xs[xs.length - 1])}` : side(c.x),
+        x: c.x,
+        ...(Number.isFinite(c.dist)
+          ? { depth: c.dist < 1.6 ? 'foreground' : c.dist < 4 ? 'midground' : 'background', distM: c.dist }
+          : { size: c.share >= 0.6 ? 'fills the frame height' : c.share >= 0.3 ? 'large' : 'small / far' }),
+      };
+    });
 }
 
 function _script(sbScene, sbShot) {
@@ -164,7 +225,9 @@ export default {
   },
 
   async execute(params) {
-    const timelineId = params?.timelineId ? String(params.timelineId) : await resolveTimelineId({});
+    let timelineId = params?.timelineId ? String(params.timelineId) : await resolveTimelineId({});
+    // A GUI tab handle ("tab-0") is not a timeline id: the active timeline is.
+    if (timelineId && !getTimeline(timelineId)) timelineId = await resolveTimelineId({});
     const tl = timelineId ? getTimeline(timelineId) : null;
     if (!tl) return { success: false, error: 'prepare_scene3d_video: no timeline — pass `timelineId`.' };
     const all = (tl.clips || []).filter((c) => c?.scene3d?.sceneId && c.scene3d?.shotId);
@@ -240,7 +303,9 @@ export default {
       const place = g[0].sbScene ? sceneSpatialRefs(g[0].sb, g[0].sbScene).slice(0, 4) : [];
       place.forEach(addImg);
       let at = 0;
+      const castKey = _castKey(scene);
       const shots = g.map((x, i) => {
+        const onScreen = _onScreen(parts[i], castKey);
         const s = {
           n: i + 1,
           clipId: x.clip.id,
@@ -248,6 +313,8 @@ export default {
           storyboardShotId: x.sbShot?.id || x.shot.storyboardShotId || null,
           fromSec: Math.round(at) / 1000,
           toSec: Math.round(at + x.clip.durationMs) / 1000,
+          // What the reference ACTUALLY shows: wins over the script's words.
+          ...(onScreen ? { onScreen } : {}),
           script: x.sbShot ? _script(x.sbScene, x.sbShot) : null,
           ...(!isLivePath(x.clip.path) ? { currentRealVideo: x.clip.path } : {}),
         };
@@ -258,6 +325,7 @@ export default {
       const prev = (tl.clips || [])
         .filter((x) => x.track === first.track && x.startMs + x.durationMs <= first.startMs + 1)
         .sort((a, b) => b.startMs - a.startMs)[0];
+      notePendingTake(referenceVideo, timelineId, g.map((x) => x.clip.id));
       takes.push({
         startMs: first.startMs,
         clipIds: g.map((x) => x.clip.id),
@@ -268,6 +336,7 @@ export default {
         clipsSec: Math.round(total) / 1000,
         aspectRatio: scene.aspect,
         shots,
+        castKey,
         characters,
         place,
         referenceImages: images,
@@ -289,8 +358,14 @@ export default {
         'every character\'s blocking and timing, and its CUTS exactly, re-render it photographically), ALL its ' +
         '`referenceImages` (who and where — never drop them), `duration: durationSec`, `aspectRatio`, and ONE multi-shot ' +
         'cinematic prompt that walks `shots` in order with their times ("Shot 1 (0–3.2 s): …, hard cut. Shot 2 (3.2–6.5 s): …") ' +
-        'keeping light, wardrobe, props and sound continuous across the cuts. Review the take, then assign_scene3d_take ' +
-        '{ timelineId, clipIds, mediaPath } — it splits the take over the clips at its real cuts. The clip LENGTHS ARE ' +
+        'keeping light, wardrobe, props and sound continuous across the cuts. SCREEN POSITIONS come from each shot\'s ' +
+        '`onScreen` (read off the 3D: who is left / centre / right), NEVER from the script\'s words when they disagree — ' +
+        'a prompt that puts someone on the other side than the reference makes the model follow the text and mirror the ' +
+        'shot. Name every character with its previz look from `castKey` ("the boy — the small blue figure in the ' +
+        'reference — …") so the model maps each grey figure to its character sheet. Review the take, then assign_scene3d_take ' +
+        '{ timelineId, clipIds, mediaPath } — it splits the take over the clips at its real cuts (generate_video already does ' +
+        'this on its own when the take used this referenceVideo: its result says `scene3dTake`; only call it yourself to ' +
+        'put a DIFFERENT take on the clips). The clip LENGTHS ARE ' +
         'PROTECTED: never trim, stretch or move a clip, and never generate shorter than durationSec.',
     };
   },

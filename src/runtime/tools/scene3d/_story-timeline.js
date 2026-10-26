@@ -74,6 +74,18 @@ function _scriptOrder(sb) {
   return out;
 }
 
+// What the montage last laid on V1 (`<sceneId>/<shotId>` keys), in a sidecar:
+// the GUI rewrites the timeline file from its own model and drops unknown
+// fields. Lets a GUI save tell "the user deleted this clip" from "a shot
+// the montage never had".
+const _laidPath = (id) => path.join(_home(), '.koi', 'timelines', `.${id}.montage.json`);
+function _readLaid(id) {
+  return _readJson(_laidPath(id)) || { at: 0, keys: [] };
+}
+function _writeLaid(id, keys) {
+  try { _writeJson(_laidPath(id), { at: Date.now(), keys }); } catch { /* best-effort */ }
+}
+
 const _managed = (c) => c?.track === 'V1' && c.scene3d?.sceneId && c.scene3d?.shotId;
 // Still the previz (live, or a legacy pre-rendered proxy) — not a generated video.
 const _isPreviz = (p, sceneId) => isLivePath(p) || (typeof p === 'string' && p.startsWith(renderDir(sceneId) + path.sep));
@@ -109,6 +121,8 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
   let at = 0;
   for (const it of items) {
     const { scene, shot, sbScene, sbShot } = it;
+    // The user took this camera out of the montage: it stays out.
+    if (shot.inMontage === false) continue;
     const prev = old.get(`${scene.id}/${shot.id}`);
     const link = { sceneId: scene.id, shotId: shot.id, storyboardShotId: sbShot.id, storyboardSceneId: sbScene.id,
       poster: shot.preview?.poster || null };
@@ -134,6 +148,15 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
     }
     placed.push(c);
     at += c.durationMs;
+  }
+  _writeLaid(id, placed.map((c) => `${c.scene3d.sceneId}/${c.scene3d.shotId}`));
+  // A clip that moved takes its linked clips with it (the take's own sound
+  // on an audio track), or they would play out of sync.
+  for (const c of placed) {
+    const prev = old.get(`${c.scene3d.sceneId}/${c.scene3d.shotId}`);
+    const d = prev ? c.startMs - prev.startMs : 0;
+    if (!d || !c.linkId) continue;
+    for (const o of others) if (o.linkId === c.linkId) o.startMs += d;
   }
   const strip = (cs) => JSON.stringify(cs.map((c) => [c.id, c.path, c.startMs, c.durationMs, c.sourceInMs, c.sourceTotalMs, c.scene3d]));
   if (strip([...old.values()].sort((a, b) => a.startMs - b.startMs)) === strip(placed)) return { timelineId: id, changed: false };
@@ -167,6 +190,15 @@ export function applyStoryTimelineEdits(tl) {
   if (!sb) return done;
   const clips = (tl.clips || []).filter(_managed).sort((a, b) => a.startMs - b.startMs);
   if (!clips.length) return done;
+  // A clip the montage had laid and this save no longer carries was deleted
+  // on the timeline: mark its shot out of the montage, or the next re-lay
+  // brings it back. A save racing a fresh re-lay (the GUI still holding the
+  // old clips) is not a deletion.
+  const laid = _readLaid(tl.id);
+  const removed = Date.now() - laid.at < 5000 ? [] : (() => {
+    const now = new Set(clips.map((c) => `${c.scene3d.sceneId}/${c.scene3d.shotId}`));
+    return laid.keys.filter((k) => !now.has(k));
+  })();
   const scenes = new Map();
   const sceneOf = (sid) => {
     if (!scenes.has(sid)) scenes.set(sid, { s: readScene(sid), touched: new Set() });
@@ -208,6 +240,16 @@ export function applyStoryTimelineEdits(tl) {
   const nextScenes = Array.isArray(sb.scenes) && _reorder(sb.scenes, sceneRank);
   if (nextScenes) { sb.scenes = nextScenes; done.storyboard = true; }
   if (done.storyboard) _writeJson(fp, sb);
+  for (const k of removed) {
+    const [sid, shotId] = k.split('/');
+    const e = sceneOf(sid);
+    const sh = e.s?.shots?.find((x) => x.id === shotId);
+    if (sh && sh.inMontage !== false) {
+      sh.inMontage = false;
+      e.touched.add(sh.id);
+    }
+  }
+  if (removed.length) _writeLaid(tl.id, laid.keys.filter((k) => !removed.includes(k)));
   for (const [sid, e] of scenes) {
     if (!e.s || !e.touched.size) continue;
     // Built from the storyboard as it is NOW (the edit came from here).

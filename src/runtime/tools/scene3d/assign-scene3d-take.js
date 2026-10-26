@@ -93,7 +93,9 @@ export default {
     try {
       if (!ids.length) throw new Error('clipIds is empty');
       if (typeof mediaPath !== 'string' || !fs.existsSync(mediaPath)) throw new Error(`no take at ${mediaPath}`);
-      const timelineId = params.timelineId ? String(params.timelineId) : await resolveTimelineId({});
+      let timelineId = params.timelineId ? String(params.timelineId) : await resolveTimelineId({});
+      // A GUI tab handle ("tab-0") is not a timeline id: the active timeline is.
+      if (timelineId && !getTimeline(timelineId)) timelineId = await resolveTimelineId({});
       const tl = timelineId ? getTimeline(timelineId) : null;
       if (!tl) throw new Error('no timeline — pass `timelineId`');
       const clips = ids.map((id) => tl.clips.find((c) => c.id === id));

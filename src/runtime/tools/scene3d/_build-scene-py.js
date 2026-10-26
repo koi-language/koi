@@ -1413,13 +1413,19 @@ def build_camera(SHOT):
         lens = FRAMING["lens"]
 
 
+    # Zoom keyed by hand on the stage: lens keys of their own, apart from
+    # the pose keys (which then leave the focal length alone).
+    LK = [(ms_to_frame(s_ms + int(x.get("t") or 0)), float(x["mm"])) for x in (C.get("lensKeys") or [])
+          if isinstance(x, dict) and isinstance(x.get("mm"), (int, float)) and x["mm"] > 0]
+
     def place(p, a, lens_mm, frame):
         cam.location = p
         tgt.location = a
-        cam_d.lens = lens_mm
         cam.keyframe_insert("location", frame=frame)
         tgt.keyframe_insert("location", frame=frame)
-        cam_d.keyframe_insert("lens", frame=frame)
+        if not LK:
+            cam_d.lens = lens_mm
+            cam_d.keyframe_insert("lens", frame=frame)
 
 
     # Follow mode re-frames on the subject every few frames (tracking shot).
@@ -1430,12 +1436,15 @@ def build_camera(SHOT):
     amount = move.get("amount")
     keys = SHOT.get("keyframes") or C.get("keyframes")
 
+    kfocus = []  # (frame, metres): focus pulled by hand on the stage
     if keys:
         # Fully explicit camera path (ms relative to the shot start).
         for kf in keys:
             fr = ms_to_frame(s_ms + int(kf.get("t") or kf.get("ms") or 0))
             p, a = explicit_or_framed({**C, **kf}, fr)
             place(p, a, float(kf.get("lens") or lens), fr)
+            if isinstance(kf.get("focus"), (int, float)) and kf["focus"] > 0:
+                kfocus.append((fr, float(kf["focus"])))
     elif mtype in ("follow", "track", "tracking"):
         step = max(2, int(FPS / 4))
         fr = f_s
@@ -1527,6 +1536,10 @@ def build_camera(SHOT):
             except Exception:
                 pass
 
+    for fr_, mm_ in LK:
+        cam_d.lens = mm_
+        cam_d.keyframe_insert("lens", frame=fr_)
+
     # Constant speed like a dolly on rails; "ease": true for a soft start/stop.
     interp = "BEZIER" if (move.get("ease") or keys or mtype in ("follow", "track", "tracking")) else "LINEAR"
     set_key_interp(cam, interp)
@@ -1539,10 +1552,18 @@ def build_camera(SHOT):
     # Depth of field (focus on the subject / target).
     focus = C.get("focus")
     fdist = C.get("focusDistance")
-    if C.get("dof") or (move.get("dof")) or focus or fdist:
+    for fk in C.get("focusKeys") or []:  # focus pulled by hand on the stage
+        if isinstance(fk, dict) and isinstance(fk.get("d"), (int, float)) and fk["d"] > 0:
+            kfocus.append((ms_to_frame(s_ms + int(fk.get("t") or 0)), float(fk["d"])))
+    if C.get("dof") or (move.get("dof")) or focus or fdist or kfocus:
         cam_d.dof.use_dof = True
         cam_d.dof.aperture_fstop = float(C.get("fstop") or 2.0)
-        if isinstance(fdist, (int, float)) and fdist > 0 and not (isinstance(focus, list) and focus):
+        if kfocus:
+            # Keyed on the camera's keyframes: a focus pull in metres.
+            for fr_, d_ in kfocus:
+                cam_d.dof.focus_distance = max(0.1, d_)
+                cam_d.dof.keyframe_insert("focus_distance", frame=fr_)
+        elif isinstance(fdist, (int, float)) and fdist > 0 and not (isinstance(focus, list) and focus):
             # Set by hand on the stage: a fixed distance in metres.
             cam_d.dof.focus_distance = max(0.1, float(fdist))
         elif isinstance(focus, list) and focus:
@@ -2084,12 +2105,29 @@ if args.live:
 
     _POLY = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
 
+    def _hull2d(pts):
+        """Convex hull of 2D points (monotone chain), counter-clockwise."""
+        pts = sorted(set(pts))
+        if len(pts) < 3:
+            return pts
+        cross = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+        lo, hi = [], []
+        for p_ in pts:
+            while len(lo) >= 2 and cross(lo[-2], lo[-1], p_) <= 0:
+                lo.pop()
+            lo.append(p_)
+        for p_ in reversed(pts):
+            while len(hi) >= 2 and cross(hi[-2], hi[-1], p_) <= 0:
+                hi.pop()
+            hi.append(p_)
+        return lo[:-1] + hi[:-1]
+
     def _lines(coords, color, width, w, h):
         if not coords:
             return
         _POLY.bind()
         _POLY.uniform_float("viewportSize", (w, h))
-        _POLY.uniform_float("lineWidth", width)
+        _POLY.uniform_float("lineWidth", width * LIVE.get("px", 1.0))  # stage drawn at screen pixels
         _POLY.uniform_float("color", color)
         batch_for_shader(_POLY, "LINES", {"pos": coords}).draw(_POLY)
 
@@ -2114,11 +2152,24 @@ if args.live:
                     seg = []
                     for i in range(4):
                         seg += [apex, fr[i], fr[i], fr[(i + 1) % 4]]
-                    # "Up" tick on top of the frame.
-                    top_mid = (fr[0] + fr[3]) / 2
-                    up = (fr[0] - fr[1]).normalized() * 0.12
-                    seg += [fr[0], top_mid + up, top_mid + up, fr[3]]
                     _lines(seg, (1.0, 0.62, 0.25, 1.0), 2.4, w, h)
+                    cd_ = cam.data
+                    if cd_.dof.use_dof:
+                        # Where it is in focus: the frame at the focus distance,
+                        # in grey (the camera's own frame stays amber).
+                        fo = cd_.dof.focus_object
+                        if fo is not None:
+                            fwd = -(mw.to_3x3() @ Vector((0, 0, 1)))
+                            fd = (fo.matrix_world.translation - apex).dot(fwd)
+                        else:
+                            fd = float(cd_.dof.focus_distance)
+                        fd = max(0.1, min(60.0, fd))
+                        loc = [v * (fd / max(1e-4, -v.z)) for v in cd_.view_frame(scene=scn)]
+                        fp = [mw @ v for v in loc]
+                        segf = []
+                        for i in range(4):
+                            segf += [fp[i], fp[(i + 1) % 4]]
+                        _lines(segf, (0.78, 0.78, 0.76, 0.85), 1.6, w, h)
                     pts = LIVE["paths"].get(sid) or []
                     segp = []
                     for a, b in zip(pts, pts[1:]):
@@ -2141,11 +2192,21 @@ if args.live:
         for sid in ORDER:
             if sid != LIVE["stage_shot"]:
                 continue
-            p = CAMS[sid].matrix_world.translation
+            cam = CAMS[sid]
+            p = cam.matrix_world.translation
             q = m @ Vector((p.x, p.y, p.z, 1.0))
             if q.w <= 1e-4:
                 continue
-            out.append({"shot": sid, "x": (q.x / q.w + 1) / 2, "y": (1 - q.y / q.w) / 2})
+            # The drawn frustum (apex + frame corners) on screen, so a click
+            # anywhere on the camera picks it, not only on its label.
+            mw = cam.matrix_world
+            sc_ = 0.55 / max(cam.data.display_size, 1e-3)
+            poly = []
+            for v in [p] + [mw @ (c * sc_) for c in cam.data.view_frame(scene=scn)]:
+                qq = m @ Vector((v.x, v.y, v.z, 1.0))
+                if qq.w > 1e-4:
+                    poly += [round((qq.x / qq.w + 1) / 2, 4), round((1 - qq.y / qq.w) / 2, 4)]
+            out.append({"shot": sid, "x": (q.x / q.w + 1) / 2, "y": (1 - q.y / q.w) / 2, "frustum": poly})
         return out
 
     def _send_json(obj, only=None):
@@ -2212,15 +2273,28 @@ if args.live:
         ad = obj.animation_data
         if not ad or not ad.action:
             return []
-        try:
-            return list(ad.action.fcurves)
-        except AttributeError:  # Blender 5 layered actions
-            out = []
-            for layer in ad.action.layers:
-                for strip in layer.strips:
+        act = ad.action
+        layers = getattr(act, "layers", None)
+        if not layers:
+            return list(act.fcurves)
+        # Blender 5 layered actions: the camera object and its data (lens,
+        # focus) can share ONE action in separate slots — read this ID's slot
+        # only (the legacy "fcurves" gives the first slot, i.e. the object's).
+        slot = getattr(ad, "action_slot", None)
+        out = []
+        for layer in layers:
+            for strip in layer.strips:
+                if slot is not None:
+                    try:
+                        bag = strip.channelbag(slot)
+                    except Exception:
+                        bag = None
+                    if bag is not None:
+                        out.extend(bag.fcurves)
+                else:
                     for bag in strip.channelbags:
                         out.extend(bag.fcurves)
-            return out
+        return out
 
     def _cam_pose_at(sid, frame):
         keep = scn.frame_current
@@ -2245,7 +2319,8 @@ if args.live:
         if keys and all(isinstance(k.get("position"), (list, tuple)) and isinstance(k.get("target"), (list, tuple))
                         for k in keys):
             return [{"t": int(k.get("t") or k.get("ms") or 0), "position": list(k["position"]),
-                     "target": list(k["target"]), "lens": float(k.get("lens") or (sh.get("camera") or {}).get("lens") or 35)}
+                     "target": list(k["target"]), "lens": float(k.get("lens") or (sh.get("camera") or {}).get("lens") or 35),
+                     **({"focus": float(k["focus"])} if isinstance(k.get("focus"), (int, float)) else {})}
                     for k in keys]
         frames = set()
         for fc in _anim_curves(CAMS[sid]):
@@ -2270,6 +2345,7 @@ if args.live:
                     bpy.data.cameras.remove(data)
         was_scene_cam = scn.camera is None
         CAMS[sid] = build_camera(_by_id[sid])
+        LIVE.setdefault("fcurves", {}).pop(sid, None)
         if was_scene_cam:
             scn.camera = CAMS[sid]
         LIVE["paths"].pop(sid, None)
@@ -2318,16 +2394,85 @@ if args.live:
         cp = lambda v: json.loads(json.dumps(v)) if v is not None else None
         return {"shot": sid, "keyframes": cp(sh.get("keyframes")), "move": cp(sh.get("move")), "camera": cp(sh.get("camera"))}
 
+    # Camera settings the stage edits besides the keyframes (saved with them).
+    CAM_FIELDS = ("dof", "fstop", "focusDistance", "focusOn", "focus", "focusKeys", "lensKeys", "lensKit")
+
     def _cam_edit(c, conn):
         sid = c.get("shot")
         if sid not in _by_id or not LIVE["stage_view"]:
             return False
         sh = _by_id[sid]
         op = c.get("op")
+        if op == "focus" and c.get("key"):
+            op = "focus_key"  # the focus distance keyed at the playhead
+        if op == "focus" and c.get("unkey"):
+            op = "focus_unkey"  # that focus key removed
+        if op == "lens":
+            op, c = "lane", {**c, "lane": "lens", "act": "key", "value": c.get("lens")}
+        elif op in ("focus_key", "focus_unkey"):
+            op, c = "lane", {**c, "lane": "focus", "act": "key" if op == "focus_key" else "unkey",
+                             "value": c.get("distance")}
+        if op == "lane":
+            # Zoom and focus keys live apart from the camera's pose keys, each
+            # on its lane: keyed at the playhead, slid in time, removed —
+            # nothing else moves.
+            lane = c.get("lane")
+            fld = {"lens": ("lensKeys", "mm"), "focus": ("focusKeys", "d")}.get(lane)
+            if not fld:
+                return False
+            lk, vk = fld
+            cam_c = dict(sh.get("camera") or {})
+            s0, dur0 = int(sh.get("startMs") or 0), int(sh.get("durationMs") or 3000)
+            half_ = 500.0 / FPS
+            relof = lambda ms_: int(round(max(0.0, min(float(dur0), float(ms_) - s0))))
+            ks = [dict(x) for x in cam_c.get(lk) or [] if isinstance(x, dict)]
+            if not ks:
+                # First touch: keep what the shot had (the zoom on its pose keys;
+                # a rack focus from the script, a character it follows) as keys,
+                # or the edit would replace it wholesale.
+                ks = _lane_bake(sid, lane)
+            act = c.get("act")
+            rel = relof(c.get("ms", c.get("t", s0)))
+            if act == "key":
+                v = float(c.get("value") or 0)
+                if lane == "lens":
+                    kit = cam_c.get("lensKit") if isinstance(cam_c.get("lensKit"), dict) else None
+                    lo, hi = (float(kit.get("min") or 8), float(kit.get("max") or 300)) if kit else (8.0, 300.0)
+                    v = round(max(lo, min(hi, v or 35.0)), 2)
+                else:
+                    v = round(max(0.1, min(500.0, v or 3.0)), 3)
+                    cam_c["dof"] = True
+                    cam_c.setdefault("fstop", 2.8)
+                    for f_ in ("focusDistance", "focusOn", "focus"):
+                        cam_c.pop(f_, None)
+                ks = [x for x in ks if abs(int(x.get("t") or 0) - rel) > half_] + [{"t": rel, vk: v}]
+            elif act == "unkey":
+                near = [x for x in ks if abs(int(x.get("t") or 0) - rel) <= half_ + 1]
+                if not near or (lane == "lens" and len(ks) <= 1):
+                    return False
+                ks.remove(near[0])
+            elif act == "retime":
+                to = relof(c.get("to", s0))
+                near = [x for x in ks if abs(int(x.get("t") or 0) - rel) <= half_ + 1]
+                if not near or any(x is not near[0] and abs(int(x.get("t") or 0) - to) <= half_ for x in ks):
+                    return False
+                near[0]["t"] = to
+            else:
+                return False
+            ks.sort(key=lambda x: int(x.get("t") or 0))
+            if ks:
+                cam_c[lk] = ks
+            else:
+                cam_c.pop(lk, None)
+            sh["camera"] = cam_c
+            _rebuild_cam(sid)
+            _send_json({"type": "cam_edited", "shot": sid, "op": "focus", "keyframes": sh.get("keyframes"),
+                        "camera": {f_: cam_c.get(f_) for f_ in CAM_FIELDS}}, only=conn)
+            return True
         if op == "focus":  # depth of field: aperture / focus distance, whole shot
             cam_c = dict(sh.get("camera") or {})
             if c.get("off"):
-                for f_ in ("dof", "fstop", "focusDistance", "focusOn", "focus"):
+                for f_ in ("dof", "fstop", "focusDistance", "focusOn", "focus", "focusKeys"):
                     cam_c.pop(f_, None)
             else:
                 cam_c["dof"] = True
@@ -2340,14 +2485,35 @@ if args.live:
             sh["camera"] = cam_c
             _rebuild_cam(sid)
             _send_json({"type": "cam_edited", "shot": sid, "op": "focus", "keyframes": sh.get("keyframes"),
-                        "camera": {f_: cam_c.get(f_) for f_ in ("dof", "fstop", "focusDistance", "focusOn", "focus")}},
+                        "camera": {f_: cam_c.get(f_) for f_ in CAM_FIELDS}},
                        only=conn)
             return True
         s_ms = int(sh.get("startMs") or 0)
         dur = int(sh.get("durationMs") or 3000)
         keys = _shot_keys(sid)
         half = 500.0 / FPS
-        if op in ("move", "aim", "lens", "pose", "rotate"):
+        cam_c = dict(sh.get("camera") or {})
+        kit = cam_c.get("lensKit") if isinstance(cam_c.get("lensKit"), dict) else None
+        def fit(mm):  # a focal length the shot's lens can reach
+            lo, hi = (float(kit.get("min") or 8), float(kit.get("max") or 300)) if kit else (8.0, 300.0)
+            return max(lo, min(hi, float(mm)))
+        if op == "kit":
+            # The lens on the camera (objetivo) is one for the whole shot: a
+            # prime fixes the focal length, a zoom bounds it.
+            k_ = c.get("kit")
+            if isinstance(k_, dict) and k_.get("min"):
+                kit = {"name": str(k_.get("name") or ""), "min": float(k_["min"]), "max": float(k_.get("max") or k_["min"])}
+                cam_c["lensKit"] = kit
+            else:
+                kit = None
+                cam_c.pop("lensKit", None)
+            for k_ in keys:
+                k_["lens"] = round(fit(k_["lens"]), 2)
+            if isinstance(cam_c.get("lensKeys"), list):
+                cam_c["lensKeys"] = [{**x, "mm": round(fit(x.get("mm") or 35), 2)} for x in cam_c["lensKeys"]
+                                     if isinstance(x, dict)]
+            i = None
+        elif op in ("move", "aim", "pose", "rotate"):
             rel = max(0.0, min(float(dur), float(c.get("ms", s_ms)) - s_ms))
             i = next((j for j, k in enumerate(keys) if abs(k["t"] - rel) <= half), None)
             if i is None:
@@ -2359,8 +2525,15 @@ if args.live:
             i = int(c.get("index", -1))
             if not 0 <= i < len(keys):
                 return False
-        k = keys[i]
-        P, A = Vector(k["position"]), Vector(k["target"])
+        if op == "retime":  # a keyframe slid along the shot
+            t_ = int(round(max(0.0, min(float(dur), float(c.get("t") or 0)))))
+            if any(j != i and abs(k_["t"] - t_) <= half for j, k_ in enumerate(keys)):
+                return False
+            keys[i]["t"] = t_
+            keys.sort(key=lambda k_: k_["t"])
+            i = None
+        k = keys[i] if i is not None else None
+        P, A = (Vector(k["position"]), Vector(k["target"])) if k else (None, None)
         def motion(pt):
             if c.get("delta") is not None:  # along a gizmo axis, world metres
                 return Vector([float(v) for v in c["delta"]][:3])
@@ -2378,35 +2551,119 @@ if args.live:
             ax = Vector([float(v) for v in (c.get("axis") or [0, 0, 1])][:3])
             if ax.length > 1e-6:
                 A = P + Matrix.Rotation(float(c.get("angle") or 0.0), 3, ax.normalized()) @ (A - P)
-        elif op == "lens":
-            k["lens"] = max(8.0, min(300.0, float(c.get("lens") or k["lens"])))
         elif op == "pose":  # the stage's own view becomes the camera here
             f = LIVE["stage_view"]
             P, A = f["pos"].copy(), f["tgt"].copy()
-            k["lens"] = float(c.get("lens") or f["lens"])
+            k["lens"] = fit(c.get("lens") or f["lens"])
         elif op == "delete_key":
             if len(keys) > 1:
                 keys.pop(i)
-        if op != "delete_key":
+        if k is not None and op != "delete_key":
             k["position"] = [round(v, 4) for v in P]
             k["target"] = [round(v, 4) for v in A]
         sh["keyframes"] = keys
         sh.pop("move", None)
-        cam_c = dict(sh.get("camera") or {})
         cam_c.pop("frame", None)  # baked aims are already composed
         cam_c.pop("keyframes", None)
         cam_c.pop("move", None)
         sh["camera"] = cam_c
         _rebuild_cam(sid)
-        _send_json({"type": "cam_edited", "shot": sid, "keyframes": keys}, only=conn)
+        _send_json({"type": "cam_edited", "shot": sid, "keyframes": keys,
+                    "camera": {f_: cam_c.get(f_) for f_ in CAM_FIELDS}}, only=conn)
         return True
+
+    def _lane_bake(sid, lane):
+        """The zoom / focus a shot has now, as keys of its lane [{t, mm|d}]."""
+        sh = _by_id[sid]
+        s0 = int(sh.get("startMs") or 0)
+        if lane == "lens":
+            return _runs([{"t": k["t"], "mm": round(float(k["lens"]), 2)} for k in _shot_keys(sid)], "mm")
+        fc_ = _focus_curve(sid)
+        times = [m_ - s0 for m_ in fc_["keys"]] or (
+            [p_[0] - s0 for p_ in fc_["pts"]] if CAMS[sid].data.dof.focus_object is not None else [])
+        out = []
+        for t_ in times:
+            d_ = _focus_at(sid, s0 + t_)
+            if d_ is not None:
+                out.append({"t": int(t_), "d": round(d_, 3)})
+        return _runs(out, "d")
+
+    def _runs(ks, vk):
+        """Keys without repeats: a held value keeps only where it starts and,
+        when it changes after, where it ends (the hold before a change)."""
+        out = []
+        for j, k_ in enumerate(ks):
+            prev = ks[j - 1][vk] if j else None
+            nxt = ks[j + 1][vk] if j + 1 < len(ks) else None
+            same = lambda a_, b_: a_ is not None and b_ is not None and abs(a_ - b_) < 1e-3
+            if j == 0 or not same(prev, k_[vk]) or (nxt is not None and not same(nxt, k_[vk])):
+                out.append(k_)
+        return out
+
+    def _focus_at(sid, ms):
+        """Focus distance of the shot camera at scene time MS (None: no DOF)."""
+        cam = CAMS[sid]
+        cd = cam.data
+        if not cd.dof.use_dof:
+            return None
+        keep = scn.frame_current
+        scn.frame_set(ms_to_frame(ms))
+        fo = cd.dof.focus_object
+        if fo is not None:
+            fwd = -(cam.matrix_world.to_3x3() @ Vector((0, 0, 1)))
+            d = (fo.matrix_world.translation - cam.matrix_world.translation).dot(fwd)
+        else:
+            d = float(cd.dof.focus_distance)
+        scn.frame_set(keep)
+        return max(0.1, d)
+
+    def _focus_curve(sid):
+        """The focus distance over the shot, for the stage's lane: points
+        [ms, metres] and the moments it is keyed (rack focus from the script
+        or pulled by hand). Cached until the camera is rebuilt."""
+        cache = LIVE.setdefault("fcurves", {})
+        if sid in cache:
+            return cache[sid]
+        cam = CAMS[sid]
+        cd = cam.data
+        sh = _by_id[sid]
+        s_ms = int(sh.get("startMs") or 0)
+        dur = int(sh.get("durationMs") or 3000)
+        out = {"pts": [], "keys": []}
+        if cd.dof.use_dof:
+            fr_of = lambda ms: 1 + ms * FPS / 1000.0
+            fc = next((f for f in _anim_curves(cd) if f.data_path == "dof.focus_distance"), None)
+            if fc is not None:
+                for i in range(25):
+                    ms = s_ms + dur * i / 24.0
+                    out["pts"].append([int(ms), round(max(0.1, fc.evaluate(fr_of(ms))), 3)])
+                for kp in fc.keyframe_points:
+                    ms = _frame_ms(kp.co[0])
+                    if s_ms - 1 <= ms <= s_ms + dur + 1:
+                        out["keys"].append(int(round(ms)))
+            elif cd.dof.focus_object is not None:
+                # On a character / prop: the distance changes as they move.
+                keep = scn.frame_current
+                fo = cd.dof.focus_object
+                for i in range(13):
+                    ms = s_ms + dur * i / 12.0
+                    scn.frame_set(ms_to_frame(ms))
+                    fwd = -(cam.matrix_world.to_3x3() @ Vector((0, 0, 1)))
+                    d = (fo.matrix_world.translation - cam.matrix_world.translation).dot(fwd)
+                    out["pts"].append([int(ms), round(max(0.1, d), 3)])
+                scn.frame_set(keep)
+            else:
+                d = round(float(cd.dof.focus_distance), 3)
+                out["pts"] = [[s_ms, d], [s_ms + dur, d]]
+        cache[sid] = out
+        return out
 
     def _cam_handles(sid, m):
         """What the stage needs to draw and drag the selected camera: its
         keyframes (camera point + aim point), where it is and looks now, and
         the view-projection to put world points on screen."""
         out = {"vp": [round(v, 6) for row in m for v in row], "keys": [], "cam": None, "aim": None, "lens": None,
-               "fstop": None, "focus": None}
+               "fstop": None, "focus": None, "kit": None, "s0": None, "dur": None}
         if sid not in _by_id:
             return out
         sh = _by_id[sid]
@@ -2414,7 +2671,20 @@ if args.live:
         for i, k in enumerate(sh.get("keyframes") or []):
             if isinstance(k.get("position"), (list, tuple)) and isinstance(k.get("target"), (list, tuple)):
                 out["keys"].append({"i": i, "ms": s_ms + int(k.get("t") or 0),
-                                    "p": [float(v) for v in k["position"]][:3], "t": [float(v) for v in k["target"]][:3]})
+                                    "p": [float(v) for v in k["position"]][:3], "t": [float(v) for v in k["target"]][:3],
+                                    "lens": float(k.get("lens") or 35),
+                                    "focus": float(k["focus"]) if isinstance(k.get("focus"), (int, float)) else None})
+        out["s0"], out["dur"] = s_ms, int(sh.get("durationMs") or 3000)
+        kit = (sh.get("camera") or {}).get("lensKit")
+        out["kit"] = kit if isinstance(kit, dict) else None
+        out["fcurve"] = _focus_curve(sid)
+        # The keys of each lane, as the stage draws them (scene ms).
+        cc = sh.get("camera") or {}
+        lk = [x for x in cc.get("lensKeys") or [] if isinstance(x, dict)]
+        out["lensKeys"] = ([[s_ms + int(x.get("t") or 0), float(x.get("mm") or 35)] for x in lk] if lk else
+                           [[x["t"], x["mm"]] for x in _runs([{"t": k_["ms"], "mm": k_["lens"]} for k_ in out["keys"]], "mm")])
+        fk = [x for x in cc.get("focusKeys") or [] if isinstance(x, dict)]
+        out["focusKeys"] = ([s_ms + int(x.get("t") or 0) for x in fk] if fk else list(out["fcurve"]["keys"]))
         cam = CAMS[sid]
         out["lens"] = round(float(cam.data.lens), 1)
         cd = cam.data
@@ -2500,6 +2770,9 @@ if args.live:
             LIVE["stage_view"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 24),
                                   "ortho": bool(c.get("ortho"))}
             LIVE["cut_dirty"] = True
+            # Orbiting draws fast (1 sample, like playback); the full-quality
+            # frame lands a beat after it stops.
+            LIVE["moved_at"] = time.time()
         elif k == "stage_time":  # scene clock (ms), + the shot the editor is on
             before = (ms_to_frame(LIVE["stage_ms"]), ms_to_frame(LIVE["clock"] or 0), LIVE["stage_shot"])
             new_ms = max(0.0, min(float(c.get("ms") or 0), float(DUR_MS)))
@@ -2543,25 +2816,35 @@ if args.live:
                 return False
             # Hover: where the character sits on screen (0..1 box), so the
             # stage can mark it and float its mini card over it.
+            # ...and its silhouette: every body part's outline on screen (the
+            # 2D hull of its vertices), which the stage unites into the
+            # figure's shape as it stands now.
             box = None
+            parts = []
             if found:
                 xs, ys = [], []
                 for o2 in scn.objects:
                     if o2.type != "MESH" or not o2.name.startswith(f"{found}_") or not o2.visible_get():
                         continue
                     mw = o2.matrix_world
-                    for corner in o2.bound_box:
-                        v = mw @ Vector(corner) - pos
+                    pts2 = []
+                    for vx in o2.data.vertices:
+                        v = mw @ vx.co - pos
                         z = v.dot(fwd)
                         if z <= 0.05:
                             continue
                         if ortho:
                             z = (tgt - pos).length
-                        xs.append((v.dot(right) / z / half_w + 1) / 2)
-                        ys.append((1 - v.dot(up) / z / half_h) / 2)
+                        pts2.append(((v.dot(right) / z / half_w + 1) / 2, (1 - v.dot(up) / z / half_h) / 2))
+                    if len(pts2) < 3:
+                        continue
+                    hull = _hull2d(pts2)
+                    parts.append([round(q, 4) for pt in hull for q in pt])
+                    xs += [pt[0] for pt in hull]
+                    ys += [pt[1] for pt in hull]
                 if xs:
                     box = [min(xs), min(ys), max(xs), max(ys)]
-            _send_json({"type": "pick", "hover": True, "character": found, "box": box}, only=conn)
+            _send_json({"type": "pick", "hover": True, "character": found, "box": box, "parts": parts}, only=conn)
             return False
         elif k == "cam_edit":
             return _cam_edit(c, conn)
@@ -2604,6 +2887,7 @@ if args.live:
         elif k == "size":
             LIVE["w"] = max(64, int(c.get("w") or 960))
             LIVE["h"] = max(64, int(c.get("h") or 540))
+            LIVE["px"] = max(1.0, min(3.0, float(c.get("px") or 1.0)))  # image pixels per screen point
             # A timeline preview may send its size before its first follow:
             # keep it for the view that follow creates.
             LIVE.setdefault("early_size", {})[conn] = (LIVE["w"], LIVE["h"])
@@ -3361,10 +3645,11 @@ def in_frame(cam, f0, f1):
             if vis:
                 ys = [min(max(q.y, 0.0), 1.0) for q in pts if q.z > 0]
                 share = (max(ys) - min(ys)) if ys else 0.0
-                c = chars.setdefault(cid, {"frames": 0, "share": 0.0, "x": 0.0})
+                c = chars.setdefault(cid, {"frames": 0, "share": 0.0, "xs": [], "zs": []})
+                c["zs"].append(sum(q.z for q in vis) / len(vis))
                 c["frames"] += 1
                 c["share"] = max(c["share"], round(share, 2))
-                c["x"] = round(min(1.0, max(0.0, sum(q.x for q in vis) / len(vis))), 2)
+                c["xs"].append(min(1.0, max(0.0, sum(q.x for q in vis) / len(vis))))
         for p_ in SETD.get("props") or []:
             ob = bpy.data.objects.get(f"prop_{p_.get('id')}")
             if not ob:
@@ -3376,7 +3661,9 @@ def in_frame(cam, f0, f1):
     return {
         "characters": [{"id": cid, "name": (names.get(cid) or {}).get("name") or cid,
                         "characterId": (names.get(cid) or {}).get("characterId"),
-                        "share": v["share"], "x": v["x"], "frames": v["frames"], "of": len(frames)}
+                        "share": v["share"], "x": round(sum(v["xs"]) / len(v["xs"]), 2),
+                        "xs": [round(x_, 2) for x_ in v["xs"]], "dist": round(sum(v["zs"]) / len(v["zs"]), 2),
+                        "frames": v["frames"], "of": len(frames)}
                        for cid, v in chars.items()],
         "props": sorted(props),
     }
