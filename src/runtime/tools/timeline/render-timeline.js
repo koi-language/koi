@@ -20,6 +20,27 @@ import { startJob, awaitJob, getJob } from '../../state/jobs.js';
 import { ensureFfmpeg } from '../../media/ffmpeg-installer.js';
 import { compileTimeline } from '../../media/timeline-renderer.js';
 import { resolveTimelineId } from './_resolve-timeline-id.js';
+import { bakeWindow, isLivePath } from '../scene3d/_store.js';
+
+/** Live 3D clips (`scene3d:…`) have no file: bake exactly the windows the
+ *  timeline uses (cached), and render from a copy pointing at them. */
+async function _bakeLive3d(tl, action) {
+  const live = (tl.clips || []).filter((c) => isLivePath(c.path) && c.scene3d?.sceneId && c.scene3d?.shotId);
+  if (!live.length) return tl;
+  const width = action.width || tl.settings?.width;
+  const height = action.height || tl.settings?.height;
+  const baked = new Map();
+  await Promise.all(live.map(async (c) => {
+    const from = Math.max(0, Math.round(c.sourceInMs || 0));
+    baked.set(c.id, await bakeWindow(c.scene3d.sceneId, c.scene3d.shotId, from, from + c.durationMs, { width, height }));
+  }));
+  return {
+    ...tl,
+    clips: tl.clips.map((c) => (baked.has(c.id)
+      ? { ...c, path: baked.get(c.id), sourceInMs: 0, sourceTotalMs: c.durationMs }
+      : c)),
+  };
+}
 
 export default {
   type: 'render_timeline',
@@ -62,8 +83,13 @@ export default {
     if (!id) {
       return { success: false, error: 'render_timeline: pass `id` (or have a timeline as the active document).' };
     }
-    const tl = getTimeline(id);
+    let tl = getTimeline(id);
     if (!tl) return { success: false, error: `Timeline ${id} not found` };
+    try {
+      tl = await _bakeLive3d(tl, action);
+    } catch (e) {
+      return { success: false, error: `render_timeline: baking 3D previz shots failed: ${e.message}` };
+    }
 
     let plan;
     try {

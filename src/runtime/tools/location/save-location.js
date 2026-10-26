@@ -280,7 +280,15 @@ export default {
       `${normalized.plate ? ', plate' : ''})` +
       `${collisionRenamedFrom ? ` [id "${collisionRenamedFrom}" was taken → saved as "${normalized.id}"]` : ''}.`);
 
+    // The 3D previz of every storyboard using this place must follow its
+    // new plate / photos.
+    let previz3d = [];
+    try {
+      const { previzForLocation } = await import('../scene3d/_previz-sync.js');
+      previz3d = previzForLocation(normalized.id);
+    } catch { /* advisory */ }
     return {
+      ...(previz3d.length ? { previz3d } : {}),
       success: true,
       filePath,
       location: normalized,

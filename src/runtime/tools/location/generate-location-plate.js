@@ -181,7 +181,15 @@ export default {
     channel.log('generate_location_plate',
       `${view} view ${platePath} (model ${r.model || model}, refs ${refs.length})${locationId ? ` [attached=${attached}]` : ''}`);
 
+    let previz3d = [];
+    if (locationId && attached) {
+      try {
+        const { previzForLocation } = await import('../scene3d/_previz-sync.js');
+        previz3d = previzForLocation(locationId);
+      } catch { /* advisory */ }
+    }
     return {
+      ...(previz3d.length ? { previz3d } : {}),
       success: true,
       view,
       [field]: platePath,

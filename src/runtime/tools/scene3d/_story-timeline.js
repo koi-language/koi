@@ -1,0 +1,221 @@
+/**
+ * The story's own montage timeline (`role: 'storyboard'`).
+ *
+ * Every 3D shot of a storyboard lies on V1 of ONE timeline, in script order,
+ * end to end — a LIVE window on the scene clock (`scene3d:<scene>/<shot>`:
+ * Blender interprets it in the preview, nothing is pre-rendered). The link runs
+ * both ways:
+ *   - script / 3D → timeline: `ensureStoryTimeline` re-lays the clips
+ *     (after every re-render, storyboard save or new shot);
+ *   - timeline → script / 3D: `applyStoryTimelineEdits` writes a trim, slip
+ *     or reorder made on the timeline back into the storyboard (durations,
+ *     shot order) and the scene3d shot windows, re-stamping their source
+ *     signature so the edit never reads as "previz out of date".
+ *
+ * Clips the user generated a real video onto keep their media; they only
+ * move with the script order.
+ */
+
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { listScenes, readScene, writeScene, storyboardPath, renderDir, renderScene, livePath, isLivePath } from './_store.js';
+import { createTimeline, getTimeline, updateTimeline } from '../../state/timelines.js';
+import { stampSources } from './_previz-sync.js';
+import { channel } from '../../io/channel.js';
+
+const _home = () => process.env.HOME || os.homedir();
+
+function _readJson(fp) {
+  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+}
+
+function _writeJson(fp, obj) {
+  const tmp = `${fp}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, fp);
+}
+
+/** Id of the storyboard's montage timeline, or null. */
+export function findStoryTimeline(storyboardId) {
+  if (!storyboardId) return null;
+  const dir = path.join(_home(), '.koi', 'timelines');
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return null; }
+  let best = null;
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    let raw;
+    try { raw = fs.readFileSync(fp, 'utf8'); } catch { continue; }
+    if (!raw.includes(storyboardId) || !raw.includes('"storyboard"')) continue;
+    const tl = _readJson(fp);
+    if (tl?.role === 'storyboard' && tl.storyboardId === storyboardId) {
+      if (!best || String(tl.createdAt || '') < String(best.createdAt || '')) best = tl;
+    }
+  }
+  return best?.id || null;
+}
+
+/** Linked 3D shots in script order: [{ sbScene, sbShot, scene, shot }]. */
+function _scriptOrder(sb) {
+  const linked = new Map();
+  for (const meta of listScenes()) {
+    if (meta.storyboard?.id !== sb.id) continue;
+    const s = readScene(meta.id);
+    for (const sh of s?.shots || []) if (sh.storyboardShotId) linked.set(sh.storyboardShotId, { scene: s, shot: sh });
+  }
+  const out = [];
+  for (const sc of sb.scenes || []) {
+    for (const shot of sc.shots || []) {
+      const l = linked.get(shot?.id);
+      if (l) out.push({ sbScene: sc, sbShot: shot, ...l });
+    }
+  }
+  return out;
+}
+
+const _managed = (c) => c?.track === 'V1' && c.scene3d?.sceneId && c.scene3d?.shotId;
+// Still the previz (live, or a legacy pre-rendered proxy) — not a generated video.
+const _isPreviz = (p, sceneId) => isLivePath(p) || (typeof p === 'string' && p.startsWith(renderDir(sceneId) + path.sep));
+
+/**
+ * Create (when missing and `create`) and re-lay the storyboard's montage.
+ * @returns {{ timelineId: string|null, changed: boolean }}
+ */
+export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
+  const sb = _readJson(storyboardPath(storyboardId));
+  if (!sb) return { timelineId: null, changed: false };
+  const items = _scriptOrder(sb);
+  let id = findStoryTimeline(storyboardId);
+  if (!id) {
+    if (!create || !items.length) return { timelineId: null, changed: false };
+    const first = items[0].scene;
+    const [w, h] = [first.resolution?.width, first.resolution?.height];
+    const k = w && h ? 1920 / Math.max(w, h) : 1;
+    const even = (v) => Math.round((v * k) / 2) * 2;
+    id = createTimeline({
+      name: sb.name || 'Storyboard',
+      storyboardId,
+      role: 'storyboard',
+      summary: `Montage of the storyboard "${sb.name || storyboardId}": every 3D shot in script order`,
+      settings: { videoTracks: 2, audioTracks: 2, ...(w && h ? { fps: first.fps, width: even(w), height: even(h) } : {}) },
+    }).id;
+  }
+  const tl = getTimeline(id);
+  if (!tl) return { timelineId: null, changed: false };
+  const old = new Map((tl.clips || []).filter(_managed).map((c) => [`${c.scene3d.sceneId}/${c.scene3d.shotId}`, c]));
+  const others = (tl.clips || []).filter((c) => !_managed(c));
+  const placed = [];
+  let at = 0;
+  for (const it of items) {
+    const { scene, shot, sbScene, sbShot } = it;
+    const prev = old.get(`${scene.id}/${shot.id}`);
+    const link = { sceneId: scene.id, shotId: shot.id, storyboardShotId: sbShot.id, storyboardSceneId: sbScene.id,
+      poster: shot.preview?.poster || null };
+    let c;
+    if (prev && !_isPreviz(prev.path, scene.id)) {
+      // A real generated video sits here: keep its media, follow the order.
+      c = { ...prev, startMs: at, scene3d: { ...prev.scene3d, ...link } };
+    } else {
+      c = {
+        ...(prev || {}),
+        track: 'V1',
+        path: livePath(scene.id, shot.id),
+        startMs: at,
+        durationMs: shot.durationMs,
+        // A window on the scene clock: trim / slip move it, live.
+        sourceInMs: shot.startMs,
+        sourceTotalMs: scene.durationMs,
+        hasAudio: false,
+        sourceWidthPx: scene.resolution?.width,
+        sourceHeightPx: scene.resolution?.height,
+        scene3d: link,
+      };
+    }
+    placed.push(c);
+    at += c.durationMs;
+  }
+  const strip = (cs) => JSON.stringify(cs.map((c) => [c.id, c.path, c.startMs, c.durationMs, c.sourceInMs, c.sourceTotalMs, c.scene3d]));
+  if (strip([...old.values()].sort((a, b) => a.startMs - b.startMs)) === strip(placed)) return { timelineId: id, changed: false };
+  updateTimeline(id, { ...tl, clips: [...others, ...placed] });
+  return { timelineId: id, changed: true };
+}
+
+/** Ordering key per item: its clip rank, or just after the previous one. */
+function _reorder(list, rankOf) {
+  let last = -1;
+  const keyed = list.map((x, i) => {
+    const r = rankOf(x);
+    const k = r == null ? last + 0.001 : r;
+    last = k;
+    return { x, k, i };
+  });
+  keyed.sort((a, b) => a.k - b.k || a.i - b.i);
+  const out = keyed.map((e) => e.x);
+  return out.some((x, i) => x !== list[i]) ? out : null;
+}
+
+/**
+ * A GUI save of a montage timeline: carry its edits into the story.
+ * @returns {{ storyboard: boolean, scenes: string[] }} what changed
+ */
+export function applyStoryTimelineEdits(tl) {
+  const done = { storyboard: false, scenes: [] };
+  if (tl?.role !== 'storyboard' || !tl.storyboardId) return done;
+  const fp = storyboardPath(tl.storyboardId);
+  const sb = _readJson(fp);
+  if (!sb) return done;
+  const clips = (tl.clips || []).filter(_managed).sort((a, b) => a.startMs - b.startMs);
+  if (!clips.length) return done;
+  const scenes = new Map();
+  const sceneOf = (sid) => {
+    if (!scenes.has(sid)) scenes.set(sid, { s: readScene(sid), touched: new Set() });
+    return scenes.get(sid);
+  };
+  const sbShots = new Map();
+  for (const sc of sb.scenes || []) for (const sh of sc.shots || []) sbShots.set(sh.id, sh);
+  const rank = new Map(); // storyboard shot id → clip order
+  clips.forEach((c, i) => {
+    const e = sceneOf(c.scene3d.sceneId);
+    const sh = e.s?.shots?.find((x) => x.id === c.scene3d.shotId);
+    if (!sh) return;
+    if (sh.storyboardShotId) rank.set(sh.storyboardShotId, i);
+    const dur = Math.max(200, Math.round(c.durationMs));
+    let start = sh.startMs;
+    if (isLivePath(c.path)) start = Math.round(c.sourceInMs || 0);
+    start = Math.max(0, Math.min(start, Math.max(0, (e.s.durationMs || start + dur) - dur)));
+    if (start !== sh.startMs || dur !== sh.durationMs) {
+      sh.startMs = start;
+      sh.durationMs = dur;
+      e.touched.add(sh.id);
+    }
+    const sbShot = sh.storyboardShotId && sbShots.get(sh.storyboardShotId);
+    const secs = Math.round(dur / 100) / 10;
+    if (sbShot && sbShot.duration !== secs) {
+      sbShot.duration = secs;
+      done.storyboard = true;
+    }
+  });
+  // Shot order (inside each scene) and scene order follow the montage.
+  for (const sc of sb.scenes || []) {
+    const next = Array.isArray(sc.shots) && _reorder(sc.shots, (sh) => rank.get(sh?.id) ?? null);
+    if (next) { sc.shots = next; done.storyboard = true; }
+  }
+  const sceneRank = (sc) => {
+    const r = (sc.shots || []).map((sh) => rank.get(sh?.id)).filter((x) => x != null);
+    return r.length ? Math.min(...r) : null;
+  };
+  const nextScenes = Array.isArray(sb.scenes) && _reorder(sb.scenes, sceneRank);
+  if (nextScenes) { sb.scenes = nextScenes; done.storyboard = true; }
+  if (done.storyboard) _writeJson(fp, sb);
+  for (const [sid, e] of scenes) {
+    if (!e.s || !e.touched.size) continue;
+    // Built from the storyboard as it is NOW (the edit came from here).
+    stampSources(e.s, e.touched);
+    writeScene(e.s);
+    done.scenes.push(sid);
+    renderScene(e.s, { shotIds: [...e.touched] })
+      .catch((err) => channel.log('scene3d', `re-render after montage edit ${sid}: ${err.message}`));
+  }
+  return done;
+}

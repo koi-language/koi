@@ -1,0 +1,297 @@
+/**
+ * prepare_scene3d_video — everything the REAL video of one or more 3D
+ * timeline clips is generated from. The 3D is the SOURCE of the real take:
+ *
+ *   - each clip's exact window on the scene clock (trim / slip included) is
+ *     baked to an mp4 → the motion reference (camera + blocking);
+ *   - the pictures of what is in it: the characters' turnaround sheets /
+ *     photos, the place's plates and the storyboard's reference images;
+ *   - the storyboard shot it plays (look, light, action, dialogue).
+ *
+ * ONE TAKE over several small ones: consecutive clips of the same 3D set
+ * (same track, end to end) form a GROUP — their windows are joined into one
+ * reference and generated as ONE multi-shot take (same light, wardrobe,
+ * props and sound bed across the cuts), which assign_scene3d_take then
+ * splits back over the clips at its real cuts.
+ *
+ * The clips' LENGTHS are protected: the reference covers at least the clips
+ * (rounded up to whole seconds, continuing on the scene clock), the take is
+ * generated at least that long, and each clip windows its own stretch — the
+ * 3D stays as every clip's placeholder, one toggle away.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { spawn } from 'child_process';
+import { readScene, bakeWindow, isLivePath, storyboardPath, renderDir } from './_store.js';
+import { sceneSpatialRefs } from './_previz-sync.js';
+import { getTimeline } from '../../state/timelines.js';
+import { readCharacter } from '../../state/character-registry.js';
+import { resolveTimelineId } from '../timeline/_resolve-timeline-id.js';
+import { channel } from '../../io/channel.js';
+
+/** The model 3D clips are generated with (user decision: Seedance 2.5). */
+export const SCENE3D_VIDEO_MODEL = 'bytedance/seedance-2.5/us/reference-to-video';
+// Seedance 2.5 reference-to-video: 4–30 s per generation.
+const MIN_TAKE_MS = 4000;
+const MAX_TAKE_MS = 30000;
+
+const _IMG = /\.(png|jpe?g|webp)$/i;
+const _file = (p) => typeof p === 'string' && path.isAbsolute(p) && _IMG.test(p) && fs.existsSync(p);
+
+function _readJson(fp) {
+  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+}
+
+/** Scene-clock ms where the clip's window starts, whichever side it shows. */
+export function scene3dWindowStart(clip, shot) {
+  if (isLivePath(clip.path)) return Math.round(clip.sourceInMs || 0);
+  const ai = clip.aiState;
+  if (ai && isLivePath(ai.placeholderPath) && Number.isFinite(ai.placeholderSourceInMs)) {
+    return Math.round(ai.placeholderSourceInMs);
+  }
+  return shot.startMs;
+}
+
+function _characterRefs(scene, shot, sb) {
+  const seen = shot.preview?.inFrame?.characters;
+  const ids = Array.isArray(seen) && seen.length ? new Set(seen.map((c) => c.id)) : null;
+  const cast = Array.isArray(sb?.characters) ? sb.characters : [];
+  const out = [];
+  for (const c of scene.characters || []) {
+    if (ids && !ids.has(c.id)) continue;
+    const name = String(c.name || '').toLowerCase();
+    const cardId = c.characterId
+      || cast.find((x) => x?.characterId && name && String(x.name || '').toLowerCase() === name)?.characterId;
+    const card = cardId ? readCharacter(cardId) : null;
+    if (!card) continue;
+    const imgs = [card.sheet, ...(Array.isArray(card.photos) ? card.photos : [])].filter(_file);
+    if (imgs.length) out.push({ character: card.name || c.name, images: imgs.slice(0, 2) });
+  }
+  return out;
+}
+
+function _script(sbScene, sbShot) {
+  const pick = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+  return {
+    location: pick(sbScene?.location),
+    shot: pick(sbShot?.shot),
+    camera: pick(sbShot?.camera || sbShot?.movement),
+    composition: pick(sbShot?.composition),
+    lighting: pick(sbShot?.lighting),
+    action: pick(sbShot?.action),
+    dialogue: sbShot?.dialogue || undefined,
+    sound: pick(sbShot?.sound),
+  };
+}
+
+async function _ffmpeg() {
+  try {
+    const r = await (await import('../../media/ffmpeg-installer.js')).ensureFfmpeg();
+    return r?.ffmpeg || 'ffmpeg';
+  } catch {
+    return 'ffmpeg';
+  }
+}
+
+function _run(bin, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${err.slice(-300)}`))));
+  });
+}
+
+/** Join baked windows end to end into one reference (cached by content). */
+async function _join(sceneId, parts) {
+  if (parts.length === 1) return parts[0];
+  const key = crypto.createHash('sha1').update(JSON.stringify(parts)).digest('hex').slice(0, 10);
+  const out = path.join(renderDir(sceneId), `take-${key}.mp4`);
+  if (fs.existsSync(out)) return out;
+  const list = `${out}.txt`;
+  fs.writeFileSync(list, parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
+  try {
+    await _run(await _ffmpeg(), ['-y', '-f', 'concat', '-safe', '0', '-i', list,
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '-an', `${out}.part.mp4`]);
+    fs.renameSync(`${out}.part.mp4`, out);
+    return out;
+  } finally {
+    fs.rmSync(list, { force: true });
+  }
+}
+
+/** Consecutive clips of one 3D set, end to end on one track, ≤ MAX_TAKE_MS. */
+function _groups(items, oneTake) {
+  const out = [];
+  for (const it of items) {
+    const g = out[out.length - 1];
+    const last = g?.[g.length - 1];
+    const total = g ? g.reduce((n, x) => n + x.clip.durationMs, 0) : 0;
+    const joins = oneTake && last
+      && last.clip.track === it.clip.track
+      && last.scene.id === it.scene.id
+      && Math.abs(last.clip.startMs + last.clip.durationMs - it.clip.startMs) <= 50
+      && Math.ceil((total + it.clip.durationMs) / 1000) * 1000 <= MAX_TAKE_MS;
+    if (joins) g.push(it); else out.push([it]);
+  }
+  return out;
+}
+
+export default {
+  type: 'prepare_scene3d_video',
+  intent: 'prepare_scene3d_video',
+  description:
+    'FIRST STEP to turn 3D previz timeline clips into REAL video ("pásalo a vídeo", "genera el vídeo de este/estos clips"). ' +
+    'Consecutive clips of the same 3D set are joined into ONE take (better continuity than separate clips): per take it ' +
+    'bakes the clips\' exact 3D windows end to end into one mp4 (the motion reference: camera + characters\' blocking + the ' +
+    'cuts), and collects the pictures of what is in it (character sheets/photos, the place\'s plates, storyboard refs) plus ' +
+    'each shot\'s script and where it falls in the take. `clipIds` omitted → every 3D clip of the timeline still showing its ' +
+    'previz. Then per take: generate_video with the returned `model`, `referenceVideos: [referenceVideo]`, `referenceImages`, ' +
+    '`duration: durationSec`, and finally assign_scene3d_take — every clip keeps its length and the 3D stays one toggle away.',
+  thinkingHint: 'Preparing 3D references',
+  permission: 'write',
+
+  schema: {
+    type: 'object',
+    properties: {
+      timelineId: { type: 'string', description: 'Timeline id (default: the active one)' },
+      clipIds: { type: 'array', items: { type: 'string' }, description: '3D clips to turn into video (default: all still in 3D)' },
+      oneTake: { type: 'boolean', description: 'Join consecutive clips of one set into one take (default true). false only when the user asks for separate takes.' },
+    },
+  },
+
+  async execute(params) {
+    const timelineId = params?.timelineId ? String(params.timelineId) : await resolveTimelineId({});
+    const tl = timelineId ? getTimeline(timelineId) : null;
+    if (!tl) return { success: false, error: 'prepare_scene3d_video: no timeline — pass `timelineId`.' };
+    const all = (tl.clips || []).filter((c) => c?.scene3d?.sceneId && c.scene3d?.shotId);
+    let clips;
+    if (Array.isArray(params.clipIds) && params.clipIds.length) {
+      const byId = new Map(all.map((c) => [c.id, c]));
+      const missing = params.clipIds.filter((id) => !byId.has(id));
+      if (missing.length) {
+        return { success: false, error: `prepare_scene3d_video: not 3D clips of ${timelineId}: ${missing.join(', ')}` };
+      }
+      clips = params.clipIds.map((id) => byId.get(id));
+    } else {
+      clips = all.filter((c) => isLivePath(c.path));
+    }
+    if (!clips.length) return { success: false, error: 'prepare_scene3d_video: no 3D clips to turn into video on this timeline.' };
+    clips.sort((a, b) => String(a.track).localeCompare(String(b.track)) || a.startMs - b.startMs);
+
+    const sbCache = new Map();
+    const storyboard = (id) => {
+      if (!id) return null;
+      if (!sbCache.has(id)) sbCache.set(id, _readJson(storyboardPath(id)));
+      return sbCache.get(id);
+    };
+
+    const failed = [];
+    const items = [];
+    for (const c of clips) {
+      const scene = readScene(c.scene3d.sceneId);
+      const shot = scene?.shots?.find((s) => s.id === c.scene3d.shotId);
+      if (!shot) { failed.push({ clipId: c.id, error: `no 3D shot ${c.scene3d.sceneId}/${c.scene3d.shotId}` }); continue; }
+      const sb = storyboard(scene.storyboard?.id);
+      const sbScene = sb?.scenes?.find((x) => x?.id === (c.scene3d.storyboardSceneId || scene.storyboard?.sceneId));
+      const sbShot = sbScene?.shots?.find((x) => x?.id === (c.scene3d.storyboardShotId || shot.storyboardShotId));
+      items.push({ clip: c, scene, shot, sb, sbScene, sbShot, from: scene3dWindowStart(c, shot) });
+    }
+
+    const { width, height } = tl.settings || {};
+    const takes = [];
+    await Promise.all(_groups(items, params.oneTake !== false).map(async (g) => {
+      const total = g.reduce((n, x) => n + x.clip.durationMs, 0);
+      const takeMs = Math.min(MAX_TAKE_MS, Math.max(MIN_TAKE_MS, Math.ceil(total / 1000) * 1000));
+      const { scene } = g[0];
+      let parts;
+      try {
+        parts = await Promise.all(g.map((x, i) => {
+          // The last window runs on past its clip (same camera, scene clock)
+          // so the reference is the whole take: the take never ends early.
+          const len = i === g.length - 1
+            ? Math.max(x.clip.durationMs, Math.min(x.clip.durationMs + takeMs - total, scene.durationMs - x.from))
+            : x.clip.durationMs;
+          return bakeWindow(scene.id, x.shot.id, x.from, x.from + len, { width, height });
+        }));
+      } catch (e) {
+        for (const x of g) failed.push({ clipId: x.clip.id, error: `3D bake failed: ${e.message}` });
+        return;
+      }
+      let referenceVideo;
+      try {
+        referenceVideo = await _join(scene.id, parts);
+      } catch (e) {
+        for (const x of g) failed.push({ clipId: x.clip.id, error: `joining the 3D windows failed: ${e.message}` });
+        return;
+      }
+      const characters = [];
+      const images = [];
+      const addImg = (p) => { if (!images.includes(p)) images.push(p); };
+      for (const x of g) {
+        for (const ch of _characterRefs(x.scene, x.shot, x.sb)) {
+          if (!characters.some((y) => y.character === ch.character)) characters.push(ch);
+        }
+      }
+      for (const ch of characters) ch.images.forEach(addImg);
+      const place = g[0].sbScene ? sceneSpatialRefs(g[0].sb, g[0].sbScene).slice(0, 4) : [];
+      place.forEach(addImg);
+      let at = 0;
+      const shots = g.map((x, i) => {
+        const s = {
+          n: i + 1,
+          clipId: x.clip.id,
+          shotId: x.shot.id,
+          storyboardShotId: x.sbShot?.id || x.shot.storyboardShotId || null,
+          fromSec: Math.round(at) / 1000,
+          toSec: Math.round(at + x.clip.durationMs) / 1000,
+          script: x.sbShot ? _script(x.sbScene, x.sbShot) : null,
+          ...(!isLivePath(x.clip.path) ? { currentRealVideo: x.clip.path } : {}),
+        };
+        at += x.clip.durationMs;
+        return s;
+      });
+      const first = g[0].clip;
+      const prev = (tl.clips || [])
+        .filter((x) => x.track === first.track && x.startMs + x.durationMs <= first.startMs + 1)
+        .sort((a, b) => b.startMs - a.startMs)[0];
+      takes.push({
+        startMs: first.startMs,
+        clipIds: g.map((x) => x.clip.id),
+        sceneId: scene.id,
+        model: SCENE3D_VIDEO_MODEL,
+        referenceVideo,
+        durationSec: takeMs / 1000,
+        clipsSec: Math.round(total) / 1000,
+        aspectRatio: scene.aspect,
+        shots,
+        characters,
+        place,
+        referenceImages: images,
+        style: g[0].sb?.style || g[0].sb?.look || undefined,
+        ...(prev && !isLivePath(prev.path) ? { previousClip: { clipId: prev.id, path: prev.path } } : {}),
+      });
+    }));
+    takes.sort((a, b) => a.startMs - b.startMs);
+    if (failed.length) channel.log('scene3d', `prepare_scene3d_video: ${failed.map((f) => `${f.clipId}: ${f.error}`).join('; ')}`);
+
+    return {
+      success: takes.length > 0,
+      timelineId,
+      takes,
+      ...(failed.length ? { failed } : {}),
+      next:
+        'For EACH take (several → start them all with wait:false, then await): generate_video with `model` (always Seedance ' +
+        '2.5 reference-to-video), `referenceVideos: [referenceVideo]` (a grey 3D previz: keep its camera moves, composition, ' +
+        'every character\'s blocking and timing, and its CUTS exactly, re-render it photographically), ALL its ' +
+        '`referenceImages` (who and where — never drop them), `duration: durationSec`, `aspectRatio`, and ONE multi-shot ' +
+        'cinematic prompt that walks `shots` in order with their times ("Shot 1 (0–3.2 s): …, hard cut. Shot 2 (3.2–6.5 s): …") ' +
+        'keeping light, wardrobe, props and sound continuous across the cuts. Review the take, then assign_scene3d_take ' +
+        '{ timelineId, clipIds, mediaPath } — it splits the take over the clips at its real cuts. The clip LENGTHS ARE ' +
+        'PROTECTED: never trim, stretch or move a clip, and never generate shorter than durationSec.',
+    };
+  },
+};

@@ -370,10 +370,16 @@ export default {
     channel.log('update_storyboard',
       `patched ${filePath} (${drift ? `root[${(drift.root || []).join(',')}] shots[${(drift.shots || []).join(' ')}]` : 'no editorial change'}).`);
 
+    let previz3d = null;
+    try {
+      const { refreshPrevizFlags, previzDirective } = await import('../scene3d/_previz-sync.js');
+      previz3d = previzDirective(refreshPrevizFlags(normalized.id, { markPending: true }));
+    } catch { /* previz is advisory here */ }
     return {
       success: true,
       path: filePath,
       id: normalized.id,
+      ...(previz3d ? { previz3d } : {}),
       ...(drift ? { editorialChanges: drift } : {}),
       // Newly inserted panels always render — fold them in (they cannot show
       // up in a field diff, which matches shots by id).

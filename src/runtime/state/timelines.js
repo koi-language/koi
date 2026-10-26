@@ -443,6 +443,10 @@ function _validateClip(c, settings) {
     // reads them to know each take's [from,to] range and cut it. Also
     // `shotCutVersion` (settings) drives the GUI's re-detect-if-stale check.
     'shotCuts',
+    // 3D previz link { sceneId, shotId, poster? }: while the clip shows the
+    // previz its `path` is `scene3d:<scene>/<shot>` (played live by Blender,
+    // baked only on export), so the link must survive every save.
+    'scene3d',
   ];
   for (const key of _passthrough) {
     if (c[key] !== undefined && c[key] !== null) {
@@ -547,6 +551,9 @@ function _normalise(state) {
   if (typeof state.summary === 'string' && state.summary.trim()) {
     out.summary = state.summary.trim();
   }
+  // 'storyboard' = the story's own montage: every 3D shot of the
+  // storyboard in script order, kept in sync both ways by scene3d.
+  if (state.role === 'storyboard') out.role = 'storyboard';
   return out;
 }
 
@@ -623,7 +630,7 @@ async function _mirrorToMediaLibrary(filePath, state) {
  * `state` argument that follows the JSON schema documented at the top
  * of this file (id and timestamps are filled in for you).
  */
-export function createTimeline({ name, settings, clips, state, summary, storyboardId } = {}) {
+export function createTimeline({ name, settings, clips, state, summary, storyboardId, role } = {}) {
   const id = _newId();
   let toWrite;
   if (state && typeof state === 'object') {
@@ -636,6 +643,7 @@ export function createTimeline({ name, settings, clips, state, summary, storyboa
       settings,
       clips: clips || [],
       storyboardId,
+      role,
     });
   }
   // Stamp the agent-supplied "what is this timeline for" onto the
@@ -1152,7 +1160,7 @@ export function updateClip(id, clipId, changes) {
  * dispatch) we mint one with `placeholderPath = clip.path` BEFORE the swap,
  * so the toggle still has a placeholder to flip back to.
  */
-export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
+export function assignGeneratedMedia(id, clipId, { mediaPath, chatId, sourceInMs = 0, hasAudio } = {}) {
   if (!mediaPath || typeof mediaPath !== 'string') {
     throw new Error('assignGeneratedMedia.mediaPath must be a non-empty string');
   }
@@ -1169,6 +1177,11 @@ export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
     // mark a later "show me the original again" lands at the wrong second.
     if (c.path === c.aiState.placeholderPath) {
       c.aiState.placeholderSourceInMs = Number.isFinite(c.sourceInMs) ? c.sourceInMs : 0;
+      // A live 3D placeholder has no file to re-probe: keep its scene length
+      // so "back to 3D" can still trim / slip over the whole scene clock.
+      if (c.scene3d && Number.isFinite(c.sourceTotalMs) && c.sourceTotalMs > 0) {
+        c.aiState.placeholderSourceTotalMs = c.sourceTotalMs;
+      }
     }
     c.aiState.lastRenderedPath = mediaPath;
     if (typeof chatId === 'string' && chatId) {
@@ -1192,10 +1205,17 @@ export function assignGeneratedMedia(id, clipId, { mediaPath, chatId } = {}) {
     // not, which is why it only happened when the EDIT was driven from chat.
     // Zeroing the dims/total forces the GUI's `_probeMedia` to re-read the real
     // values from the new file instead of trusting the old source's.
-    c.sourceInMs = 0;
+    //
+    // Exception: ONE take generated for several consecutive 3D clips — each
+    // clip windows its own stretch of it, starting at `sourceInMs`.
+    const inMs = Number.isFinite(sourceInMs) && sourceInMs > 0 ? Math.round(sourceInMs) : 0;
+    c.sourceInMs = inMs;
+    if (inMs) c.aiState.lastRenderedSourceInMs = inMs; else delete c.aiState.lastRenderedSourceInMs;
     c.sourceTotalMs = 0;
     c.sourceWidthPx = 0;
     c.sourceHeightPx = 0;
+    // A 3D clip is silent; its generated take may carry sound.
+    if (typeof hasAudio === 'boolean') c.hasAudio = hasAudio;
     return state;
   });
 }

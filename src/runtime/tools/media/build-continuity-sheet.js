@@ -137,7 +137,7 @@ export default {
     'Required: "video" (absolute path to the clip). Optional: "cuts" — the INTERIOR shot boundaries in seconds (cumulative shot durations from the storyboard, e.g. [3.5, 6.5, 9.5, 12.5] for a 5-shot clip); omit for a single-take clip. Optional: "saveTo", "cellWidth". ' +
     'Layout: 2 columns x N rows — one row per take in order, left cell = its first frame, right cell = its last frame. No text is drawn into the sheet. ' +
     'Returns { success, savedTo, takes, rows, width, height, promptHint } — paste `promptHint` into the next clip\'s prompt so the description matches the actual grid. ' +
-    'Attach it as-is on every model EXCEPT one with a likeness filter (Seedance): there, run the sheet through the Seedream 1:1 re-description clone first, exactly like a character turnaround.',
+    'Attach it as-is on every model (Seedance included — never re-synthesise it through Seedream).',
   thinkingHint: 'Building continuity sheet',
   permission: 'write',
 

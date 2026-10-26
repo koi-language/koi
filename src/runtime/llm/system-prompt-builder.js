@@ -537,7 +537,22 @@ export async function buildWorkingAreaBlock() {
             const _selId = typeof active.selectedClipId === 'string' ? active.selectedClipId : null;
             const _selClip = _selId ? _clips.find((c) => c?.id === _selId) : null;
 
-            if (_selClip && typeof _selClip.path === 'string') {
+            const _3d = _clips.filter((c) => c?.scene3d?.sceneId && c.scene3d?.shotId);
+            if (_3d.length > 0) {
+              lines.push('');
+              lines.push(`3D previz clips on this timeline (${_3d.length}) — the 3D is the SOURCE of each clip's real video:`);
+              for (const c of _3d) {
+                const _real = typeof c.path === 'string' && !c.path.startsWith('scene3d:');
+                const _side = _real ? `showing its real take \`${c.path}\`${c.scene3d.renderStale ? ' (3D changed since — take out of date)' : ''}` : 'showing the 3D';
+                lines.push(`- ${c.track || 'V1'} id ${c.id} (${(c.durationMs / 1000).toFixed(2)}s) scene3d ${c.scene3d.sceneId}/${c.scene3d.shotId}, ${_side}`);
+              }
+              lines.push('"Pásalo/pásalos a vídeo", "genera el vídeo real" on these clips: activate scene-3d + video-generator + cinematic-video-prompt-engineer and call prepare_scene3d_video { timelineId, clipIds } FIRST (it joins consecutive clips into ONE take — one longer generation, better continuity), generate each take with Seedance 2.5 and land it with assign_scene3d_take — never pass a `scene3d:` path to any media tool, it is not a file. Their length is protected: never trim them to fit a take.');
+            }
+
+            if (_selClip && typeof _selClip.path === 'string' && _selClip.scene3d) {
+              lines.push('');
+              lines.push(`**Selected clip on this timeline**: the 3D previz clip id ${_selClip.id} (scene3d ${_selClip.scene3d.sceneId}/${_selClip.scene3d.shotId}). "Este clip" means it; its real video comes from prepare_scene3d_video.`);
+            } else if (_selClip && typeof _selClip.path === 'string') {
               // A specific clip is selected — narrow the agent's scope
               // to JUST that clip's source. Override beats listing.
               const _durSec = typeof _selClip.durationMs === 'number' ? (_selClip.durationMs / 1000).toFixed(2) : '?';
@@ -579,6 +594,27 @@ export async function buildWorkingAreaBlock() {
               }
             }
           } catch { /* malformed JSON or fs error — fall through silently */ }
+        }
+
+        // Storyboard on its TIMELINE view: every scene in 3D beside the
+        // montage. "Este plano / la cámara / que entre antes" = the 3D shot
+        // the user picked (or the montage as a whole).
+        if (active.type === 'storyboard' && active.montage && typeof active.montage.timelinePath === 'string') {
+          lines.push('');
+          lines.push(`The storyboard is on its TIMELINE view: the 3D scenes (free camera, every shot camera in place) beside the montage timeline \`${active.montage.timelinePath}\` (one 3D shot per storyboard shot, in script order; trims / reorders there are written back to the storyboard automatically).`);
+          try {
+            const _tl = JSON.parse(fs.readFileSync(active.montage.timelinePath, 'utf8'));
+            const _sel = typeof active.montage.selectedClipId === 'string'
+              ? (_tl.clips || []).find((c) => c?.id === active.montage.selectedClipId) : null;
+            if (_sel?.scene3d) {
+              const _l = _sel.scene3d;
+              lines.push(`**Selected 3D shot**: storyboard shot \`${_l.storyboardShotId || '?'}\` (scene ${_l.storyboardSceneId || '?'}) = scene3d \`${_l.sceneId}\` shot \`${_l.shotId}\`${_sel.path && !_sel.path.startsWith('scene3d:') && !_sel.path.includes('/scenes3d/') ? `, real video \`${_sel.path}\`${_sel.scene3d?.renderStale ? ' (3D changed since — out of date)' : ''}` : ''}.`);
+              lines.push('"Este plano", "la cámara", "que entre antes", "más cerrado" mean THIS shot: change its staging / camera / timing with get_scene3d → update_scene3d (scene-3d skill) — the card and the montage re-render by themselves; change its script text (dialogue, action wording) with update_storyboard. Generating its real video ("pásalo a vídeo"): prepare_scene3d_video { timelineId: "' + path.basename(active.montage.timelinePath, '.json') + '", clipIds: ["' + _sel.id + '"] } first, then generate_video (Seedance 2.5) + assign_scene3d_take — the clip keeps its length and the 3D stays its source.');
+            } else {
+              lines.push('No shot is selected: a request about "the scene" / "the 3D" applies to the scene(s) it names — use get_scene3d { storyboardId } to find them.');
+              lines.push('To turn montage clips into real video: prepare_scene3d_video { timelineId: "' + path.basename(active.montage.timelinePath, '.json') + '", clipIds? } (omit clipIds = every clip still in 3D) — consecutive clips come back as ONE take; generate it with Seedance 2.5 and land it with assign_scene3d_take.');
+            }
+          } catch { /* montage not on disk yet */ }
         }
 
         // DocumentBundle — compact rendering. Only the fields the agent

@@ -827,7 +827,15 @@ export default {
       `${collisionRenamedFrom ? ` [id "${collisionRenamedFrom}" was taken → saved as "${normalized.id}" to avoid overwriting it]` : ''}.`);
 
     const drift = _editorialDiff(existing, normalized);
+    // The 3D previz is part of the storyboard: flag stale cards and tell the
+    // agent which shots still need (re)blocking. Never fails the save.
+    let previz3d = null;
+    try {
+      const { refreshPrevizFlags, previzDirective } = await import('../scene3d/_previz-sync.js');
+      previz3d = previzDirective(refreshPrevizFlags(normalized.id, { markPending: true }));
+    } catch { /* previz is advisory here */ }
     return {
+      ...(previz3d ? { previz3d } : {}),
       success: true,
       path: filePath,
       id: normalized.id,

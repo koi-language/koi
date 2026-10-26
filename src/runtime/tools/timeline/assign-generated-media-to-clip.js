@@ -19,8 +19,30 @@
  * (calling twice with the same value is a no-op besides the broadcast).
  */
 
-import { assignGeneratedMedia } from '../../state/timelines.js';
+import fs from 'fs';
+import { assignGeneratedMedia, getTimeline } from '../../state/timelines.js';
+import { stampScene3dRender } from '../scene3d/_store.js';
 import { channel } from '../../io/channel.js';
+
+/** Media duration in ms (ffprobe), or 0 when unknown. */
+async function _probeDurationMs(file) {
+  if (!/\.(mp4|mov|webm|mkv|m4v)$/i.test(file) || !fs.existsSync(file)) return 0;
+  let bin = 'ffprobe';
+  try {
+    const r = await (await import('../../media/ffmpeg-installer.js')).ensureFfmpeg();
+    if (r?.ffprobe) bin = r.ffprobe;
+  } catch { /* PATH */ }
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const { stdout } = await promisify(execFile)(
+      bin, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], { timeout: 5000 });
+    const sec = parseFloat(String(stdout).trim());
+    return Number.isFinite(sec) ? Math.round(sec * 1000) : 0;
+  } catch {
+    return 0;
+  }
+}
 
 export default {
   type: 'assign_generated_media_to_clip',
@@ -63,7 +85,22 @@ export default {
       if (!mediaPath || typeof mediaPath !== 'string') {
         throw new Error('mediaPath must be a non-empty string');
       }
-      const tl = assignGeneratedMedia(id, clipId, { mediaPath, chatId });
+      // A 3D clip's length is protected: the take is windowed to it, so a
+      // take shorter than the clip would freeze on its last frame.
+      const clip = getTimeline(id)?.clips?.find((c) => c.id === clipId);
+      if (clip?.scene3d) {
+        const got = await _probeDurationMs(mediaPath);
+        if (got > 0 && got + 80 < clip.durationMs) {
+          throw new Error(
+            `the take is ${(got / 1000).toFixed(2)}s but the 3D clip is ${(clip.durationMs / 1000).toFixed(2)}s and its ` +
+            `length is protected — regenerate with duration ≥ ${Math.ceil(clip.durationMs / 1000)}s (never trim the clip).`);
+        }
+      }
+      let tl = assignGeneratedMedia(id, clipId, { mediaPath, chatId });
+      if (clip?.scene3d) {
+        stampScene3dRender(id, clipId, mediaPath);
+        tl = getTimeline(id);
+      }
       // Broadcast AFTER the state mutation succeeds so the GUI never sees
       // a "ready" event for a swap that didn't actually persist.
       channel.clipMediaGenerated({ clipId, mediaPath, chatId: chatId ?? null });
