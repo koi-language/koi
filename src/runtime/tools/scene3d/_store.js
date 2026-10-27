@@ -158,11 +158,24 @@ export function normalizeScene(input, existing = null) {
     if (!Array.isArray(c.position)) throw new Error(`character "${id}" needs position: [x, y] (metres)`);
     return { ...c, id };
   });
+  const propIds = new Set(((s.set && s.set.props) || s.props || []).map((p) => p?.id).filter(Boolean));
   s.actions = s.actions.map((a, i) => {
     if (!_isObj(a)) throw new Error(`actions[${i}] must be an object`);
-    if (!charIds.has(a.character)) {
+    const type = String(a.type || '').toLowerCase();
+    if (type === 'drive' || type === 'ride') {
+      // A vehicle drives itself; whoever rides it sits in it.
+      if (!propIds.has(a.prop)) {
+        throw new Error(`actions[${i}].prop "${a.prop}" is not a prop id (a ${type} needs the vehicle's prop id)`);
+      }
+      if (type === 'drive' && !(Array.isArray(a.to) && a.to.length >= 2)) {
+        throw new Error(`actions[${i}]: a drive needs to: [x, y]`);
+      }
+    }
+    if (type !== 'drive' && !charIds.has(a.character)) {
       throw new Error(`actions[${i}].character "${a.character}" is not a character id (have: ${[...charIds].join(', ') || 'none'})`);
     }
+    // A ride with no times is for the whole scene: keep it untimed.
+    if (type === 'ride' && a.startMs == null && a.endMs == null) return { ...a };
     return { ...a, startMs: Math.max(0, _int(a.startMs)), endMs: a.endMs != null ? Math.max(0, _int(a.endMs)) : undefined };
   });
   const prevById = new Map((existing?.shots || []).map((x) => [x.id, x]));

@@ -1216,7 +1216,38 @@ export function assignGeneratedMedia(id, clipId, { mediaPath, chatId, sourceInMs
     c.sourceHeightPx = 0;
     // A 3D clip is silent; its generated take may carry sound.
     if (typeof hasAudio === 'boolean') c.hasAudio = hasAudio;
+    // ...and that sound goes in WITH the picture, as a linked clip on the
+    // matching audio track (how an imported video carries its sound). The
+    // GUI used to add it only after probing the file itself: the take showed
+    // up silent for a while.
+    if (c.scene3d && hasAudio === true) _linkTakeAudio(state, c, mediaPath, inMs);
     return state;
+  });
+}
+
+function _linkTakeAudio(state, c, mediaPath, inMs) {
+  const isA = (t) => typeof t === 'string' && /^A\d+$/.test(t);
+  const peers = c.linkId ? state.clips.filter((x) => x !== c && x.linkId === c.linkId && isA(x.track)) : [];
+  const same = peers.find((x) => x.path === mediaPath);
+  if (same) {
+    Object.assign(same, { startMs: c.startMs, durationMs: c.durationMs, sourceInMs: inMs });
+    return;
+  }
+  const stale = new Set(peers);
+  const s0 = c.startMs, e0 = c.startMs + c.durationMs;
+  const nA = Math.max(1, Number(state.settings?.audioTracks) || 2);
+  const vIdx = Number(String(c.track || 'V1').slice(1)) || 1;
+  const order = [vIdx <= nA ? `A${vIdx}` : null, ...Array.from({ length: nA }, (_, i) => `A${i + 1}`)]
+    .filter((t, i, arr) => t && arr.indexOf(t) === i);
+  const free = (t) => !state.clips.some((x) => !stale.has(x) && x.track === t
+    && x.startMs < e0 && x.startMs + x.durationMs > s0);
+  const track = order.find(free);
+  if (!track) return; // every audio track is taken there
+  state.clips = state.clips.filter((x) => !stale.has(x));
+  if (!c.linkId) c.linkId = `L${randomBytes(3).toString('hex')}`;
+  state.clips.push({
+    id: _newClipId(), track, path: mediaPath, startMs: c.startMs, durationMs: c.durationMs,
+    sourceInMs: inMs, sourceTotalMs: 0, linkId: c.linkId, hasAudio: true,
   });
 }
 

@@ -133,6 +133,84 @@ function _onScreen(bake, key) {
     });
 }
 
+/** What the reference shows second by second, as stretches of the take:
+ *  [{ fromSec, toSec, inFrame: ["HERMANA (left, close)", "silver racecar driven by PILOTO_B (centre, 6 m)"] }]
+ *  or [{ …, inFrame: [] }] when nobody / no vehicle is in view. */
+function _inFrameTimeline(bake, scene, key, takeOffsetMs, fromMs, lenMs) {
+  const tl = bakeInFrame(bake)?.timeline;
+  if (!Array.isArray(tl) || !tl.length) return undefined;
+  const props = new Map(((scene.set && scene.set.props) || []).map((p) => [p.id, p]));
+  const name = (id) => key.find((k) => k.id === id)?.name || id;
+  const riderOf = new Map((scene.actions || []).filter((a) => String(a.type).toLowerCase() === 'ride').map((a) => [a.prop, a.character]));
+  const side = (x) => (x < 0.1 ? 'left edge' : x > 0.9 ? 'right edge' : x < 0.36 ? 'left' : x > 0.64 ? 'right' : 'centre');
+  const near = (d) => (d < 2 ? 'close' : d < 8 ? `${Math.round(d)} m` : 'far');
+  // Which way it faces as the shot sees it (front / back / profile): a
+  // "medium close-up of his helmet" written frontal while the reference shows
+  // the back of his head made the model CUT to a frontal shot mid-take.
+  const facing = (f) => ({
+    front: 'seen from the front', back: 'seen from directly behind',
+    'front-left': 'three-quarter front, its left side', 'front-right': 'three-quarter front, its right side',
+    'side-left': 'its left side (profile)', 'side-right': 'its right side (profile)',
+    'back-left': 'three-quarter from behind, its left side', 'back-right': 'three-quarter from behind, its right side',
+  })[f];
+  const where = (e) => [side(e.x), near(e.dist), facing(e.faces)].filter(Boolean).join(', ');
+  const label = (e) => {
+    if (e.kind === 'vehicle') {
+      const p = props.get(e.id) || {};
+      const who = riderOf.get(e.id);
+      return `${_colourWord(p.color)} ${p.shape || 'vehicle'}${who ? ` driven by ${name(who)}` : ''} (${where(e)})`;
+    }
+    return `${name(e.id)} (${where(e)})`;
+  };
+  const out = [];
+  for (const smp of tl) {
+    const t = smp.ms - fromMs;
+    if (t < -50 || t > lenMs + 50) continue;
+    // In frame vs nearby but OUT of frame (an event can happen there: the
+    // prompt must say it happens AND that it stays out of shot).
+    const all = smp.seen || [];
+    const fold = (list, offFrame) => {
+      // A rider whose vehicle is listed is said by the vehicle; on its own
+      // (a close-up on the driver) it is said as the driver in it.
+      const veh = new Set(list.filter((e) => e.kind === 'vehicle').map((e) => e.id));
+      return list
+        .filter((e) => !(e.in && veh.has(e.in)))
+        .map((e) => {
+          const what = e.in
+            ? `${name(e.id)} in the ${_colourWord(props.get(e.in)?.color)} ${props.get(e.in)?.shape || 'vehicle'}`
+            : null;
+          if (offFrame) {
+            const base = what || label({ ...e, x: 0.5 }).replace(/ \(.*\)$/, '');
+            return `${base} (off-frame ${e.off}, ${near(e.dist)})`;
+          }
+          return what ? `${what} (${where(e)})` : label(e);
+        })
+        .filter(Boolean)
+        .sort();
+    };
+    // A driver and their vehicle are one thing on screen: if either is in
+    // frame, the other is not listed as "off frame".
+    const inIds = new Set();
+    for (const e of all) {
+      if (e.off) continue;
+      inIds.add(e.id);
+      if (e.in) inIds.add(e.in);
+      if (e.kind === 'vehicle' && riderOf.get(e.id)) inIds.add(riderOf.get(e.id));
+    }
+    const seen = fold(all.filter((e) => !e.off), false);
+    const offFrame = fold(all.filter((e) => e.off && !inIds.has(e.id) && !(e.in && inIds.has(e.in))), true);
+    const strip = (x) => x.replace(/, (close|\d+ m|far)(?=[,)])/, ''); // distance alone is no change
+    const sig = [...seen.map(strip), '/', ...offFrame.map(strip)].join('|');
+    const sec = Math.round(takeOffsetMs + Math.max(0, Math.min(lenMs, t))) / 1000;
+    const last = out[out.length - 1];
+    if (last && last.sig === sig) { last.toSec = sec; continue; }
+    if (last) last.toSec = sec;
+    out.push({ fromSec: sec, toSec: sec, inFrame: seen, ...(offFrame.length ? { offFrame } : {}), sig });
+  }
+  if (out.length) out[out.length - 1].toSec = Math.round(takeOffsetMs + lenMs) / 1000;
+  return out.map(({ sig, ...r }) => r);
+}
+
 function _script(sbScene, sbShot) {
   const pick = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
   return {
@@ -306,6 +384,7 @@ export default {
       const castKey = _castKey(scene);
       const shots = g.map((x, i) => {
         const onScreen = _onScreen(parts[i], castKey);
+        const inFrameTimeline = _inFrameTimeline(parts[i], scene, castKey, at, x.from, x.clip.durationMs);
         const s = {
           n: i + 1,
           clipId: x.clip.id,
@@ -315,6 +394,7 @@ export default {
           toSec: Math.round(at + x.clip.durationMs) / 1000,
           // What the reference ACTUALLY shows: wins over the script's words.
           ...(onScreen ? { onScreen } : {}),
+          ...(inFrameTimeline ? { inFrameTimeline } : {}),
           script: x.sbShot ? _script(x.sbScene, x.sbShot) : null,
           ...(!isLivePath(x.clip.path) ? { currentRealVideo: x.clip.path } : {}),
         };
@@ -356,9 +436,25 @@ export default {
         'For EACH take (several → start them all with wait:false, then await): generate_video with `model` (always Seedance ' +
         '2.5 reference-to-video), `referenceVideos: [referenceVideo]` (a grey 3D previz: keep its camera moves, composition, ' +
         'every character\'s blocking and timing, and its CUTS exactly, re-render it photographically), ALL its ' +
-        '`referenceImages` (who and where — never drop them), `duration: durationSec`, `aspectRatio`, and ONE multi-shot ' +
-        'cinematic prompt that walks `shots` in order with their times ("Shot 1 (0–3.2 s): …, hard cut. Shot 2 (3.2–6.5 s): …") ' +
-        'keeping light, wardrobe, props and sound continuous across the cuts. SCREEN POSITIONS come from each shot\'s ' +
+        '`referenceImages` (who and where — never drop them), `duration: durationSec`, `aspectRatio`, and ONE prompt ' +
+        'written SHOT BY SHOT: one block per entry of `shots` ("Shot 1 (0–3.2 s): …"), and between two blocks the words ' +
+        '"HARD CUT". Inside a block NO times at all (no "0–6 s", no "around 6 s": time marks read as more shots and the ' +
+        'model cuts there): one paragraph that says this shot follows the reference video\'s camera EXACTLY as ONE ' +
+        'continuous move, then tells in order what happens — what the camera does (its moves, zoom, focus pulls, ' +
+        'framing), who is who and what they look like, what they do and feel (acting, gestures, lines), what happens ' +
+        'out of shot, light and sound — chained with "then", "as", "while", never with times. Say once, plainly: "Cut ONLY at HARD CUT; never anywhere else." Keep light, wardrobe, props and ' +
+        'sound continuous across the cuts. THE REFERENCE IS THE MASTER: open the prompt ' +
+        'by saying the attached video\'s camera, framing, what is in and out of frame, positions, sides and timing override ' +
+        'anything in the text. Describe each moment with what `inFrameTimeline` says: `inFrame` is what the shot SHOWS, ' +
+        '`offFrame` is what is near but OUT of shot (side, distance). Something that happens off frame IS said — and said ' +
+        'as off frame: "A\'s car overtakes on his right, entirely out of frame: we never see it, only its roar, the wash of ' +
+        'its passing and B\'s eyes following it". Never write it as seen while the reference does not show it (the model ' +
+        'invents it to obey the text), and never leave it unsaid when the story needs it. If the user wants it ON screen, ' +
+        'tell them the 3D camera must frame it first. Say each figure\'s view EXACTLY as `inFrameTimeline` gives it (front / ' +
+        'three-quarter front / side / three-quarter from behind / behind, and which of its sides): asking for a view the ' +
+        'reference\'s camera does not have (e.g. "his face, sun full on it" while it shows the back of his head) makes the ' +
+        'model CUT to get it. Write every change of framing inside a shot as the camera MOVING there, never as a new shot. Spend the words on WHO and WHAT things look like (cast, cars, place, light, sound), not on re-staging ' +
+        'the motion the video already carries. SCREEN POSITIONS come from each shot\'s ' +
         '`onScreen` (read off the 3D: who is left / centre / right), NEVER from the script\'s words when they disagree — ' +
         'a prompt that puts someone on the other side than the reference makes the model follow the text and mirror the ' +
         'shot. Name every character with its previz look from `castKey` ("the boy — the small blue figure in the ' +

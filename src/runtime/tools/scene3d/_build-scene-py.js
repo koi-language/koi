@@ -358,7 +358,7 @@ if backdrop:
 # Real-world default sizes [width x, depth y, height z] in metres. Vehicles
 # point their nose at +y. A prop's "size" scales its whole silhouette.
 PROP_SIZES = {
-    "car": [1.8, 4.5, 1.45], "van": [2.0, 5.0, 2.2], "truck": [2.5, 7.5, 3.3], "bus": [2.55, 12.0, 3.1],
+    "car": [1.8, 4.5, 1.45], "racecar": [2.0, 5.6, 1.0], "van": [2.0, 5.0, 2.2], "truck": [2.5, 7.5, 3.3], "bus": [2.55, 12.0, 3.1],
     "motorbike": [0.8, 2.1, 1.15], "bicycle": [0.6, 1.75, 1.05], "bench": [1.8, 0.6, 0.85],
     "stool": [0.4, 0.4, 0.75], "wardrobe": [1.2, 0.6, 2.0], "fridge": [0.7, 0.7, 1.85],
     "tv": [1.25, 0.25, 1.2], "monitor": [0.55, 0.2, 0.45], "laptop": [0.34, 0.24, 0.24],
@@ -410,6 +410,52 @@ def build_prop(p, parent=None):
         for x in xs:
             for y in ys:
                 Hcyl("wheel", x, y, r, wdt, r, tyre)
+
+    def tyres(xs, ys, r, wdt, rim_r=None):
+        """Tyre + rim (a lighter disc just proud of the tyre's outer face)."""
+        rim = material("rim", "#a9adb3", 0.35)
+        for x in xs:
+            for y in ys:
+                Hcyl("tyre", x, y, r, wdt, r, tyre)
+                Hcyl("rim", x, y, r, wdt + 0.02, rim_r or r * 0.62, rim)  # proud of both faces
+
+    def Profile(name, pts, width, top=1.0, mat=m, x=0.0, bevel=0.035):
+        """Bodywork from a SIDE PROFILE: the closed outline pts [(y, z)] in
+        the prop's default frame, extruded across x to [width], narrowing to
+        [top] x the width at its highest point (tumblehome), edges bevelled.
+        Reads as a real car body where stacked boxes read as toys."""
+        zs = [z for _, z in pts]
+        z0, z1 = min(zs), max(zs)
+        verts = []
+        for side in (-1, 1):
+            for (y, z) in pts:
+                k = 1.0 + (top - 1.0) * ((z - z0) / max(1e-6, z1 - z0))
+                verts.append(((x + side * width * k / 2) * fx, y * fy, z * fz))
+        n = len(pts)
+        faces = [list(range(n))[::-1], list(range(n, 2 * n))]
+        for i in range(n):
+            j = (i + 1) % n
+            faces.append([i, j, n + j, n + i])
+        ob = mesh_obj(f"{pid}_{name}", verts, faces, mat, root)
+        try:
+            me = ob.data
+            import bmesh as _bm
+            bm = _bm.new()
+            bm.from_mesh(me)
+            _bm.ops.recalc_face_normals(bm, faces=bm.faces)
+            bm.to_mesh(me)
+            bm.free()
+            mod = ob.modifiers.new("bevel", "BEVEL")
+            mod.width = bevel
+            mod.segments = 2
+            mod.limit_method = "ANGLE"
+            mod.angle_limit = math.radians(40)
+            for poly in me.polygons:
+                poly.use_smooth = True
+            ob.modifiers.new("normals", "WEIGHTED_NORMAL").keep_sharp = True
+        except Exception as e_:
+            print(f"[scene3d] profile {name}: {e_}", file=sys.stderr)
+        return ob
 
     if kind in PRIMS:
         prim(kind, pid, (0, 0, sz_ / 2), (sx, sy, sz_), m, root, taper=p.get("taper"))
@@ -504,15 +550,53 @@ def build_prop(p, parent=None):
         P("cylinder", "trunk", 0, 0, 0, 0.3, 0.3, 3.0, material("trunk", "#5a4636"), taper=0.7)
         P("sphere", "crown", 0, 0, 2.0, 2.5, 2.5, 3.0, material("crown", "#4a6338"))
     elif kind == "car":
-        # Sedan: body, bonnet/boot, cabin with raked screens, four wheels.
-        P("box", "body", 0, 0, 0.18, 1.8, 4.5, 0.62)
-        P("box", "cabin", 0, -0.2, 0.8, 1.56, 1.6, 0.6, glass)
-        P("wedge", "screen", 0, 0.85, 0.8, 1.56, 0.5, 0.6, glass)
-        P("wedge", "rear", 0, -1.25, 0.8, 1.56, 0.5, 0.6, glass, rot=(0, 0, math.pi))
-        P("box", "roof", 0, -0.2, 1.38, 1.5, 1.5, 0.07)
+        # Sedan built from its side profile: bonnet, raked windscreen, roof,
+        # rear window and boot; glass house narrowing over the body; tyres
+        # with rims, lights and mirrors. Nose at +y.
+        Profile("body", [(-2.3, 0.32), (2.3, 0.32), (2.34, 0.5), (2.28, 0.72), (2.05, 0.85), (0.98, 0.99),
+                         (-1.75, 1.01), (-2.2, 0.97), (-2.31, 0.76), (-2.34, 0.5)], 1.8, top=0.96)
+        Profile("glasshouse", [(0.99, 0.97), (0.2, 1.39), (-0.98, 1.41), (-1.8, 0.99)], 1.62, top=0.8, mat=glass, bevel=0.03)
+        Profile("roof", [(0.25, 1.36), (0.2, 1.42), (-0.98, 1.44), (-1.05, 1.38)], 1.32, top=0.98, bevel=0.02)
         for ix in (-1, 1):
-            P("box", "headlight", ix * 0.62, 2.24, 0.55, 0.32, 0.04, 0.12, light)
-        wheels((-0.8, 0.8), (-1.4, 1.38), 0.33, 0.22)
+            P("box", "pillar_b", ix * 0.72, -0.38, 1.0, 0.05, 0.12, 0.38)
+            P("box", "headlight", ix * 0.6, 2.26, 0.62, 0.42, 0.06, 0.12, light)
+            P("box", "taillight", ix * 0.62, -2.3, 0.76, 0.38, 0.05, 0.11, material("taillight", "#b0201a", 0.3, emission="#7a1410"))
+            P("box", "mirror", ix * 0.97, 0.82, 0.92, 0.16, 0.1, 0.09)
+        P("box", "grille", 0, 2.32, 0.48, 0.7, 0.04, 0.14, dark)
+        tyres((-0.79, 0.79), (-1.42, 1.4), 0.34, 0.24)
+    elif kind == "racecar":
+        # Open-wheel single-seater (Formula 1) from its side profiles: the
+        # needle nose rising to the cockpit, the airbox above the driver, the
+        # engine cover falling to the rear; sidepods; wings with endplates;
+        # halo; exposed wheels on their suspension arms. Nose at +y.
+        carbon = material("carbon", "#1e2125", 0.35)
+        Profile("chassis", [(2.78, 0.12), (2.7, 0.22), (1.6, 0.33), (0.75, 0.5), (0.45, 0.63), (0.05, 0.6),
+                            (-0.28, 0.99), (-0.8, 0.99), (-1.45, 0.72), (-2.1, 0.5), (-2.32, 0.32), (-2.32, 0.1)],
+                0.62, top=0.5, bevel=0.03)
+        Profile("sidepods", [(0.62, 0.12), (0.56, 0.5), (0.2, 0.57), (-1.2, 0.46), (-1.75, 0.22), (-1.82, 0.1)],
+                1.42, top=0.72, bevel=0.04)
+        P("box", "cockpit", 0, 0.22, 0.6, 0.36, 0.52, 0.03, carbon)
+        P("box", "intake", 0, -0.3, 0.86, 0.2, 0.04, 0.12, carbon)
+        P("box", "floor", 0, -0.4, 0.04, 1.5, 3.8, 0.04, carbon)
+        P("box", "front_wing", 0, 2.56, 0.06, 1.95, 0.5, 0.035, carbon)
+        P("box", "front_flap", 0, 2.44, 0.1, 1.9, 0.24, 0.035)
+        P("box", "rear_wing", 0, -2.55, 0.86, 1.0, 0.36, 0.045)
+        P("box", "rear_flap", 0, -2.47, 0.94, 0.98, 0.18, 0.035, carbon)
+        P("box", "beam_wing", 0, -2.45, 0.38, 0.9, 0.2, 0.03, carbon)
+        P("box", "rw_pylon", 0, -2.38, 0.36, 0.05, 0.16, 0.52, carbon)
+        P("wedge", "diffuser", 0, -2.1, 0.04, 1.1, 0.5, 0.2, carbon, rot=(0, 0, math.pi))
+        P("box", "halo_front", 0, 0.46, 0.6, 0.05, 0.05, 0.24, carbon)
+        P("box", "halo_top", 0, 0.16, 0.82, 0.46, 0.08, 0.045, carbon)
+        for ix in (-1, 1):
+            P("box", "fw_endplate", ix * 0.97, 2.52, 0.03, 0.03, 0.58, 0.26, carbon)
+            P("box", "rw_endplate", ix * 0.5, -2.52, 0.4, 0.03, 0.52, 0.56, carbon)
+            P("box", "halo_side", ix * 0.22, 0.14, 0.8, 0.05, 0.6, 0.045, carbon)
+            P("box", "mirror", ix * 0.5, 0.6, 0.66, 0.15, 0.07, 0.07, carbon)
+            for y_, x_ in ((1.7, 0.82), (-1.78, 0.84)):
+                P("box", "arm_hi", ix * (0.2 + x_) / 2, y_, 0.38, x_ - 0.2, 0.05, 0.03, carbon)
+                P("box", "arm_lo", ix * (0.2 + x_) / 2, y_, 0.2, x_ - 0.2, 0.05, 0.03, carbon)
+        tyres((-0.82, 0.82), (1.7,), 0.33, 0.32, rim_r=0.19)
+        tyres((-0.84, 0.84), (-1.78,), 0.36, 0.42, rim_r=0.2)
     elif kind == "van":
         P("box", "body", 0, -0.35, 0.2, 2.0, 4.3, 1.95)
         P("box", "hood", 0, 2.1, 0.2, 2.0, 0.8, 0.85)
@@ -625,6 +709,7 @@ def build_prop(p, parent=None):
     root.location = v3(p.get("position"))
     root.rotation_euler = _rot3(p.get("rotation"))
     root["h"] = float(sz_)
+    root["kind"] = kind
     return root
 
 
@@ -743,6 +828,10 @@ def build_character(c, idx):
     neck = empty(f"{cid}_neck", K(0, 0, 1.45), hips)
     ball(f"{cid}_neckball", K(0, 0, 1.475), 0.048 * k, joint, neck)
     egg_head(f"{cid}_head", K(0, 0.005, 1.635), k, wood, neck)
+    # A dark visor band across the face: a smooth head reads the same from
+    # the front and from behind, and the video model then guesses which way
+    # a figure looks (it cut to a frontal shot the camera did not have).
+    instance("ball", f"{cid}_visor", K(0, 0.084, 1.655), K(0.085, 0.04, 0.04), material("visor", "#2b2e34", 0.4), neck)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
@@ -788,6 +877,7 @@ def build_block_figure(c, idx):
     instance("box", f"{cid}_torso", K(0, 0, 1.215), K(0.36, 0.2, 0.53), clay, hips)
     neck = empty(f"{cid}_neck", K(0, 0, 1.49), hips)
     instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, neck)
+    instance("ball", f"{cid}_visor", K(0, 0.095, 1.645), K(0.088, 0.04, 0.04), material("visor", "#2b2e34", 0.4), neck)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
@@ -815,7 +905,7 @@ def char_head(cid):
     ch = CHARS.get(cid)
     if not ch:
         return None
-    return ch["root"].location + Vector((0, 0, 1.62 * ch["k"]))
+    return ch["root"].matrix_world.translation + Vector((0, 0, 1.62 * ch["k"]))
 
 
 # ─────────────────────────────────────────────────────────── actions ──
@@ -829,9 +919,9 @@ def resolve_point(t, default=None):
         return v3(t)
     if isinstance(t, str):
         if t in CHARS:
-            return CHARS[t]["root"].location.copy()
+            return CHARS[t]["root"].matrix_world.translation.copy()
         if t.startswith("char:") and t[5:] in CHARS:
-            return CHARS[t[5:]]["root"].location.copy()
+            return CHARS[t[5:]]["root"].matrix_world.translation.copy()
         ob = bpy.data.objects.get(f"prop_{t}")
         if ob:
             return ob.location.copy()
@@ -1186,6 +1276,91 @@ for prop, ch, sides, fa, fb, _at in HOLDS:
         prop.keyframe_insert("location", frame=fr)
     set_key_interp(prop, "LINEAR")
 
+# ───────────────────────────────────────────────────────── vehicles ──
+# "drive": a prop travels to "to" over [startMs, endMs], nose first (heading
+# from the path, eased through each waypoint); legs chain. "ride": a character
+# sits in a prop and travels with it (the driver of a car, a pilot).
+_SEATS = {  # character root in the vehicle's frame (sitting: hips 0.54 m above it)
+    "racecar": (0.0, -0.1, -0.4), "car": (-0.37, -0.1, -0.1), "van": (-0.5, 1.3, 0.36),
+    "truck": (-0.6, 2.8, 0.95), "bus": (-0.8, 5.2, 0.55), "motorbike": (0.0, -0.25, 0.26),
+    "bicycle": (0.0, -0.2, 0.36),
+}
+
+
+def _prop_ob(pid):
+    return bpy.data.objects.get(f"prop_{pid}") if pid else None
+
+
+_legs = {}
+for a in acts:
+    if (a.get("type") or "").lower() == "drive" and _prop_ob(a.get("prop")) is not None \
+            and isinstance(a.get("to"), (list, tuple)) and len(a["to"]) >= 2:
+        _legs.setdefault(a["prop"], []).append(a)
+for pid, legs in _legs.items():
+    ob = _prop_ob(pid)
+    z0 = ob.location.z
+    pts = [(ms_to_frame(legs[0].get("startMs") or 0), ob.location.copy())]
+    for a in legs:
+        f0 = ms_to_frame(a.get("startMs") or 0)
+        f1 = max(f0 + 1, ms_to_frame(a.get("endMs") or (int(a.get("startMs") or 0) + 1000)))
+        if f0 > pts[-1][0]:
+            pts.append((f0, pts[-1][1].copy()))  # waits where it is until this leg
+        to = a["to"]
+        pts.append((f1, Vector((float(to[0]), float(to[1]), float(to[2]) if len(to) > 2 else z0))))
+    yaw_prev = ob.rotation_euler.z
+    for i, (fr, pt) in enumerate(pts):
+        dirs = []
+        if i > 0:
+            dirs.append((pt - pts[i - 1][1]).to_2d())
+        if i + 1 < len(pts):
+            dirs.append((pts[i + 1][1] - pt).to_2d())
+        dirs = [d.normalized() for d in dirs if d.length > 1e-3]
+        yaw = yaw_prev
+        if dirs:
+            d = sum(dirs, Vector((0.0, 0.0)))
+            if d.length > 1e-6:
+                yaw = math.atan2(-d.x, d.y)  # nose at +y, like yaw_to
+        while yaw - yaw_prev > math.pi:
+            yaw -= 2 * math.pi
+        while yaw - yaw_prev < -math.pi:
+            yaw += 2 * math.pi
+        yaw_prev = yaw
+        ob.location = pt
+        ob.rotation_euler.z = yaw
+        ob.keyframe_insert("location", frame=fr)
+        ob.keyframe_insert("rotation_euler", frame=fr)
+    set_key_interp(ob, "LINEAR")  # a steady speed along each leg
+
+for a in acts:
+    if (a.get("type") or "").lower() != "ride":
+        continue
+    ch, ob = CHARS.get(a.get("character")), _prop_ob(a.get("prop"))
+    if not ch or ob is None:
+        continue
+    seat = Vector([float(v) for v in (a.get("seat") or _SEATS.get(ob.get("kind"), (0.0, 0.0, 0.0)))][:3])
+    root = ch["root"]
+    _sit_pose(ch)
+    for part in JOINTS:
+        key(ch[part], "rotation_euler", 1)
+    key(ch["hips"], "location", 1)
+    if a.get("startMs") is None and a.get("endMs") is None:
+        # The whole scene in it: seated in the vehicle, moving with it.
+        if root.animation_data:
+            root.animation_data_clear()
+        root.parent = ob
+        root.location = seat
+        root.rotation_euler = (0, 0, 0)
+    else:
+        fa = ms_to_frame(a.get("startMs") or 0)
+        fb = ms_to_frame(a.get("endMs")) if a.get("endMs") is not None else scn.frame_end
+        for fr in range(fa, fb + 1):
+            scn.frame_set(fr)
+            mw = ob.matrix_world
+            root.location = mw @ seat
+            root.rotation_euler = (0, 0, mw.to_euler().z)
+            root.keyframe_insert("location", frame=fr)
+            root.keyframe_insert("rotation_euler", frame=fr)
+
 # ──────────────────────────────────────────────────────────── camera ──
 
 SHOT_SIZES = {  # vertical framing extent in metres for a 1.75 m subject
@@ -1206,9 +1381,9 @@ aspect = RW / RH
 def subject_info(sid):
     if isinstance(sid, str) and sid in CHARS:
         ch = CHARS[sid]
-        return ch["root"].location.copy(), ch["height"], ch["root"].rotation_euler.z
+        return ch["root"].matrix_world.translation.copy(), ch["height"], ch["root"].matrix_world.to_euler().z
     if isinstance(sid, list) and sid:
-        pts = [CHARS[x]["root"].location for x in sid if x in CHARS]
+        pts = [CHARS[x]["root"].matrix_world.translation.copy() for x in sid if x in CHARS]
         if pts:
             c = sum(pts, Vector((0, 0, 0))) / len(pts)
             return c, max(CHARS[x]["height"] for x in sid if x in CHARS), None
@@ -1225,7 +1400,7 @@ def framing_pose(C, at_frame):
     size = (C.get("shotSize") or C.get("size") or "medium").lower().replace("-", "_").replace(" ", "_")
     ext = SHOT_SIZES.get(size, 1.05) * (h / 1.75)
     if isinstance(subj, list) and len(subj) > 1:  # two-shot: widen to fit both
-        pts = [CHARS[x]["root"].location for x in subj if x in CHARS]
+        pts = [CHARS[x]["root"].matrix_world.translation.copy() for x in subj if x in CHARS]
         spread = max((p - q).length for p in pts for q in pts)
         ext = max(ext, spread / aspect * 1.4)
     aim = base + Vector((0, 0, h * AIM_Z.get(size, 0.78)))
@@ -1255,7 +1430,7 @@ def framing_pose(C, at_frame):
     # Over-the-shoulder: slide behind the shoulder of "ots" character.
     if C.get("ots") and C["ots"] in CHARS:
         o = CHARS[C["ots"]]
-        op = o["root"].location
+        op = o["root"].matrix_world.translation
         towards = (aim - op)
         towards.z = 0
         towards.normalize()
@@ -2142,7 +2317,7 @@ if args.live:
             with gpu.matrix.push_pop_projection():
                 gpu.matrix.load_projection_matrix(proj)
                 for sid in ORDER:
-                    if sid != active:
+                    if sid != active or LIVE.get("stage_pov"):  # through it: no frame of its own
                         continue
                     cam = CAMS[sid]
                     mw = cam.matrix_world
@@ -2170,6 +2345,8 @@ if args.live:
                         for i in range(4):
                             segf += [fp[i], fp[(i + 1) % 4]]
                         _lines(segf, (0.78, 0.78, 0.76, 0.85), 1.6, w, h)
+                    if not LIVE.get("stage_sel"):  # the move shows only on the selected camera
+                        continue
                     pts = LIVE["paths"].get(sid) or []
                     segp = []
                     for a, b in zip(pts, pts[1:]):
@@ -2184,6 +2361,34 @@ if args.live:
                     if tob is not None:  # the line of sight, now
                         _lines([apex, tob.matrix_world.translation.copy()], (1.0, 0.62, 0.25, 0.35), 1.0, w, h)
         gpu.state.blend_set("NONE")
+
+    def _follow_active_cam():
+        """Follow mode: the stage view sits behind and a little above the
+        active camera, looking where it looks, so its frame and everything it
+        sees are in view — as the camera moves, keys change or time runs."""
+        sid = LIVE["stage_shot"]
+        cam = CAMS.get(sid)
+        tob = bpy.data.objects.get(f"cam_target_{sid}")
+        if cam is None or tob is None:
+            return
+        p = cam.matrix_world.translation.copy()
+        a = tob.matrix_world.translation.copy()
+        fwd = a - p
+        dist = max(0.5, fwd.length)
+        fwd.normalize()
+        flat = Vector((fwd.x, fwd.y, 0.0))
+        flat = flat.normalized() if flat.length > 1e-4 else Vector((0.0, 1.0, 0.0))
+        back = max(1.8, min(6.0, 1.0 + dist * 0.22))
+        pos = p - flat * back + Vector((0.0, 0.0, 0.6 + back * 0.3))
+        tgt = p + fwd * min(dist, 12.0) * 0.55  # between the camera and what it frames
+        lens = max(14.0, min(40.0, float(cam.data.lens) * 0.75))  # a bit wider than the camera
+        key = (tuple(round(v, 3) for v in pos), tuple(round(v, 3) for v in tgt), round(lens, 1))
+        if key == LIVE.get("follow_key"):
+            return
+        LIVE["follow_key"] = key
+        LIVE["stage_view"] = {"pos": pos, "tgt": tgt, "lens": lens, "ortho": False}
+        LIVE["cut_dirty"] = True
+        LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _stage_proj(view, proj):
         """Where the active camera sits on the stage image (for its label)."""
@@ -2766,6 +2971,17 @@ if args.live:
                             "shots": [{"id": sid, "startMs": int(_by_id[sid].get("startMs") or 0),
                                        "durationMs": int(_by_id[sid].get("durationMs") or 3000)} for sid in ORDER],
                             "durationMs": DUR_MS})
+        elif k == "stage_follow":  # the stage view rides behind the active camera
+            LIVE["stage_follow"] = bool(c.get("on"))
+            LIVE["follow_key"] = None
+        elif k == "stage_pov":  # the stage looks through the active camera, live
+            LIVE["stage_pov"] = bool(c.get("on"))
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        elif k == "stage_sel":  # the active camera is selected: draw its path
+            LIVE["stage_sel"] = bool(c.get("on"))
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
         elif k == "stage_view":
             LIVE["stage_view"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 24),
                                   "ortho": bool(c.get("ortho"))}
@@ -2989,6 +3205,8 @@ if args.live:
                     # the same frame.
                     with bpy.context.temp_override(view_layer=_stage_layer()):
                         scn.frame_set(fr)
+            if stage_on and LIVE.get("stage_follow"):
+                _follow_active_cam()
             # Playback renders 1 EEVEE sample per frame (the offscreen draw
             # renders ALL taa_samples every time: 8 cost ~8x and broke real
             # time); a beat after it stops, one full-quality redraw.
@@ -3316,6 +3534,8 @@ void main() {
         w, h = LIVE["w"], LIVE["h"]
         cam = CAMS.get(sh["id"])
         f = LIVE["stage_view"] if LIVE["stage"] else LIVE["free"]
+        if LIVE["stage"] and LIVE.get("stage_pov"):
+            f = None  # through the shot camera itself: its move, zoom and cuts, live
         if f:
             cam_d_live = bpy.data.cameras.get("live_cam") or bpy.data.cameras.new("live_cam")
             live = bpy.data.objects.get("live_cam") or bpy.data.objects.new("live_cam", cam_d_live)
@@ -3343,6 +3563,9 @@ void main() {
                 LIVE["proj_at"] = now
                 msg = {"type": "stage", "ms": LIVE["stage_ms"], "cams": _stage_proj(view, proj),
                        "active": LIVE["stage_shot"], **_cam_handles(LIVE["stage_shot"], proj @ view)}
+                if LIVE.get("stage_follow") and LIVE["stage_view"]:
+                    sv = LIVE["stage_view"]
+                    msg["follow"] = {"pos": list(sv["pos"]), "target": list(sv["tgt"]), "lens": sv["lens"]}
                 for conn in conns:
                     _send_json(msg, only=conn)
         LIVE.setdefault("pend", {})["st"] = (o, w, h, list(conns))
@@ -3658,7 +3881,105 @@ def in_frame(cam, f0, f1):
             if q.z > 0 and 0 <= q.x <= 1 and 0 <= q.y <= 1:
                 props[p_.get("id")] = True
     names = {c.get("id"): c for c in (S.get("characters") or [])}
+    # Second by second (cap 40 samples): who and which moving vehicle is in
+    # frame, where (x 0 left .. 1 right) and how far (m) — a long take changes
+    # what it shows many times; three samples said nothing about it.
+    riders = {a_.get("character"): a_.get("prop") for a_ in (S.get("actions") or [])
+              if (a_.get("type") or "").lower() == "ride"}
+    # Vehicles only (a driven prop that is a vehicle shape, or carries someone):
+    # small parts driven along with them (a steering wheel) are noise.
+    _veh = {"car", "racecar", "van", "truck", "bus", "motorbike", "bicycle"}
+    _shape = {p_.get("id"): (p_.get("shape") or p_.get("kind") or "") for p_ in (SETD.get("props") or [])}
+    movers = sorted({a_.get("prop") for a_ in (S.get("actions") or [])
+                     if (a_.get("type") or "").lower() == "drive" and a_.get("prop")
+                     and (_shape.get(a_.get("prop")) in _veh or a_.get("prop") in riders.values())})
+    step = max(1, int(FPS), (f1 - f0) // 40)
+    timeline = []
+
+    def _faces(ob, wpt):
+        """Which way something faces as the shot sees it: 'camera' (we see
+        its front), 'away' (its back), 'left' / 'right' (profile, facing that
+        side of the frame). Characters and vehicles both face local +y."""
+        fwd = (ob.matrix_world.to_3x3() @ Vector((0.0, 1.0, 0.0)))
+        fwd.z = 0.0
+        if fwd.length < 1e-6:
+            return None
+        fwd.normalize()
+        to_cam = cam.matrix_world.translation - wpt
+        to_cam.z = 0.0
+        if to_cam.length < 1e-6:
+            return None
+        to_cam.normalize()
+        # The angle between where it faces and where the camera is, and which
+        # of ITS sides the camera is on: the way an operator names the view.
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, fwd.dot(to_cam)))))
+        side_ = "left" if (fwd.x * to_cam.y - fwd.y * to_cam.x) > 0 else "right"
+        if ang < 25:
+            return "front"
+        if ang < 65:
+            return f"front-{side_}"
+        if ang < 115:
+            return f"side-{side_}"
+        if ang < 155:
+            return f"back-{side_}"
+        return "back"
+
+    def _off(qs, wpt):
+        """Where something NOT in frame is, from the camera: 'left' / 'right' /
+        'above' / 'below' / 'behind', and how far (m) — only when near (< 25 m)."""
+        d = (wpt - cam.matrix_world.translation).length
+        if d > 25.0:
+            return None
+        zq = [q for q in qs if q.z > 0]
+        if not zq:
+            return ("behind", round(d, 1))
+        cx = sum(q.x for q in zq) / len(zq)
+        cy = sum(q.y for q in zq) / len(zq)
+        side_ = "left" if cx < 0 else "right" if cx > 1 else ("below" if cy < 0 else "above")
+        return (side_, round(d, 1))
+    for fr in range(f0, f1 + 1, step):
+        scn.frame_set(fr)
+        seen = []
+        for cid, parts in CHARS.items():
+            root = parts["root"].matrix_world.translation
+            hgt = float(parts.get("height") or 1.75)
+            qs = [world_to_camera_view(scn, cam, root + Vector((0, 0, hgt * t))) for t in (0.05, 0.5, 0.95)]
+            # The head where it really is (seated, in a cockpit, a close-up).
+            nk = parts.get("neck")
+            if nk is not None:
+                qs.append(world_to_camera_view(scn, cam, nk.matrix_world.translation + Vector((0, 0, 0.12 * hgt / 1.75))))
+            vis = [q for q in qs if q.z > 0 and -0.02 <= q.x <= 1.02 and -0.02 <= q.y <= 1.02]
+            if not vis:
+                o_ = _off(qs, root)
+                if o_:
+                    seen.append({"id": cid, "kind": "character", "off": o_[0], "dist": o_[1],
+                                 **({"in": riders[cid]} if cid in riders else {})})
+            if vis:
+                seen.append({"id": cid, "kind": "character", "x": round(sum(q.x for q in vis) / len(vis), 2),
+                             "dist": round(sum(q.z for q in vis) / len(vis), 1),
+                             "faces": _faces(parts["root"], root),
+                             **({"in": riders[cid]} if cid in riders else {})})
+        for pid_ in movers:
+            ob = bpy.data.objects.get(f"prop_{pid_}")
+            if not ob:
+                continue
+            # The vehicle's footprint corners + centre: in frame if any is.
+            mw = ob.matrix_world
+            corners = ([mw @ Vector((dx, dy, 0.4)) for dx in (-0.9, 0.9) for dy in (-2.5, 2.5)]
+                       + [mw @ Vector((0.0, dy, 0.55)) for dy in (-1.5, 0.0, 1.5)] + [mw.translation])
+            qs = [world_to_camera_view(scn, cam, v) for v in corners]
+            vis = [q for q in qs if q.z > 0 and -0.02 <= q.x <= 1.02 and -0.05 <= q.y <= 1.05]
+            if not vis:
+                o_ = _off(qs, mw.translation)
+                if o_:
+                    seen.append({"id": pid_, "kind": "vehicle", "off": o_[0], "dist": o_[1]})
+            if vis:
+                seen.append({"id": pid_, "kind": "vehicle", "x": round(sum(q.x for q in vis) / len(vis), 2),
+                             "dist": round(sum(q.z for q in vis) / len(vis), 1),
+                             "faces": _faces(ob, mw.translation)})
+        timeline.append({"ms": int(round((fr - 1) * 1000.0 / FPS)), "seen": seen})
     return {
+        "timeline": timeline,
         "characters": [{"id": cid, "name": (names.get(cid) or {}).get("name") or cid,
                         "characterId": (names.get(cid) or {}).get("characterId"),
                         "share": v["share"], "x": round(sum(v["xs"]) / len(v["xs"]), 2),
