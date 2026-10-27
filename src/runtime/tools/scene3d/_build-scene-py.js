@@ -2110,6 +2110,32 @@ if args.live:
     import socket
     import struct
     import time
+    import os
+    _PERF_ON = bool(os.environ.get("KOI_LIVE_PERF"))
+    _PERF = {}
+    def _perf(key, t0):
+        if _PERF_ON:
+            a = _PERF.setdefault(key, [0, 0.0, 0.0])
+            d = (time.perf_counter() - t0) * 1000.0
+            a[0] += 1
+            a[1] += d
+            a[2] = max(a[2], d)
+    def _perf_dump():
+        if not _PERF_ON:
+            return
+        now_ = time.time()
+        if now_ - _PERF.get("_at", now_) < 2.0:
+            _PERF.setdefault("_at", now_)
+            return
+        span = now_ - _PERF.get("_at", now_)
+        _PERF["_at"] = now_
+        parts = []
+        for k_, v_ in sorted(_PERF.items()):
+            if k_ == "_at" or not v_[0]:
+                continue
+            parts.append(f"{k_} {v_[0] / span:.1f}/s avg {v_[1] / v_[0]:.1f} max {v_[2]:.1f}ms")
+            _PERF[k_] = [0, 0.0, 0.0]
+        print("[live-perf] " + " | ".join(parts), flush=True)
     import gpu
 
     LIVE = {"w": 960, "h": 540, "shot": JOBS[0]["shot"], "ms": 0.0, "playing": True, "seq": False,
@@ -2361,6 +2387,28 @@ if args.live:
                     if tob is not None:  # the line of sight, now
                         _lines([apex, tob.matrix_world.translation.copy()], (1.0, 0.62, 0.25, 0.35), 1.0, w, h)
         gpu.state.blend_set("NONE")
+
+    def _playback_shadows(playing):
+        """While the clock runs, the sun casts no shadow: in EEVEE its
+        shadow costs ~20 ms per view per frame whatever its resolution,
+        filter or the geometry (measured, Blender 4.5) — with the timeline
+        preview and the stage both open that capped them at ~20 and ~4 fps.
+        Paused, the shadow is back for the still."""
+        if LIVE.get("pb_shadow_off") == playing:
+            return
+        LIVE["pb_shadow_off"] = playing
+        off = LIVE.setdefault("sun_off", set())
+        for ob_ in scn.objects:
+            if ob_.type != "LIGHT" or ob_.data.type != "SUN":
+                continue
+            if playing and ob_.data.use_shadow:
+                off.add(ob_.name)
+                ob_.data.use_shadow = False
+            elif not playing and ob_.name in off:
+                ob_.data.use_shadow = True
+        if not playing:
+            off.clear()
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _follow_active_cam():
         """Follow mode: the stage view sits behind and a little above the
@@ -2934,6 +2982,7 @@ if args.live:
                 v["shot"] = c.get("shot")
             v["ms"] = max(0.0, min(float(c.get("ms") or 0), float(DUR_MS)))
             LIVE["clock"] = v["ms"]
+            LIVE["follow_at"] = time.time()
             if not fresh and before == (v["shot"], ms_to_frame(v["ms"]), ms_to_frame(v["ms"])):
                 return False
         elif k == "size" and conn in LIVE["views"]:
@@ -2996,10 +3045,16 @@ if args.live:
                     and abs(new_ms - (LIVE["clock"] or 0)) < 4.0):
                 return False  # sub-frame jitter (see follow)
             LIVE["stage_ms"] = new_ms
-            LIVE["clock"] = LIVE["stage_ms"]
+            # ONE owner for the clock: while the timeline preview is being
+            # fed, it alone sets the time. The stage sends the same playhead
+            # later (throttled), so the two interleaved and the clock went
+            # back and forth — frames out of order, the preview stuttered
+            # only when both viewers were open.
+            if not (LIVE["views"] and time.time() - LIVE.get("follow_at", 0.0) < 0.5):
+                LIVE["clock"] = LIVE["stage_ms"]
             if c.get("shot") in _by_id:
                 LIVE["stage_shot"] = c.get("shot")
-            if before == (ms_to_frame(LIVE["stage_ms"]), ms_to_frame(LIVE["stage_ms"]), LIVE["stage_shot"]):
+            if before == (ms_to_frame(LIVE["stage_ms"]), ms_to_frame(LIVE["clock"] or 0), LIVE["stage_shot"]):
                 return False
         elif k == "free_off":
             LIVE["free"] = None
@@ -3109,6 +3164,31 @@ if args.live:
             LIVE.setdefault("early_size", {})[conn] = (LIVE["w"], LIVE["h"])
         elif k == "view":  # free camera, Blender coords
             LIVE["free"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 35)}
+        elif k == "diag":  # diagnostics: heaviest objects (evaluated triangles)
+            dg_ = bpy.context.evaluated_depsgraph_get()
+            rows = []
+            for ob_ in scn.objects:
+                if ob_.type == "MESH":
+                    ev = ob_.evaluated_get(dg_)
+                    rows.append((sum(max(1, len(p_.vertices) - 2) for p_ in ev.data.polygons), ob_.name, ob_.visible_shadow,
+                                 bool(ob_.animation_data or (ob_.parent and ob_.parent.animation_data))))
+            from collections import Counter
+            print("[scene3d] diag types=%s instancers=%s" % (dict(Counter(o_.type for o_ in scn.objects)),
+                  [o_.name for o_ in scn.objects if o_.instance_type != "NONE" or any(m_.type == "NODES" for m_ in getattr(o_, "modifiers", []))][:10]), flush=True)
+            print("[scene3d] diag instances=%d" % sum(1 for _ in dg_.object_instances), flush=True)
+            print("[scene3d] diag eevee=%s" % {p_.identifier: getattr(scn.eevee, p_.identifier) for p_ in scn.eevee.bl_rna.properties if p_.type in ("BOOLEAN", "INT", "FLOAT", "ENUM") and not p_.is_readonly}, flush=True)
+            print("[scene3d] diag world=%s" % ([n_.bl_idname for n_ in scn.world.node_tree.nodes] if scn.world and scn.world.use_nodes else None), flush=True)
+            rows.sort(reverse=True)
+            print("[scene3d] diag tris=%d objs=%d top=%s" % (sum(r[0] for r in rows), len(rows), rows[:12]), flush=True)
+        elif k == "light_set":  # diagnostics / tuning: { attr: value } on every light
+            for ob_ in scn.objects:
+                if ob_.type == "LIGHT" and c.get("only", ob_.data.type) == ob_.data.type:
+                    print(f"[scene3d] light {ob_.name} {ob_.data.type} shadow={getattr(ob_.data, 'use_shadow', None)} hide={ob_.hide_render}", flush=True)
+                    for attr, val in (c.get("values") or {}).items():
+                        try:
+                            setattr(ob_.data, attr, val)
+                        except Exception as e:
+                            print(f"[scene3d] light_set {attr}: {e}", flush=True)
         elif k == "eevee_set":  # diagnostics / tuning: { attr: value } on scene.eevee
             for attr, val in (c.get("values") or {}).items():
                 try:
@@ -3193,18 +3273,40 @@ if args.live:
             if LIVE.get("lit_for") != lit:
                 LIVE["lit_for"] = lit
                 apply_shot_light(_by_id[lit])
+                LIVE["pb_shadow_off"] = None  # new lights: apply the playback rule again
             ms = LIVE["clock"] if LIVE["clock"] is not None else LIVE["stage_ms"]
             fr = ms_to_frame(ms)
-            if scn.frame_current != fr or LIVE.pop("stage_stale", False):
+            if LIVE.pop("stage_stale", False):
+                LIVE["stage_fr"] = None
+                LIVE["main_fr"] = None
+            if scn.frame_current != fr or LIVE.get("main_fr") != fr:
+                t0_ = time.perf_counter()
                 scn.frame_set(fr)
+                _perf("frame_set", t0_)
+                LIVE["main_fr"] = fr
+                LIVE["clock_at"] = now
                 # Playing: one draw per frame (two only for a lone change).
                 LIVE["dirty"] = 1 if now - LIVE.get("moved_at", 0.0) < 0.25 else 2
                 LIVE["moved_at"] = now
-                if stage_on:
-                    # The stage layer has its own depsgraph: evaluate it at
-                    # the same frame.
-                    with bpy.context.temp_override(view_layer=_stage_layer()):
-                        scn.frame_set(fr)
+            # The stage draws every frame too, on its own view layer (its own
+            # depsgraph, evaluated here for the frames it draws). It used to
+            # be throttled to ~5/s because each stage draw cost ~20 ms — that
+            # was its free camera's 100 m far clip (see live_cam), not the
+            # stage itself. KOI_STAGE_FPS caps it again if ever needed.
+            cap_ = float(os.environ.get("KOI_STAGE_FPS") or 0)
+            stage_due = stage_on and (not follows or not LIVE.get("moving") or cap_ <= 0
+                                      or now - LIVE.get("stage_drawn", 0.0) >= 1.0 / cap_)
+            if stage_due and LIVE.get("stage_fr") != fr:
+                # The stage layer has its own depsgraph: evaluate it at the
+                # same frame.
+                t0_ = time.perf_counter()
+                with bpy.context.temp_override(view_layer=_stage_layer()):
+                    scn.frame_set(fr)
+                _perf("frame_set_stage", t0_)
+                LIVE["stage_fr"] = fr
+            LIVE["stage_due"] = stage_due
+            if not os.environ.get("KOI_KEEP_SHADOWS"):
+                _playback_shadows(now - LIVE.get("clock_at", 0.0) < 0.25)
             if stage_on and LIVE.get("stage_follow"):
                 _follow_active_cam()
             # Playback renders 1 EEVEE sample per frame (the offscreen draw
@@ -3226,6 +3328,7 @@ if args.live:
                     LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
             except Exception:
                 pass
+            _perf_dump()
             flush = not LIVE.get("dirty", 0) and bool(LIVE.get("pend"))
             if LIVE.get("dirty", 0) > 0 or flush:
                 if flush:
@@ -3487,7 +3590,9 @@ void main() {
         for key, (po, pw, ph, pconns) in list(pend.items()):
             pconns = [c_ for c_ in pconns if c_ in LIVE["clients"]]
             if pconns:
+                t0_ = time.perf_counter()
                 _ship(po, pw, ph, pconns)
+                _perf("ship_" + str(key[0] if isinstance(key, tuple) else key), t0_)
         pend.clear()
         if req == "flush":  # nothing new to draw: the last frame went out
             return
@@ -3503,17 +3608,22 @@ void main() {
                     continue
                 w, h = v["w"], v["h"]
                 tag = id(conn)
+                t0_ = time.perf_counter()
                 o = _offscreen_k(("v", tag, w, h), w, h, used)
                 o.draw_view3d(scn, ctx.view_layer, sp, reg, cam.matrix_world.inverted(),
                               cam.calc_matrix_camera(dg, x=w, y=h), do_color_management=True)
                 pend[("v", tag)] = (_dof_pass(o, cam, w, h, used, tag), w, h, [conn])
+                _perf("draw_preview", t0_)
         if legacy:
             # While playing, the stage (a second full render competing for
-            # the GPU) refreshes ~5x/s; the preview keeps every frame.
-            now_ = time.time()
-            if not LIVE.get("moving") or now_ - LIVE.get("stage_drawn", 0.0) >= 0.2 or not LIVE["views"]:
-                LIVE["stage_drawn"] = now_
+            # the GPU) refreshes ~5x/s, on the frames the tick evaluated its
+            # layer for (stage_due); the preview keeps every frame.
+            if not LIVE["stage"] or not LIVE["views"] or LIVE.get("stage_due"):
+                LIVE["stage_drawn"] = time.time()
+                LIVE["stage_due"] = False
+                t0_ = time.perf_counter()
                 _draw_legacy(ctx, sp, reg, dg, used, legacy)
+                _perf("draw_stage", t0_)
             else:
                 used.update(k for k in offscreen if k[0] == "st")
         for k in [k for k in offscreen if k not in used]:
@@ -3539,25 +3649,39 @@ void main() {
         if f:
             cam_d_live = bpy.data.cameras.get("live_cam") or bpy.data.cameras.new("live_cam")
             live = bpy.data.objects.get("live_cam") or bpy.data.objects.new("live_cam", cam_d_live)
-            cam_d_live.sensor_fit = "HORIZONTAL"
-            cam_d_live.sensor_width = 36.0
-            cam_d_live.lens = f["lens"]
-            # Orthographic stage view (Blender's numpad-5): same framing width.
-            cam_d_live.type = "ORTHO" if f.get("ortho") else "PERSP"
-            cam_d_live.ortho_scale = max(0.1, 2.0 * (f["tgt"] - f["pos"]).length * 18.0 / f["lens"])
-            cam_d_live.clip_start = 0.05
-            live.location = f["pos"]
-            live.rotation_euler = (f["tgt"] - f["pos"]).to_track_quat("-Z", "Y").to_euler()
-            live.matrix_world = live.matrix_basis
+            # Write the free camera ONLY when it changed: every RNA write tags
+            # the depsgraph, and EEVEE then re-synced the whole scene on every
+            # stage draw (~20 ms, the stage's whole cost while playing).
+            key = (tuple(f["pos"]), tuple(f["tgt"]), float(f["lens"]), bool(f.get("ortho")))
+            if LIVE.get("live_cam_key") != key or live.data is not cam_d_live:
+                LIVE["live_cam_key"] = key
+                cam_d_live.sensor_fit = "HORIZONTAL"
+                cam_d_live.sensor_width = 36.0
+                cam_d_live.lens = f["lens"]
+                # Orthographic stage view (Blender's numpad-5): same framing width.
+                cam_d_live.type = "ORTHO" if f.get("ortho") else "PERSP"
+                cam_d_live.ortho_scale = max(0.1, 2.0 * (f["tgt"] - f["pos"]).length * 18.0 / f["lens"])
+                cam_d_live.clip_start = 0.05
+                # Same far clip as the shot cameras. Blender's default 100 m
+                # made EEVEE's every stage draw ~10x slower (24 ms vs 2.4 ms,
+                # measured), whatever the view showed.
+                cam_d_live.clip_end = 500.0
+                live.location = f["pos"]
+                live.rotation_euler = (f["tgt"] - f["pos"]).to_track_quat("-Z", "Y").to_euler()
+                live.matrix_world = live.matrix_basis
             cam = live
         view = cam.matrix_world.inverted()
         proj = cam.calc_matrix_camera(dg, x=w, y=h)
         o = _offscreen_k(("st", w, h), w, h, used)
+        t0_ = time.perf_counter()
         o.draw_view3d(scn, _stage_layer() if LIVE["stage"] else ctx.view_layer, sp, reg, view, proj,
                       do_color_management=True)
+        _perf("stage_view3d", t0_)
         if LIVE["stage"]:
+            t0_ = time.perf_counter()
             with o.bind():
                 _draw_cams(view, proj, w, h)
+            _perf("stage_cams", t0_)
             now = time.time()
             if now - LIVE["proj_at"] > 0.08:
                 LIVE["proj_at"] = now
