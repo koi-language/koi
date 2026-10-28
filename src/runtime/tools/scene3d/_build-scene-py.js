@@ -3386,7 +3386,15 @@ if args.live:
             o_ = pos
             if ortho:
                 o_, d, _hh = _screen_ray(float(c.get("x", 0.5)), float(c.get("y", 0.5)))
-            hit, _loc, _n, _i, ob, _m = scn.ray_cast(bpy.context.evaluated_depsgraph_get(), o_, d)
+            if LIVE["stage"]:
+                # Against what the stage SHOWS: its own layer, walls cut away
+                # there only. The main layer's walls stood invisibly in the
+                # way — no hover or click on anyone behind one (most sets).
+                with bpy.context.temp_override(view_layer=_stage_layer()):
+                    dg_ = bpy.context.evaluated_depsgraph_get()
+            else:
+                dg_ = bpy.context.evaluated_depsgraph_get()
+            hit, _loc, _n, _i, ob, _m = scn.ray_cast(dg_, o_, d)
             found = None
             if hit and ob:
                 for cid in CHARS:
