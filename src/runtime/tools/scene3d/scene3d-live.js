@@ -13,12 +13,86 @@ import fs from 'fs';
 import net from 'net';
 import path from 'path';
 import { spawn } from 'child_process';
-import { readScene, writeScene, normalizeScene, renderScene, renderDir, cleanId, syncLinks, storyboardPath } from './_store.js';
+import { readScene, writeScene, normalizeScene, renderScene, renderDir, cleanId, syncLinks, storyboardPath, stripPlan, finishStrip } from './_store.js';
 import { stampSources, refreshPrevizFlags } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
 import { ensureBlender, builderScriptPath, liveSurfaceLib } from './_blender.js';
 
-const _sessions = new Map(); // "<sceneId>#<slot>" → { proc, port }
+const _sessions = new Map(); // "<sceneId>#<slot>" → { proc, port, ctl }
+
+/**
+ * The engine's own link to a live session (`ctl`: never a view, never the
+ * stage). It asks for timeline filmstrips, which the session draws in its
+ * idle moments — a few ms a frame, with the scene already loaded, instead
+ * of a separate Blender per strip.
+ */
+function _ctlLink(s, sceneId) {
+  if (s.ctl) return s.ctl;
+  const sock = net.createConnection({ host: '127.0.0.1', port: s.port });
+  const ctl = { sock, waiting: new Map() }; // raw path → { shotId, plan }
+  s.ctl = ctl;
+  let buf = Buffer.alloc(0);
+  sock.on('connect', () => sock.write(JSON.stringify({ cmd: 'ctl' }) + '\n'));
+  sock.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    while (buf.length >= 16) {
+      const len = buf.readUInt32LE(12);
+      if (buf.length < 16 + len) break;
+      const magic = buf.toString('latin1', 0, 4);
+      const body = buf.subarray(16, 16 + len);
+      buf = buf.subarray(16 + len);
+      if (magic !== 'BRXJ') continue;
+      let m;
+      try { m = JSON.parse(body.toString('utf8')); } catch { continue; }
+      if (m.type !== 'strip_done') continue;
+      const w = ctl.waiting.get(m.out);
+      if (!w) continue;
+      ctl.waiting.delete(m.out);
+      if (m.skipped) { fs.rmSync(m.out, { force: true }); continue; }
+      finishStrip(sceneId, w.shotId, m.out, w.plan)
+        .catch((e) => channel.log('scene3d', `strip ${sceneId}/${w.shotId}: ${e.message}`));
+    }
+  });
+  const drop = () => {
+    if (s.ctl === ctl) s.ctl = null;
+    for (const raw of ctl.waiting.keys()) fs.rmSync(raw, { force: true });
+    ctl.waiting.clear();
+  };
+  sock.on('error', drop);
+  sock.on('close', drop);
+  return ctl;
+}
+
+/**
+ * Filmstrips for the shots of a scene that lack one (all of them by
+ * default), drawn by its running live session. Each request carries the
+ * shot's camera as saved: a session still showing an older version skips
+ * it (it is about to restart, and its start asks again). No session: the
+ * timeline shows the review sheet until one runs.
+ */
+export function requestStrips(sceneId, shotIds = null) {
+  const id = cleanId(sceneId);
+  const s = _sessions.get(`${id}#main`);
+  const scene = s && readScene(id);
+  if (!scene) return 0;
+  const ctl = _ctlLink(s, id);
+  const dir = renderDir(id);
+  let n = 0;
+  for (const sh of scene.shots || []) {
+    if (shotIds && !shotIds.includes(sh.id)) continue;
+    const plan = stripPlan(scene, sh);
+    if (fs.existsSync(plan.strip)) continue;
+    const raw = path.join(dir, `.strip-${sh.id}-${plan.hash}.rgba`);
+    if (ctl.waiting.has(raw)) continue;
+    ctl.waiting.set(raw, { shotId: sh.id, plan });
+    ctl.sock.write(JSON.stringify({
+      cmd: 'strip', shot: sh.id, out: raw, times: plan.times, w: plan.w, h: plan.h,
+      expect: { keyframes: sh.keyframes ?? null, camera: sh.camera ?? null },
+    }) + '\n');
+    n++;
+  }
+  return n;
+}
 
 function _freePort() {
   return new Promise((resolve, reject) => {
@@ -32,15 +106,83 @@ function _freePort() {
   });
 }
 
-function _stop(sceneId) {
+/**
+ * Pool of Blenders. A stopped session's process is PARKED instead of killed,
+ * and the next start of any scene takes it over (`load`: the builder runs
+ * again in that process on the new scene — no launch, shaders already
+ * compiled). At most MAX_BLENDERS processes in all, live + parked.
+ */
+const MAX_BLENDERS = 3;
+const _parked = []; // { proc, port, log }
+
+function _kill(proc) {
+  try { proc.kill('SIGTERM'); } catch { /* gone */ }
+}
+
+function _stop(sceneId, { park = true } = {}) {
   const s = _sessions.get(sceneId);
   if (!s) return false;
-  try { s.proc.kill('SIGTERM'); } catch { /* gone */ }
   _sessions.delete(sceneId);
+  try { s.ctl?.sock.destroy(); } catch { /* closed */ }
+  if (park && s.proc.exitCode == null && !s.proc.killed) {
+    _parked.push({ proc: s.proc, port: s.port, log: s.log });
+    while (_parked.length && _sessions.size + _parked.length > MAX_BLENDERS) _kill(_parked.shift().proc);
+  } else {
+    _kill(s.proc);
+  }
   return true;
 }
 
-process.on('exit', () => { for (const id of [..._sessions.keys()]) _stop(id); });
+process.on('exit', () => {
+  for (const id of [..._sessions.keys()]) _stop(id, { park: false });
+  for (const p of _parked.splice(0)) _kill(p.proc);
+});
+
+/** Wait for a (re)built live session: its "live on" line, or a failure. */
+function _waitReady(proc, log, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    let buf = '';
+    const done = (r) => {
+      clearTimeout(t);
+      proc.stdout.off('data', on);
+      proc.stderr.off('data', on);
+      proc.off('exit', onExit);
+      resolve(r);
+    };
+    const t = setTimeout(() => done({ ok: false, log: buf }), timeoutMs);
+    const on = (d) => {
+      buf += d;
+      if (buf.includes('[scene3d] live on')) done({ ok: true });
+      else if (buf.includes('Traceback')) done({ ok: false, log: buf });
+    };
+    const onExit = () => done({ ok: false, log: buf });
+    proc.stdout.on('data', on);
+    proc.stderr.on('data', on);
+    proc.on('exit', onExit);
+  });
+}
+
+/** A parked Blender, rebuilt on [snap]; null when none could take it. */
+async function _fromPool(snap) {
+  while (_parked.length) {
+    const p = _parked.pop(); // the most recent: its shaders are the freshest
+    if (p.proc.exitCode != null || p.proc.killed) continue;
+    // A reload takes well under a second: one that has not answered in 10 s
+    // is not coming (a deaf process) — a fresh Blender beats a frozen stage.
+    const ready = _waitReady(p.proc, p.log, 10000);
+    const sent = await new Promise((resolve) => {
+      const sock = net.createConnection({ host: '127.0.0.1', port: p.port }, () => {
+        sock.end(JSON.stringify({ cmd: 'load', scene: snap, script: builderScriptPath() }) + '\n', () => resolve(true));
+      });
+      sock.on('error', () => resolve(false));
+    });
+    const r = sent ? await ready : { ok: false };
+    if (r.ok) return p;
+    channel.log('scene3d', `pooled Blender could not load: ${String(r.log || '').slice(-400)} | before: ${String(p.log?.tail || '').slice(-1500)}`);
+    _kill(p.proc);
+  }
+  return null;
+}
 
 /**
  * A new camera from the stage: the shot under the playhead is cut at
@@ -182,48 +324,65 @@ export default {
     if (params?.op === 'add_camera') return _addCamera(params);
     const scene = readScene(id);
     if (!scene) return { success: false, error: `scene3d_live: no scene "${params?.id}".` };
-    _stop(key); // a fresh start always reflects the scene as saved now
+    _stop(key); // a fresh start always reflects the scene as saved now (its Blender is reused)
     // Timelines made before live 3D still point at pre-rendered proxies:
     // repoint them to the live shot (cheap, idempotent).
     syncLinks(scene).catch(() => {});
     const { bin } = await ensureBlender();
-    const port = await _freePort();
     const surfaceLib = liveSurfaceLib();
     const dir = renderDir(id);
     fs.mkdirSync(dir, { recursive: true });
     const snap = path.join(dir, `.snapshot-live-${process.pid}-${key.split("#")[1]}.json`);
     fs.writeFileSync(snap, JSON.stringify(scene), 'utf8');
+    const reused = await _fromPool(snap);
+    if (reused) {
+      channel.log('scene3d', `live ${key}: reused a pooled Blender`);
+      _sessions.set(key, { proc: reused.proc, port: reused.port, log: reused.log });
+      return _started(key, id, scene, reused.port, surfaceLib);
+    }
+    const port = await _freePort();
     const proc = spawn(bin, [
       '--factory-startup', '--no-window-focus', '--window-geometry', '-4000', '-4000', '48', '48', '-noaudio',
       '-P', builderScriptPath(), '--', '--scene', snap, '--live', String(port),
       // Frames through shared memory (IOSurface) when the native lib exists.
       ...(surfaceLib ? ['--surface-lib', surfaceLib] : []),
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    _sessions.set(key, { proc, port });
-    proc.on('exit', () => { if (_sessions.get(key)?.proc === proc) _sessions.delete(key); });
-    const ready = await new Promise((resolve) => {
-      let log = '';
-      const t = setTimeout(() => resolve({ ok: false, log }), 60000);
-      const on = (d) => {
-        log += d;
-        if (log.includes('[scene3d] live on')) { clearTimeout(t); resolve({ ok: true }); }
-        else if (log.includes('Traceback')) { clearTimeout(t); resolve({ ok: false, log }); }
-      };
-      proc.stdout.on('data', on);
-      proc.stderr.on('data', on);
-      proc.on('exit', () => { clearTimeout(t); resolve({ ok: false, log }); });
+    const log = { tail: '' };
+    _sessions.set(key, { proc, port, log });
+    proc.on('exit', () => {
+      for (const [k, s] of _sessions) if (s.proc === proc) _sessions.delete(k);
+      const i = _parked.findIndex((p) => p.proc === proc);
+      if (i >= 0) _parked.splice(i, 1);
     });
+    // Keep the pipes drained for the whole life of the process (a pooled
+    // Blender keeps printing; a full pipe would block it).
+    // The last output stays on hand (a pooled reload that fails says why),
+    // and an error inside the live loop goes to the log as it happens.
+    const keep = (d) => {
+      log.tail = (log.tail + d).slice(-4000);
+      if (String(d).includes('[scene3d] tick error')) channel.log('scene3d', `live ${port}: ${String(d).slice(-1500)}`);
+    };
+    proc.stdout.on('data', keep);
+    proc.stderr.on('data', keep);
+    const ready = await _waitReady(proc, log);
     if (!ready.ok) {
-      _stop(key);
+      _stop(key, { park: false });
       return { success: false, error: `scene3d_live: Blender did not start: ${String(ready.log || '').slice(-800)}` };
     }
-    return {
-      success: true,
-      port,
-      shots: scene.shots.map((s) => ({ id: s.id, name: s.name, storyboardShotId: s.storyboardShotId, durationMs: s.durationMs })),
-      characters: (scene.characters || []).map((c) => ({ id: c.id, name: c.name, characterId: c.characterId })),
-      aspect: (scene.resolution?.width || 16) / (scene.resolution?.height || 9),
-      surface: !!surfaceLib,
-    };
+    return _started(key, id, scene, port, surfaceLib);
   },
 };
+
+function _started(key, id, scene, port, surfaceLib) {
+  // Shots without a filmstrip (new, edited, or from before it existed):
+  // this session draws them when idle.
+  if (key.endsWith('#main')) requestStrips(id);
+  return {
+    success: true,
+    port,
+    shots: scene.shots.map((s) => ({ id: s.id, name: s.name, storyboardShotId: s.storyboardShotId, durationMs: s.durationMs })),
+    characters: (scene.characters || []).map((c) => ({ id: c.id, name: c.name, characterId: c.characterId })),
+    aspect: (scene.resolution?.width || 16) / (scene.resolution?.height || 9),
+    surface: !!surfaceLib,
+  };
+}

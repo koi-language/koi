@@ -34,6 +34,7 @@ import json
 import math
 import sys
 import argparse
+import zlib
 from mathutils import Vector, Euler, Matrix
 
 # ─────────────────────────────────────────────────────────────── args ──
@@ -381,10 +382,48 @@ def _rot3(r):
     return (0, 0, math.radians(float(r or 0)))
 
 
+def _mix_hex(a, b, t):
+    ca, cb = a.lstrip("#"), b.lstrip("#")
+    va = [int(ca[i:i + 2], 16) for i in (0, 2, 4)]
+    vb = [int(cb[i:i + 2], 16) for i in (0, 2, 4)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(va, vb))
+
+
+def _lane_fit(keys, vk, dur):
+    """A zoom / focus lane inside its shot: keys left past the end (the shot
+    was shortened after they were set) fold into one key at the end, holding
+    the value the lane had there, so every key sits on the shot and can be
+    picked."""
+    ks = sorted((dict(x) for x in keys or [] if isinstance(x, dict) and isinstance(x.get(vk), (int, float))),
+                key=lambda x: int(x.get("t") or 0))
+    inside = [x for x in ks if 0 <= int(x.get("t") or 0) <= dur]
+    past = [x for x in ks if int(x.get("t") or 0) > dur]
+    for x in ks:
+        if int(x.get("t") or 0) < 0:
+            x["t"] = 0
+            inside.insert(0, x)
+    if not past:
+        return inside
+    after = past[0]
+    v = float(after[vk])
+    if inside:
+        before = inside[-1]
+        t0, t1 = int(before.get("t") or 0), int(after.get("t") or 0)
+        v = float(before[vk]) + (v - float(before[vk])) * (dur - t0) / max(1, t1 - t0)
+    inside = [x for x in inside if int(x.get("t") or 0) != dur]
+    return inside + [{**after, "t": dur, vk: round(v, 3)}]
+
+
+# Props the scene gives no colour: muted mid tones (wood, stone, canvas,
+# slate), one per prop and always the same for it. One light default (it was
+# #c9c1b4) turned a whole set near-white in full sun — no contrast at all.
+PROP_PALETTE = ["#8a6a45", "#9a8f7e", "#a58f74", "#6f7a8a", "#7d7468", "#8a9a7a", "#b39a78", "#6b5a4a"]
+
+
 def build_prop(p, parent=None):
     kind = (p.get("shape") or p.get("kind") or "box").lower()
     pid = p.get("id") or kind
-    col = p.get("color") or "#c9c1b4"
+    col = p.get("color") or PROP_PALETTE[zlib.crc32(str(pid).encode()) % len(PROP_PALETTE)]
     m = material(f"prop_{pid}", col, 0.7)
     root = empty(f"prop_{pid}", (0, 0, 0))
     sz = p.get("size")
@@ -503,7 +542,10 @@ def build_prop(p, parent=None):
         P("box", "duvet", 0, -0.25, 0.5, 1.62, 1.4, 0.06, material("duvet", "#cfc6b8"))
     elif kind in ("counter", "cabinet"):
         P("box", "body", 0, 0, 0, dflt[0], dflt[1], dflt[2] - 0.04)
-        P("box", "top", 0, 0, dflt[2] - 0.04, dflt[0] + 0.02, dflt[1] + 0.02, 0.04, material("worktop", "#d8d4cc"))
+        # The top a shade lighter than the body: a fixed pale worktop on a
+        # 28 m market counter in full sun read as one white band.
+        P("box", "top", 0, 0, dflt[2] - 0.04, dflt[0] + 0.02, dflt[1] + 0.02, 0.04,
+          material(f"worktop_{pid}", p.get("topColor") or _mix_hex(col, "#ffffff", 0.3)))
     elif kind == "desk":
         P("box", "top", 0, 0, 0.71, 1.4, 0.7, 0.04)
         for ix in (-1, 1):
@@ -740,13 +782,6 @@ def yaw_to(src, dst):
     return math.atan2(-d.x, d.y)
 
 
-def _mix_hex(a, b, t):
-    ca, cb = a.lstrip("#"), b.lstrip("#")
-    va = [int(ca[i:i + 2], 16) for i in (0, 2, 4)]
-    vb = [int(cb[i:i + 2], 16) for i in (0, 2, 4)]
-    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(va, vb))
-
-
 def wood_material(name, tint):
     """Light birch, faintly tinted per character so the cast stays
     distinguishable. Workbench shows the flat colour; EEVEE ("lit") gets a
@@ -828,10 +863,6 @@ def build_character(c, idx):
     neck = empty(f"{cid}_neck", K(0, 0, 1.45), hips)
     ball(f"{cid}_neckball", K(0, 0, 1.475), 0.048 * k, joint, neck)
     egg_head(f"{cid}_head", K(0, 0.005, 1.635), k, wood, neck)
-    # A dark visor band across the face: a smooth head reads the same from
-    # the front and from behind, and the video model then guesses which way
-    # a figure looks (it cut to a frontal shot the camera did not have).
-    instance("ball", f"{cid}_visor", K(0, 0.084, 1.655), K(0.085, 0.04, 0.04), material("visor", "#2b2e34", 0.4), neck)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
@@ -877,7 +908,6 @@ def build_block_figure(c, idx):
     instance("box", f"{cid}_torso", K(0, 0, 1.215), K(0.36, 0.2, 0.53), clay, hips)
     neck = empty(f"{cid}_neck", K(0, 0, 1.49), hips)
     instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, neck)
-    instance("ball", f"{cid}_visor", K(0, 0.095, 1.645), K(0.088, 0.04, 0.04), material("visor", "#2b2e34", 0.4), neck)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
@@ -1590,7 +1620,7 @@ def build_camera(SHOT):
 
     # Zoom keyed by hand on the stage: lens keys of their own, apart from
     # the pose keys (which then leave the focal length alone).
-    LK = [(ms_to_frame(s_ms + int(x.get("t") or 0)), float(x["mm"])) for x in (C.get("lensKeys") or [])
+    LK = [(ms_to_frame(s_ms + int(x.get("t") or 0)), float(x["mm"])) for x in _lane_fit(C.get("lensKeys"), "mm", e_ms - s_ms)
           if isinstance(x, dict) and isinstance(x.get("mm"), (int, float)) and x["mm"] > 0]
 
     def place(p, a, lens_mm, frame):
@@ -1727,7 +1757,7 @@ def build_camera(SHOT):
     # Depth of field (focus on the subject / target).
     focus = C.get("focus")
     fdist = C.get("focusDistance")
-    for fk in C.get("focusKeys") or []:  # focus pulled by hand on the stage
+    for fk in _lane_fit(C.get("focusKeys"), "d", int(SHOT.get("durationMs") or 3000)):  # focus pulled by hand on the stage
         if isinstance(fk, dict) and isinstance(fk.get("d"), (int, float)) and fk["d"] > 0:
             kfocus.append((ms_to_frame(s_ms + int(fk.get("t") or 0)), float(fk["d"])))
     if C.get("dof") or (move.get("dof")) or focus or fdist or kfocus:
@@ -1904,6 +1934,14 @@ def eevee_clean(live=False):
         e.taa_render_samples = args.samples or 32
     except Exception:
         pass
+    if live:
+        # The shadow page pool is GPU memory held for the whole session: the
+        # default 512 MB made each live Blender ~2 GB (and every open scene
+        # runs one). 128 MB keeps the shadows of a previz set (~1.3 GB each).
+        try:
+            e.shadow_pool_size = "128"
+        except Exception:
+            pass
     for ld in bpy.data.lights:
         # Small physical penumbra (traced = noisy) + wide FILTER (smooth).
         for attr, val in (("use_shadow_jitter", False),):
@@ -2111,6 +2149,19 @@ if args.live:
     import struct
     import time
     import os
+    # Live views draw no shadows at all: they add little to a previz and,
+    # switched off while the clock ran (~20 ms each per view) and back on when
+    # it stopped, they popped in and out = flicker. With none, the shadow page
+    # pool (GPU memory held all session) can be the minimum.
+    def _live_look():
+        try:
+            if scn.eevee.use_shadows:
+                scn.eevee.use_shadows = False
+            if scn.eevee.shadow_pool_size != "16":
+                scn.eevee.shadow_pool_size = "16"
+        except Exception:
+            pass
+    _live_look()
     _PERF_ON = bool(os.environ.get("KOI_LIVE_PERF"))
     _PERF = {}
     def _perf(key, t0):
@@ -2186,6 +2237,18 @@ if args.live:
                 root = CHARS[cid]["root"].matrix_world.translation
                 hgt = float(CHARS[cid].get("height") or 1.7)
                 pts += [root.copy(), root + Vector((0, 0, hgt))]
+        # The side it looks from is the SCENE's, measured over the cast's
+        # whole run: taken from around the playhead, it flipped from one
+        # moment to the next and the overview came from the other side.
+        hs = LIVE.get("home_side")
+        if not hs or hs[0] != (S.get("id"), DUR_MS):
+            run = []
+            for k in range(9):
+                scn.frame_set(ms_to_frame(float(DUR_MS) * k / 8))
+                run += [CHARS[cid]["root"].matrix_world.translation.copy() for cid in who]
+            wide = (max(p.x for p in run) - min(p.x for p in run) >= max(p.y for p in run) - min(p.y for p in run)
+                    if run else True)
+            hs = LIVE["home_side"] = ((S.get("id"), DUR_MS), wide)
         scn.frame_set(keep)
         if not pts:
             pts = [Vector((-3, -3, 0)), Vector((3, 3, 1.8))]
@@ -2194,7 +2257,7 @@ if args.live:
         c = (lo + hi) / 2
         # Look across the long axis (its whole length faces the lens), from
         # 35 deg off square and 38 deg up: a 3/4 view, depth readable.
-        side = Vector((0.0, -1.0, 0.0)) if hi.x - lo.x >= hi.y - lo.y else Vector((-1.0, 0.0, 0.0))
+        side = Vector((0.0, -1.0, 0.0)) if hs[1] else Vector((-1.0, 0.0, 0.0))
         a = math.radians(35)
         rot = Vector((side.x * math.cos(a) - side.y * math.sin(a), side.x * math.sin(a) + side.y * math.cos(a), 0))
         el = math.radians(38)
@@ -2332,6 +2395,44 @@ if args.live:
         _POLY.uniform_float("color", color)
         batch_for_shader(_POLY, "LINES", {"pos": coords}).draw(_POLY)
 
+    def _cam_model():
+        """Wireframe film camera in camera space (looks down -Z, +Y up), the
+        lens at the origin: (points, edges). Metres, about 0.7 m long."""
+        pts, edges = [], []
+
+        def add(vs, es):
+            o_ = len(pts)
+            pts.extend(Vector(v) for v in vs)
+            edges.extend((a + o_, b + o_) for a, b in es)
+
+        def box(x0, x1, y0, y1, z0, z1):
+            vs = [(x, y, z) for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)]
+            es = [(0, 1), (2, 3), (0, 2), (1, 3), (4, 5), (6, 7), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)]
+            add(vs, es)
+
+        # Body behind the lens.
+        box(-0.09, 0.09, -0.12, 0.12, 0.14, 0.62)
+        # Lens hood: a short truncated pyramid opening forward.
+        n_, f_ = (0.045, 0.045), (0.085, 0.065)
+        add([(-n_[0], -n_[1], 0.14), (n_[0], -n_[1], 0.14), (n_[0], n_[1], 0.14), (-n_[0], n_[1], 0.14),
+             (-f_[0], -f_[1], 0.0), (f_[0], -f_[1], 0.0), (f_[0], f_[1], 0.0), (-f_[0], f_[1], 0.0)],
+            [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)])
+        # Two reels on top, their axis across the body (X).
+        import math as _m
+        k_, r_ = 12, 0.13
+        for zc in (0.25, 0.51):
+            vs = []
+            for x in (-0.04, 0.04):
+                for i in range(k_):
+                    a = 2 * _m.pi * i / k_
+                    vs.append((x, 0.12 + r_ + r_ * _m.sin(a), zc + r_ * _m.cos(a)))
+            es = [(i, (i + 1) % k_) for i in range(k_)] + [(k_ + i, k_ + (i + 1) % k_) for i in range(k_)]
+            es += [(i, k_ + i) for i in range(0, k_, 2)]
+            add(vs, es)
+        return pts, edges
+
+    _CAM_MODEL = _cam_model()
+
     def _draw_cams(view, proj, w, h):
         """The active shot camera only, as an amber frustum (+ its move as a
         path); the other cameras stay hidden."""
@@ -2347,30 +2448,32 @@ if args.live:
                         continue
                     cam = CAMS[sid]
                     mw = cam.matrix_world
-                    sc_ = 0.55 / max(cam.data.display_size, 1e-3)
-                    fr = [mw @ (v * sc_) for v in cam.data.view_frame(scene=scn)]
                     apex = mw.translation
+                    # A film camera (body, two reels, lens hood) in wireframe...
                     seg = []
-                    for i in range(4):
-                        seg += [apex, fr[i], fr[i], fr[(i + 1) % 4]]
-                    _lines(seg, (1.0, 0.62, 0.25, 1.0), 2.4, w, h)
+                    for a_, b_ in _CAM_MODEL[1]:
+                        seg += [mw @ _CAM_MODEL[0][a_], mw @ _CAM_MODEL[0][b_]]
+                    _lines(seg, (1.0, 0.62, 0.25, 1.0), 1.8, w, h)
+                    # ...and its field of view, out to where it focuses (the
+                    # focus distance with depth of field, else its aim point).
                     cd_ = cam.data
+                    fwd = -(mw.to_3x3() @ Vector((0, 0, 1)))
+                    tob = bpy.data.objects.get(f"cam_target_{sid}")
                     if cd_.dof.use_dof:
-                        # Where it is in focus: the frame at the focus distance,
-                        # in grey (the camera's own frame stays amber).
                         fo = cd_.dof.focus_object
-                        if fo is not None:
-                            fwd = -(mw.to_3x3() @ Vector((0, 0, 1)))
-                            fd = (fo.matrix_world.translation - apex).dot(fwd)
-                        else:
-                            fd = float(cd_.dof.focus_distance)
-                        fd = max(0.1, min(60.0, fd))
-                        loc = [v * (fd / max(1e-4, -v.z)) for v in cd_.view_frame(scene=scn)]
-                        fp = [mw @ v for v in loc]
-                        segf = []
-                        for i in range(4):
-                            segf += [fp[i], fp[(i + 1) % 4]]
-                        _lines(segf, (0.78, 0.78, 0.76, 0.85), 1.6, w, h)
+                        fd = (fo.matrix_world.translation - apex).dot(fwd) if fo is not None else float(cd_.dof.focus_distance)
+                    elif tob is not None:
+                        fd = (tob.matrix_world.translation - apex).dot(fwd)
+                    else:
+                        fd = 5.0
+                    fd = max(0.3, min(80.0, fd))
+                    fp = [mw @ (v * (fd / max(1e-4, -v.z))) for v in cd_.view_frame(scene=scn)]
+                    segf, segr = [], []
+                    for i in range(4):
+                        segf += [apex, fp[i]]
+                        segr += [fp[i], fp[(i + 1) % 4]]
+                    _lines(segf, (0.92, 0.92, 0.9, 0.55), 1.1, w, h)
+                    _lines(segr, (0.92, 0.92, 0.9, 0.8), 1.4, w, h)
                     if not LIVE.get("stage_sel"):  # the move shows only on the selected camera
                         continue
                     pts = LIVE["paths"].get(sid) or []
@@ -2388,27 +2491,72 @@ if args.live:
                         _lines([apex, tob.matrix_world.translation.copy()], (1.0, 0.62, 0.25, 0.35), 1.0, w, h)
         gpu.state.blend_set("NONE")
 
-    def _playback_shadows(playing):
-        """While the clock runs, the sun casts no shadow: in EEVEE its
-        shadow costs ~20 ms per view per frame whatever its resolution,
-        filter or the geometry (measured, Blender 4.5) — with the timeline
-        preview and the stage both open that capped them at ~20 and ~4 fps.
-        Paused, the shadow is back for the still."""
-        if LIVE.get("pb_shadow_off") == playing:
+    def _track_cast():
+        """What the overview keeps centred: what the home view frames — the
+        cast (characters with a sheet; else everyone) — where it is NOW:
+        (centre, points). Falls back to the active camera's aim."""
+        cast = [c.get("id") for c in S.get("characters") or [] if c.get("characterId") and c.get("id") in CHARS]
+        pts = []
+        for cid in cast or list(CHARS):
+            root = CHARS[cid]["root"].matrix_world.translation
+            pts += [root.copy(), root + Vector((0, 0, float(CHARS[cid].get("height") or 1.7)))]
+        if not pts:
+            tob = bpy.data.objects.get(f"cam_target_{LIVE['stage_shot']}")
+            if tob is None:
+                return None, []
+            pts = [tob.matrix_world.translation.copy()]
+        lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+        hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+        return (lo + hi) / 2, pts
+
+    def _fit_dist(c, pts, d, lens):
+        """Distance along view direction d (pointing from the target to the
+        lens) at which every point fits — as the home view measures it."""
+        right = d.cross(Vector((0, 0, 1)))
+        right = right.normalized() if right.length > 1e-5 else Vector((1, 0, 0))
+        up = right.cross(d).normalized()
+        tan_h = 18.0 / max(1.0, lens)
+        tan_v = tan_h * 0.7
+        dist = 3.0
+        for p in pts:
+            q = p - c
+            along = q.dot(d)
+            dist = max(dist, abs(q.dot(right)) / tan_h + along, abs(q.dot(up)) / tan_v + along)
+        return dist * 1.25 + 0.8
+
+    def _track_overview():
+        """Centred overview — as if the home button were pressed every frame,
+        from one angle: the view keeps its direction (the home one, or the
+        user's after orbiting), its target follows the cast, and its distance
+        refits the cast (times the user's own zoom), eased so it never pumps."""
+        sv = LIVE["stage_view"]
+        if sv is None or time.time() - LIVE.get("cam_edit_at", 0.0) < 0.6:
+            return  # a camera being dragged: the view holds still under the pointer
+        c, pts = _track_cast()
+        if c is None:
             return
-        LIVE["pb_shadow_off"] = playing
-        off = LIVE.setdefault("sun_off", set())
-        for ob_ in scn.objects:
-            if ob_.type != "LIGHT" or ob_.data.type != "SUN":
-                continue
-            if playing and ob_.data.use_shadow:
-                off.add(ob_.name)
-                ob_.data.use_shadow = False
-            elif not playing and ob_.name in off:
-                ob_.data.use_shadow = True
-        if not playing:
-            off.clear()
-            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        tr = LIVE.get("track_off")
+        if tr is None:
+            v = sv["pos"] - sv["tgt"]
+            d = v.normalized() if v.length > 1e-4 else Vector((0, -1, 0.6)).normalized()
+            fit = _fit_dist(c, pts, d, sv["lens"])
+            if LIVE.pop("track_recentre", False):
+                # Just switched on: centred on the cast, fitted, from this angle.
+                LIVE["track_off"] = {"d": d, "shift": Vector((0, 0, 0)), "zoom": 1.0, "dist": fit}
+            else:
+                LIVE["track_off"] = {"d": d, "shift": sv["tgt"] - c, "zoom": max(0.05, v.length / fit), "dist": v.length}
+            return
+        fit = _fit_dist(c, pts, tr["d"], sv["lens"])
+        # Eased while playing (never pumps); paused, exact: the same moment
+        # always frames the same, however the playhead got there.
+        tr["dist"] += (fit * tr["zoom"] - tr["dist"]) * (0.15 if LIVE.get("playing") else 1.0)
+        tgt = c + tr["shift"]
+        pos = tgt + tr["d"] * tr["dist"]
+        if (pos - sv["pos"]).length < 1e-4 and (tgt - sv["tgt"]).length < 1e-4:
+            return
+        LIVE["stage_view"] = {"pos": pos, "tgt": tgt, "lens": sv["lens"], "ortho": sv.get("ortho", False)}
+        LIVE["cut_dirty"] = True
+        LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _follow_active_cam():
         """Follow mode: the stage view sits behind and a little above the
@@ -2450,17 +2598,149 @@ if args.live:
             q = m @ Vector((p.x, p.y, p.z, 1.0))
             if q.w <= 1e-4:
                 continue
-            # The drawn frustum (apex + frame corners) on screen, so a click
-            # anywhere on the camera picks it, not only on its label.
+            # The drawn camera's points on screen (the GUI takes their hull),
+            # so a click anywhere on the camera picks it, not only its label.
             mw = cam.matrix_world
-            sc_ = 0.55 / max(cam.data.display_size, 1e-3)
             poly = []
-            for v in [p] + [mw @ (c * sc_) for c in cam.data.view_frame(scene=scn)]:
+            for v in [p] + [mw @ c for c in _CAM_MODEL[0]]:
                 qq = m @ Vector((v.x, v.y, v.z, 1.0))
                 if qq.w > 1e-4:
                     poly += [round((qq.x / qq.w + 1) / 2, 4), round((1 - qq.y / qq.w) / 2, 4)]
             out.append({"shot": sid, "x": (q.x / q.w + 1) / 2, "y": (1 - q.y / q.w) / 2, "frustum": poly})
         return out
+
+    def _same_json(a, b):
+        """Same value, numbers within 1e-3, a missing key == None."""
+        if isinstance(a, dict) and isinstance(b, dict):
+            return all(_same_json(a.get(k_), b.get(k_)) for k_ in set(a) | set(b))
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            return len(a) == len(b) and all(_same_json(x_, y_) for x_, y_ in zip(a, b))
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+            return abs(float(a) - float(b)) < 1e-3
+        return a == b
+
+    def _reload(req):
+        """Pool: take this Blender over for another scene without a restart.
+        Everything this run owns goes (clients, socket, surfaces, offscreens,
+        draw handler, the world and its data); then the builder runs again,
+        in this process, on the new scene — same port. Compiled shaders stay
+        in the process, so the next scene draws in a fraction of a cold start."""
+        print(f"[scene3d] live reload -> {req.get('scene')}", flush=True)
+        for conn in list(LIVE["clients"]):
+            try:
+                conn.close()
+            except Exception:
+                pass
+        LIVE["clients"] = []
+        try:
+            srv.close()
+        except Exception:
+            pass
+        for sf in LIVE["surf"].values():
+            if sf.get("s") and _SURF is not None:
+                _SURF.bls_release(sf["s"])
+        LIVE["surf"] = {}
+        for o_ in list(offscreen.values()):
+            try:
+                o_.free()
+            except Exception:
+                pass
+        offscreen.clear()
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(LIVE["draw_h"], "WINDOW")
+        except Exception:
+            pass
+        # The world and everything it made.
+        for ob_ in list(bpy.data.objects):
+            bpy.data.objects.remove(ob_, do_unlink=True)
+        for co_ in list(bpy.data.collections):
+            bpy.data.collections.remove(co_)
+        for vl_ in list(scn.view_layers)[1:]:
+            scn.view_layers.remove(vl_)
+        for coll_ in (bpy.data.actions, bpy.data.cameras, bpy.data.lights, bpy.data.meshes, bpy.data.curves,
+                      bpy.data.materials, bpy.data.images, bpy.data.node_groups, bpy.data.worlds):
+            for id_ in list(coll_):
+                try:
+                    coll_.remove(id_)
+                except Exception:
+                    pass
+        try:
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        except Exception:
+            pass
+        argv_ = sys.argv[:]
+        i_ = argv_.index("--scene")
+        argv_[i_ + 1] = req["scene"]
+        script_ = req.get("script") or __file__
+
+        def _again():
+            sys.argv = argv_
+            try:
+                with open(script_, "r", encoding="utf-8") as f_:
+                    code_ = compile(f_.read(), script_, "exec")
+                exec(code_, {"__name__": "__main__", "__file__": script_})
+            except SystemExit:
+                print("Traceback: reload exited", flush=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+            return None
+
+        bpy.app.timers.register(_again, first_interval=0.05)
+
+    def _strip_step(now):
+        """One filmstrip frame per tick, only while nothing plays or moves:
+        move the scene to that moment and ask _draw for it. The next normal
+        tick puts the clock frame back (main_fr is reset)."""
+        q = LIVE.get("strip_q")
+        if not q or LIVE.get("strip_draw"):
+            return False
+        if max(LIVE.get("clock_at", 0.0), LIVE.get("moved_at", 0.0), LIVE.get("cmd_at", 0.0)) > now - 0.6:
+            return False
+        try:  # half-compiled shaders would land in the strip
+            if bpy.app.is_job_running("SHADER_COMPILATION"):
+                return False
+        except Exception:
+            pass
+        job = q[0]
+        if job["conn"] not in LIVE["clients"] or job["shot"] not in CAMS:
+            q.pop(0)
+            return False
+        if job["i"] == 0 and LIVE.get("lit_for") != job["shot"]:
+            apply_shot_light(_by_id[job["shot"]])
+            LIVE["lit_for"] = job["shot"]
+        scn.frame_set(ms_to_frame(job["times"][job["i"]]))
+        LIVE["main_fr"] = None
+        LIVE["stage_fr"] = None
+        LIVE["strip_draw"] = job
+        LIVE["draw_req"] = "strip"
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+        return True
+
+    def _strip_draw(ctx, sp, reg, dg, used):
+        job = LIVE.pop("strip_draw", None)
+        if job is None:
+            return
+        cam = CAMS[job["shot"]]
+        w, h = job["w"], job["h"]
+        o = _offscreen_k(("strip", w, h), w, h, used)
+        o.draw_view3d(scn, ctx.view_layer, sp, reg, cam.matrix_world.inverted(),
+                      cam.calc_matrix_camera(dg, x=w, y=h), do_color_management=True)
+        px = o.texture_color.read()
+        px.dimensions = w * h * 4
+        with open(job["out"], "ab") as f_:
+            mv_ = memoryview(px)
+            f_.write(mv_.cast("B") if mv_.format != "B" else mv_)
+        job["i"] += 1
+        if job["i"] >= len(job["times"]):
+            LIVE["strip_q"].remove(job)
+            _send_json({"type": "strip_done", "shot": job["shot"], "out": job["out"], "w": w, "h": h,
+                        "n": len(job["times"])}, only=job["conn"])
+        LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _send_json(obj, only=None):
         data = json.dumps(obj).encode()
@@ -2569,9 +2849,14 @@ if args.live:
         sh = _by_id[sid]
         keys = sh.get("keyframes") or (sh.get("camera") or {}).get("keyframes")
         s_ms = int(sh.get("startMs") or 0)
+        # Keys snapped to frames can land a few ms outside the shot (its start
+        # is not on a frame): clamp, or the first key sits before the shot and
+        # an edit at its start keys a new one instead of changing it.
+        dur_ = int(sh.get("durationMs") or 3000)
+        inw = lambda t_: max(0, min(dur_, int(round(t_))))
         if keys and all(isinstance(k.get("position"), (list, tuple)) and isinstance(k.get("target"), (list, tuple))
                         for k in keys):
-            return [{"t": int(k.get("t") or k.get("ms") or 0), "position": list(k["position"]),
+            return [{"t": inw(k.get("t") or k.get("ms") or 0), "position": list(k["position"]),
                      "target": list(k["target"]), "lens": float(k.get("lens") or (sh.get("camera") or {}).get("lens") or 35),
                      **({"focus": float(k["focus"])} if isinstance(k.get("focus"), (int, float)) else {})}
                     for k in keys]
@@ -2584,7 +2869,7 @@ if args.live:
         out = []
         for fr in sorted(frames):
             p, a, ln = _cam_pose_at(sid, fr)
-            out.append({"t": int(round(_frame_ms(fr) - s_ms)), "position": [round(v, 4) for v in p],
+            out.append({"t": inw(_frame_ms(fr) - s_ms), "position": [round(v, 4) for v in p],
                         "target": [round(v, 4) for v in a], "lens": round(ln, 2)})
         return out
 
@@ -2678,7 +2963,7 @@ if args.live:
             s0, dur0 = int(sh.get("startMs") or 0), int(sh.get("durationMs") or 3000)
             half_ = 500.0 / FPS
             relof = lambda ms_: int(round(max(0.0, min(float(dur0), float(ms_) - s0))))
-            ks = [dict(x) for x in cam_c.get(lk) or [] if isinstance(x, dict)]
+            ks = _lane_fit(cam_c.get(lk), vk, dur0)
             if not ks:
                 # First touch: keep what the shot had (the zoom on its pose keys;
                 # a rack focus from the script, a character it follows) as keys,
@@ -2703,7 +2988,11 @@ if args.live:
                 near = [x for x in ks if abs(int(x.get("t") or 0) - rel) <= half_ + 1]
                 if not near or (lane == "lens" and len(ks) <= 1):
                     return False
+                ks.sort(key=lambda x: int(x.get("t") or 0))
+                first = ks[0] is near[0]
                 ks.remove(near[0])
+                if first and ks:  # the next key becomes the lane's first: it starts the shot
+                    ks[0]["t"] = 0
             elif act == "retime":
                 to = relof(c.get("to", s0))
                 near = [x for x in ks if abs(int(x.get("t") or 0) - rel) <= half_ + 1]
@@ -2811,6 +3100,8 @@ if args.live:
         elif op == "delete_key":
             if len(keys) > 1:
                 keys.pop(i)
+                if i == 0:  # the next key becomes the shot's first: it starts it
+                    keys[0]["t"] = 0
         if k is not None and op != "delete_key":
             k["position"] = [round(v, 4) for v in P]
             k["target"] = [round(v, 4) for v in A]
@@ -2923,7 +3214,7 @@ if args.live:
         s_ms = int(sh.get("startMs") or 0)
         for i, k in enumerate(sh.get("keyframes") or []):
             if isinstance(k.get("position"), (list, tuple)) and isinstance(k.get("target"), (list, tuple)):
-                out["keys"].append({"i": i, "ms": s_ms + int(k.get("t") or 0),
+                out["keys"].append({"i": i, "ms": s_ms + max(0, min(int(sh.get("durationMs") or 3000), int(k.get("t") or 0))),
                                     "p": [float(v) for v in k["position"]][:3], "t": [float(v) for v in k["target"]][:3],
                                     "lens": float(k.get("lens") or 35),
                                     "focus": float(k["focus"]) if isinstance(k.get("focus"), (int, float)) else None})
@@ -2933,11 +3224,13 @@ if args.live:
         out["fcurve"] = _focus_curve(sid)
         # The keys of each lane, as the stage draws them (scene ms).
         cc = sh.get("camera") or {}
-        lk = [x for x in cc.get("lensKeys") or [] if isinstance(x, dict)]
+        lk = _lane_fit(cc.get("lensKeys"), "mm", out["dur"])
         out["lensKeys"] = ([[s_ms + int(x.get("t") or 0), float(x.get("mm") or 35)] for x in lk] if lk else
                            [[x["t"], x["mm"]] for x in _runs([{"t": k_["ms"], "mm": k_["lens"]} for k_ in out["keys"]], "mm")])
-        fk = [x for x in cc.get("focusKeys") or [] if isinstance(x, dict)]
+        fk = _lane_fit(cc.get("focusKeys"), "d", out["dur"])
         out["focusKeys"] = ([s_ms + int(x.get("t") or 0) for x in fk] if fk else list(out["fcurve"]["keys"]))
+        if not out["focusKeys"] and CAMS[sid].data.dof.use_dof:
+            out["focusKeys"] = [s_ms]  # one focus for the whole shot: its key at the start, like zoom
         cam = CAMS[sid]
         out["lens"] = round(float(cam.data.lens), 1)
         cd = cam.data
@@ -3011,6 +3304,8 @@ if args.live:
                 pos, tgt, ln = _stage_home()
                 if not LIVE["stage_view"] or c.get("home"):
                     LIVE["stage_view"] = {"pos": pos, "tgt": tgt, "lens": ln}
+                    LIVE["track_off"] = None
+                    LIVE["track_recentre"] = True  # tracking from home: on the cast, no offset
                 LIVE["cut_dirty"] = True
                 LIVE["stage_stale"] = True
             else:
@@ -3020,9 +3315,24 @@ if args.live:
                             "shots": [{"id": sid, "startMs": int(_by_id[sid].get("startMs") or 0),
                                        "durationMs": int(_by_id[sid].get("durationMs") or 3000)} for sid in ORDER],
                             "durationMs": DUR_MS})
+        elif k == "warm_stage":
+            # A preloaded scene (the next one on the timeline) draws its stage
+            # once, unseen, at the stage's size: the first real stage frame
+            # then takes ~100 ms instead of ~450 (layer, batches, buffers).
+            ctl_ = LIVE.get("ctl", set())
+            if not any(c_ not in LIVE["views"] and c_ not in ctl_ for c_ in LIVE["clients"]):
+                LIVE["warm_req"] = (max(64, int(c.get("w") or 1280)), max(64, int(c.get("h") or 720)))
+                LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
         elif k == "stage_follow":  # the stage view rides behind the active camera
             LIVE["stage_follow"] = bool(c.get("on"))
             LIVE["follow_key"] = None
+            LIVE["track_off"] = None
+        elif k == "stage_track":  # the overview slides with the active camera's subject
+            LIVE["stage_track"] = bool(c.get("on"))
+            LIVE["track_off"] = None
+            # Switched on: centre the cast whatever the view looked at. A
+            # reconnect ("keep") resumes from the view it sent instead.
+            LIVE["track_recentre"] = not c.get("keep") or LIVE.get("track_recentre", False)
         elif k == "stage_pov":  # the stage looks through the active camera, live
             LIVE["stage_pov"] = bool(c.get("on"))
             LIVE["cut_dirty"] = True
@@ -3034,6 +3344,7 @@ if args.live:
         elif k == "stage_view":
             LIVE["stage_view"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 24),
                                   "ortho": bool(c.get("ortho"))}
+            LIVE["track_off"] = None  # steered by hand: keep tracking from this angle
             LIVE["cut_dirty"] = True
             # Orbiting draws fast (1 sample, like playback); the full-quality
             # frame lands a beat after it stops.
@@ -3118,6 +3429,7 @@ if args.live:
             _send_json({"type": "pick", "hover": True, "character": found, "box": box, "parts": parts}, only=conn)
             return False
         elif k == "cam_edit":
+            LIVE["cam_edit_at"] = time.time()
             return _cam_edit(c, conn)
         elif k == "cam_begin":  # one undo step per gesture (drag, slider, delete…)
             sid = c.get("shot")
@@ -3164,6 +3476,30 @@ if args.live:
             LIVE.setdefault("early_size", {})[conn] = (LIVE["w"], LIVE["h"])
         elif k == "view":  # free camera, Blender coords
             LIVE["free"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 35)}
+        elif k == "load":  # pooled Blender: drop this scene, build another in this process
+            LIVE["reload"] = {"scene": c.get("scene"), "script": c.get("script")}
+            return False
+        elif k == "ctl":  # the engine's control link: never a view, never the stage
+            LIVE.setdefault("ctl", set()).add(conn)
+            return False
+        elif k == "strip":  # timeline filmstrip: small frames of a shot, drawn when idle
+            sid_ = c.get("shot")
+            if sid_ in CAMS:
+                # Only when this session shows the shot as saved (a stale one
+                # is about to restart and will be asked again).
+                exp_ = c.get("expect")
+                if exp_ is not None and not _same_json(exp_, {"keyframes": _by_id[sid_].get("keyframes"),
+                                                             "camera": _by_id[sid_].get("camera")}):
+                    _send_json({"type": "strip_done", "shot": sid_, "out": c.get("out"), "skipped": True}, only=conn)
+                    return False
+                try:
+                    os.remove(c["out"])
+                except Exception:
+                    pass
+                LIVE.setdefault("strip_q", []).append({"conn": conn, "shot": sid_, "out": c["out"], "i": 0,
+                                                       "times": [float(t_) for t_ in c.get("times") or []],
+                                                       "w": int(c.get("w") or 320), "h": int(c.get("h") or 180)})
+            return False
         elif k == "diag":  # diagnostics: heaviest objects (evaluated triangles)
             dg_ = bpy.context.evaluated_depsgraph_get()
             rows = []
@@ -3201,8 +3537,14 @@ if args.live:
                     ob.hide_viewport = bool(c.get("on", True))
         elif k == "engine":  # "workbench" (clay, fastest) | "eevee" (lit, real light)
             if c.get("name") == "eevee":
-                set_engine("EEVEE")
-                eevee_clean(live=True)
+                # Every view sends this on connect. Re-applying the settings
+                # when nothing changed turned shadows back on — a recompile of
+                # every material (seconds without frames: a frozen stage on
+                # each scene change). Only a real switch sets them up.
+                if not scn.render.engine.startswith("BLENDER_EEVEE"):
+                    set_engine("EEVEE")
+                    eevee_clean(live=True)
+                _live_look()
             else:
                 workbench_studio()
         elif k == "shading":
@@ -3213,10 +3555,13 @@ if args.live:
                 except Exception:
                     pass
 
-    def _tick():
+    def _tick_body():
         now = time.time()
         dt = now - LIVE["last"]
         LIVE["last"] = now
+        if LIVE.get("reload"):
+            _reload(LIVE.pop("reload"))
+            return None  # this run's timer ends; the new run registers its own
         try:
             while True:
                 conn, _a = srv.accept()
@@ -3240,6 +3585,7 @@ if args.live:
                         # which re-sends the time — a loop that never ends.
                         if _cmd(json.loads(line), conn) is not False:
                             LIVE["dirty"] = 2
+                            LIVE["cmd_at"] = now
                 LIVE["buf"][conn] = b
             except BlockingIOError:
                 pass
@@ -3252,10 +3598,15 @@ if args.live:
             sf = LIVE["surf"].pop(conn)
             if sf["s"]:
                 _SURF.bls_release(sf["s"])
-        if not LIVE["clients"]:
+        ctl = LIVE.get("ctl", set())
+        for conn in [c_ for c_ in ctl if c_ not in LIVE["clients"]]:
+            ctl.discard(conn)
+        if _strip_step(now):
+            return 1.0 / 60.0
+        if not [c_ for c_ in LIVE["clients"] if c_ not in ctl]:
             return 0.05
         follows = list(LIVE["views"].values())
-        stage_on = LIVE["stage"] and any(c_ not in LIVE["views"] for c_ in LIVE["clients"])
+        stage_on = LIVE["stage"] and any(c_ not in LIVE["views"] and c_ not in ctl for c_ in LIVE["clients"])
         if stage_on or follows:
             # Stage and timeline preview share ONE world and ONE clock; the
             # stage's dollhouse cut lives on its own view layer.
@@ -3273,7 +3624,6 @@ if args.live:
             if LIVE.get("lit_for") != lit:
                 LIVE["lit_for"] = lit
                 apply_shot_light(_by_id[lit])
-                LIVE["pb_shadow_off"] = None  # new lights: apply the playback rule again
             ms = LIVE["clock"] if LIVE["clock"] is not None else LIVE["stage_ms"]
             fr = ms_to_frame(ms)
             if LIVE.pop("stage_stale", False):
@@ -3305,10 +3655,18 @@ if args.live:
                 _perf("frame_set_stage", t0_)
                 LIVE["stage_fr"] = fr
             LIVE["stage_due"] = stage_due
-            if not os.environ.get("KOI_KEEP_SHADOWS"):
-                _playback_shadows(now - LIVE.get("clock_at", 0.0) < 0.25)
+            if LIVE.get("warm_req") and not stage_on:
+                # Its depsgraph first (drawing a never-evaluated layer
+                # crashes Blender), then the unseen draw (warm_stage).
+                with bpy.context.temp_override(view_layer=_stage_layer()):
+                    scn.frame_set(fr)
+                LIVE["stage_fr"] = fr
+                LIVE["warm_stage"] = LIVE.pop("warm_req")
+                LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
             if stage_on and LIVE.get("stage_follow"):
                 _follow_active_cam()
+            elif stage_on and LIVE.get("stage_track") and not LIVE.get("stage_pov"):
+                _track_overview()
             # Playback renders 1 EEVEE sample per frame (the offscreen draw
             # renders ALL taa_samples every time: 8 cost ~8x and broke real
             # time); a beat after it stops, one full-quality redraw.
@@ -3600,7 +3958,11 @@ void main() {
         sp, reg = ctx.space_data, ctx.region
         dg = ctx.evaluated_depsgraph_get()
         used = set()
-        legacy = [c_ for c_ in LIVE["clients"] if c_ not in LIVE["views"]]
+        if req == "strip":  # only the filmstrip frame: the views keep their last one
+            _strip_draw(ctx, sp, reg, dg, used)
+            return
+        ctl = LIVE.get("ctl", set())
+        legacy = [c_ for c_ in LIVE["clients"] if c_ not in LIVE["views"] and c_ not in ctl]
         if LIVE["views"]:
             for conn, v in list(LIVE["views"].items()):
                 cam = CAMS.get(v["shot"])
@@ -3614,6 +3976,20 @@ void main() {
                               cam.calc_matrix_camera(dg, x=w, y=h), do_color_management=True)
                 pend[("v", tag)] = (_dof_pass(o, cam, w, h, used, tag), w, h, [conn])
                 _perf("draw_preview", t0_)
+        if LIVE.get("warm_stage") and not legacy:
+            ww_, wh_ = LIVE.pop("warm_stage")
+            keep_ = (LIVE["stage"], LIVE["w"], LIVE["h"])
+            LIVE["stage"], LIVE["w"], LIVE["h"] = True, ww_, wh_
+            try:
+                if not LIVE["stage_view"]:
+                    pos_, tgt_, ln_ = _stage_home()
+                    LIVE["stage_view"] = {"pos": pos_, "tgt": tgt_, "lens": ln_}
+                _draw_legacy(ctx, sp, reg, dg, used, [])
+            except Exception as e:
+                print("[scene3d] warm stage failed:", repr(e), flush=True)
+            finally:
+                LIVE["stage"], LIVE["w"], LIVE["h"] = keep_
+                LIVE.get("pend", {}).pop("st", None)
         if legacy:
             # While playing, the stage (a second full render competing for
             # the GPU) refreshes ~5x/s, on the frames the tick evaluated its
@@ -3687,14 +4063,14 @@ void main() {
                 LIVE["proj_at"] = now
                 msg = {"type": "stage", "ms": LIVE["stage_ms"], "cams": _stage_proj(view, proj),
                        "active": LIVE["stage_shot"], **_cam_handles(LIVE["stage_shot"], proj @ view)}
-                if LIVE.get("stage_follow") and LIVE["stage_view"]:
+                if (LIVE.get("stage_follow") or LIVE.get("stage_track")) and LIVE["stage_view"]:
                     sv = LIVE["stage_view"]
                     msg["follow"] = {"pos": list(sv["pos"]), "target": list(sv["tgt"]), "lens": sv["lens"]}
                 for conn in conns:
                     _send_json(msg, only=conn)
         LIVE.setdefault("pend", {})["st"] = (o, w, h, list(conns))
 
-    bpy.types.SpaceView3D.draw_handler_add(_draw, (), "WINDOW", "POST_PIXEL")
+    LIVE["draw_h"] = bpy.types.SpaceView3D.draw_handler_add(_draw, (), "WINDOW", "POST_PIXEL")
     def _stealth():
         """Keep the UI session invisible: no splash, no Dock icon, app hidden
         (like Cmd-H) — through the Objective-C runtime, no permissions."""
@@ -3749,6 +4125,20 @@ void main() {
         return None
 
     bpy.app.timers.register(_stealth, first_interval=0.05)
+    def _tick():
+        # An exception would unregister the timer for good: the process stays
+        # up but deaf (no frames, no commands — a pooled one never loads).
+        # Report each distinct error once and keep ticking.
+        try:
+            return _tick_body()
+        except Exception as e:
+            seen = LIVE.setdefault("tick_errs", set())
+            if repr(e) not in seen:
+                seen.add(repr(e))
+                import traceback
+                print("[scene3d] tick error:", traceback.format_exc(), flush=True)
+            return 0.05
+
     bpy.app.timers.register(_tick, first_interval=0.2, persistent=True)
     # Viewport look = the scene's own render engine (Workbench clay/sketch or
     # EEVEE when lit), drawn live; no overlays / gizmos.
@@ -4131,10 +4521,24 @@ for j in ([] if args.live else JOBS):  # live: Blender stays open, timers drive 
         if hasattr(im, "media_type"):  # Blender 5.x
             im.media_type = "IMAGE"
         im.file_format = "PNG"
+        full_pct, full_smp = r.resolution_percentage, getattr(scn.eevee, "taa_render_samples", 0)
         for i, ms in enumerate(j["stills"]):
+            if j.get("smallFrom") is not None and i == int(j["smallFrom"]):
+                # Filmstrip thumbnails: a quarter size, few samples — seconds
+                # instead of a minute for a whole shot.
+                r.resolution_percentage = max(10, full_pct // 4)
+                try:
+                    scn.eevee.taa_render_samples = 4
+                except Exception:
+                    pass
             scn.frame_set(ms_to_frame(ms))
             r.filepath = f"{j['out']}-{i}.png"
             bpy.ops.render.render(write_still=True)
+        r.resolution_percentage = full_pct
+        try:
+            scn.eevee.taa_render_samples = full_smp
+        except Exception:
+            pass
         print(f"[scene3d] done {j['shot']} {len(j['stills'])} stills → {j['out']}", flush=True)
         continue
     if hasattr(im, "media_type"):  # Blender 5.x

@@ -365,9 +365,12 @@ export function builderScriptPath() {
   return file;
 }
 
-// Previz renders are short and mostly Blender start-up + scene build, so a
-// few in parallel scale well; capped so a laptop stays responsive.
-const _MAX_PARALLEL = Math.max(2, Math.min(4, Math.floor(os.cpus().length / 3)));
+// Previz renders are short and mostly Blender start-up + scene build, but
+// each render Blender holds ~2 GB (EEVEE): memory, not cores, sets how many
+// run at once — one on a 16 GB Mac (four at once ran it out of memory next
+// to the live viewers), more only with RAM to spare.
+const _MAX_PARALLEL = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 3),
+  Math.floor((os.totalmem() / 2 ** 30 - 12) / 4)));
 let _active = 0;
 const _waiters = [];
 

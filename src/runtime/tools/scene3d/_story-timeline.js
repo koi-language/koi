@@ -48,7 +48,18 @@ export function findStoryTimeline(storyboardId) {
     let raw;
     try { raw = fs.readFileSync(fp, 'utf8'); } catch { continue; }
     if (!raw.includes(storyboardId) || !raw.includes('"storyboard"')) continue;
-    const tl = _readJson(fp);
+    let tl = _readJson(fp);
+    // Caught mid-write (a writer that truncates first): read again shortly.
+    // Never "not found" — that created a second, empty montage and the
+    // generated takes vanished from the story.
+    for (let i = 0; !tl && i < 5; i++) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
+      tl = _readJson(fp);
+    }
+    if (!tl) {
+      if (/"role"\s*:\s*"storyboard"/.test(raw)) return f.slice(0, -5);
+      continue;
+    }
     if (tl?.role === 'storyboard' && tl.storyboardId === storyboardId) {
       if (!best || String(tl.createdAt || '') < String(best.createdAt || '')) best = tl;
     }

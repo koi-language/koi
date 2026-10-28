@@ -32,7 +32,17 @@ import { BUILD_SCENE_PY } from './_build-scene-py.js';
 
 // Builder version: a change to the Blender script must invalidate every
 // cached render, or old previews would survive a fix forever.
-const _BUILDER_HASH = crypto.createHash('sha1').update(BUILD_SCENE_PY).digest('hex').slice(0, 8);
+// What renders depend on: the builder WITHOUT its live-viewport server (the
+// block from the output section's "if args.live:" to "elif args.export_glb:").
+// Hashing the whole script made every live-only change (stage drawing, pool,
+// strips) re-render every poster of every scene on the next start — four
+// 2 GB Blenders at once on a 16 GB Mac.
+const _BUILDER_HASH = (() => {
+  const a = BUILD_SCENE_PY.indexOf('\nif args.live:', BUILD_SCENE_PY.indexOf('# ───────────────────────────────────────────────────────────── output ──'));
+  const b = BUILD_SCENE_PY.indexOf('\nelif args.export_glb:', a);
+  const renderPart = a > 0 && b > a ? BUILD_SCENE_PY.slice(0, a) + BUILD_SCENE_PY.slice(b) : BUILD_SCENE_PY;
+  return crypto.createHash('sha1').update(renderPart).digest('hex').slice(0, 8);
+})();
 import { getTimeline, updateTimeline } from '../../state/timelines.js';
 import { channel } from '../../io/channel.js';
 
@@ -323,7 +333,10 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
     const poster = `${base}-${win}.jpg`;
     const sheet = `${base}-sheet-${win}.jpg`;
     const stills = `${base}-${win}.stills`;
-    const plan = { sh, pv, cut, poster, sheet, stills, base, win, outs: [] };
+    // The timeline filmstrip comes from the live session (stripPlan), not
+    // from here: a separate Blender per strip was the expensive part.
+    const strip = stripPlan(scene, sh).strip;
+    const plan = { sh, pv, cut, poster, sheet, stills, strip, base, win, outs: [] };
     const job = (pass, out) => {
       byPass[pass].push({ shot: sh.id, out: `${out}.part.mp4`, fromMs: sh.startMs, toMs: sh.startMs + sh.durationMs });
       plan.outs.push([pass, out]);
@@ -334,6 +347,7 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
     // (generation references, export).
     if (force || !_exists(poster) || !_exists(sheet)) {
       const last = Math.max(sh.startMs, sh.startMs + sh.durationMs - Math.ceil(1000 / (scene.fps || 24)));
+      // Stills 0-2: first / middle / last (poster + review sheet).
       byPass.beauty.push({ shot: sh.id, out: stills, stills: [sh.startMs, Math.round(sh.startMs + sh.durationMs / 2), last],
         fromMs: sh.startMs, toMs: sh.startMs + sh.durationMs });
       plan.outs.push(['stills', stills]);
@@ -348,6 +362,7 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
     if (!plan.outs.length) {
       pv.sheet = sheet;
       pv.poster = poster;
+      if (_exists(strip)) pv.strip = strip;
       res.reused.push(sh.id);
       sh.preview = pv;
       previews.set(sh.id, pv);
@@ -363,7 +378,7 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
   const finished = new Set();
   let publishChain = Promise.resolve();
   const finishPlan = async (pl) => {
-    const { sh, pv, cut, poster, sheet, stills, outs } = pl;
+    const { sh, pv, cut, poster, sheet, stills, strip, outs } = pl;
     try {
       if (failedBatch.has(sh.id)) throw new Error(failedBatch.get(sh.id));
       for (const [pass, out] of outs) {
@@ -385,6 +400,7 @@ export async function renderScene(scene, { shotIds = null, passes = ['beauty'], 
         throw new Error('stills were not rendered');
       }
       if (_exists(sheet)) pv.sheet = sheet;
+      if (_exists(strip)) pv.strip = strip;
       // What the camera actually sees (written by the builder): the shot's
       // continuity, derived from the 3D — kept internally, never shown.
       try {
@@ -469,6 +485,53 @@ function _commitPreviews(scene, st, previews) {
   writeScene(fresh);
   Object.assign(scene, fresh);
   _gc(scene);
+}
+
+/**
+ * The timeline filmstrip of a shot: a frame every ~1.5 s as a tiny video,
+ * shown frame by frame like a real take's. Drawn by the scene's live
+ * session (a few ms per frame, no extra Blender); its name carries the
+ * shot's hash and window like the other renders.
+ */
+export function stripPlan(scene, sh) {
+  const base = path.join(renderDir(scene.id), `${sh.id}-${shotHash(scene, sh, 'lit')}`);
+  const strip = `${base}-strip-${sh.startMs}-${sh.startMs + sh.durationMs}.mp4`;
+  const n = Math.max(2, Math.min(24, Math.round(sh.durationMs / 1500)));
+  const stepMs = sh.durationMs / n;
+  const rw = scene.resolution?.width || 16, rh = scene.resolution?.height || 9;
+  return {
+    strip,
+    hash: shotHash(scene, sh, 'lit'),
+    stepMs,
+    times: Array.from({ length: n }, (_, i) => Math.round(sh.startMs + i * stepMs)),
+    w: 320,
+    h: Math.max(2, Math.round((320 * rh) / rw / 2) * 2),
+  };
+}
+
+/** Raw RGBA frames (bottom-up, as the GPU reads them) → the strip mp4,
+ *  then onto the shot's preview when the shot is still the same. */
+export async function finishStrip(sceneId, shotId, raw, plan) {
+  const ffmpeg = await _ffmpegBin();
+  // Dot-named while in flight: _gc never touches it.
+  const part = path.join(path.dirname(plan.strip), `.${path.basename(plan.strip)}.part.mp4`);
+  try {
+    // Frame i shows from i·step on: the strip's own time is the shot's.
+    await _run(ffmpeg, ['-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${plan.w}x${plan.h}`,
+      '-framerate', String(1000 / plan.stepMs), '-i', raw, '-vf', 'vflip', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      '-g', '1', '-r', String(Math.max(1, Math.ceil(1000 / plan.stepMs))), part]);
+    fs.renameSync(part, plan.strip);
+  } finally {
+    fs.rmSync(raw, { force: true });
+    fs.rmSync(part, { force: true });
+  }
+  const fresh = readScene(sceneId);
+  const sh = fresh?.shots?.find((x) => x.id === shotId);
+  if (!sh || shotHash(fresh, sh, 'lit') !== plan.hash) return false;
+  sh.preview = { ...(sh.preview?.hash === plan.hash ? sh.preview : { hash: plan.hash, style: 'lit' }), strip: plan.strip };
+  writeScene(fresh);
+  await syncLinks(fresh);
+  return true;
 }
 
 /** Timeline clip path of a live 3D shot: no file — the GUI's preview has
@@ -561,7 +624,7 @@ function _gc(scene) {
   try { files = fs.readdirSync(dir); } catch { return; }
   const live = new Set();
   for (const sh of scene.shots || []) {
-    for (const k of ['cut', 'poster', 'sheet', 'depth', 'mask']) {
+    for (const k of ['cut', 'poster', 'sheet', 'strip', 'depth', 'mask']) {
       if (sh.preview?.[k]) live.add(path.basename(sh.preview[k]));
     }
   }

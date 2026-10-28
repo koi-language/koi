@@ -6,6 +6,7 @@
  * re-renders that shot, trimming a static shot only re-cuts its card.
  */
 
+import { requestStrips } from './scene3d-live.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId } from './_store.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
@@ -111,6 +112,9 @@ export default {
     ].filter(Boolean));
     stampSources(scene, touched);
     writeScene(scene);
+    // Filmstrips of the changed shots from the live session, when it already
+    // shows this version (a camera edit made on the stage).
+    requestStrips(scene.id, touched ? [...touched] : null);
     let r = { rendered: [], reused: [], failed: [] };
     if (params.render !== false) {
       try {
