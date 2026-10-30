@@ -23,7 +23,7 @@ import path from 'path';
 
 import { channel } from '../../io/channel.js';
 import { saveLocationEntry } from '../../state/media-library.js';
-import { slugifyLocationId } from '../../state/location-registry.js';
+import { slugifyLocationId, locationViews } from '../../state/location-registry.js';
 
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -64,6 +64,16 @@ function _validate(loc) {
       return '"details" (when provided) must be an array of absolute file paths (strings) — close-ups / detail shots of the place.';
     }
   }
+  if (loc.views !== undefined && loc.views !== null) {
+    if (!Array.isArray(loc.views) || loc.views.some((v) => !_isObj(v) ||
+        ['id', 'label', 'path'].some((k) => v[k] !== undefined && v[k] !== null && !_isStr(v[k])))) {
+      return '"views" (when provided) must be an array of { id?, label?, path? } objects with string values.';
+    }
+    const hero = _normViews(loc.views).find((v) => v.path)?.path ?? null;
+    if (_isStr(loc.plate) && loc.plate.trim() && loc.plate.trim() !== hero) {
+      return '"plate" is derived from "views" (the first view with an image). Change the path inside "views" and omit "plate".';
+    }
+  }
   if (loc.plateCells !== undefined && loc.plateCells !== null) {
     if (!Array.isArray(loc.plateCells) ||
         loc.plateCells.some((c) => !c || typeof c !== 'object' ||
@@ -85,6 +95,24 @@ function _normPhotos(v) {
     seen.add(s);
     out.push(s);
   }
+  return out;
+}
+
+function _normViews(v) {
+  if (!Array.isArray(v)) return [];
+  const seen = new Set();
+  const out = [];
+  v.forEach((view, i) => {
+    if (!_isObj(view)) return;
+    let id = _isStr(view.id) ? view.id.trim() : '';
+    if (!id || seen.has(id)) id = `v-${Date.now()}-${i}`;
+    seen.add(id);
+    out.push({
+      id,
+      label: _isStr(view.label) ? view.label.trim() : '',
+      path: (_isStr(view.path) && view.path.trim()) ? view.path.trim() : null,
+    });
+  });
   return out;
 }
 
@@ -116,6 +144,7 @@ function _normalize(loc, existing) {
     (existing && _isStr(existing.createdAt) && existing.createdAt) ||
     (_isStr(loc.createdAt) && loc.createdAt) ||
     now;
+  const views = _normViews(locationViews(loc));
   return {
     id: loc.id,
     name: loc.name.trim(),
@@ -129,14 +158,11 @@ function _normalize(loc, existing) {
     tags: _normTags(loc.tags),
     photos: _normPhotos(loc.photos),
     // The establishing views of the empty location that lock the world's look
-    // across every clip. `plate` = FRONT, the ONLY one a location needs; the
-    // other three are OPTIONAL extra angles, each generated FROM the front (it
-    // is attached as reference) or assigned by the user. Each view owns its own
-    // field so one never overwrites another.
-    plate: (_isStr(loc.plate) && loc.plate.trim()) ? loc.plate.trim() : null,
-    plateRear: (_isStr(loc.plateRear) && loc.plateRear.trim()) ? loc.plateRear.trim() : null,
-    plateLeft: (_isStr(loc.plateLeft) && loc.plateLeft.trim()) ? loc.plateLeft.trim() : null,
-    plateRight: (_isStr(loc.plateRight) && loc.plateRight.trim()) ? loc.plateRight.trim() : null,
+    // across every clip: a free list, labelled by the user. A view without a
+    // path is an empty slot waiting to be generated or assigned. `plate` is
+    // derived (the first view with an image) so hero readers need not know.
+    views,
+    plate: views.find((v) => v.path)?.path ?? null,
     // DETAIL shots: close-ups of the place (a sign, a scale, a corner) the user
     // uploaded or assigned. Pointers only, like `photos`. Distinct from
     // `photos`, which are the INPUT reference photos that DEFINE the location.
@@ -158,12 +184,12 @@ export default {
     'Write a reusable LOCATION / set entity to ~/.koi/locations/<id>.json with STRUCTURED args (the location as an OBJECT, not a JSON string). ' +
     'A location is a persisted, reusable place (a dining room, a warehouse, a beach…) the user references across storyboards and video prompts. A scene = its characters + its location; both are first-class reusable identity anchors (a character has a turnaround sheet; a location has an establishing PLATE). ' +
     'Use for BOTH creating new locations and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
-    'Call shape: { location: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, plate? } }. ' +
+    'Call shape: { location: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, views? } }. ' +
     'location.locationType is a short canonical string ("interior" / "exterior" / "mixed"); location.timeOfDay (e.g. "night", "golden hour"), location.palette (color/mood note) and location.lighting (the set\'s default light) are optional strings; location.tags an optional string array. ' +
     'Required: location.name (non-empty). location.id is OPTIONAL — a kebab-case slug that MUST match the on-disk filename; when omitted it is derived from the name. ' +
     'location.handle is the BARE @mention WITHOUT the leading "@" (e.g. "comedor") — when set together with at least one photo, the first photo is registered under `@handle` so `@handle` resolves in prompts. ' +
     'location.description is what the place looks like. location.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, bytes never copied; photos[0] is the hero image. ' +
-    'location.plate is the FRONT establishing view — the only one a location needs. location.plateRear / plateLeft / plateRight are OPTIONAL extra angles, generated only when the story needs them or the user asks. All four are usually set by generate_location_plate, not by hand. ' +
+    'location.views is the list of establishing views, [{ id, label, path }]: labels are free text owned by the user, and there are no fixed angles. They are usually added by generate_location_plate, not by hand. location.plate is READ-ONLY, derived from the first view with an image. ' +
     'location.details is an OPTIONAL array of ABSOLUTE paths to close-up / detail shots of the place (pointers only) — distinct from location.photos, which are the INPUT reference photos that DEFINE the location. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, location:<normalized> } on success, or { success:false, error } with the exact invalid field on failure.',
@@ -179,7 +205,7 @@ export default {
     properties: {
       location: {
         type: 'object',
-        description: 'Full location object: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, plate? }. See description for required fields.',
+        description: 'Full location object: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, views? }. See description for required fields.',
       },
       summary: { type: 'string', description: 'OPTIONAL. One-line "what is this location" — pinned to this session\'s creations ledger. Only attached on the FIRST save of a given location id. When omitted, the ledger falls back to the location\'s description.' },
     },

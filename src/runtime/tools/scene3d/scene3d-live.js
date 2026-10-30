@@ -349,7 +349,8 @@ export default {
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     const log = { tail: '' };
     _sessions.set(key, { proc, port, log });
-    proc.on('exit', () => {
+    proc.on('exit', (code, signal) => {
+      channel.log('scene3d', `live :${port}: Blender exited (code ${code}, signal ${signal}): ${log.tail.slice(-400)}`);
       for (const [k, s] of _sessions) if (s.proc === proc) _sessions.delete(k);
       const i = _parked.findIndex((p) => p.proc === proc);
       if (i >= 0) _parked.splice(i, 1);

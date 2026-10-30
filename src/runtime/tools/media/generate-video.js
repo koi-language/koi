@@ -41,7 +41,9 @@ import {
   stripVideoEditList,
   normalizeVideoForProvider,
   trimBlackEdges,
+  scaleVideoToDims,
 } from './_pad-and-recover.js';
+import { pendingTakeFor } from '../scene3d/_pending-takes.js';
 import { spawn as _spawnForProbe } from 'child_process';
 import { ensureFfmpeg as _ensureFfmpegForProbe } from '../../media/ffmpeg-installer.js';
 
@@ -1013,6 +1015,15 @@ const generateVideoAction = {
       }
     }
 
+    // A 3D previz reference only carries camera and blocking: it is scaled to
+    // the output the user asked for, never padded to an envelope and cropped
+    // back (that handed over the bake's size, whatever resolution was asked).
+    const previzRef = !!pendingTakeFor(action.referenceVideos);
+    if (previzRef && !action.aspectRatio) {
+      const d = await _probeRefDims(action.referenceVideos[0]);
+      if (d) action.aspectRatio = _closestAspectLabel(d.width, d.height);
+    }
+
     if (typeof instance.peekResolvedModel === 'function') {
       // Build the same opts the resolver will see, so the pick is the
       // one the actual generate() will land on. We don't have the
@@ -1066,7 +1077,7 @@ const generateVideoAction = {
                   ? { path: action.startFrame, kind: 'image' }
                   : null);
 
-          if (probeTarget) {
+          if (probeTarget && !previzRef) {
             const refDims = await _probeRefDims(probeTarget.path);
             if (refDims) {
               envelope = pickEnvelopeResolution({
@@ -1188,7 +1199,9 @@ const generateVideoAction = {
     if (caps.videoToVideo && Array.isArray(action.referenceVideos) && action.referenceVideos.length > 0) {
       const padded = [];
       for (let i = 0; i < action.referenceVideos.length; i++) {
-        const rv = action.referenceVideos[i];
+        const rv = previzRef && padTargetDims
+          ? await scaleVideoToDims(action.referenceVideos[i], padTargetDims)
+          : action.referenceVideos[i];
         const r = await padIfNeeded(rv, 'video', padOpts);
         if (i === 0 && r.geometry?.needsPadding) {
           recoveryGeometry = { ...r.geometry, kind: 'video' };

@@ -29,6 +29,7 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { runBuilder } from './_blender.js';
 import { BUILD_SCENE_PY } from './_build-scene-py.js';
+import { modelStamps } from './_models.js';
 
 // Builder version: a change to the Blender script must invalidate every
 // cached render, or old previews would survive a fix forever.
@@ -235,6 +236,9 @@ export function shotHash(scene, shot, style) {
     set: scene.set, characters: scene.characters, actions: scene.actions, characterStyle: scene.characterStyle,
     lighting: scene.lighting, fps: scene.fps, resolution: scene.resolution,
     durationMs: scene.durationMs, style,
+    // A rebuilt model (prop / set `model`) changes the pixels too. Only
+    // present when used, so scenes without models keep their hashes.
+    ...(modelStamps(scene) ? { models: modelStamps(scene) } : {}),
     key: keyShot ? [keyShot.light, keyShot.camera, keyShot.move, keyShot.keyframes, keyShot.startMs] : null,
   };
   const cam = {
@@ -243,7 +247,9 @@ export function shotHash(scene, shot, style) {
     // window out so trimming a static shot never re-renders the proxy.
     window: moving ? [shot.startMs, shot.durationMs] : null,
     // The subject-framed camera is solved at the window start.
-    solveAt: shot.camera?.position == null ? shot.startMs : null,
+    solveAt: shot.camera?.position == null ? (shot.camWindow?.[0] ?? shot.startMs) : null,
+    // A trimmed shot's move is solved over its untrimmed window.
+    ...(shot.camWindow ? { camWindow: shot.camWindow } : {}),
   };
   return crypto.createHash('sha1').update(JSON.stringify([_BUILDER_HASH, world, cam])).digest('hex').slice(0, 10);
 }
@@ -577,7 +583,7 @@ export async function bakeStill(sceneId, shotId, ms, { width, height } = {}) {
  * for what needs a real file: exporting a timeline. Cached per scene state +
  * window + size, so a second export of an untouched montage is instant.
  */
-export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height } = {}) {
+export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height, maxQuality = false } = {}) {
   const scene = readScene(sceneId);
   const sh = scene?.shots?.find((x) => x.id === shotId);
   if (!sh) throw new Error(`scene3d bake: no shot ${sceneId}/${shotId}`);
@@ -586,7 +592,7 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height 
   fs.mkdirSync(dir, { recursive: true });
   const w = width ? Math.round(width / 2) * 2 : 0;
   const h = height ? Math.round(height / 2) * 2 : 0;
-  const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h])).digest('hex').slice(0, 10);
+  const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h, maxQuality])).digest('hex').slice(0, 10);
   const out = path.join(dir, `${sh.id}-${key}-bake-${Math.round(fromMs)}-${Math.round(toMs)}.mp4`);
   // Kept beside the bake: who the camera sees and where (bakeInFrame).
   if (_exists(out) && _exists(`${out}.inframe.json`)) return out;
@@ -597,7 +603,8 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height 
     fs.writeFileSync(snap, JSON.stringify(scene), 'utf8');
     fs.writeFileSync(jf, JSON.stringify([{ shot: sh.id, out: `${out}.part.mp4`, fromMs, toMs }]), 'utf8');
     try {
-      await runBuilder(['--scene', snap, '--jobs', jf, '--pass', 'beauty', '--style', st, '--samples', '8',
+      await runBuilder(['--scene', snap, '--jobs', jf, '--pass', 'beauty', '--style', st, '--samples', maxQuality ? '64' : '8',
+        ...(maxQuality ? ['--max-quality'] : []),
         ...(w && h ? ['--width', String(w), '--height', String(h)] : [])], { heavy: true });
       fs.renameSync(`${out}.part.mp4`, out);
       return out;

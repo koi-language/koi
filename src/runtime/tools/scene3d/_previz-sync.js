@@ -18,6 +18,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { listScenes, readScene, storyboardPath, cleanId } from './_store.js';
+import { locationViews } from '../../state/location-registry.js';
 
 /** Editorial inputs of a storyboard shot that change its 3D blocking. */
 export function storyboardShotSig(sb, sc, sh) {
@@ -43,7 +44,7 @@ function _locationImages(locId) {
   const fp = path.join(process.env.HOME || os.homedir(), '.koi', 'locations', `${path.basename(locId)}.json`);
   try {
     const loc = JSON.parse(fs.readFileSync(fp, 'utf8'));
-    return [loc.plate, loc.plateRear, loc.plateLeft, loc.plateRight, ...(loc.photos || [])];
+    return [...locationViews(loc).map((v) => v?.path), ...(loc.photos || [])];
   } catch {
     return [];
   }
@@ -224,7 +225,7 @@ export function previzDirective(status) {
       (status.scenes.length
         ? 'update the existing scene3d scene(s) (get_scene3d → update_scene3d: re-block only the listed shots, add missing ones, remove orphans), '
         : 'build it — one save_scene3d per storyboard scene, one 3D shot per storyboard shot with storyboardShotId, ') +
-      'then check the posters. SPEED: delegate each storyboard scene that needs work to a `previz-blocker` subagent, ' +
+      'then check the posters. SPEED: delegate each storyboard scene that needs work to a `previz-creator` subagent, ' +
       'ALL IN PARALLEL in one message (one Agent call per scene), instead of doing them one after another.',
   };
 }

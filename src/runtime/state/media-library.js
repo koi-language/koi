@@ -1702,17 +1702,15 @@ export async function saveStoryboardEntry(filePath, storyboard, llmProvider, opt
     aspect,
     updatedAt: storyboard?.updatedAt || null,
   };
-  // Preserve the storyboard's REAL authored date so backfilled rows land
-  // at their true position in "Latest" instead of clustering at "now".
-  // Prefer the JSON's createdAt, then updatedAt, then the file mtime.
-  let createdAt = (typeof storyboard?.createdAt === 'string' && storyboard.createdAt)
-    ? storyboard.createdAt
-    : (typeof storyboard?.updatedAt === 'string' && storyboard.updatedAt)
-        ? storyboard.updatedAt
-        : null;
-  if (!createdAt) {
-    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to now */ }
-  }
+  // A storyboard stays open for days: "Latest" places it by when it was last
+  // worked on, not by when it was first authored. Not every writer bumps the
+  // JSON's dates (a story edited today sat at its August date), so the file's
+  // mtime counts too. Backfilled rows still land at their true position.
+  let mtime = null;
+  try { mtime = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to the JSON */ }
+  const createdAt = [storyboard?.createdAt, storyboard?.updatedAt, mtime]
+    .filter((d) => typeof d === 'string' && Number.isFinite(Date.parse(d)))
+    .sort((a, b) => Date.parse(b) - Date.parse(a))[0] || null;
   return lib.save({
     filePath,
     mediaType: 'storyboard',

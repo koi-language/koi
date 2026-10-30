@@ -189,6 +189,56 @@ function _reorder(list, rankOf) {
   return out.some((x, i) => x !== list[i]) ? out : null;
 }
 
+const _lerp = (a, b, f) => (Array.isArray(a) && Array.isArray(b)
+  ? a.map((x, i) => (typeof x === 'number' && typeof b[i] === 'number' ? x + (b[i] - x) * f : x))
+  : typeof a === 'number' && typeof b === 'number' ? a + (b - a) * f : a);
+
+/**
+ * Keys (t = ms from the shot start) re-based on a shot window that now
+ * starts [delta] ms later and lasts [dur]: the camera at the new start is
+ * where it was at that moment, and what falls outside is cut at the edges.
+ */
+function _rebaseKeys(keys, delta, dur) {
+  if (!Array.isArray(keys) || !keys.length) return keys;
+  const ks = keys.filter((k) => k && typeof k === 'object')
+    .map((k) => ({ ...k, t: (Number(k.t ?? k.ms) || 0) - delta }))
+    .sort((a, b) => a.t - b.t);
+  const at = (t) => {
+    const j = ks.findIndex((k) => k.t >= t);
+    if (j < 0) return { ...ks[ks.length - 1], t };
+    if (j === 0) return { ...ks[0], t };
+    const a = ks[j - 1], b = ks[j], f = (t - a.t) / Math.max(1, b.t - a.t);
+    const out = { ...a, t };
+    for (const [key, v] of Object.entries(b)) if (key !== 't' && key !== 'ms') out[key] = _lerp(a[key], v, f);
+    return out;
+  };
+  const inside = ks.filter((k) => k.t > 0 && k.t < dur);
+  const out = [at(0), ...inside, ...(ks[ks.length - 1].t > 0 ? [at(dur)] : [])];
+  for (const k of out) { k.t = Math.round(k.t); delete k.ms; }
+  return out.filter((k, i) => !i || k.t !== out[i - 1].t);
+}
+
+/**
+ * A trim / slip on the montage windows the shot's camera instead of
+ * re-staging it: hand-keyed paths and lanes are re-based, and a scripted
+ * move keeps being solved over the window it was made for (`camWindow`,
+ * widened when the shot grows past it), so the camera at the new start is
+ * the one the shot had at that second.
+ */
+function _trimCamera(sh, start, dur) {
+  const delta = start - sh.startMs;
+  const cam = sh.camera && typeof sh.camera === 'object' ? sh.camera : null;
+  if (Array.isArray(sh.keyframes) && sh.keyframes.length) sh.keyframes = _rebaseKeys(sh.keyframes, delta, dur);
+  else if (Array.isArray(cam?.keyframes) && cam.keyframes.length) cam.keyframes = _rebaseKeys(cam.keyframes, delta, dur);
+  for (const lane of ['lensKeys', 'focusKeys', 'focus']) {
+    if (Array.isArray(cam?.[lane]) && cam[lane].length) cam[lane] = _rebaseKeys(cam[lane], delta, dur);
+  }
+  const w = Array.isArray(sh.camWindow) && sh.camWindow.length === 2 ? sh.camWindow : [sh.startMs, sh.durationMs];
+  const ws = Math.min(w[0], start), we = Math.max(w[0] + w[1], start + dur);
+  if (ws === start && we === start + dur) delete sh.camWindow;
+  else sh.camWindow = [ws, we - ws];
+}
+
 /**
  * A GUI save of a montage timeline: carry its edits into the story.
  * @returns {{ storyboard: boolean, scenes: string[] }} what changed
@@ -228,6 +278,7 @@ export function applyStoryTimelineEdits(tl) {
     if (isLivePath(c.path)) start = Math.round(c.sourceInMs || 0);
     start = Math.max(0, Math.min(start, Math.max(0, (e.s.durationMs || start + dur) - dur)));
     if (start !== sh.startMs || dur !== sh.durationMs) {
+      _trimCamera(sh, start, dur);
       sh.startMs = start;
       sh.durationMs = dur;
       e.touched.add(sh.id);

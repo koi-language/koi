@@ -1026,6 +1026,39 @@ export async function padIfNeeded(filePath, kind, opts = {}) {
 }
 
 /**
+ * Scale a video to exactly `{ w, h }`. For a reference whose pixels are not the
+ * deliverable (a 3D previz): padding it would make the model paint the borders
+ * and the crop-back would throw away the requested resolution. Returns the
+ * ORIGINAL when already that size, when the aspect differs (scaling would
+ * distort it) or on any failure, so the caller's padding still applies.
+ */
+export async function scaleVideoToDims(filePath, { w, h }) {
+  const dims = await _probeDimensions(filePath);
+  if (!dims || (dims.width === w && dims.height === h)) return filePath;
+  if (Math.abs(dims.width / dims.height - w / h) / (w / h) > 0.01) {
+    channel.log('pad', `scaleVideoToDims: ${dims.width}×${dims.height} is not the aspect of ${w}×${h} — keeping it`);
+    return filePath;
+  }
+  const bins = await _resolveFfmpeg();
+  if (!bins?.ffmpeg) return filePath;
+  const stat = fs.statSync(filePath);
+  const key = _hash([filePath, String(stat.size), String(stat.mtimeMs | 0), `${w}x${h}`]);
+  const out = path.join(_ensureTmpDir(), `${key}.scaled.mp4`);
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
+  const part = `${out}.part.mp4`;
+  const ok = await _runFfmpeg(bins, ['-hide_banner', '-loglevel', 'error', '-i', filePath,
+    '-vf', `scale=${w}:${h}:flags=lanczos`, '-an', '-c:v', 'libx264', '-preset', 'slow', '-crf', '12',
+    '-pix_fmt', 'yuv420p', '-bf', '0', '-movflags', '+faststart', '-use_editlist', '0', '-y', part]);
+  if (!ok) {
+    fs.rmSync(part, { force: true });
+    return filePath;
+  }
+  fs.renameSync(part, out);
+  channel.log('pad', `scaled ${path.basename(filePath)} ${dims.width}×${dims.height} → ${w}×${h}`);
+  return out;
+}
+
+/**
  * Detect the content's bounding box inside [filePath] by running
  * ffmpeg's `cropdetect` filter — finds the rectangle of non-black
  * pixels averaged across a few seconds of frames. Used by

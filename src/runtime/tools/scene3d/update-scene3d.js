@@ -85,7 +85,18 @@ export default {
       if (Array.isArray(params.removeShots)) {
         next.shots = (next.shots || []).filter((s) => !params.removeShots.includes(s.id));
       }
-      if (Array.isArray(params.shots)) _mergeById(next.shots || [], params.shots, 'shot');
+      if (Array.isArray(params.shots)) {
+        _mergeById(next.shots || [], params.shots, 'shot');
+        // Re-staging a shot's camera or timing drops the window a montage
+        // trim kept for it.
+        for (const p of params.shots) {
+          const set = _isObj(p?.set) ? p.set : (p || {});
+          if (!('camWindow' in set) && ['startMs', 'durationMs', 'camera', 'move', 'keyframes'].some((k) => k in set)) {
+            const sh = (next.shots || []).find((x) => x.id === p.id);
+            if (sh) delete sh.camWindow;
+          }
+        }
+      }
       if (Array.isArray(params.addShots)) next.shots = [...(next.shots || []), ...params.addShots];
       if (Array.isArray(params.removeActions)) {
         const drop = new Set(params.removeActions.map(Number));

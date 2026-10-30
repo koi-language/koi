@@ -34,6 +34,10 @@ import { notePendingTake } from './_pending-takes.js';
 
 /** The model 3D clips are generated with (user decision: Seedance 2.5). */
 export const SCENE3D_VIDEO_MODEL = 'bytedance/seedance-2.5/us/reference-to-video';
+// A take's reference is always baked at the model's top resolution (short side,
+// Seedance 2.5: 1080p) and top quality, whatever the take's output: a soft
+// reference makes a soft take. generate_video scales it down to the output.
+const REFERENCE_SHORT_SIDE = 1080;
 // Seedance 2.5 reference-to-video: 4–30 s per generation.
 const MIN_TAKE_MS = 4000;
 const MAX_TAKE_MS = 30000;
@@ -254,7 +258,7 @@ async function _join(sceneId, parts) {
   fs.writeFileSync(list, parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
   try {
     await _run(await _ffmpeg(), ['-y', '-f', 'concat', '-safe', '0', '-i', list,
-      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '-an', `${out}.part.mp4`]);
+      '-c:v', 'libx264', '-preset', 'slow', '-pix_fmt', 'yuv420p', '-crf', '12', '-an', `${out}.part.mp4`]);
     fs.renameSync(`${out}.part.mp4`, out);
     return out;
   } finally {
@@ -342,7 +346,13 @@ export default {
       items.push({ clip: c, scene, shot, sb, sbScene, sbShot, from: scene3dWindowStart(c, shot) });
     }
 
-    const { width, height } = tl.settings || {};
+    /** The reference's size: the canvas' shape (else the scene's) at the top resolution. */
+    const referenceSize = (scene) => {
+      const w = tl.settings?.width || scene.resolution?.width || 16;
+      const h = tl.settings?.height || scene.resolution?.height || 9;
+      const k = REFERENCE_SHORT_SIDE / Math.min(w, h);
+      return { width: Math.round(w * k), height: Math.round(h * k) };
+    };
     const takes = [];
     await Promise.all(_groups(items, params.oneTake !== false).map(async (g) => {
       const total = g.reduce((n, x) => n + x.clip.durationMs, 0);
@@ -356,7 +366,7 @@ export default {
           const len = i === g.length - 1
             ? Math.max(x.clip.durationMs, Math.min(x.clip.durationMs + takeMs - total, scene.durationMs - x.from))
             : x.clip.durationMs;
-          return bakeWindow(scene.id, x.shot.id, x.from, x.from + len, { width, height });
+          return bakeWindow(scene.id, x.shot.id, x.from, x.from + len, { ...referenceSize(scene), maxQuality: true });
         }));
       } catch (e) {
         for (const x of g) failed.push({ clipId: x.clip.id, error: `3D bake failed: ${e.message}` });
@@ -443,7 +453,11 @@ export default {
         'continuous move, then tells in order what happens — what the camera does (its moves, zoom, focus pulls, ' +
         'framing), who is who and what they look like, what they do and feel (acting, gestures, lines), what happens ' +
         'out of shot, light and sound — chained with "then", "as", "while", never with times. Say once, plainly: "Cut ONLY at HARD CUT; never anywhere else." Keep light, wardrobe, props and ' +
-        'sound continuous across the cuts. THE REFERENCE IS THE MASTER: open the prompt ' +
+        'sound continuous across the cuts. PICTURE QUALITY: the grey reference only carries motion and framing, never its ' +
+        'look. Ask for the sharpest image the model can give: crisp focus on the subject, fine detail in skin, hair and ' +
+        'fabric, clean high-resolution picture. Never ask for softness or degradation (no soft focus, soft contrast, haze, ' +
+        'heavy film grain, low-res, VHS) unless the user asked for that look. Same framing as the reference: nothing tighter, ' +
+        'nothing wider, the headroom it has. THE REFERENCE IS THE MASTER: open the prompt ' +
         'by saying the attached video\'s camera, framing, what is in and out of frame, positions, sides and timing override ' +
         'anything in the text. Describe each moment with what `inFrameTimeline` says: `inFrame` is what the shot SHOWS, ' +
         '`offFrame` is what is near but OUT of shot (side, distance). Something that happens off frame IS said — and said ' +

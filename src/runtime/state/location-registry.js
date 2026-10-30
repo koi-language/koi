@@ -20,7 +20,8 @@
  *     lighting:     string,           // optional default lighting of the set
  *     tags:         string[],         // optional free tags
  *     photos:       string[],         // absolute file paths (POINTERS, never copied)
- *     plate:        string|null,      // path to the generated establishing plate
+ *     views:        [{ id, label, path }], // establishing views, free user labels
+ *     plate:        string|null,      // DERIVED: first view with an image (the hero)
  *     createdAt:    ISO string,
  *     updatedAt:    ISO string,
  *   }
@@ -48,6 +49,17 @@ function _ensureDir() {
   const dir = locationsDir();
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** A location's establishing views. Docs older than `views` kept fixed
+ *  plate / plateRear / plateLeft / plateRight fields: those become views.
+ *  Mirrors `LocationLibrary.viewsOf` in the GUI. */
+export function locationViews(loc) {
+  if (Array.isArray(loc?.views)) return loc.views;
+  const legacy = [['front', 'plate', ''], ['rear', 'plateRear', 'Rear'], ['left', 'plateLeft', 'Left'], ['right', 'plateRight', 'Right']];
+  return legacy
+    .filter(([, field]) => typeof loc?.[field] === 'string' && loc[field].trim())
+    .map(([id, field, label]) => ({ id, label, path: loc[field].trim() }));
 }
 
 /** List every location entry, best-effort. Returns [] when the directory

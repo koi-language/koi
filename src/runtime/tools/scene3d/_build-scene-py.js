@@ -54,6 +54,7 @@ ap.add_argument("--still", type=int, default=-1, help="render a single PNG at th
 ap.add_argument("--from-ms", type=int, default=-1, help="render only from this scene ms")
 ap.add_argument("--to-ms", type=int, default=-1, help="render only up to this scene ms")
 ap.add_argument("--samples", type=int, default=0, help="EEVEE render samples (lit style); 0 = default")
+ap.add_argument("--max-quality", action="store_true", help="encode for a generation reference: visually lossless, slowest preset")
 ap.add_argument("--grade", default=None, help="tuning only: view_transform:look:exposure")
 ap.add_argument("--live", type=int, default=0,
                 help="LIVE viewport: keep Blender open and stream its real viewport (EEVEE/Workbench) to 127.0.0.1:<port>")
@@ -108,7 +109,39 @@ DUR_MS = scene_duration_ms()
 
 # ──────────────────────────────────────────────────────── reset scene ──
 
+def hide_live_windows():
+    """macOS clamps --window-geometry back on screen, so the live session's
+    window would show up on the user's desktop. Keep it (the viewport draws
+    through it) but fully transparent, shadowless and click-through."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        import ctypes.util
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def send(obj, sel, *a, res=ctypes.c_void_p, types=()):
+            f = ctypes.CFUNCTYPE(res, ctypes.c_void_p, ctypes.c_void_p, *types)(
+                ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value)
+            return f(obj, objc.sel_registerName(sel.encode()), *a)
+
+        app = send(objc.objc_getClass(b"NSApplication"), "sharedApplication")
+        wins = send(app, "windows")
+        for i in range(send(wins, "count", res=ctypes.c_ulong)):
+            w = send(wins, "objectAtIndex:", i, types=(ctypes.c_ulong,))
+            send(w, "setAlphaValue:", 0.0, res=None, types=(ctypes.c_double,))
+            send(w, "setHasShadow:", False, res=None, types=(ctypes.c_bool,))
+            send(w, "setIgnoresMouseEvents:", True, res=None, types=(ctypes.c_bool,))
+    except Exception as e:
+        print(f"[scene3d] hide window failed: {e}", flush=True)
+
+
 if args.live:
+    hide_live_windows()
     # UI session (the viewport needs a window): clear the startup scene by
     # data API — reloading factory settings mid-startup would tear the UI down.
     for ob in list(bpy.data.objects):
@@ -309,6 +342,69 @@ def set_key_interp(obj, interp="BEZIER"):
             kp.interpolation = interp
 
 
+# ──────────────────────────────────────────────────── modeled assets ──
+# Objects and sets modeled with build_model3d (~/.koi/models3d/<id>/model.glb):
+# authored in metres, front at +y, objects centred and standing on z = 0.
+
+import os
+
+MODELS_DIR = os.path.join(os.path.expanduser("~"), ".koi", "models3d")
+
+
+def model_glb(ref):
+    ref = str(ref or "")
+    if not ref:
+        return None
+    if os.path.isabs(ref):
+        return ref if os.path.exists(ref) else None
+    p = os.path.join(MODELS_DIR, ref, "model.glb")
+    return p if os.path.exists(p) else None
+
+
+def import_model(ref, name, parent=None):
+    """Import a model under a holder empty; returns (holder, min, max) in
+    the holder's frame, or None (the caller falls back to its own shape)."""
+    path = model_glb(ref)
+    if not path:
+        print(f"[scene3d] model not found: {ref}", file=sys.stderr)
+        return None
+    before = set(bpy.data.objects)
+    try:
+        bpy.ops.import_scene.gltf(filepath=path)
+    except Exception as e:
+        print(f"[scene3d] model import failed ({ref}): {e}", file=sys.stderr)
+        return None
+    new = [o for o in bpy.data.objects if o not in before]
+    holder = empty(name, (0, 0, 0), parent)
+    for o in new:
+        if o.type in ("CAMERA", "LIGHT"):
+            bpy.data.objects.remove(o, do_unlink=True)
+    new = [o for o in bpy.data.objects if o not in before and o is not holder]
+    for o in new:
+        if o.parent is None or o.parent not in new:
+            o.parent = holder
+        for sl in getattr(o, "material_slots", []):
+            m_ = sl.material
+            if m_ and m_.node_tree:  # Workbench shows diffuse_color
+                b_ = m_.node_tree.nodes.get("Principled BSDF")
+                if b_:
+                    m_.diffuse_color = tuple(b_.inputs["Base Color"].default_value)
+    bpy.context.view_layer.update()
+    mn = Vector((1e9, 1e9, 1e9))
+    mx = Vector((-1e9, -1e9, -1e9))
+    inv = holder.matrix_world.inverted()
+    for o in new:
+        if o.type != "MESH":
+            continue
+        for c in o.bound_box:
+            w = inv @ (o.matrix_world @ Vector(c))
+            mn = Vector((min(mn.x, w.x), min(mn.y, w.y), min(mn.z, w.z)))
+            mx = Vector((max(mx.x, w.x), max(mx.y, w.y), max(mx.z, w.z)))
+    if mx.x < mn.x:
+        mn, mx = Vector((0, 0, 0)), Vector((0, 0, 0))
+    return holder, mn, mx
+
+
 # ─────────────────────────────────────────────────────────────── set ──
 
 SETD = S.get("set") or {}
@@ -317,12 +413,16 @@ W, D, H = (list(SETD.get("size") or [8, 8, 3]) + [3])[:3]
 floor_col = SETD.get("floorColor") or ("#8a8884" if set_kind != "exterior" else "#7d8a6a")
 wall_col = SETD.get("wallColor") or "#d9cdb8"
 
+# A modeled set replaces the procedural shell (floor, walls, ceiling).
+SET_MODEL = import_model(SETD.get("model"), "set_model") if SETD.get("model") else None
+
 # Floor (large for exteriors so the horizon never shows an edge).
 fw, fd = (W, D) if set_kind == "room" else (max(W, 80), max(D, 80))
-mesh_obj("floor", [(-fw / 2, -fd / 2, 0), (fw / 2, -fd / 2, 0), (fw / 2, fd / 2, 0), (-fw / 2, fd / 2, 0)],
-         [(0, 1, 2, 3)], material("floor", floor_col, 0.9))
+if not SET_MODEL:
+    mesh_obj("floor", [(-fw / 2, -fd / 2, 0), (fw / 2, -fd / 2, 0), (fw / 2, fd / 2, 0), (-fw / 2, fd / 2, 0)],
+             [(0, 1, 2, 3)], material("floor", floor_col, 0.9))
 
-if set_kind == "room":
+if set_kind == "room" and not SET_MODEL:
     wm = material("wall", wall_col, 0.85, cull=True)
     hw, hd = W / 2, D / 2
     # Normals point INTO the room; back-face culling makes a wall vanish
@@ -430,6 +530,24 @@ def build_prop(p, parent=None):
     dflt = PROP_SIZES.get(kind, [1, 1, 1])
     sx, sy, sz_ = (list(sz or dflt) + dflt[len(sz or []):])[:3]
     fx, fy, fz = sx / dflt[0], sy / dflt[1], sz_ / dflt[2]
+    got = import_model(p.get("model"), f"{pid}_model", root) if p.get("model") else None
+    if got:
+        # Modeled at its real size; an explicit size scales it uniformly
+        # (never distorts it) by its longest given axis.
+        holder, mn_, mx_ = got
+        ext = mx_ - mn_
+        k_ = 1.0
+        if sz:
+            axes = [(float(v), e) for v, e in zip(list(sz)[:3], (ext.x, ext.y, ext.z)) if e > 1e-6]
+            if axes:
+                v_, e_ = max(axes, key=lambda a: a[0])
+                k_ = v_ / e_
+        holder.scale = (k_, k_, k_)
+        root.location = v3(p.get("position"))
+        root.rotation_euler = _rot3(p.get("rotation"))
+        root["h"] = float(ext.z * k_)
+        root["kind"] = kind
+        return root
     glass = material("glass", "#2b3238", 0.1)
     tyre = material("tyre", "#1d1d1d", 0.9)
     dark = material("darkmetal", "#3a3d42", 0.4)
@@ -1612,8 +1730,16 @@ def build_camera(SHOT):
     s_ms = int(SHOT.get("startMs") or 0)
     e_ms = s_ms + int(SHOT.get("durationMs") or 3000)
     f_s, f_e = ms_to_frame(s_ms), ms_to_frame(e_ms)
+    # A shot trimmed on the montage keeps the camera of the window it was
+    # staged for (camWindow): its move is solved over that window and the
+    # shot only shows its part of it.
+    cw = SHOT.get("camWindow")
+    w_s, w_e = s_ms, e_ms
+    if isinstance(cw, (list, tuple)) and len(cw) == 2:
+        w_s, w_e = int(cw[0]), int(cw[0]) + max(200, int(cw[1]))
+    f_ws, f_we = ms_to_frame(w_s), ms_to_frame(w_e)
 
-    pos0, aim0 = explicit_or_framed(C, f_s)
+    pos0, aim0 = explicit_or_framed(C, f_ws)
     if C.get("position") is None and FRAMING.get("lens"):
         lens = FRAMING["lens"]
 
@@ -1652,20 +1778,20 @@ def build_camera(SHOT):
                 kfocus.append((fr, float(kf["focus"])))
     elif mtype in ("follow", "track", "tracking"):
         step = max(2, int(FPS / 4))
-        fr = f_s
-        while fr <= f_e:
+        fr = f_ws
+        while fr <= f_we:
             p, a = framing_pose(C, fr)
             place(p, a, FRAMING.get("lens", lens), fr)
             fr += step
-        p, a = framing_pose(C, f_e)
-        place(p, a, FRAMING.get("lens", lens), f_e)
+        p, a = framing_pose(C, f_we)
+        place(p, a, FRAMING.get("lens", lens), f_we)
     else:
-        place(pos0, aim0, lens, f_s)
+        place(pos0, aim0, lens, f_ws)
         p1, a1, l1 = pos0.copy(), aim0.copy(), lens
         # Real camera moves have a SPEED, not a destination: "dolly in muy
         # lento" over 3.5 s travels ~25 cm, not a third of the way to the
         # subject. Defaults to "slow"; an explicit "amount" still wins.
-        dur_s = max(0.2, (e_ms - s_ms) / 1000.0)
+        dur_s = max(0.2, (w_e - w_s) / 1000.0)
         spd = str(move.get("speed") or "slow").lower().replace("-", "_").replace(" ", "_")
         M_PER_S = {"very_slow": 0.07, "muy_lento": 0.07, "slow": 0.18, "lento": 0.18,
                    "medium": 0.4, "medio": 0.4, "fast": 0.9, "rapido": 0.9, "rápido": 0.9}
@@ -1712,9 +1838,9 @@ def build_camera(SHOT):
         # dolly in. Keep at least half the opening distance to where it ENDS.
         subj_id = C.get("subject") if isinstance(C.get("subject"), str) else None
         if subj_id in CHARS and mtype in ("dolly_in", "push_in", "truck_left", "truck_right", "crane_up", "crane_down"):
-            scn.frame_set(f_s)
+            scn.frame_set(f_ws)
             head_start = char_head(subj_id)
-            scn.frame_set(f_e)
+            scn.frame_set(f_we)
             head_end = char_head(subj_id)
             # The subject moved during the shot: the aim travels with it.
             a1 = a1 + (head_end - head_start)
@@ -1726,13 +1852,13 @@ def build_camera(SHOT):
                 back_dir.z = 0
                 back_dir = back_dir.normalized() if back_dir.length > 1e-4 else -fwd_n
                 p1 = Vector((head_end.x, head_end.y, p1.z)) + back_dir * min_d
-            scn.frame_set(f_s)
+            scn.frame_set(f_ws)
         if mtype != "static":
-            place(p1, a1, l1, f_e)
+            place(p1, a1, l1, f_we)
         if mtype == "handheld" or move.get("handheld"):
             for ob in (cam, tgt):
                 if ob.animation_data is None:
-                    ob.keyframe_insert("location", frame=f_s)
+                    ob.keyframe_insert("location", frame=f_ws)
             try:
                 for fc in tgt.animation_data.action.fcurves:
                     mod = fc.modifiers.new("NOISE")
@@ -2237,29 +2363,44 @@ if args.live:
                 root = CHARS[cid]["root"].matrix_world.translation
                 hgt = float(CHARS[cid].get("height") or 1.7)
                 pts += [root.copy(), root + Vector((0, 0, hgt))]
-        # The side it looks from is the SCENE's, measured over the cast's
-        # whole run: taken from around the playhead, it flipped from one
-        # moment to the next and the overview came from the other side.
+        # The side it looks from is the SCENE's (taken from around the
+        # playhead it flipped from one moment to the next): the side the
+        # shots are filmed from, so what they frame faces the view instead
+        # of the back of a wall. No cameras: across the cast's long axis.
         hs = LIVE.get("home_side")
         if not hs or hs[0] != (S.get("id"), DUR_MS):
-            run = []
-            for k in range(9):
-                scn.frame_set(ms_to_frame(float(DUR_MS) * k / 8))
-                run += [CHARS[cid]["root"].matrix_world.translation.copy() for cid in who]
-            wide = (max(p.x for p in run) - min(p.x for p in run) >= max(p.y for p in run) - min(p.y for p in run)
-                    if run else True)
-            hs = LIVE["home_side"] = ((S.get("id"), DUR_MS), wide)
+            look = Vector((0.0, 0.0, 0.0))
+            for sid_, cam_ in CAMS.items():
+                tob_ = bpy.data.objects.get(f"cam_target_{sid_}")
+                sh_ = _by_id.get(sid_)
+                if tob_ is None or sh_ is None:
+                    continue
+                scn.frame_set(ms_to_frame(int(sh_.get("startMs") or 0) + int(sh_.get("durationMs") or 0) / 2))
+                v_ = cam_.matrix_world.translation - tob_.matrix_world.translation
+                v_ = Vector((v_.x, v_.y, 0.0))
+                if v_.length > 1e-4:
+                    look += v_.normalized()
+            if look.length > 0.2:
+                side = look.normalized()
+            else:
+                run = []
+                for k in range(9):
+                    scn.frame_set(ms_to_frame(float(DUR_MS) * k / 8))
+                    run += [CHARS[cid]["root"].matrix_world.translation.copy() for cid in who]
+                wide = (max(p.x for p in run) - min(p.x for p in run) >= max(p.y for p in run) - min(p.y for p in run)
+                        if run else True)
+                a = math.radians(35)  # 3/4: 35 deg off square
+                sq = Vector((0.0, -1.0, 0.0)) if wide else Vector((-1.0, 0.0, 0.0))
+                side = Vector((sq.x * math.cos(a) - sq.y * math.sin(a), sq.x * math.sin(a) + sq.y * math.cos(a), 0))
+            hs = LIVE["home_side"] = ((S.get("id"), DUR_MS), side)
         scn.frame_set(keep)
         if not pts:
             pts = [Vector((-3, -3, 0)), Vector((3, 3, 1.8))]
         lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
         hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
         c = (lo + hi) / 2
-        # Look across the long axis (its whole length faces the lens), from
-        # 35 deg off square and 38 deg up: a 3/4 view, depth readable.
-        side = Vector((0.0, -1.0, 0.0)) if hs[1] else Vector((-1.0, 0.0, 0.0))
-        a = math.radians(35)
-        rot = Vector((side.x * math.cos(a) - side.y * math.sin(a), side.x * math.sin(a) + side.y * math.cos(a), 0))
+        # From that side and 38 deg up: depth readable.
+        rot = hs[1]
         el = math.radians(38)
         d = Vector((rot.x * math.cos(el), rot.y * math.cos(el), math.sin(el))).normalized()
         right = d.cross(Vector((0, 0, 1))).normalized()
@@ -2434,8 +2575,8 @@ if args.live:
     _CAM_MODEL = _cam_model()
 
     def _draw_cams(view, proj, w, h):
-        """The active shot camera only, as an amber frustum (+ its move as a
-        path); the other cameras stay hidden."""
+        """The active shot camera only, amber (white while selected) with its
+        frustum (+ its move as a path); the other cameras stay hidden."""
         active = LIVE["stage_shot"]
         gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("ALPHA")
@@ -2453,7 +2594,7 @@ if args.live:
                     seg = []
                     for a_, b_ in _CAM_MODEL[1]:
                         seg += [mw @ _CAM_MODEL[0][a_], mw @ _CAM_MODEL[0][b_]]
-                    _lines(seg, (1.0, 0.62, 0.25, 1.0), 1.8, w, h)
+                    _lines(seg, (1.0, 1.0, 1.0, 1.0) if LIVE.get("stage_sel") else (1.0, 0.62, 0.25, 1.0), 1.8, w, h)
                     # ...and its field of view, out to where it focuses (the
                     # focus distance with depth of field, else its aim point).
                     cd_ = cam.data
@@ -2587,7 +2728,7 @@ if args.live:
         LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _stage_proj(view, proj):
-        """Where the active camera sits on the stage image (for its label)."""
+        """Where the active camera sits on the stage image (to pick it)."""
         m = proj @ view
         out = []
         for sid in ORDER:
@@ -2860,16 +3001,30 @@ if args.live:
                      "target": list(k["target"]), "lens": float(k.get("lens") or (sh.get("camera") or {}).get("lens") or 35),
                      **({"focus": float(k["focus"])} if isinstance(k.get("focus"), (int, float)) else {})}
                     for k in keys]
+        # A move (dolly, pan, zoom…) only lives in the animation: its keys
+        # are where the camera, its aim or its lens are keyed in the shot.
         frames = set()
-        for fc in _anim_curves(CAMS[sid]):
-            if fc.data_path == "location":
-                frames.update(int(round(kp.co[0])) for kp in fc.keyframe_points)
+        tob = bpy.data.objects.get(f"cam_target_{sid}")
+        for id_, path_ in ((CAMS[sid], "location"), (tob, "location"), (CAMS[sid].data, "lens")):
+            if id_ is None:
+                continue
+            for fc in _anim_curves(id_):
+                if fc.data_path == path_:
+                    frames.update(int(round(kp.co[0])) for kp in fc.keyframe_points)
+        f0_, f1_ = ms_to_frame(s_ms), ms_to_frame(s_ms + dur_)
+        # A move solved over a wider window (a trimmed shot) is keyed past
+        # the shot's edges: key it where the shot starts and ends instead.
+        edges = ({f0_} if any(f_ < f0_ for f_ in frames) else set()) | ({f1_} if any(f_ > f1_ for f_ in frames) else set())
+        frames = {f_ for f_ in frames if f0_ <= f_ <= f1_} | edges
         if not frames:
-            frames = {ms_to_frame(s_ms)}
+            frames = {f0_}
         out = []
         for fr in sorted(frames):
             p, a, ln = _cam_pose_at(sid, fr)
-            out.append({"t": inw(_frame_ms(fr) - s_ms), "position": [round(v, 4) for v in p],
+            t_ = inw(_frame_ms(fr) - s_ms)
+            if out and out[-1]["t"] == t_:
+                continue
+            out.append({"t": t_, "position": [round(v, 4) for v in p],
                         "target": [round(v, 4) for v in a], "lens": round(ln, 2)})
         return out
 
@@ -2884,6 +3039,7 @@ if args.live:
         was_scene_cam = scn.camera is None
         CAMS[sid] = build_camera(_by_id[sid])
         LIVE.setdefault("fcurves", {}).pop(sid, None)
+        LIVE.setdefault("skeys", {}).pop(sid, None)
         if was_scene_cam:
             scn.camera = CAMS[sid]
         LIVE["paths"].pop(sid, None)
@@ -3212,7 +3368,9 @@ if args.live:
             return out
         sh = _by_id[sid]
         s_ms = int(sh.get("startMs") or 0)
-        for i, k in enumerate(sh.get("keyframes") or []):
+        # The same keys the edits index (_shot_keys), worked out outside the
+        # draw callback (frame_set) — see the stage tick.
+        for i, k in enumerate(LIVE.get("skeys", {}).get(sid) or []):
             if isinstance(k.get("position"), (list, tuple)) and isinstance(k.get("target"), (list, tuple)):
                 out["keys"].append({"i": i, "ms": s_ms + max(0, min(int(sh.get("durationMs") or 3000), int(k.get("t") or 0))),
                                     "p": [float(v) for v in k["position"]][:3], "t": [float(v) for v in k["target"]][:3],
@@ -3345,6 +3503,7 @@ if args.live:
             LIVE["stage_view"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 24),
                                   "ortho": bool(c.get("ortho"))}
             LIVE["track_off"] = None  # steered by hand: keep tracking from this angle
+            LIVE["view_seq"] = c.get("seq")  # echoed in follow: the GUI skips older views
             LIVE["cut_dirty"] = True
             # Orbiting draws fast (1 sample, like playback); the full-quality
             # frame lands a beat after it stops.
@@ -3621,8 +3780,10 @@ if args.live:
             if stage_on:
                 if LIVE["stage_shot"] in _by_id and LIVE["stage_shot"] not in LIVE["paths"]:
                     _cam_path(LIVE["stage_shot"])  # frame_set: never inside the draw callback
+                if LIVE["stage_shot"] in _by_id and LIVE["stage_shot"] not in LIVE.setdefault("skeys", {}):
+                    LIVE["skeys"][LIVE["stage_shot"]] = _shot_keys(LIVE["stage_shot"])
                 _stage_cutaway(True)
-            # Light follows the shot on screen (apply_shot_light moves the
+            # The scene's light rig is built on first use (it moves the
             # frame, so it runs here, before the clock frame is set).
             if follows:
                 lit = follows[-1]["shot"]
@@ -4073,7 +4234,8 @@ void main() {
                        "active": LIVE["stage_shot"], **_cam_handles(LIVE["stage_shot"], proj @ view)}
                 if (LIVE.get("stage_follow") or LIVE.get("stage_track")) and LIVE["stage_view"]:
                     sv = LIVE["stage_view"]
-                    msg["follow"] = {"pos": list(sv["pos"]), "target": list(sv["tgt"]), "lens": sv["lens"]}
+                    msg["follow"] = {"pos": list(sv["pos"]), "target": list(sv["tgt"]), "lens": sv["lens"],
+                                     "seq": LIVE.get("view_seq")}
                 for conn in conns:
                     _send_json(msg, only=conn)
         LIVE.setdefault("pend", {})["st"] = (o, w, h, list(conns))
@@ -4217,8 +4379,8 @@ if hasattr(im, "media_type"):  # Blender 5.x
 im.file_format = "FFMPEG"
 r.ffmpeg.format = "MPEG4"
 r.ffmpeg.codec = "H264"
-r.ffmpeg.constant_rate_factor = "MEDIUM"
-r.ffmpeg.ffmpeg_preset = "REALTIME"
+r.ffmpeg.constant_rate_factor = "PERC_LOSSLESS" if args.max_quality else "MEDIUM"
+r.ffmpeg.ffmpeg_preset = "BEST" if args.max_quality else "REALTIME"
 r.ffmpeg.gopsize = max(1, FPS // 2)  # short GOP → snappy scrubbing
 r.ffmpeg.audio_codec = "NONE"
 r.use_file_extension = False
@@ -4277,33 +4439,50 @@ def _key_dir(spec, right, back):
     return toward.normalized() * math.cos(math.radians(elev)) + up * math.sin(math.radians(elev))
 
 
+def _scene_subject():
+    """Centre and spread of everything the shots look at (each at its start)."""
+    pts = []
+    for s_ in _by_id.values():
+        t_ = bpy.data.objects.get(f"cam_target_{s_['id']}")
+        if t_ is None:
+            continue
+        scn.frame_set(ms_to_frame(int(s_.get("startMs") or 0)))
+        pts.append(t_.matrix_world.translation.copy())
+    if not pts:
+        return Vector((0, 0, 1.4)), 0.0
+    c_ = sum(pts, Vector((0, 0, 0))) / len(pts)
+    return c_, max((p_ - c_).length for p_ in pts)
+
+
+_scene_rig = []
+
+
 def apply_shot_light(sh):
     """shot.light = { key: "screen_left"|"screen_right"|"back"|"front"|"top"|"left"|"right"|deg,
-    quality: "soft"|"hard", intensity?, color?, rim?: bool }. The KEY (where
-    the light comes from, its quality, colour, strength) is the SCENE's,
-    fixed in the world (see _scene_key_light) — cutting never relights the
-    set, nothing switches on or off between shots (rim included).
-    Workbench gets the shadow direction, EEVEE a key (+ rim) sun."""
-    for ob in _shot_lights.values():
-        ob.hide_render = True
-        ob.hide_viewport = True
+    quality: "soft"|"hard", intensity?, color?, rim?: bool }. The lighting is
+    the SCENE's, built ONCE and fixed in the world (see _scene_key_light):
+    cutting to another camera never moves, relights or switches anything.
+    SH is only the shot about to be seen; the rig ignores it.
+    Workbench gets the shadow direction, EEVEE a key (+ rim) rig."""
+    if _scene_rig:
+        return
+    _scene_rig.append(True)
     key = _scene_key_light()
-    cam = CAMS.get(sh["id"])
-    if key is None or cam is None:
+    if key is None:
         return
     toward, hard, spec, kback = key
-    scn.frame_set(ms_to_frame(int(sh.get("startMs") or 0)))
-    m = cam.matrix_world.to_3x3()
-    up, back = Vector((0, 0, 1)), m.col[2].normalized()  # back = towards camera
+    up = Vector((0, 0, 1))
     try:
         scn.display.light_direction = toward
         scn.display.shadow_focus = 0.05 if hard else 0.6
     except Exception:
         pass
-    # Lights live INSIDE the set, placed around the subject (a sun would be
-    # blocked by the room's walls / ceiling): soft = big area, hard = spot.
-    tgt_ob = bpy.data.objects.get(f"cam_target_{sh['id']}")
-    subj = tgt_ob.matrix_world.translation.copy() if tgt_ob else Vector((0, 0, 1.4))
+    # Lights live INSIDE the set (a sun would be blocked by the room's walls /
+    # ceiling), aimed at the centre of all the action with a cone wide
+    # enough to cover every shot's subject: soft = big area, hard = spot.
+    subj, spread = _scene_subject()
+    dist = float(spec.get("distance") or 3.0)
+    cone = min(math.radians(160), max(math.radians(70), 2 * math.atan((spread + 1.0) / dist)))
     if preset in DAYLIGHT:
         # Daylight: the SUN is the key — the shot only says where it comes
         # from (window on frame-left, backlight…). Never a studio spot.
@@ -4331,7 +4510,7 @@ def apply_shot_light(sh):
     if spec.get("fill", True) and preset not in DAYLIGHT:
         rig.append(("fillside", (-Vector((toward.x, toward.y, 0)) + kback * 0.6 + up * 0.3).normalized(), 70.0))
     for name, vec, energy in rig:
-        lid = f"shotlight_{sh['id']}_{name}"
+        lid = f"scenelight_{name}"
         ob = _shot_lights.get(lid)
         if ob is None:
             # ONE shadow-casting light (the key, a spot — a big soft AREA's
@@ -4340,7 +4519,6 @@ def apply_shot_light(sh):
             ob = bpy.data.objects.new(lid, ld)
             link(ob)
             _shot_lights[lid] = ob
-        dist = float(spec.get("distance") or 3.0)
         ob.location = subj + vec * dist
         ob.rotation_euler = (subj - ob.location).to_track_quat("-Z", "Y").to_euler()
         ob.data.energy = energy * float(spec.get("intensity") or 1.0) * (dist / 3.0) ** 2
@@ -4349,7 +4527,7 @@ def apply_shot_light(sh):
             ob.data.size = 2.2 if name != "rim" else 1.2
             ob.data.use_shadow = False
         else:
-            ob.data.spot_size = math.radians(70)
+            ob.data.spot_size = cone
             ob.data.spot_blend = 0.6
             ob.data.shadow_soft_size = 0.01 if hard else 0.05
             ob.data.use_shadow = True

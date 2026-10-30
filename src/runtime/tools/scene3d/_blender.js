@@ -25,6 +25,7 @@ import { spawn, spawnSync } from 'child_process';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { BUILD_SCENE_PY } from './_build-scene-py.js';
+import { BUILD_MODEL_PY } from './_build-model-py.js';
 import { LIVE_SURFACE_C } from './_live-surface-c.js';
 
 export const BLENDER_VERSION = '4.5.15';
@@ -351,18 +352,27 @@ export function liveSurfaceLib() {
   return _surfaceLib;
 }
 
-/** The builder script, materialised once per content hash. */
-export function builderScriptPath() {
-  const hash = crypto.createHash('sha1').update(BUILD_SCENE_PY).digest('hex').slice(0, 10);
+function _materialise(name, src) {
+  const hash = crypto.createHash('sha1').update(src).digest('hex').slice(0, 10);
   const dir = path.join(blenderDir(), 'scripts');
-  const file = path.join(dir, `build_scene-${hash}.py`);
+  const file = path.join(dir, `${name}-${hash}.py`);
   if (!fs.existsSync(file)) {
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, BUILD_SCENE_PY, 'utf8');
+    fs.writeFileSync(tmp, src, 'utf8');
     fs.renameSync(tmp, file);
   }
   return file;
+}
+
+/** The builder script, materialised once per content hash. */
+export function builderScriptPath() {
+  return _materialise('build_scene', BUILD_SCENE_PY);
+}
+
+/** The modeler script (build_model3d), materialised the same way. */
+export function modelerScriptPath() {
+  return _materialise('build_model', BUILD_MODEL_PY);
 }
 
 // Previz renders are short and mostly Blender start-up + scene build, but
@@ -401,9 +411,9 @@ function _release() {
  * (`--scene`, `--shot`, `--out`, …). Resolves with the tail of the log;
  * rejects with the Python traceback when the script fails.
  */
-export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000, heavy = false } = {}) {
+export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000, heavy = false, script = null } = {}) {
   const { bin } = await ensureBlender({ onProgress });
-  const script = builderScriptPath();
+  script ??= builderScriptPath();
   // Long renders (video bakes) go one at a time: several Blenders rendering
   // whole clips at once saturate the GPU the live previz and the app's own
   // UI draw on, and everything froze for half a minute.
