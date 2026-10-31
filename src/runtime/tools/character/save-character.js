@@ -1,6 +1,6 @@
 /**
  * save_character — write a reusable "character" entity to
- * `~/.koi/characters/<id>.json` with structured args.
+ * `<project>/characters/<id>.json` with structured args.
  *
  * A character is a persisted, reusable entity (a person, a mascot, a
  * product spokesperson…) the user can reference across storyboards,
@@ -34,6 +34,7 @@ import { channel } from '../../io/channel.js';
 import { saveCharacterEntry } from '../../state/media-library.js';
 import { slugifyCharacterId } from '../../state/character-registry.js';
 
+import { docDir } from '../../state/doc-root.js';
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_character: ${msg}` }; }
@@ -173,7 +174,7 @@ export default {
   intent: 'save_character',
   description:
     'REQUIRED FIRST: activate the `characters` skill before creating or editing a character — it is the full contract (the character JSON schema and every field, the REQUIRED Seedream 5 Pro model for the turnaround sheet, and the voice-assignment flow). ' +
-    'Write a reusable CHARACTER entity to ~/.koi/characters/<id>.json with STRUCTURED args (the character as an OBJECT, not a JSON string). ' +
+    'Write a reusable CHARACTER entity to <project>/characters/<id>.json with STRUCTURED args (the character as an OBJECT, not a JSON string). ' +
     'A character is a persisted, reusable identity (a person, mascot, spokesperson…) the user can reference across storyboards, image/video prompts and audio. ' +
     'Use for BOTH creating new characters and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
     'Call shape: { character: { id?, name, handle?, description?, backstory?, sex?, age?, height?, weight?, build?, photos?, voiceId?, sheet?, sheetCells?, ttsModel? } }. '
@@ -189,7 +190,7 @@ export default {
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved from the existing file or set to now, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, character:<normalized> } on success, or { success:false, error } with the exact invalid field on validation failure.',
   instructions:
-    'save_character REPLACES write_file for ~/.koi/characters/*.json — never hand-serialize the JSON (this tool sidesteps quote-escaping by accepting the object directly). ' +
+    'save_character REPLACES write_file for <project>/characters/*.json — never hand-serialize the JSON (this tool sidesteps quote-escaping by accepting the object directly). ' +
     'Update flow: read the existing JSON, mutate the parsed object in memory, then save_character with the whole mutated object (include its id so the same file is updated). ' +
     'After a CREATE, call show_result with resourceType "file" and the returned filePath so the GUI opens the character tab.',
   thinkingHint: (action) => `Saving character ${action?.character?.id || action?.character?.name || ''}`.trim(),
@@ -227,7 +228,7 @@ export default {
     if (validationError) return _err(validationError);
 
     const home = process.env.HOME || os.homedir();
-    const dir = path.join(home, '.koi', 'characters');
+    const dir = path.join(docDir('characters'));
     let filePath = path.join(dir, `${ch.id}.json`);
 
     // Read the file currently at this id FIRST, so create-vs-update is decided

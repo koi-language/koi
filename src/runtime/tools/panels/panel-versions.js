@@ -2,7 +2,7 @@
  * panel_versions — per-panel VERSION HISTORY of a panel sheet.
  *
  * Every replace_panel automatically records versions under
- * ~/.koi/panels/<sheet-basename>/p<N>/ (the pre-existing cell content becomes
+ * <project>/panels/<sheet-basename>/p<N>/ (the pre-existing cell content becomes
  * the first version, each replacement appends one; versions.json tracks order
  * and which one is currently composited into the sheet). This tool lists,
  * restores or deletes those versions. The sheet itself always shows the

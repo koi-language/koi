@@ -21,6 +21,7 @@ import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-descr
 import { exportMediaCopy } from './util/export-copy.js';
 import { downloadAssetToFile, undownloadableResult } from '../../io/download-asset.js';
 
+import { docDir } from '../../state/doc-root.js';
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -49,7 +50,7 @@ const backgroundRemovalAction = {
       },
       saveTo: {
         type: 'string',
-        description: 'Where to place a COPY of the result (a directory, or a full .png/.webp file path). The original always stays in ~/.koi/images/ so the creations drawer finds it. Mirrors generate_image. images[].savedTo is the original; images[].exportedTo is the copy at your saveTo.',
+        description: 'Where to place a COPY of the result (a directory, or a full .png/.webp file path). The original always stays in <project>/images/ so the creations drawer finds it. Mirrors generate_image. images[].savedTo is the original; images[].exportedTo is the copy at your saveTo.',
       },
     },
     required: ['image'],
@@ -166,15 +167,15 @@ const backgroundRemovalAction = {
     }
 
     // Persist output — honor saveTo when provided (mirrors generate_image).
-    // Default lives in ~/.koi/images/ so new results still feed the global
+    // Default lives in <project>/images/ so new results still feed the global
     // media library without the agent having to specify a directory.
     if (!result.images?.length) {
       return { success: false, provider: resolved.provider, model: result.model, error: 'Background removal returned no images.' };
     }
 
-    // ORIGINAL always in ~/.koi/images (media library / creations drawer
+    // ORIGINAL always in <project>/images (media library / creations drawer
     // indexes it); a caller saveTo gets a COPY before the return.
-    const saveDir = path.join(os.homedir(), '.koi', 'images');
+    const saveDir = path.join(docDir('images'));
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = action.outputFormat === 'webp' ? 'webp' : 'png';

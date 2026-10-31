@@ -9,7 +9,7 @@
  *   - list recent sessions ("Recent Sessions" submenu / drawer tab)
  *   - vector-search across them ("Open Session…" dialog)
  *
- * Storage layout — same `~/.koi/media-library/vector-cache/index.sqlite`
+ * Storage layout — same `<project>/media-library/vector-cache/index.sqlite`
  * the media library uses, but a dedicated table `conversations` (not
  * the `media` table). Reusing the file keeps backups and ops simple
  * (one SQLite to ship), and the dedicated table avoids leaking
@@ -31,7 +31,9 @@ import path from 'path';
 import os from 'os';
 import { sweepSessionIntoPalace } from './palace.js';
 
-const DB_DIR = path.join(os.homedir(), '.koi', 'media-library', 'vector-cache');
+import { docDir } from './doc-root.js';
+// The project's index (state/doc-root.js), resolved on use.
+const _dbDir = () => path.join(docDir('media-library'), 'vector-cache');
 const TABLE = 'conversations';
 const DEBOUNCE_MS = 30 * 1000;
 const MIN_TURNS_BETWEEN_EMBEDS = 2;
@@ -54,8 +56,8 @@ async function _ensureDb() {
   if (_dbPromise) return _dbPromise;
   _dbPromise = (async () => {
     const { connect } = await import('./_sqlite-vector-adapter.js');
-    fs.mkdirSync(DB_DIR, { recursive: true });
-    _db = await connect(DB_DIR);
+    fs.mkdirSync(_dbDir(), { recursive: true });
+    _db = await connect(_dbDir());
     return _db;
   })();
   return _dbPromise;

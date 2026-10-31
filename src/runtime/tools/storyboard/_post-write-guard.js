@@ -22,12 +22,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-/** True when [p] is a storyboard document under ~/.koi/storyboards/. */
+import { docDir } from '../../state/doc-root.js';
+/** True when [p] is a storyboard document under <project>/storyboards/. */
 export function isStoryboardPath(p) {
   if (typeof p !== 'string' || !p) return false;
   if (!/\.json$/i.test(p)) return false;
   const home = process.env.HOME || os.homedir();
-  const dir = path.resolve(home, '.koi', 'storyboards');
+  const dir = path.resolve(docDir('storyboards'));
   return path.resolve(p).startsWith(dir + path.sep);
 }
 

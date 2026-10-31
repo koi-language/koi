@@ -1,7 +1,7 @@
 /**
  * 3D models ("models3d") modeled by the agent in Blender for the previz.
  *
- * One folder per model in ~/.koi/models3d/<id>/:
+ * One folder per model in <project>/models3d/<id>/:
  *   model.json   metadata (name, kind object|set, dims, links, rev)
  *   build.py     the modeling script it is built from (edited to iterate)
  *   refs.json    reference photos + the camera each was taken from
@@ -13,12 +13,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { docDir } from '../../state/doc-root.js';
 function _home() {
   return process.env.HOME || os.homedir();
 }
 
 export function modelsDir() {
-  return path.join(_home(), '.koi', 'models3d');
+  return path.join(docDir('models3d'));
 }
 
 export function cleanModelId(id) {

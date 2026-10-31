@@ -6,7 +6,7 @@
  * anchor (a character has a turnaround SHEET; a location has an establishing
  * PLATE).
  *
- * Storage: ONE JSON file per location at `~/.koi/locations/<id>.json`
+ * Storage: ONE JSON file per location at `<project>/locations/<id>.json`
  * (same model as characters / storyboards / timelines). Each file is shaped:
  *
  *   {
@@ -35,9 +35,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-/** Absolute path to the locations directory (`~/.koi/locations`). */
+import { docDir } from './doc-root.js';
+/** Absolute path to the locations directory (`<project>/locations`). */
 export function locationsDir() {
-  return path.join(os.homedir(), '.koi', 'locations');
+  return path.join(docDir('locations'));
 }
 
 /** Absolute path to a single location's JSON file. */

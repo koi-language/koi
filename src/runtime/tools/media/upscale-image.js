@@ -28,6 +28,7 @@ import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-descr
 import { exportMediaCopy } from './util/export-copy.js';
 import { downloadAssetToFile, undownloadableResult } from '../../io/download-asset.js';
 
+import { docDir } from '../../state/doc-root.js';
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -72,7 +73,7 @@ const upscaleImageAction = {
       },
       saveTo: {
         type: 'string',
-        description: 'Where to place a COPY of the result (a directory, or a full .png/.jpg/.webp file path). The original always stays in ~/.koi/images/ so the creations drawer finds it. Mirrors generate_image / background_removal. images[].savedTo is the original; images[].exportedTo is the copy at your saveTo.',
+        description: 'Where to place a COPY of the result (a directory, or a full .png/.jpg/.webp file path). The original always stays in <project>/images/ so the creations drawer finds it. Mirrors generate_image / background_removal. images[].savedTo is the original; images[].exportedTo is the copy at your saveTo.',
       },
       extra: {
         type: 'object',
@@ -243,10 +244,10 @@ const upscaleImageAction = {
       return { success: false, provider: resolved.provider, model: result.model, error: 'Upscaler returned no images.' };
     }
 
-    // The ORIGINAL always lands in ~/.koi/images so the media library /
+    // The ORIGINAL always lands in <project>/images so the media library /
     // creations drawer always indexes it; a caller saveTo gets a COPY after
     // the loop (exportMediaCopy). Mirrors generate_image.
-    const saveDir = path.join(os.homedir(), '.koi', 'images');
+    const saveDir = path.join(docDir('images'));
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
     const outExt = ({ webp: 'webp', jpeg: 'jpg', jpg: 'jpg' }[action.outputFormat] || 'png');
@@ -330,7 +331,7 @@ const upscaleImageAction = {
     } catch { /* lineage is best-effort */ }
 
     // Export a COPY to the caller's saveTo (library + lineage above already
-    // registered the canonical original in ~/.koi/images). `savedTo` stays the
+    // registered the canonical original in <project>/images). `savedTo` stays the
     // original; `exportedTo` is the copy.
     if (action.saveTo) {
       saved.forEach((img, i) => {

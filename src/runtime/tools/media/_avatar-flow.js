@@ -37,7 +37,7 @@ export async function runAvatarFlow(action, agent) {
   if (!audioPath) return { success: false, error: 'generate_video (avatar): "audioFile" is required' };
 
   // Resolve paths via MediaLibrary lookup when the literal path doesn't
-  // exist (workers routinely hallucinate `~/.koi/media/<id>.png`-style
+  // exist (workers routinely hallucinate `<project>/media/<id>.png`-style
   // paths from recall results; the library row is authoritative).
   let resolvedImage = path.resolve(imagePath);
   if (!fs.existsSync(resolvedImage)) {
@@ -258,7 +258,7 @@ export async function runAvatarFlow(action, agent) {
   }
 
   let savedTo = null;
-  let exportedTo = null; // copy at the caller's saveTo (original stays in ~/.koi/videos)
+  let exportedTo = null; // copy at the caller's saveTo (original stays in <project>/videos)
   let saveError = null;
   if (final.url) {
     reportProgress?.(0.95, 'Downloading video…');

@@ -19,7 +19,9 @@ import path from 'path';
 import crypto from 'crypto';
 import { listScenes, readScene, storyboardPath, cleanId } from './_store.js';
 import { locationViews } from '../../state/location-registry.js';
+import { readObject, objectImages } from '../../state/object-registry.js';
 
+import { docDir } from '../../state/doc-root.js';
 /** Editorial inputs of a storyboard shot that change its 3D blocking. */
 export function storyboardShotSig(sb, sc, sh) {
   const payload = [
@@ -41,7 +43,7 @@ const _IMG = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|avif)$/i;
 
 function _locationImages(locId) {
   if (typeof locId !== 'string' || !locId.trim()) return [];
-  const fp = path.join(process.env.HOME || os.homedir(), '.koi', 'locations', `${path.basename(locId)}.json`);
+  const fp = path.join(docDir('locations'), `${path.basename(locId)}.json`);
   try {
     const loc = JSON.parse(fs.readFileSync(fp, 'utf8'));
     return [...locationViews(loc).map((v) => v?.path), ...(loc.photos || [])];
@@ -70,6 +72,26 @@ export function sceneSpatialRefs(sb, sc) {
         && sc.location.toLowerCase().includes(String(l.name).toLowerCase())) locIds.push(l.locationId);
   }
   for (const id of locIds) for (const p of _locationImages(id)) add(p);
+  return out;
+}
+
+/**
+ * The story objects a 3D scene shows: each prop linked to a roster object
+ * (`prop.object`) whose saved card (`objectId`) has images. Its 3D model
+ * must be built from them; `prop.modelFrom` records the ones it was built from.
+ */
+export function sceneObjectRefs(sb, scene) {
+  const out = [];
+  const roster = Array.isArray(sb?.objects) ? sb.objects : [];
+  for (const p of scene?.props || []) {
+    if (typeof p?.object !== 'string' || !p.object.trim()) continue;
+    const entry = roster.find((o) => typeof o?.name === 'string' && o.name.toLowerCase() === p.object.toLowerCase());
+    if (!entry?.objectId) continue;
+    const card = readObject(entry.objectId);
+    if (!card) continue;
+    const images = objectImages(card).filter((x) => typeof x === 'string' && _IMG.test(x) && fs.existsSync(x));
+    if (images.length) out.push({ propId: p.id, object: entry.name, objectId: entry.objectId, images, modelFrom: p.modelFrom });
+  }
   return out;
 }
 
@@ -114,7 +136,7 @@ export function stampSources(scene, onlyShotIds = null) {
 export function previzStatus(storyboardId) {
   const id = cleanId(storyboardId);
   const sb = _readStoryboard(id);
-  const status = { storyboardId: id, totalShots: 0, upToDate: 0, missing: [], stale: [], orphans: [], scenes: [], layout: [] };
+  const status = { storyboardId: id, totalShots: 0, upToDate: 0, missing: [], stale: [], orphans: [], scenes: [], layout: [], objects: [] };
   if (!sb) return status;
   const idx = _sbShotIndex(sb);
   status.totalShots = idx.size;
@@ -133,6 +155,15 @@ export function previzStatus(storyboardId) {
       const fresh = refs.filter((r) => !used.has(r));
       if (fresh.length) {
         status.layout.push({ scene3dId: s.id, storyboardSceneId: sbScene.id, newReferences: fresh, allReferences: refs });
+        s._layoutStale = true;
+      }
+    }
+    // A story object's card has views its 3D model was not built from.
+    for (const o of sceneObjectRefs(sb, s)) {
+      const used = new Set(Array.isArray(o.modelFrom) ? o.modelFrom : []);
+      const fresh = o.images.filter((r) => !used.has(r));
+      if (fresh.length) {
+        status.objects.push({ scene3dId: s.id, propId: o.propId, object: o.object, objectId: o.objectId, newReferences: fresh, allReferences: o.images });
         s._layoutStale = true;
       }
     }
@@ -207,11 +238,14 @@ export function refreshPrevizFlags(storyboardId, { markPending = false } = {}) {
 /** The `previz3d` block tool results carry when the previz is behind. */
 export function previzDirective(status) {
   if (!status || !status.totalShots) return null;
-  const { missing, stale, orphans, layout = [] } = status;
-  if (!missing.length && !stale.length && !orphans.length && !layout.length) return null;
+  const { missing, stale, orphans, layout = [], objects = [] } = status;
+  if (!missing.length && !stale.length && !orphans.length && !layout.length && !objects.length) return null;
   const parts = [];
   for (const l of layout) {
     parts.push(`scene3d ${l.scene3dId} (storyboard scene ${l.storyboardSceneId}) has NEW reference images of the place it was not built from: ${l.newReferences.join(', ')} — READ every image and rebuild/adjust its set to match them spatially (room size and shape, walls/openings, every visible object with its real dimensions, position and orientation, recognizable silhouettes), then set set.layoutFrom to ALL of: ${l.allReferences.join(', ')}`);
+  }
+  for (const o of objects) {
+    parts.push(`scene3d ${o.scene3dId} prop ${o.propId} is the story object ${o.object} (object card ${o.objectId}) and the card has views its 3D model was not built from: ${o.newReferences.join(', ')}. READ them, (re)build its model from ALL the card's views (model-builder / build_model3d), save the model id on the card (save_object, field model), set the prop's model to it and its modelFrom to ALL of: ${o.allReferences.join(', ')}`);
   }
   if (missing.length) parts.push(`${missing.length} shot(s) without 3D previz: ${missing.map((m) => m.storyboardShotId).join(', ')}`);
   if (stale.length) parts.push(`${stale.length} 3D shot(s) out of date with the storyboard: ${stale.map((m) => m.storyboardShotId).join(', ')}`);
@@ -230,11 +264,17 @@ export function previzDirective(status) {
   };
 }
 
+/** A saved object card changed (new views / photos / model): re-check every
+ *  storyboard whose roster links it and return the previz3d directives. */
+export function previzForObject(objectId) {
+  return previzForLocation(objectId);
+}
+
 /** A saved location changed (new plate / photos): re-check every storyboard
  *  that uses it and return the previz3d directives for the agent. */
 export function previzForLocation(locationId) {
   if (typeof locationId !== 'string' || !locationId) return [];
-  const dir = path.join(process.env.HOME || os.homedir(), '.koi', 'storyboards');
+  const dir = path.join(docDir('storyboards'));
   const out = [];
   let files = [];
   try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return out; }

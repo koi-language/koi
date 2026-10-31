@@ -1703,7 +1703,7 @@ function _describeEditorSelection(content, start, end) {
 }
 
 // ─── Timeline → renderable-video resolution ─────────────────────────
-// A timeline is a JSON file under `~/.koi/timelines/`. When the agent
+// A timeline is a JSON file under `<project>/timelines/`. When the agent
 // calls read_file on it, the raw JSON is useless for sound design —
 // what matters is what the rendered video shows. These helpers turn
 // the JSON into a video path (either a single underlying clip or a
@@ -1716,7 +1716,7 @@ function _isTimelineFile(absPath) {
   if (!absPath) return false;
   if (!_TIMELINE_PATH_RE.test(absPath)) return false;
   if (!fs.existsSync(absPath)) return false;
-  // Path-based detection is enough: ~/.koi/timelines/ is a koi-managed
+  // Path-based detection is enough: <project>/timelines/ is a koi-managed
   // directory, every .json inside is a timeline. The earlier "sniff
   // first 200 bytes for `clips`" guard sounded prudent but actively
   // broke real timelines whose settings block (videoTracks, audioTracks,

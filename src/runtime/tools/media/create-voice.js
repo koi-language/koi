@@ -4,7 +4,7 @@
  * Sends the sample to the gateway's voice-clone endpoint (which routes
  * through a per-model adapter to whichever fal voice-clone provider was
  * picked: ElevenLabs, PlayAI, …) and persists the resulting voice in
- * the local registry under `~/.koi/voices/voices.json` so subsequent
+ * the local registry under `<project>/voices/voices.json` so subsequent
  * `generate_audio` calls can reference it by name.
  *
  * Permission: 'generate_audio' (same scope — voice creation is an audio

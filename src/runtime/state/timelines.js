@@ -69,6 +69,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
+import { docDir } from './doc-root.js';
 const SCHEMA_VERSION = 2;
 
 // ── Filesystem helpers ───────────────────────────────────────────────
@@ -77,13 +78,10 @@ function _projectRoot() {
   return process.env.KOI_PROJECT_ROOT || process.cwd();
 }
 
-/// Canonical, user-global timelines dir. Matches the GUI's
-/// `TimelineLibrary._dir` and the rest of the user-content storage
-/// convention (`~/.koi/voices/`, `~/.koi/images/`). Timelines belong
-/// to the user, not to a specific project — moving across projects
-/// shouldn't lose them.
+/// The project's timelines dir (see state/doc-root.js), like every other
+/// document kind.
 function _dir() {
-  return path.join(os.homedir(), '.koi', 'timelines');
+  return docDir('timelines');
 }
 
 /// Legacy directory: previous engine versions wrote `<project>/.koi/
@@ -95,10 +93,6 @@ function _legacyProjectDir() {
 }
 
 function _ensureDir() {
-  const koiDir = path.join(os.homedir(), '.koi');
-  if (!fs.existsSync(koiDir)) {
-    fs.mkdirSync(koiDir, { recursive: true });
-  }
   const dir = _dir();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });

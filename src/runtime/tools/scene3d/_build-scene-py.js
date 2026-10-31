@@ -35,7 +35,7 @@ import math
 import sys
 import argparse
 import zlib
-from mathutils import Vector, Euler, Matrix
+from mathutils import Vector, Euler, Matrix, Quaternion
 
 # ─────────────────────────────────────────────────────────────── args ──
 
@@ -55,6 +55,8 @@ ap.add_argument("--from-ms", type=int, default=-1, help="render only from this s
 ap.add_argument("--to-ms", type=int, default=-1, help="render only up to this scene ms")
 ap.add_argument("--samples", type=int, default=0, help="EEVEE render samples (lit style); 0 = default")
 ap.add_argument("--max-quality", action="store_true", help="encode for a generation reference: visually lossless, slowest preset")
+ap.add_argument("--flat-surfaces", action="store_true",
+                help="a video-generation reference: every surface but the characters one matte grey (no textures, patches or markings to copy)")
 ap.add_argument("--grade", default=None, help="tuning only: view_transform:look:exposure")
 ap.add_argument("--live", type=int, default=0,
                 help="LIVE viewport: keep Blender open and stream its real viewport (EEVEE/Workbench) to 127.0.0.1:<port>")
@@ -343,12 +345,23 @@ def set_key_interp(obj, interp="BEZIER"):
 
 
 # ──────────────────────────────────────────────────── modeled assets ──
-# Objects and sets modeled with build_model3d (~/.koi/models3d/<id>/model.glb):
+# Objects and sets modeled with build_model3d (<project>/models3d/<id>/model.glb):
 # authored in metres, front at +y, objects centred and standing on z = 0.
 
 import os
 
-MODELS_DIR = os.path.join(os.path.expanduser("~"), ".koi", "models3d")
+def _models_dir():
+    """The project's models3d/: a sibling of the scenes3d/ folder the scene
+    (or its snapshot) was loaded from. Models belong to the project."""
+    p = os.path.dirname(os.path.abspath(args.scene))
+    while p and os.path.basename(p) != "scenes3d" and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    if os.path.basename(p) == "scenes3d":
+        return os.path.join(os.path.dirname(p), "models3d")
+    return os.environ.get("KOI_MODELS_DIR") or os.path.join(os.path.expanduser("~"), ".koi", "models3d")
+
+
+MODELS_DIR = _models_dir()
 
 
 def model_glb(ref):
@@ -1011,10 +1024,12 @@ def build_character(c, idx):
 
 
 def build_block_figure(c, idx):
-    """Abstract BLOCK FIGURE (default look): a faceted ball head floating over
-    a slab torso, slab arms and block legs — flat grey clay, like a
-    Blender layout pass. Same pivots as the mannequin, so every action
-    (walk, sit, gestures) drives it unchanged."""
+    """Abstract BLOCK FIGURE (default look): a faceted head, a slab trunk,
+    block arms and legs. It shows WHERE someone is, where they go, which way
+    they face and the exact BODY POSE of the moment (POSES), held still and
+    switched in one step. It never performs: no walk cycle, no crouch before a
+    jump, no gesture or strike, because the video model copies any limb motion
+    it sees. Arms move only to hold, take or hand over an object."""
     cid = c.get("id") or f"char{idx}"
     h = float(c.get("height") or 1.75)
     k = h / 1.75
@@ -1024,36 +1039,48 @@ def build_block_figure(c, idx):
     root = empty(f"char_{cid}", v3(c.get("position")))
     hips = empty(f"{cid}_hips", K(0, 0, 0.95), root)
     instance("box", f"{cid}_torso", K(0, 0, 1.215), K(0.36, 0.2, 0.53), clay, hips)
+    instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, hips)
     neck = empty(f"{cid}_neck", K(0, 0, 1.49), hips)
-    instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, neck)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
         sh = empty(f"{cid}_shoulder{side}", (x, 0, 1.45 * k), hips)
-        instance("box", f"{cid}_upperarm{side}", (x, 0, 1.275 * k), K(0.07, 0.11, 0.33), clay, sh)
         el = empty(f"{cid}_elbow{side}", (x, 0, 1.11 * k), sh)
-        instance("box", f"{cid}_forearm{side}", (x, 0, 0.935 * k), K(0.065, 0.1, 0.33), clay, el)
-        hp = empty(f"{cid}_hip{side}", (sx * 0.085 * k, 0, 0.93 * k), hips)
-        instance("box", f"{cid}_thigh{side}", (sx * 0.085 * k, 0, 0.715 * k), K(0.15, 0.18, 0.43), clay, hp)
-        kn = empty(f"{cid}_knee{side}", (sx * 0.085 * k, 0, 0.5 * k), hp)
-        instance("box", f"{cid}_shin{side}", (sx * 0.085 * k, 0.0, 0.25 * k), K(0.14, 0.17, 0.5), clay, kn)
+        instance("box", f"{cid}_upperarm{side}", (x, 0, 1.28 * k), K(0.09, 0.1, 0.34), clay, sh)
+        instance("box", f"{cid}_forearm{side}", (x, 0, 0.94 * k), K(0.08, 0.09, 0.34), clay, el)
+        hp = empty(f"{cid}_hip{side}", (sx * 0.09 * k, 0, 0.95 * k), hips)
+        kn = empty(f"{cid}_knee{side}", (sx * 0.09 * k, 0, 0.5 * k), hp)
+        instance("box", f"{cid}_thigh{side}", (sx * 0.09 * k, 0, 0.725 * k), K(0.15, 0.18, 0.45), clay, hp)
+        instance("box", f"{cid}_shin{side}", (sx * 0.09 * k, 0, 0.25 * k), K(0.15, 0.18, 0.5), clay, kn)
         parts.update({f"shoulder{side}": sh, f"elbow{side}": el, f"hip{side}": hp, f"knee{side}": kn})
-        el.rotation_euler.x = math.radians(6)
-    parts.update(height=h, k=k, idx=idx, id=cid, mask=MASK_PALETTE[idx % len(MASK_PALETTE)])
+    parts.update(height=h, k=k, idx=idx, id=cid, mask=MASK_PALETTE[idx % len(MASK_PALETTE)], rigid=True,
+                 meshes=[o for o in bpy.data.objects if o.type == "MESH" and o.name.startswith(f"{cid}_")])
     CHARS[cid] = parts
     return parts
 
 
 CHARACTER_STYLE = (S.get("characterStyle") or "block").lower()
 for i, c in enumerate(S.get("characters") or []):
-    (build_character if CHARACTER_STYLE == "mannequin" else build_block_figure)(c, i)
+    # Always the rigid figure (user rule): any limb on screen gets copied by
+    # the video model. The articulated mannequin stays only for reference.
+    build_block_figure(c, i)
+
+
+def body_point(ch, frac):
+    """The point at "frac" of the height along the body AS IT IS POSED (the
+    hips carry trunk and head): a seated or lying figure is framed where its
+    head really is, not where it would be standing."""
+    if ch.get("rigid"):
+        local = Vector((0, 0, (frac * 1.75 - 0.95) * ch["k"]))
+        return ch["hips"].matrix_world @ local
+    return ch["root"].matrix_world.translation + Vector((0, 0, frac * ch["height"]))
 
 
 def char_head(cid):
     ch = CHARS.get(cid)
     if not ch:
         return None
-    return ch["root"].matrix_world.translation + Vector((0, 0, 1.62 * ch["k"]))
+    return body_point(ch, 1.62 / 1.75)
 
 
 # ─────────────────────────────────────────────────────────── actions ──
@@ -1099,21 +1126,110 @@ def initial_facing(c):
 JOINTS = ("hipL", "hipR", "kneeL", "kneeR", "shoulderL", "shoulderR", "elbowL", "elbowR", "neck")
 
 
-def _sit_pose(ch, on=True):
-    """Seat height ≈ knee height: hips drop, thighs forward, shins down."""
-    k = ch["k"]
-    ch["hips"].location.z = (0.95 - 0.41) * k if on else 0.95 * k
+# Held body shapes. hips: trunk rotation in degrees (x > 0 leans back,
+# 90 = flat on the back; y rolls onto a side). seat: hips height when the
+# body rests on a seat (else it is lowered until it touches the ground).
+# Joints in degrees, "L"/"R" or both: hip.x > 0 leg forward, knee.x < 0 shin
+# back, shoulder.x > 0 arm forward, shoulder.y > 0 arm out to the side
+# (mirrored per side), elbow.x > 0 forearm forward.
+POSES = {
+    "standing": {"hips": (0, 0, 0), "seat": 0.95, "elbow": (6, 0, 0)},
+    "sitting": {"hips": (0, 0, 0), "seat": 0.54, "hip": (90, 0, 0), "knee": (-90, 0, 0),
+                "shoulder": (20, 0, 0), "elbow": (60, 0, 0)},
+    "riding": {"hips": (-18, 0, 0), "seat": 0.54, "hip": (80, 6, 0), "knee": (-100, 0, 0),
+               "shoulder": (62, 0, 0), "elbow": (18, 0, 0)},
+    "driving": {"hips": (8, 0, 0), "seat": 0.54, "hip": (85, 0, 0), "knee": (-70, 0, 0),
+                "shoulder": (55, 0, 0), "elbow": (35, 0, 0)},
+    "lying": {"hips": (90, 0, 0), "elbow": (4, 0, 0)},
+    "lying_front": {"hips": (-90, 0, 0), "elbow": (4, 0, 0)},
+    "lying_side": {"hips": (90, 90, 0), "hip": (30, 0, 0), "knee": (-45, 0, 0),
+                   "shoulder": (40, 0, 0), "elbow": (40, 0, 0)},
+    "on_elbow": {"hips": (60, 0, 0), "hip": (30, 0, 0),
+                 "L": {"shoulder": (-60, 8, 0), "elbow": (90, 0, 0)},
+                 "R": {"shoulder": (0, 0, 0), "elbow": (10, 0, 0)}},
+    "sitting_ground": {"hips": (10, 0, 0), "hip": (80, 4, 0), "knee": (-20, 0, 0),
+                       "shoulder": (-30, 10, 0), "elbow": (0, 0, 0)},
+    "kneeling": {"hips": (0, 0, 0), "elbow": (10, 0, 0),
+                 "L": {"hip": (90, 0, 0), "knee": (-90, 0, 0)},
+                 "R": {"hip": (0, 0, 0), "knee": (-90, 0, 0)}},
+    "kneeling_both": {"hips": (0, 0, 0), "knee": (-90, 0, 0), "elbow": (10, 0, 0)},
+    "crouching": {"hips": (-30, 0, 0), "hip": (120, 8, 0), "knee": (-140, 0, 0),
+                  "shoulder": (45, 0, 0), "elbow": (40, 0, 0)},
+    "all_fours": {"hips": (-90, 0, 0), "hip": (90, 0, 0), "knee": (-90, 0, 0), "shoulder": (90, 0, 0)},
+}
+POSE_ALIASES = {
+    "stand": "standing", "sit": "sitting", "seated": "sitting", "ride": "riding",
+    "drive": "driving", "lie": "lying", "lying_back": "lying", "supine": "lying",
+    "prone": "lying_front", "lying_face_down": "lying_front", "on_side": "lying_side",
+    "propped": "on_elbow", "propped_on_elbow": "on_elbow", "kneel": "kneeling",
+    "crouch": "crouching", "squat": "crouching", "squatting": "crouching",
+    "sit_ground": "sitting_ground", "sitting_on_ground": "sitting_ground",
+}
+
+
+def _pose_name(p):
+    p = str(p or "standing").lower().strip().replace(" ", "_").replace("-", "_")
+    p = POSE_ALIASES.get(p, p)
+    return p if p in POSES else "standing"
+
+
+def _local_chain(ob, root):
+    m = Matrix.Identity(4)
+    while ob is not None and ob != root:
+        m = ob.matrix_basis @ m
+        ob = ob.parent
+    return m
+
+
+def _lowest_z(ch):
+    """Lowest point of the figure in its root frame, from the property values
+    (no depsgraph: a pose set mid-bake is not evaluated yet)."""
+    root, low = ch["root"], None
+    for ob in ch["meshes"]:
+        m = _local_chain(ob, root)
+        for corner in ob.bound_box:
+            z = (m @ Vector(corner)).z
+            low = z if low is None or z < low else low
+    return low or 0.0
+
+
+def _set_pose(ch, pose, side=None):
+    """One held body shape, never a motion (see POSES). side: which arm
+    props an "on_elbow" body (default left)."""
+    k, hips = ch["k"], ch["hips"]
+    name = _pose_name(pose)
+    P = POSES[name]
+    R = math.radians
+    hips.rotation_euler = tuple(R(v) for v in P.get("hips", (0, 0, 0)))
+    hips.location.z = P.get("seat", 0.95) * k
     for s in ("L", "R"):
-        ch[f"hip{s}"].rotation_euler.x = math.pi / 2 if on else 0
-        ch[f"knee{s}"].rotation_euler.x = -math.pi / 2 if on else 0
-        ch[f"elbow{s}"].rotation_euler.x = math.radians(55 if on else 8)
-        ch[f"shoulder{s}"].rotation_euler.x = math.radians(18 if on else 0)
+        own = s
+        if name == "on_elbow" and str(side or "left").lower().startswith("r"):
+            own = "R" if s == "L" else "L"
+        per = P.get(own, {})
+        mirror = -1 if s == "R" else 1
+        for joint, rest in (("hip", (0, 0, 0)), ("knee", (0, 0, 0)), ("shoulder", (0, 0, 0)), ("elbow", (6, 0, 0))):
+            v = per.get(joint, P.get(joint, rest))
+            ch[f"{joint}{s}"].rotation_euler = (R(v[0]), R(v[1]) * mirror, R(v[2]) * mirror)
+    if "seat" not in P:
+        hips.location.z += -_lowest_z(ch)
+    ch["pose"] = name
 
 
 def _key_pose(ch, frame):
     key(ch["hips"], "location", frame)
+    key(ch["hips"], "rotation_euler", frame)
     for part in JOINTS:
         key(ch[part], "rotation_euler", frame)
+
+
+def _switch_pose(ch, f0, f1, pose, side=None):
+    """The old shape is held until the frame before f1 and the new one is
+    there AT f1: a one-frame cut, no in-between motion for the video model
+    to copy."""
+    _key_pose(ch, max(1, f1 - 1))
+    _set_pose(ch, pose, side)
+    _key_pose(ch, f1)
 
 
 # Per-character state machine baked as keyframes, sorted by start time.
@@ -1124,11 +1240,8 @@ for i, c in enumerate(S.get("characters") or []):
     root.rotation_euler = (0, 0, initial_facing(c))
     key(root, "location", 1)
     key(root, "rotation_euler", 1)
-    if c.get("pose") == "sitting":
-        _sit_pose(ch)
-    for part in JOINTS:
-        key(ch[part], "rotation_euler", 1)
-    key(hips, "location", 1)
+    _set_pose(ch, c.get("pose"), c.get("poseSide"))
+    _key_pose(ch, 1)
 
 acts = sorted(S.get("actions") or [], key=lambda a: int(a.get("startMs") or 0))
 for a in acts:
@@ -1145,7 +1258,8 @@ for a in acts:
     if typ in ("walk", "run", "move"):
         src = root.location.copy()
         dst = resolve_point(a.get("to"), src)
-        dst = Vector((dst.x, dst.y, 0))
+        to = a.get("to")
+        dst = Vector((dst.x, dst.y, dst.z if isinstance(to, (list, tuple)) and len(to) > 2 else src.z))
         yaw = yaw_to(src, dst)
         key(root, "location", f0)
         if yaw is not None:
@@ -1168,6 +1282,34 @@ for a in acts:
                 cur = root.rotation_euler.z
                 root.rotation_euler.z = cur + (y2 - cur + math.pi) % (2 * math.pi) - math.pi
                 key(root, "rotation_euler", f1 + max(1, int(0.3 * FPS)))
+
+    elif typ == "jump":
+        # One rigid body on a true ballistic arc from the duration (gravity
+        # sets the height); the video model performs take-off and landing.
+        src = root.location.copy()
+        dst = resolve_point(a.get("to"), src)
+        to = a.get("to")
+        dst = Vector((dst.x, dst.y, dst.z if isinstance(to, (list, tuple)) and len(to) > 2 else src.z))
+        span = f1 - f0
+        fa = f0 + max(1, min(int(0.3 * FPS), span // 5))
+        fl = f1 - max(1, min(int(0.4 * FPS), span // 4))
+        fl = max(fa + 2, fl)
+        f1 = max(fl + 1, f1)
+        air = (fl - fa) / FPS
+        key(root, "location", f0)
+        key(root, "location", fa)
+        yaw = yaw_to(src, dst)
+        if yaw is not None:
+            key(root, "rotation_euler", f0)
+            cur = root.rotation_euler.z
+            root.rotation_euler.z = cur + (yaw - cur + math.pi) % (2 * math.pi) - math.pi
+            key(root, "rotation_euler", fa)
+        for fr in range(fa + 1, fl + 1):
+            u = (fr - fa) / (fl - fa)
+            p = src.lerp(dst, u)
+            p.z += 0.5 * 9.81 * air * air * u * (1 - u)
+            root.location = p
+            key(root, "location", fr)
 
     elif typ in ("turn", "face", "look_at", "look"):
         tgt = a.get("target") if a.get("target") is not None else a.get("facing")
@@ -1196,14 +1338,16 @@ for a in acts:
             key(root, "rotation_euler", f1)
 
     elif typ in ("sit", "sit_down"):
-        _key_pose(ch, f0)
-        _sit_pose(ch, True)
-        _key_pose(ch, f1)
+        _switch_pose(ch, f0, f1, "sitting")
 
-    elif typ in ("stand", "stand_up"):
-        _key_pose(ch, f0)
-        _sit_pose(ch, False)
-        _key_pose(ch, f1)
+    elif typ in ("stand", "stand_up", "get_up"):
+        _switch_pose(ch, f0, f1, "standing")
+
+    elif typ in ("lie", "lie_down"):
+        _switch_pose(ch, f0, f1, a.get("pose") or "lying", a.get("side"))
+
+    elif typ == "pose":
+        _switch_pose(ch, f0, f1, a.get("pose"), a.get("side"))
 
     elif typ in ("gesture", "wave", "point", "raise_arm", "nod", "shake_head"):
         continue  # retired: markers don't act; the video model performs it
@@ -1382,22 +1526,8 @@ for a in acts:
             prop.location = dest
             prop.keyframe_insert("location", frame=f1)
     elif typ == "kick":
-        side = "R" if not hands.startswith("l") else "L"
-        hp, kn = ch[f"hip{side}"], ch[f"knee{side}"]
+        # No leg swing (the video model performs the kick): only the ball flies.
         mid = (f0 + f1) // 2
-        key(hp, "rotation_euler", f0)
-        key(kn, "rotation_euler", f0)
-        hp.rotation_euler.x = math.radians(-25)
-        kn.rotation_euler.x = math.radians(-60)
-        key(hp, "rotation_euler", max(f0 + 1, mid - _ramp))
-        key(kn, "rotation_euler", max(f0 + 1, mid - _ramp))
-        hp.rotation_euler.x = math.radians(70)
-        kn.rotation_euler.x = 0
-        key(hp, "rotation_euler", mid)
-        key(kn, "rotation_euler", mid)
-        hp.rotation_euler.x = 0
-        key(hp, "rotation_euler", f1)
-        key(kn, "rotation_euler", f1)
         if prop and a.get("to") is not None:
             dest = resolve_point(a.get("to"), None)
             if dest is not None:
@@ -1487,10 +1617,18 @@ for a in acts:
         continue
     seat = Vector([float(v) for v in (a.get("seat") or _SEATS.get(ob.get("kind"), (0.0, 0.0, 0.0)))][:3])
     root = ch["root"]
-    _sit_pose(ch)
-    for part in JOINTS:
-        key(ch[part], "rotation_euler", 1)
-    key(ch["hips"], "location", 1)
+    kind = str(ob.get("kind") or "")
+    shape = a.get("pose") or ("riding" if kind in ("motorbike", "bicycle", "horse", "scooter") else
+                              "driving" if kind in ("car", "racecar", "van", "truck", "bus") else "sitting")
+    if a.get("startMs") is None:
+        _set_pose(ch, shape)
+        _key_pose(ch, 1)
+    else:
+        fa = ms_to_frame(a.get("startMs"))
+        _switch_pose(ch, fa, max(2, fa), shape)
+    if a.get("endMs") is not None:
+        fe = ms_to_frame(a.get("endMs"))
+        _switch_pose(ch, fe, fe + 1, "standing")
     if a.get("startMs") is None and a.get("endMs") is None:
         # The whole scene in it: seated in the vehicle, moving with it.
         if root.animation_data:
@@ -1552,6 +1690,8 @@ def framing_pose(C, at_frame):
         spread = max((p - q).length for p in pts for q in pts)
         ext = max(ext, spread / aspect * 1.4)
     aim = base + Vector((0, 0, h * AIM_Z.get(size, 0.78)))
+    if isinstance(subj, str) and subj in CHARS:
+        aim = body_point(CHARS[subj], AIM_Z.get(size, 0.78))
     if C.get("target") is not None:
         aim = resolve_point(C["target"], aim)
         if isinstance(C["target"], str) and C["target"] in CHARS:
@@ -1575,6 +1715,22 @@ def framing_pose(C, at_frame):
         pos = aim + Vector((0, 0.01, max(3.0, dist)))
     elif height == "ground":
         pos.z = 0.15
+    ch = CHARS.get(subj) if isinstance(subj, str) else None
+    if ch and ch.get("rigid") and C.get("position") is None:
+        m = ch["hips"].matrix_world.to_3x3()
+        along = (m @ Vector((0, 0, 1))).normalized()  # towards the head
+        if abs(along.z) < 0.5:
+            # Lying: "frontal" is above the face. The camera comes from the
+            # feet side so the face reads upright; "angle" rolls it round the
+            # body, "height" sets how steeply it looks down.
+            front = (m @ Vector((0, 1, 0))).normalized()
+            front = Quaternion(along, ang) @ front
+            tilt = {"overhead": 0.0, "top": 0.0, "high": 0.45, "low": 1.6, "ground": 2.5}.get(height, 1.0) \
+                if isinstance(height, str) else 1.0
+            v = (front - along * tilt).normalized()
+            if v.z < 0.08:
+                v = Vector((v.x, v.y, 0.08)).normalized()
+            pos = aim + v * dist
     # Over-the-shoulder: slide behind the shoulder of "ots" character.
     if C.get("ots") and C["ots"] in CHARS:
         o = CHARS[C["ots"]]
@@ -2268,6 +2424,33 @@ elif STYLE == "lit":
 else:  # clay = Blender's Solid viewport look, tuned (fast + clean)
     workbench_studio()
 
+if args.flat_surfaces and PASS == "beauty":
+    # The video model re-renders whatever surface it sees (a texture, a
+    # weathered patch, a painted marking). Its reference carries form, light
+    # and placement only: one matte grey on everything but the characters
+    # (their tints map them to the cast) and the emitters (lamps, windows).
+    flat = material("reference_flat", "#a8a59f", 0.85)
+    keep = tuple(f"{cid}_" for cid in CHARS)
+
+    def _emits(m):
+        bsdf = m.node_tree.nodes.get("Principled BSDF") if m and m.use_nodes else None
+        try:
+            return bsdf is not None and bsdf.inputs["Emission Strength"].default_value > 0 \
+                and not any(n.type == "TEX_IMAGE" for n in m.node_tree.nodes)
+        except Exception:
+            return False
+
+    for ob in bpy.data.objects:
+        if ob.type != "MESH" or ob.name.startswith(keep):
+            continue
+        if ob.material_slots and all(_emits(sl.material) for sl in ob.material_slots):
+            continue
+        if not ob.material_slots:
+            ob.data.materials.append(None)
+        for slot in ob.material_slots:
+            slot.link = "OBJECT"
+            slot.material = flat
+
 # ───────────────────────────────────────────────────────────── output ──
 
 if args.live:
@@ -2433,6 +2616,30 @@ if args.live:
         LIVE["boxes"] = out
         return out
 
+    def _cast_relation(lo, hi):
+        """Does anyone stand on this piece, or anyone pass under it, at any
+        point of the scene? A deck people cross is ground, never a roof."""
+        if "cast_marks" not in LIVE:
+            marks = [p_.get("position") for p_ in SETD.get("props") or []]
+            for c in S.get("characters") or []:
+                here = list(c.get("position") or [0, 0])
+                here = here + [0.0] * (3 - len(here))
+                marks.append(here)
+                for a_ in sorted(S.get("actions") or [], key=lambda a_: int(a_.get("startMs") or 0)):
+                    to = a_.get("to")
+                    if a_.get("character") != c.get("id") or not isinstance(to, list) or len(to) < 2:
+                        continue
+                    dst = [to[0], to[1], to[2] if len(to) > 2 else here[2]]
+                    marks += [[here[i] + (dst[i] - here[i]) * k / 8.0 for i in range(3)] for k in range(1, 9)]
+                    here = dst
+            LIVE["cast_marks"] = [m for m in marks if isinstance(m, list) and len(m) >= 3]
+        on_top, under = False, False
+        for m in LIVE["cast_marks"]:
+            if lo.x <= m[0] <= hi.x and lo.y <= m[1] <= hi.y:
+                on_top = on_top or abs(m[2] - hi.z) <= 0.3
+                under = under or m[2] < lo.z
+        return on_top, under
+
     def _stage_cutaway(on):
         """Dollhouse cut: hide the walls between the stage camera and the set
         and whatever roofs it from above (awnings, ceilings) — never in a shot."""
@@ -2453,10 +2660,114 @@ if args.live:
                     if thin_y and (pos.y - c.y) * (c.y - tgt.y) > 0 and abs(pos.y - tgt.y) > 0.5:
                         want.add(ob.name)
                 elif lo.z >= 2.0 and d.z <= 0.6 and max(d.x, d.y) >= 1.5 and pos.z > hi.z:  # a roof
-                    want.add(ob.name)
+                    on_top, under = _cast_relation(lo, hi)
+                    if not on_top and (under or set_kind == "room"):
+                        want.add(ob.name)
+            want |= LIVE.get("occl_hide", set())
         if on:
             LIVE["cut_want"] = want
         _apply_cut(want)
+
+    def _stage_occluders():
+        """While the clock runs, nothing may stand between the stage view and
+        the action. Rays from the view to the cast, the active camera and the
+        view's target: a wall, ceiling, floor, what backs onto them or a tall
+        piece mid-room they cross goes (never a table or a chair), whole when it is a slab or reaches the action, otherwise behind the
+        stage camera's near clip (a dado merged across four walls, a door).
+        Only the stage's own layer and camera: the shots never change."""
+        sv = LIVE["stage_view"]
+        if not sv:
+            return
+        pos = sv["pos"]
+        fwd = (sv["tgt"] - pos).normalized()
+        ortho = bool(sv.get("ortho"))
+        pts = [sv["tgt"]]
+        for ch in CHARS.values():
+            pts.append(ch["hips"].matrix_world.translation.copy())
+            pts.append(ch["neck"].matrix_world.translation.copy())
+        cam = CAMS.get(LIVE["stage_shot"])
+        if cam is not None:
+            pts.append(cam.matrix_world.translation.copy())
+        reach = math.atan(18.0 / sv["lens"]) * 1.2
+        in_view = []
+        for p in pts:
+            v = p - pos
+            if v.dot(fwd) > 0.1 and (ortho or v.angle(fwd, 0.0) <= reach):
+                in_view.append(p)
+        if not in_view:
+            return
+        nearest = min((p - pos).dot(fwd) for p in in_view)
+        if "occl_boxes" not in LIVE:
+            def _moves(ob):
+                while ob is not None:
+                    if ob.animation_data:
+                        return True
+                    ob = ob.parent
+                return False
+            LIVE["occl_boxes"] = [(ob, lo, hi, sorted(hi - lo)) for ob, lo, hi in _stage_boxes()
+                                  if max(hi - lo) >= 1.2 and not _moves(ob)
+                                  and not (hi.z >= 2.0 and _cast_relation(lo, hi)[0])]
+        rays = [(p, False) for p in in_view]
+        if set_kind == "room" and (abs(pos.x) > W / 2 or abs(pos.y) > D / 2 or not 0 < pos.z < H):
+            # Looking in from outside, also across the frame, at the action's depth: the shell (and the
+            # furniture backed against it) may not block the rest of the picture.
+            right = fwd.cross(Vector((0, 0, 1))).normalized()
+            up = right.cross(fwd)
+            depth0 = max((p - pos).dot(fwd) for p in in_view) + 0.5
+            half = depth0 * 18.0 / sv["lens"]
+            for ix in range(-3, 4):
+                for iz in range(-2, 3):
+                    g = pos + fwd * depth0 + right * (half * ix / 3.0) + up * (half * 0.56 * iz / 2.0)
+                    if abs(g.x) < W / 2 and abs(g.y) < D / 2 and 0.05 < g.z < H:
+                        rays.append((g, True))
+
+        def _outside(lo, hi):
+            # The shell and what backs onto it, even merged across all its walls.
+            return max(abs(lo.x), abs(hi.x)) > W / 2 - 0.6 or max(abs(lo.y), abs(hi.y)) > D / 2 - 0.6 \
+                or lo.z > H - 0.3 or hi.z < 0.1
+
+        hide, clip = set(), 0.0
+        for p, shell_only in rays:
+            o = p - fwd * (p - pos).dot(fwd) if ortho else pos
+            d = p - o
+            far = d.length - 0.15
+            d = d.normalized()
+            for ob, lo, hi, sz in LIVE["occl_boxes"]:
+                if ob.name in hide or not (_outside(lo, hi) or (not shell_only and hi.z >= 2.0)):
+                    continue
+                t0, t1 = 0.0, far
+                for i in range(3):
+                    if abs(d[i]) < 1e-6:
+                        if o[i] < lo[i] or o[i] > hi[i]:
+                            t1 = -1.0
+                            break
+                    else:
+                        a, b = (lo[i] - o[i]) / d[i], (hi[i] - o[i]) / d[i]
+                        t0, t1 = max(t0, min(a, b)), min(t1, max(a, b))
+                if t0 > t1:
+                    continue
+                inv = ob.matrix_world.inverted()
+                hit, loc, _n, _i = ob.ray_cast(inv @ o, (inv.to_3x3() @ d).normalized())
+                if not hit:
+                    continue
+                w = ob.matrix_world @ loc
+                if (w - o).length >= far:
+                    continue
+                depth = (w - pos).dot(fwd)
+                if (sz[0] <= 0.6 and sz[1] >= 1.5) or depth >= nearest - 0.4:
+                    hide.add(ob.name)
+                else:
+                    clip = max(clip, depth + 0.1)
+        if hide != LIVE.get("occl_hide", set()):
+            LIVE["occl_hide"] = hide
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        # A place in the world, not a distance: a view moving between two
+        # passes must not drag the cut through what it hides.
+        pt = pos + fwd * clip if clip > 0.0 else None
+        if pt != LIVE.get("occl_clip"):
+            LIVE["occl_clip"] = pt
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
 
     def _stage_layer():
         """The stage draws through its OWN view layer: the dollhouse cut hides
@@ -3504,6 +3815,8 @@ if args.live:
                                   "ortho": bool(c.get("ortho"))}
             LIVE["track_off"] = None  # steered by hand: keep tracking from this angle
             LIVE["view_seq"] = c.get("seq")  # echoed in follow: the GUI skips older views
+            if time.time() - LIVE.get("time_at", 0.0) >= 0.4:  # the clock is still: only it clears the view
+                LIVE["occl_hide"], LIVE["occl_clip"] = set(), None
             LIVE["cut_dirty"] = True
             # Orbiting draws fast (1 sample, like playback); the full-quality
             # frame lands a beat after it stops.
@@ -3802,6 +4115,8 @@ if args.live:
                 t0_ = time.perf_counter()
                 scn.frame_set(fr)
                 _perf("frame_set", t0_)
+                if LIVE.get("main_fr") is not None:
+                    LIVE["time_at"] = now  # the clock itself moved, not a camera edit
                 LIVE["main_fr"] = fr
                 LIVE["clock_at"] = now
                 # Playing: one draw per frame (two only for a lone change).
@@ -3836,6 +4151,12 @@ if args.live:
                 _follow_active_cam()
             elif stage_on and LIVE.get("stage_track") and not LIVE.get("stage_pov"):
                 _track_overview()
+            if stage_on and not LIVE.get("stage_pov") and now - LIVE.get("time_at", 0.0) < 0.4 \
+                    and now - LIVE.get("occl_at", 0.0) >= 0.1:
+                LIVE["occl_at"] = now
+                t0_ = time.perf_counter()
+                _stage_occluders()
+                _perf("stage_occluders", t0_)
             # Playback renders 1 EEVEE sample per frame (the offscreen draw
             # renders ALL taa_samples every time: 8 cost ~8x and broke real
             # time); a beat after it stops, one full-quality redraw.
@@ -4197,7 +4518,10 @@ void main() {
             # Write the free camera ONLY when it changed: every RNA write tags
             # the depsgraph, and EEVEE then re-synced the whole scene on every
             # stage draw (~20 ms, the stage's whole cost while playing).
-            key = (tuple(f["pos"]), tuple(f["tgt"]), float(f["lens"]), bool(f.get("ortho")))
+            near_ = 0.05
+            if LIVE.get("occl_clip") is not None and LIVE["stage"]:
+                near_ = max(near_, (LIVE["occl_clip"] - f["pos"]).dot((f["tgt"] - f["pos"]).normalized()))
+            key = (tuple(f["pos"]), tuple(f["tgt"]), float(f["lens"]), bool(f.get("ortho")), near_)
             if LIVE.get("live_cam_key") != key or live.data is not cam_d_live:
                 LIVE["live_cam_key"] = key
                 cam_d_live.sensor_fit = "HORIZONTAL"
@@ -4206,7 +4530,7 @@ void main() {
                 # Orthographic stage view (Blender's numpad-5): same framing width.
                 cam_d_live.type = "ORTHO" if f.get("ortho") else "PERSP"
                 cam_d_live.ortho_scale = max(0.1, 2.0 * (f["tgt"] - f["pos"]).length * 18.0 / f["lens"])
-                cam_d_live.clip_start = 0.05
+                cam_d_live.clip_start = near_
                 # Same far clip as the shot cameras. Blender's default 100 m
                 # made EEVEE's every stage draw ~10x slower (24 ms vs 2.4 ms,
                 # measured), whatever the view showed.
@@ -4601,12 +4925,17 @@ def in_frame(cam, f0, f1):
         its front), 'away' (its back), 'left' / 'right' (profile, facing that
         side of the frame). Characters and vehicles both face local +y."""
         fwd = (ob.matrix_world.to_3x3() @ Vector((0.0, 1.0, 0.0)))
-        fwd.z = 0.0
+        # A body lying down faces the sky: seen from above its face is its
+        # front, so the view is judged in 3D, not on the ground plane.
+        flat = abs(fwd.normalized().z) < 0.7 if fwd.length > 1e-6 else True
+        if flat:
+            fwd.z = 0.0
         if fwd.length < 1e-6:
             return None
         fwd.normalize()
         to_cam = cam.matrix_world.translation - wpt
-        to_cam.z = 0.0
+        if flat:
+            to_cam.z = 0.0
         if to_cam.length < 1e-6:
             return None
         to_cam.normalize()
@@ -4657,7 +4986,7 @@ def in_frame(cam, f0, f1):
             if vis:
                 seen.append({"id": cid, "kind": "character", "x": round(sum(q.x for q in vis) / len(vis), 2),
                              "dist": round(sum(q.z for q in vis) / len(vis), 1),
-                             "faces": _faces(parts["root"], root),
+                             "faces": _faces(parts["hips"], parts["hips"].matrix_world.translation),
                              **({"in": riders[cid]} if cid in riders else {})})
         for pid_ in movers:
             ob = bpy.data.objects.get(f"prop_{pid_}")

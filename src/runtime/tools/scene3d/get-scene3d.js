@@ -8,6 +8,7 @@ import { ensureStoryTimeline } from './_story-timeline.js';
 import os from 'os';
 import path from 'path';
 
+import { docDir } from '../../state/doc-root.js';
 export default {
   type: 'get_scene3d',
   intent: 'get_scene3d',
@@ -43,7 +44,7 @@ export default {
           if (timelineId) {
             montage = {
               storyTimelineId: timelineId,
-              storyTimelinePath: path.join(process.env.HOME || os.homedir(), '.koi', 'timelines', `${timelineId}.json`),
+              storyTimelinePath: path.join(docDir('timelines'), `${timelineId}.json`),
             };
           }
         }

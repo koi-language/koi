@@ -8,7 +8,7 @@
  * Same resolution model the chat input bar's `@`-autocomplete uses:
  * most-recent row wins when several rows share the handle, so the
  * agent and user share intuition. Cross-project (the library lives at
- * `~/.koi/media-library/`) — a handle the user pinned in another
+ * `<project>/media-library/`) — a handle the user pinned in another
  * project resolves transparently here too.
  *
  * Returns either:

@@ -24,6 +24,7 @@ import { createTimeline, getTimeline, updateTimeline } from '../../state/timelin
 import { stampSources } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
 
+import { docDir } from '../../state/doc-root.js';
 const _home = () => process.env.HOME || os.homedir();
 
 function _readJson(fp) {
@@ -39,7 +40,7 @@ function _writeJson(fp, obj) {
 /** Id of the storyboard's montage timeline, or null. */
 export function findStoryTimeline(storyboardId) {
   if (!storyboardId) return null;
-  const dir = path.join(_home(), '.koi', 'timelines');
+  const dir = path.join(docDir('timelines'));
   let files = [];
   try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return null; }
   let best = null;
@@ -89,7 +90,7 @@ function _scriptOrder(sb) {
 // the GUI rewrites the timeline file from its own model and drops unknown
 // fields. Lets a GUI save tell "the user deleted this clip" from "a shot
 // the montage never had".
-const _laidPath = (id) => path.join(_home(), '.koi', 'timelines', `.${id}.montage.json`);
+const _laidPath = (id) => path.join(docDir('timelines'), `.${id}.montage.json`);
 function _readLaid(id) {
   return _readJson(_laidPath(id)) || { at: 0, keys: [] };
 }
@@ -98,6 +99,11 @@ function _writeLaid(id, keys) {
 }
 
 const _managed = (c) => c?.track === 'V1' && c.scene3d?.sceneId && c.scene3d?.shotId;
+/** Every 3D shot a montage clip plays: a continuous take covers several. */
+export const clipShotIds = (c) => (Array.isArray(c?.scene3d?.shots) && c.scene3d.shots.length
+  ? c.scene3d.shots.map((x) => x?.id).filter(Boolean)
+  : [c?.scene3d?.shotId].filter(Boolean));
+const _keys = (c) => clipShotIds(c).map((sh) => `${c.scene3d.sceneId}/${sh}`);
 // Still the previz (live, or a legacy pre-rendered proxy) — not a generated video.
 const _isPreviz = (p, sceneId) => isLivePath(p) || (typeof p === 'string' && p.startsWith(renderDir(sceneId) + path.sep));
 
@@ -126,7 +132,8 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
   }
   const tl = getTimeline(id);
   if (!tl) return { timelineId: null, changed: false };
-  const old = new Map((tl.clips || []).filter(_managed).map((c) => [`${c.scene3d.sceneId}/${c.scene3d.shotId}`, c]));
+  const old = new Map();
+  for (const c of (tl.clips || []).filter(_managed)) for (const k of _keys(c)) if (!old.has(k)) old.set(k, c);
   const others = (tl.clips || []).filter((c) => !_managed(c));
   const placed = [];
   let at = 0;
@@ -134,9 +141,31 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
     const { scene, shot, sbScene, sbShot } = it;
     // The user took this camera out of the montage: it stays out.
     if (shot.inMontage === false) continue;
-    const prev = old.get(`${scene.id}/${shot.id}`);
+    let prev = old.get(`${scene.id}/${shot.id}`);
+    // A continuous take (the script's noCutBefore): the shot joins the clip
+    // before it, one clip for the whole take, while both still show the
+    // previz and their windows meet on the scene clock.
+    const last = placed[placed.length - 1];
+    const lastShots = last?.scene3d?.shots;
+    const lastEnd = lastShots ? lastShots[lastShots.length - 1] : null;
+    if (sbShot.noCutBefore === true && last && last.scene3d.sceneId === scene.id && isLivePath(last.path)
+        && (!prev || prev === last || _isPreviz(prev.path, scene.id))
+        && lastEnd && lastEnd.startMs + lastEnd.durationMs === shot.startMs) {
+      lastShots.push({ id: shot.id, storyboardShotId: sbShot.id, startMs: shot.startMs, durationMs: shot.durationMs });
+      last.durationMs += shot.durationMs;
+      at += shot.durationMs;
+      continue;
+    }
+    if (prev && placed.some((x) => x.id === prev.id)) {
+      // Already laid: a generated take that spans this shot too keeps it;
+      // a previz clip that no longer does lends this shot a fresh clip.
+      if (!_isPreviz(prev.path, scene.id)) continue;
+      prev = null;
+    }
+    // The script's shot number, shown on the clip and on its camera: what
+    // the user says in the chat ("cambia el plano 6").
     const link = { sceneId: scene.id, shotId: shot.id, storyboardShotId: sbShot.id, storyboardSceneId: sbScene.id,
-      poster: shot.preview?.poster || null };
+      poster: shot.preview?.poster || null, ...(Number.isFinite(sbShot.number) ? { number: sbShot.number } : {}) };
     let c;
     if (prev && !_isPreviz(prev.path, scene.id)) {
       // A real generated video sits here: keep its media, follow the order.
@@ -154,13 +183,15 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
         hasAudio: false,
         sourceWidthPx: scene.resolution?.width,
         sourceHeightPx: scene.resolution?.height,
-        scene3d: link,
+        scene3d: { ...link, shots: [{ id: shot.id, storyboardShotId: sbShot.id, startMs: shot.startMs, durationMs: shot.durationMs }] },
       };
     }
     placed.push(c);
     at += c.durationMs;
   }
-  _writeLaid(id, placed.map((c) => `${c.scene3d.sceneId}/${c.scene3d.shotId}`));
+  // One shot per clip needs no list (the clip's own window says it all).
+  for (const c of placed) if (c.scene3d.shots?.length === 1) { const { shots: _, ...rest } = c.scene3d; c.scene3d = rest; }
+  _writeLaid(id, placed.flatMap(_keys));
   // A clip that moved takes its linked clips with it (the take's own sound
   // on an audio track), or they would play out of sync.
   for (const c of placed) {
@@ -169,10 +200,38 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
     if (!d || !c.linkId) continue;
     for (const o of others) if (o.linkId === c.linkId) o.startMs += d;
   }
+  _durationsFromMontage(storyboardId, sb, items);
   const strip = (cs) => JSON.stringify(cs.map((c) => [c.id, c.path, c.startMs, c.durationMs, c.sourceInMs, c.sourceTotalMs, c.scene3d]));
-  if (strip([...old.values()].sort((a, b) => a.startMs - b.startMs)) === strip(placed)) return { timelineId: id, changed: false };
+  if (strip([...new Set(old.values())].sort((a, b) => a.startMs - b.startMs)) === strip(placed)) return { timelineId: id, changed: false };
   updateTimeline(id, { ...tl, clips: [...others, ...placed] });
   return { timelineId: id, changed: true };
+}
+
+/**
+ * TIMING belongs to the montage: every story shot's `duration` is the length
+ * its 3D shot plays on the montage, written back here whatever the script
+ * said (a continuous take keeps one duration per shot, never the take's sum
+ * on its first shot). The scenes are re-stamped so the new wording of the
+ * durations never reads as "previz out of date".
+ */
+function _durationsFromMontage(storyboardId, sb, items) {
+  const touched = new Map();
+  for (const { scene, shot, sbShot } of items) {
+    if (shot.inMontage === false || !Number.isFinite(shot.durationMs)) continue;
+    const secs = Math.round(shot.durationMs / 100) / 10;
+    if (sbShot.duration === secs) continue;
+    sbShot.duration = secs;
+    if (!touched.has(scene.id)) touched.set(scene.id, new Set());
+    touched.get(scene.id).add(shot.id);
+  }
+  if (!touched.size) return;
+  _writeJson(storyboardPath(storyboardId), sb);
+  for (const [sid, ids] of touched) {
+    const s = readScene(sid);
+    if (!s) continue;
+    stampSources(s, ids);
+    writeScene(s);
+  }
 }
 
 /** Ordering key per item: its clip rank, or just after the previous one. */
@@ -239,6 +298,88 @@ function _trimCamera(sh, start, dur) {
   else sh.camWindow = [ws, we - ws];
 }
 
+// Script fields a merged shot takes from the shots it absorbs (in order).
+const _MERGE_APPEND = ['action', 'dialogue', 'sfx', 'music'];
+
+/**
+ * Merge consecutive 3D shots into the FIRST one, in [scene] and its
+ * storyboard [sb] (both mutated, nothing written): it keeps its own camera
+ * over the whole window (the action runs on the same scene clock), the other
+ * shots disappear, and the script's first shot absorbs what the others said.
+ * @returns {string[]} ids of the scene shots removed
+ */
+export function mergeShotsInto(scene, sb, shots, start = shots[0].startMs,
+  dur = shots[shots.length - 1].startMs + shots[shots.length - 1].durationMs - start) {
+  const [first, ...rest] = shots;
+  _trimCamera(first, start, dur);
+  first.startMs = start;
+  first.durationMs = dur;
+  const gone = new Set(rest.map((x) => x.id));
+  scene.shots = scene.shots.filter((x) => !gone.has(x.id));
+  if (sb) {
+    const all = (sb.scenes || []).flatMap((sc) => sc.shots || []);
+    const head = all.find((x) => x?.id === first.storyboardShotId);
+    const tails = rest.map((x) => all.find((y) => y?.id === x.storyboardShotId)).filter(Boolean);
+    if (head) {
+      for (const t of tails) {
+        for (const f of _MERGE_APPEND) {
+          const a = typeof head[f] === 'string' ? head[f].trim() : '';
+          const b = typeof t[f] === 'string' ? t[f].trim() : '';
+          if (b && b !== a) head[f] = a ? `${a} ${b}` : b;
+        }
+        if (t.continuity != null) head.continuity = t.continuity;
+        if (Array.isArray(t.references)) head.references = [...new Set([...(head.references || []), ...t.references])];
+      }
+      head.duration = Math.round(dur / 100) / 10;
+      const drop = new Set(tails);
+      for (const sc of sb.scenes || []) if (Array.isArray(sc.shots)) sc.shots = sc.shots.filter((x) => !drop.has(x));
+      _renumber(sb);
+    }
+  }
+  return [...gone];
+}
+
+function _renumber(sb) {
+  // A continuation shares the number of the shot it continues.
+  let n = 0;
+  for (const sc of sb.scenes || []) {
+    for (const sh of sc.shots || []) {
+      if (!sh || typeof sh !== 'object') continue;
+      if (!n && sh.noCutBefore === true) sh.noCutBefore = false;
+      sh.number = sh.noCutBefore === true ? n : ++n;
+    }
+  }
+}
+
+/**
+ * Merge consecutive shots of a scene (by id) into the first: scene and
+ * storyboard written, the merged shot re-rendered.
+ */
+export function mergeShots(sceneId, shotIds) {
+  const scene = readScene(sceneId);
+  if (!scene) throw new Error(`no scene "${sceneId}"`);
+  const shots = shotIds.map((id) => scene.shots.find((x) => x.id === id));
+  const missing = shotIds.filter((_, i) => !shots[i]);
+  if (missing.length) throw new Error(`no shot ${missing.join(', ')} in ${sceneId}`);
+  shots.sort((a, b) => a.startMs - b.startMs);
+  for (let i = 1; i < shots.length; i++) {
+    const p = shots[i - 1];
+    if (Math.abs(p.startMs + p.durationMs - shots[i].startMs) > 2) {
+      throw new Error(`shots ${p.id} and ${shots[i].id} do not follow each other on the scene clock`);
+    }
+  }
+  const sbId = scene.storyboard?.id;
+  const fp = sbId ? storyboardPath(sbId) : null;
+  const sb = fp ? _readJson(fp) : null;
+  const removed = mergeShotsInto(scene, sb, shots);
+  if (sb) _writeJson(fp, sb);
+  stampSources(scene, new Set([shots[0].id]));
+  writeScene(scene);
+  renderScene(scene, { shotIds: [shots[0].id] })
+    .catch((err) => channel.log('scene3d', `re-render after merging shots ${sceneId}: ${err.message}`));
+  return { merged: shots[0].id, removed, durationMs: shots[0].durationMs };
+}
+
 /**
  * A GUI save of a montage timeline: carry its edits into the story.
  * @returns {{ storyboard: boolean, scenes: string[] }} what changed
@@ -257,7 +398,7 @@ export function applyStoryTimelineEdits(tl) {
   // old clips) is not a deletion.
   const laid = _readLaid(tl.id);
   const removed = Date.now() - laid.at < 5000 ? [] : (() => {
-    const now = new Set(clips.map((c) => `${c.scene3d.sceneId}/${c.scene3d.shotId}`));
+    const now = new Set(clips.flatMap(_keys));
     return laid.keys.filter((k) => !now.has(k));
   })();
   const scenes = new Map();
@@ -268,26 +409,55 @@ export function applyStoryTimelineEdits(tl) {
   const sbShots = new Map();
   for (const sc of sb.scenes || []) for (const sh of sc.shots || []) sbShots.set(sh.id, sh);
   const rank = new Map(); // storyboard shot id → clip order
+  const setWindow = (e, sh, start, dur) => {
+    if (start === sh.startMs && dur === sh.durationMs) return;
+    _trimCamera(sh, start, dur);
+    sh.startMs = start;
+    sh.durationMs = dur;
+    e.touched.add(sh.id);
+  };
   clips.forEach((c, i) => {
     const e = sceneOf(c.scene3d.sceneId);
-    const sh = e.s?.shots?.find((x) => x.id === c.scene3d.shotId);
-    if (!sh) return;
-    if (sh.storyboardShotId) rank.set(sh.storyboardShotId, i);
-    const dur = Math.max(200, Math.round(c.durationMs));
+    const shots = clipShotIds(c).map((id) => e.s?.shots?.find((x) => x.id === id)).filter(Boolean);
+    if (!shots.length) return;
+    const sh = shots[0];
+    shots.forEach((x, j) => { if (x.storyboardShotId) rank.set(x.storyboardShotId, i + j / 100); });
+    const dur = Math.max(200 * shots.length, Math.round(c.durationMs));
     let start = sh.startMs;
     if (isLivePath(c.path)) start = Math.round(c.sourceInMs || 0);
     start = Math.max(0, Math.min(start, Math.max(0, (e.s.durationMs || start + dur) - dur)));
-    if (start !== sh.startMs || dur !== sh.durationMs) {
-      _trimCamera(sh, start, dur);
-      sh.startMs = start;
-      sh.durationMs = dur;
+    // Joined on the timeline ("Delete Through Edit") — not a take the script
+    // already glues: ONE shot from now on, with the first one's camera.
+    const joined = shots.length > 1 && shots.slice(1).some((x) => sbShots.get(x.storyboardShotId)?.noCutBefore !== true);
+    if (joined) {
+      mergeShotsInto(e.s, sb, shots, start, dur);
       e.touched.add(sh.id);
-    }
-    const sbShot = sh.storyboardShotId && sbShots.get(sh.storyboardShotId);
-    const secs = Math.round(dur / 100) / 10;
-    if (sbShot && sbShot.duration !== secs) {
-      sbShot.duration = secs;
       done.storyboard = true;
+      return;
+    }
+    if (shots.length === 1) {
+      setWindow(e, sh, start, dur);
+    } else {
+      // A continuous take: its outer edges move the first shot's start and
+      // the last shot's end; the joins between its shots stay where they are.
+      const end = start + dur;
+      const inner = shots.slice(1).map((x) => x.startMs);
+      const firstEnd = Math.max(start + 200, Math.min(inner[0], end - 200 * (shots.length - 1)));
+      setWindow(e, sh, start, firstEnd - start);
+      for (let j = 1; j < shots.length; j++) {
+        const s0 = j === 1 ? firstEnd : shots[j].startMs;
+        const s1 = j === shots.length - 1 ? end : shots[j + 1].startMs;
+        setWindow(e, shots[j], s0, Math.max(200, s1 - s0));
+      }
+    }
+    for (const [j, x] of shots.entries()) {
+      const sbShot = x.storyboardShotId && sbShots.get(x.storyboardShotId);
+      if (!sbShot) continue;
+      const secs = Math.round(x.durationMs / 100) / 10;
+      if (sbShot.duration !== secs) { sbShot.duration = secs; done.storyboard = true; }
+      // Joined on the timeline ("Delete Through Edit"): the script now
+      // plays these shots as ONE continuous take.
+      if (j > 0 && sbShot.noCutBefore !== true) { sbShot.noCutBefore = true; done.storyboard = true; e.touched.add(x.id); }
     }
   });
   // Shot order (inside each scene) and scene order follow the montage.
@@ -301,7 +471,10 @@ export function applyStoryTimelineEdits(tl) {
   };
   const nextScenes = Array.isArray(sb.scenes) && _reorder(sb.scenes, sceneRank);
   if (nextScenes) { sb.scenes = nextScenes; done.storyboard = true; }
-  if (done.storyboard) _writeJson(fp, sb);
+  if (done.storyboard) {
+    _renumber(sb);
+    _writeJson(fp, sb);
+  }
   for (const k of removed) {
     const [sid, shotId] = k.split('/');
     const e = sceneOf(sid);

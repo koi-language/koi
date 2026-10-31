@@ -166,7 +166,7 @@ export default {
       return {
         success: false,
         error: `extract_frame: "video" must point to a VIDEO file (${[..._videoExts].join(', ')}). Got "${_ext || '(no extension)'}" — \`${path.basename(resolvedVideo)}\` is not a video. ` +
-               `Common mistake: passing an audio file you just generated (sfx_*.mp3, *.wav) or a generated image (.png/.jpg). Pass the path of the SOURCE VIDEO instead — it lives under \`~/.koi/videos/\` or is the clip's source on the timeline.`,
+               `Common mistake: passing an audio file you just generated (sfx_*.mp3, *.wav) or a generated image (.png/.jpg). Pass the path of the SOURCE VIDEO instead — it lives under \`<project>/videos/\` or is the clip's source on the timeline.`,
       };
     }
 

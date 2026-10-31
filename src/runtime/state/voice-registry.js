@@ -2,7 +2,7 @@
  * Voice Registry — persist user-created voices (e.g. via create_voice voice
  * cloning) so subsequent generate_audio calls can refer to them by name.
  *
- * Storage: ~/.koi/voices/voices.json — a JSON array of entries shaped like:
+ * Storage: <project>/voices/voices.json — a JSON array of entries shaped like:
  *
  *   {
  *     id:        string,           // canonical id we mint = "voice-<timestamp>-<rnd>"
@@ -12,7 +12,7 @@
  *     modelSlug: string,           // resolved fal slug at clone time, e.g. "fal-ai/elevenlabs/voice-cloning"
  *     description?: string,
  *     language?: string,
- *     samplePath?: string,         // local copy of the sample audio (~/.koi/voices/<id>/sample.<ext>)
+ *     samplePath?: string,         // local copy of the sample audio (<project>/voices/<id>/sample.<ext>)
  *     createdAt: ISO string,
  *   }
  *
@@ -26,8 +26,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { docDir } from './doc-root.js';
 function _voicesDir() {
-  return path.join(os.homedir(), '.koi', 'voices');
+  return path.join(docDir('voices'));
 }
 
 function _voicesJson() {

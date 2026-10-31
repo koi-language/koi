@@ -1,6 +1,6 @@
 /**
  * save_storyboard — write a storyboard document to
- * `~/.koi/storyboards/<id>.json` with structured args.
+ * `<project>/storyboards/<id>.json` with structured args.
  *
  * Replaces the previous "build the full JSON in memory + write_file"
  * flow. The LLM passes the storyboard as an OBJECT (not a JSON
@@ -31,6 +31,7 @@ import path from 'path';
 import { channel } from '../../io/channel.js';
 import { saveStoryboardEntry } from '../../state/media-library.js';
 
+import { docDir } from '../../state/doc-root.js';
 const _VALID_ASPECTS = new Set([
   '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9',
 ]);
@@ -107,7 +108,7 @@ function _validate(sb) {
   // `locations` is the reusable-SET roster (the location analog of the
   // `characters` cast): an ARRAY of { name, description?, locationId? } — one
   // entry per recurring set/place. `locationId` links a saved location card
-  // `~/.koi/locations/<id>.json`. A scene then points at one via `scene.locationId`.
+  // `<project>/locations/<id>.json`. A scene then points at one via `scene.locationId`.
   if (sb.locations !== undefined && !_isStr(sb.locations)) {
     if (!Array.isArray(sb.locations)) {
       return '"locations" (when provided) must be an array of { name, description?, locationId? } objects.';
@@ -121,6 +122,26 @@ function _validate(sb) {
       for (const k of ['description', 'locationType', 'timeOfDay', 'palette', 'lighting', 'locationId']) {
         if (l[k] !== undefined && !_isStr(l[k])) {
           return `locations[${li}].${k} (when provided) must be a string.`;
+        }
+      }
+    }
+  }
+  // `objects` is the recurring-OBJECT roster (a car, a prop): an ARRAY of
+  // { name, description?, image?, objectId? }. `objectId` links a saved object
+  // card `<project>/objects/<id>.json`, whose `image` then is the roster image.
+  if (sb.objects !== undefined && !_isStr(sb.objects)) {
+    if (!Array.isArray(sb.objects)) {
+      return '"objects" (when provided) must be an array of { name, description?, image?, objectId? } objects.';
+    }
+    for (let oi = 0; oi < sb.objects.length; oi++) {
+      const o = sb.objects[oi];
+      if (!_isObj(o)) return `objects[${oi}] must be an object { name, description?, image?, objectId? }.`;
+      if (!_isStr(o.name) || !o.name.trim()) {
+        return `objects[${oi}].name must be a non-empty string: the object's name (e.g. "MOTO").`;
+      }
+      for (const k of ['description', 'image', 'objectId']) {
+        if (o[k] !== undefined && o[k] !== null && !_isStr(o[k])) {
+          return `objects[${oi}].${k} (when provided) must be a string.`;
         }
       }
     }
@@ -154,7 +175,7 @@ function _validate(sb) {
     }
     if (!_isStr(sc.title)) return `scenes[${si}].title must be a string.`;
     // `location` = free-text place (display); `locationIds` = links to saved
-    // location cards `~/.koi/locations/<id>.json` — a scene can play across
+    // location cards `<project>/locations/<id>.json` — a scene can play across
     // SEVERAL sets, so this is an ARRAY. (`locationId` singular is still
     // accepted as legacy and migrated into `locationIds`.)
     for (const k of ['notes', 'location', 'synopsis', 'locationId']) {
@@ -433,6 +454,7 @@ function _normObjects(v) {
     const entry = { name };
     if (_isStr(o.description) && o.description.trim()) entry.description = o.description.trim();
     if (_isStr(o.image) && o.image.trim()) entry.image = o.image.trim();
+    if (_isStr(o.objectId) && o.objectId.trim()) entry.objectId = o.objectId.trim();
     out.push(entry);
   }
   return out;
@@ -616,21 +638,21 @@ export default {
   type: 'save_storyboard',
   intent: 'save_storyboard',
   description:
-    'Write a storyboard document to ~/.koi/storyboards/<id>.json with STRUCTURED args (the storyboard as an OBJECT, not a JSON string). ' +
+    'Write a storyboard document to <project>/storyboards/<id>.json with STRUCTURED args (the storyboard as an OBJECT, not a JSON string). ' +
     'Use to CREATE a storyboard, or to RESTRUCTURE an existing one (add/remove/reorder scenes or shots, renumber, change ids) — same call shape; the tool detects new-vs-existing and preserves createdAt. For CONTENT edits (changing field values on existing scenes/shots or root fields) use update_storyboard instead — it patches only what changed, so it never rewrites the whole document or re-renders untouched panels. ' +
     'Call shape: { storyboard: { id, name, synopsis, continuity?, seed?, characters?, locations?, objects?, lighting?, stylePrompt?, references?, scenes: [{ id, title, location?, locationIds?, notes?, synopsis?, references?, shots: [{ id, number, duration, shot, camera, action, composition?, lighting?, noCutBefore?, continuity?, dialogue?, sfx?, music?, references? }] }] } }. ' +
     'Required: storyboard.id (kebab-case slug, MUST match the on-disk filename), storyboard.name, storyboard.synopsis (the story PREMISE/logic in the user\'s language, 1–3 sentences — who wants what, what is/ isn\'t reachable, why the ending lands; injected into EVERY shot image prompt so renders never contradict the story; the save is REJECTED if empty), storyboard.scenes (non-empty array). ' +
     'DO NOT author storyboard.aspect: the storyboard is FORMAT-AGNOSTIC — one storyboard becomes videos in MANY formats, and aspect/format is chosen ONLY at video-generation time. It is optional and defaults silently; never ask the user about format at storyboard time. ' +
     'storyboard.continuity is an OPTIONAL (strongly recommended for any narrative with physical/spatial logic) array of strings — the CONTINUITY LOCK: absolute, story-wide invariants every panel must obey and never contradict or "fix" (e.g. ["The Pepsi button stays mounted high, above the child\'s reach until he climbs", "Never make the child taller or lower the button", "The cans he stacks as a step stay intact — never crushed"]). Injected verbatim into EVERY shot\'s render prompt as hard constraints; this is how you stop the renderer from silently making the unreachable reachable or breaking an object that must stay whole. ' +
     'Each scene needs id (kebab-case), title, shots (non-empty). Each shot needs id (kebab-case), number (1-based integer, sequential across ALL scenes — EXCEPT a continuation shot, which REPEATS the previous shot\'s number; see noCutBefore), duration (number of seconds, e.g. 3.0 — not "3s"), shot (FREE TEXT: framing = shot-size + angle, e.g. "MCU low angle"), camera (FREE TEXT: camera work — movement + lens/focal + speed + focus, e.g. "Dolly in, 50mm, slow push"), action. shot.noCutBefore is an OPTIONAL boolean: when true this shot is a CONTINUATION of the previous one — one continuous take, the camera keeps moving and there is NO cut between them. A continuation shares the previous shot\'s number (do not increment) and the video pipeline renders the glued shots as a SINGLE clip; NEVER set it on the first shot. Use it to author a longer moving shot as several precise sub-takes (more descriptive than one vague panel). shot.continuity is an OPTIONAL but high-value OBJECT { characters, objects, place } — the continuity-table ROW for THIS exact panel, in the user\'s language. "characters" = who is in frame and their state (position, pose, what they wear/hold, expression — e.g. "Misma mujer, mismo abrigo negro y peinado; de pie junto a la puerta"); "objects" = the state of every key prop/scenery in frame (e.g. "Linterna en la mano derecha; puerta roja cerrada"); "place" = WHERE this exact panel physically happens — the concrete location the frame is set in, restated for THIS shot so the render never drifts out of it even on a tight close-up (e.g. "Bajo el agua, en una calle de la piscina, entre dos corcheras"; "Interior del coche, asiento del conductor, de noche"). Fill `place` on EVERY shot of a scene with a strong setting (so close-ups still read as being there, not in a void); fill characters/objects whenever a non-default state holds. The compositor composes all three into CURRENT PANEL STATE / SHOT LOCATION so the render shows this exact state AND is set in this exact place instead of resetting to a default, jumping ahead, or rendering a neutral/wrong background — AND the columns, read top-to-bottom across all shots, ARE the continuity table the user reviews. (Legacy: an old free-text shot.state string is still accepted and auto-migrated into continuity.characters.) composition (in-frame layout: lead room, thirds, depth, screen position, screen-direction / 180-axis / eyeline) and lighting (light for THIS shot, refining the storyboard-level lighting) are OPTIONAL free-text strings — the cinematography (shot/camera/composition/lighting) is authored by cinematic-video-prompt-engineer, never picked from a menu. dialogue/sfx/music are optional strings. ' +
-    'storyboard.characters is the OPTIONAL recurring-cast ROSTER. Prefer the STRUCTURED array shape: [{ name, description?, sex?, age?, characterId? }] — one entry per recurring character, name = the SHORT_UPPERCASE label reused verbatim in shot action/dialogue (e.g. "MAESTRO"), description = a one-line silhouette/wardrobe note (no faces), sex = canonical string (female|male|nonbinary|other), age = number (years), characterId = the id of a saved character document (~/.koi/characters/<id>.json) when this cast member is backed by one, so the visor can open its card. FILL sex + age whenever the story tells you them — they seed the same fields on a character card created from this member. The visor renders each entry as a clickable row. A legacy free-text roster string is still accepted and preserved verbatim (never parsed), but new/edited storyboards should emit the array. ' +
-    'storyboard.objects is the OPTIONAL roster of recurring objects (a car, a prop): [{ name, description?, image? }], image = absolute path of its reference image. ' +
-    'storyboard.locations is the OPTIONAL reusable-SET roster (the location analog of the cast): [{ name, description?, locationType?, timeOfDay?, palette?, lighting?, locationId? }] — one entry per recurring set/place, name = a SHORT label (e.g. "COMEDOR"), description = a one-line look of the set. FILL locationType (interior|exterior|mixed), timeOfDay, palette and lighting whenever the story tells you them — they SEED the same fields on a location card built from this member (just like sex/age seed a character card). locationId = the id of a saved location card (~/.koi/locations/<id>.json). Each scene may point at ONE OR MORE via scene.locationIds (an ARRAY — a scene can play across several sets), in addition to the free-text scene.location. (A legacy singular scene.locationId is still accepted and folded into locationIds.) A scene = its characters + its location(s); both are reusable identity anchors (a character has a turnaround sheet, a location has an establishing plate). ' +
+    'storyboard.characters is the OPTIONAL recurring-cast ROSTER. Prefer the STRUCTURED array shape: [{ name, description?, sex?, age?, characterId? }] — one entry per recurring character, name = the SHORT_UPPERCASE label reused verbatim in shot action/dialogue (e.g. "MAESTRO"), description = a one-line silhouette/wardrobe note (no faces), sex = canonical string (female|male|nonbinary|other), age = number (years), characterId = the id of a saved character document (<project>/characters/<id>.json) when this cast member is backed by one, so the visor can open its card. FILL sex + age whenever the story tells you them — they seed the same fields on a character card created from this member. The visor renders each entry as a clickable row. A legacy free-text roster string is still accepted and preserved verbatim (never parsed), but new/edited storyboards should emit the array. ' +
+    'storyboard.objects is the OPTIONAL roster of recurring objects (a car, a prop): [{ name, description?, image?, objectId? }]. objectId links a saved object card (<project>/objects/<id>.json, made with save_object + generate_object_sheet; activate the `objects` skill), whose views are then the object\'s references and whose `image` is the roster image; image = absolute path of its reference image (legacy, for an object without a card). ' +
+    'storyboard.locations is the OPTIONAL reusable-SET roster (the location analog of the cast): [{ name, description?, locationType?, timeOfDay?, palette?, lighting?, locationId? }] — one entry per recurring set/place, name = a SHORT label (e.g. "COMEDOR"), description = a one-line look of the set. FILL locationType (interior|exterior|mixed), timeOfDay, palette and lighting whenever the story tells you them — they SEED the same fields on a location card built from this member (just like sex/age seed a character card). locationId = the id of a saved location card (<project>/locations/<id>.json). Each scene may point at ONE OR MORE via scene.locationIds (an ARRAY — a scene can play across several sets), in addition to the free-text scene.location. (A legacy singular scene.locationId is still accepted and folded into locationIds.) A scene = its characters + its location(s); both are reusable identity anchors (a character has a turnaround sheet, a location has an establishing plate). ' +
     'references is an OPTIONAL array of strings (each entry is an `@handle` or absolute file path) that can sit at the storyboard root, on a scene, or on a single shot — the downstream visual renderer collects all three levels per panel. Preserve whatever references the agent passes (or the user added via the visor); never drop them on a round-trip read→mutate→save. ' +
     'Auto-set by the tool: version=1, updatedAt=now (UTC ISO), createdAt preserved from existing file or set to now, seed defaulted to a random integer when omitted. ' +
     'Returns: { success, path, id, created: bool } on success, or { success: false, error } with the exact invalid field on validation failure.',
   instructions:
-    'save_storyboard REPLACES write_file for ~/.koi/storyboards/*.json — never hand-serialize the JSON via write_file (quote escaping is a structural minefield; this tool sidesteps it by accepting the object directly). ' +
+    'save_storyboard REPLACES write_file for <project>/storyboards/*.json — never hand-serialize the JSON via write_file (quote escaping is a structural minefield; this tool sidesteps it by accepting the object directly). ' +
     'SCOPE: use save_storyboard to CREATE a storyboard or to RESTRUCTURE one (add/remove/reorder scenes or shots, renumber, change ids). For CONTENT edits — changing field values on existing scenes/shots or root fields — use update_storyboard instead: it patches only the named fields, so it is faster and cannot accidentally re-word (and thus re-render) untouched panels. ' +
     'Restructure flow: read_file the existing JSON, mutate the parsed object in memory, then save_storyboard with the whole mutated object. The tool detects the file exists and preserves createdAt. ' +
     'VERBATIM RULE (critical): on an UPDATE, every field you are NOT deliberately changing must be sent back CHARACTER-FOR-CHARACTER as read — never re-word, re-translate, abbreviate/expand, or "tidy" it (e.g. do not turn "Wide shot, eye level" into "Wide shot"). The visor re-renders a panel\'s sketch whenever ANY of its editorial fields (shot / camera / composition / lighting / action / continuity / scene fields) changes, and re-renders EVERY panel when a root field (synopsis / characters / lighting / continuity / stylePrompt) changes — so accidental re-wording of untouched fields nukes the user\'s reviewed sketches and re-renders the whole board. The save result reports exactly which fields changed vs the previous save: verify that list matches your INTENDED edit, and if it lists anything you did not mean to touch, re-save restoring those fields verbatim. ' +
@@ -665,7 +687,7 @@ export default {
     if (validationError) return _err(validationError);
 
     const home = process.env.HOME || os.homedir();
-    const dir = path.join(home, '.koi', 'storyboards');
+    const dir = path.join(docDir('storyboards'));
     let filePath = path.join(dir, `${sb.id}.json`);
 
     // Read the file currently at this id FIRST, so create-vs-update is decided

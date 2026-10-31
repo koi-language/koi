@@ -157,7 +157,7 @@ const generateImageAction = {
         }
       },
       outputFormat:    { type: 'string', description: 'Output format: png, webp, jpeg, b64_json (default: png)' },
-      saveTo:          { type: 'string', description: 'Where to place a COPY of the generated image(s). Either a DIRECTORY (a filename is minted inside it) OR a full FILE path ending in an image extension (.png/.jpg/.webp) — in that case the first image is copied to exactly that path. The ORIGINAL is always kept in ~/.koi/images (so the creations drawer always finds it): images[].savedTo is that original and images[].exportedTo is the copy at your saveTo. Prefer an absolute path; relative paths resolve against cwd. If omitted, only the ~/.koi/images original is produced.' },
+      saveTo:          { type: 'string', description: 'Where to place a COPY of the generated image(s). Either a DIRECTORY (a filename is minted inside it) OR a full FILE path ending in an image extension (.png/.jpg/.webp) — in that case the first image is copied to exactly that path. The ORIGINAL is always kept in <project>/images (so the creations drawer always finds it): images[].savedTo is that original and images[].exportedTo is the copy at your saveTo. Prefer an absolute path; relative paths resolve against cwd. If omitted, only the <project>/images original is produced.' },
       summary:         { type: 'string', description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari hero shot for video ad opening", "Burrow front view, 9:16, used in storyboard sheet 2". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
       metadata:        { type: 'object', additionalProperties: true, description: 'Arbitrary key/value pairs to persist alongside the generated image in the media library (queryable later via the Info panel / MediaLibrary). Use it to record provenance the generic fields don\'t cover — for example, when an image is part of a multi-step pipeline that another tool / skill later consumes, the upstream call records the source artefact path here so the downstream stage can re-attach context. **The skill / workflow you are operating under is the source of truth for which metadata keys are required for each call shape** — read its instructions. If a contract is violated (a required key is missing), the tool returns a soft warning in the result alongside `success: true`. Reserved keys (prompt, model, provider, seed, referenceImagePaths, …) are set by the tool and override this.' },
       cameraAngles: {
@@ -1380,11 +1380,11 @@ const generateImageAction = {
     // regenerate; an HTTP error → the result is genuinely unusable.
     let lastDl = null; // classified failure from fetchAssetBuffer (network|http)
     if (result.images?.length) {
-      // The ORIGINAL always lands in the persistent ~/.koi/images repo so it
+      // The ORIGINAL always lands in the persistent <project>/images repo so it
       // survives across sessions AND the media library / creations drawer
       // always indexes it. A caller-supplied saveTo gets a COPY further down
       // (see exportMediaCopy) — the user's path is never the sole home.
-      const saveDir = path.join(os.homedir(), '.koi', 'images');
+      const saveDir = path.join(docDir('images'));
       if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
       for (let i = 0; i < result.images.length; i++) {
@@ -1562,7 +1562,7 @@ const generateImageAction = {
 
     // Export a COPY to the caller's saveTo (if any) now that the canonical
     // original is final (post aspect-cap recovery). The original stays in
-    // ~/.koi/images and is what the media library / lineage below register, so
+    // <project>/images and is what the media library / lineage below register, so
     // the creations drawer always finds it; `exportedTo` is the user's copy.
     if (action.saveTo) {
       savedImages.forEach((img, i) => {
@@ -1578,7 +1578,7 @@ const generateImageAction = {
     // visor (Flutter `storyboard_tab.dart`) renders every shot card via
     // generate_image with `label: "storyboard_card"`, then immediately
     // MOVES the produced PNG into its own cache dir
-    // (`~/.koi/storyboards/.storyboard_cache/<hash>.png`). Those are
+    // (`<project>/storyboards/.storyboard_cache/<hash>.png`). Those are
     // ephemeral working thumbnails, not user-facing outputs, and must
     // never appear in the creations drawer / cajón. Auto-saving them left
     // a MediaLibrary row (pointing at a now-moved path) AND a
@@ -1717,7 +1717,7 @@ const generateImageAction = {
     }
 
     // Response contract (uniform across media tools): `savedTo` is the
-    // canonical original in ~/.koi/images (stable, indexed by the creations
+    // canonical original in <project>/images (stable, indexed by the creations
     // drawer); `exportedTo`, when present, is the COPY at the caller's saveTo.
     return {
       success: true,
@@ -1740,6 +1740,7 @@ const generateImageAction = {
 import asyncCapable from '../_async-capable.js';
 import { formatModelCatalog } from './_format-model-catalog.js';
 
+import { docDir } from '../../state/doc-root.js';
 // Wrap FIRST so the catalog refresh below mutates the registered object —
 // asyncCapable spreads a fresh schema/description, so any in-place edit
 // to the source `generateImageAction` would land on a copy nobody reads.
@@ -1821,7 +1822,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('image').then((caps) =>
   fields.push('optional "referenceImages" — array of reference assets. Each item is a string (absolute file path, attachment ID like "att-1", or `@mention` handle like "@tom") OR an object `{ alias, path }` so the prompt can refer to it by alias. How many refs the model takes is in the skill: send what it takes, they are NOT trimmed for you.');
   // `label` is intentionally NOT listed as an input field — the agent picks
   // the model directly; per-model labels live in the Catalog table below.
-  fields.push('optional "saveTo" — where to place a COPY: an absolute DIRECTORY (a filename is minted inside it) OR a full FILE path ending in .png/.jpg/.webp (the first image is copied to exactly that path). The original always stays in ~/.koi/images and is returned in images[].savedTo (use THAT for downstream chaining, never fabricate paths); the copy at your saveTo is images[].exportedTo.');
+  fields.push('optional "saveTo" — where to place a COPY: an absolute DIRECTORY (a filename is minted inside it) OR a full FILE path ending in .png/.jpg/.webp (the first image is copied to exactly that path). The original always stays in <project>/images and is returned in images[].savedTo (use THAT for downstream chaining, never fabricate paths); the copy at your saveTo is images[].exportedTo.');
 
   const header = 'REQUIRED FIRST: the `image-generator` skill MUST be active before you use this tool — if it is not, activate it now. It tells you which model to pick (by category) and how to use each one. Generate an image from a text prompt (text-to-image OR image-edit when "referenceImages" are passed). YOU MUST choose the model: pass the required "model" param with a slug from the Catalog table at the end of this description whose Categories match your operation (there is no auto-selection).\n\nIMPORTANT — this tool declares NO per-model limits: it does not tell you which aspect ratios or resolutions a model accepts, or how many reference images it takes. That lives in the `image-generator` skill, per model — it is the model+parameter contract. Do not infer a limit from this schema, and do not guess: read the skill.';
   const refNote = refsEnabled

@@ -629,7 +629,7 @@ When a command requires sudo, just use sudo normally in the command. The system 
     //      quote, or `=`, and followed by `/`, end-of-arg, quote, space,
     //      or end-of-string. This catches:
     //        • Absolute paths   `/Users/.../.koi/sessions/...`
-    //        • Plain     `~/.koi/audio`
+    //        • Plain     `<project>/audio`
     //        • Relative  `.koi/skills/...`  / `cd .koi`
     //        • Quoted    `'/Users/.../.koi/audio/...'`
     //        • Malformed `Braxil/~/.koi/...` (literal `~` inside a quoted

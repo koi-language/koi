@@ -6,6 +6,8 @@
  * re-renders that shot, trimming a static shot only re-cuts its card.
  */
 
+import { mergeShots } from './_story-timeline.js';
+import { physicsReport } from './_physics.js';
 import { requestStrips } from './scene3d-live.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId } from './_store.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
@@ -41,6 +43,9 @@ export default {
     '`characters:[{ id, set }]` / `props:[{ id, set }]` patch one character / prop, ' +
     '`addShots:[shot]`, `removeShots:["id"]`, `addActions:[action]`, `removeActions:[index]`, ' +
     '`confirmShots:["id"]` (storyboard change reviewed, blocking still right → mark up to date). ' +
+    '`mergeShots:["sh4","sh5"]` turns consecutive shots into ONE (the user: "fusiona estos planos"): the first keeps ' +
+    'its camera over the whole window, the others disappear from the scene and the story, whose first shot absorbs ' +
+    'their action / dialogue / sound (rewrite that merged wording with the cinematic skill afterwards). ' +
     'Use it for every "más cerrado", "cámara más baja", "que entre por la derecha"-style tweak. ' +
     SCENE3D_SHAPE,
   thinkingHint: 'Updating 3D scene',
@@ -59,6 +64,7 @@ export default {
       addActions: { type: 'array', items: { type: 'object' } },
       removeActions: { type: 'array', items: { type: 'number' } },
       confirmShots: { type: 'array', items: { type: 'string' }, description: 'Shot ids whose storyboard change does NOT affect the blocking (e.g. only dialogue wording) — marks them up to date without changes.' },
+      mergeShots: { type: 'array', items: { type: 'string' }, description: 'Consecutive shot ids to merge into the first (keeps its camera); applied before the rest of the patch.' },
       render: { type: 'boolean', description: 'Re-render now (default true)' },
     },
     required: ['id'],
@@ -66,6 +72,13 @@ export default {
 
   async execute(params) {
     const id = cleanId(params?.id);
+    if (Array.isArray(params?.mergeShots) && params.mergeShots.length > 1) {
+      try {
+        mergeShots(id, params.mergeShots.map(String));
+      } catch (e) {
+        return { success: false, error: `update_scene3d: mergeShots: ${e.message}` };
+      }
+    }
     const existing = id ? readScene(id) : null;
     if (!existing) return { success: false, error: `update_scene3d: no scene "${params?.id}". Use get_scene3d to list scenes.` };
     const next = JSON.parse(JSON.stringify(existing));
@@ -142,6 +155,7 @@ export default {
       ...(r.failed.length ? { failed: r.failed } : {}),
       ...(pv ? { previz3d: pv } : {}),
       ...(r.rendered.length ? buildReview(scene, r.rendered) : {}),
+      ...physicsReport(scene),
     };
   },
 };

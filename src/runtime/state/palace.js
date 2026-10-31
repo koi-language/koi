@@ -16,7 +16,7 @@
  *     recall finds the literal sentence from three weeks ago, not just a
  *     lossy session summary.
  *
- * Storage — same `~/.koi/media-library/vector-cache/index.sqlite` the
+ * Storage — same `<project>/media-library/vector-cache/index.sqlite` the
  * conversations index uses (one SQLite to ship), dedicated `palace_*` tables.
  *
  * Ingestion — `sweepSessionIntoPalace()` rides the conversations debounce
@@ -37,7 +37,9 @@ import crypto from 'crypto';
 import { buildBM25Index, searchBM25 } from '../memory/rmh/bm25.js';
 import { fuseScoreWeightedRRF } from '../memory/rmh/fusion.js';
 
-const DB_DIR = path.join(os.homedir(), '.koi', 'media-library', 'vector-cache');
+import { docDir } from './doc-root.js';
+// The project's index (state/doc-root.js), resolved on use.
+const _dbDir = () => path.join(docDir('media-library'), 'vector-cache');
 const DRAWERS_TABLE = 'palace_drawers';
 const ROOMS_TABLE = 'palace_rooms';
 const META_TABLE = 'palace_meta';
@@ -85,8 +87,8 @@ async function _ensureDb() {
   if (_dbPromise) return _dbPromise;
   _dbPromise = (async () => {
     const { connect } = await import('./_sqlite-vector-adapter.js');
-    fs.mkdirSync(DB_DIR, { recursive: true });
-    _db = await connect(DB_DIR);
+    fs.mkdirSync(_dbDir(), { recursive: true });
+    _db = await connect(_dbDir());
     return _db;
   })();
   return _dbPromise;

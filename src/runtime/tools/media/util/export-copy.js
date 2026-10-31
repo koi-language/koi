@@ -24,11 +24,11 @@ import { channel } from '../../../io/channel.js';
 const MEDIA_FILE_EXT_RE =
   /\.(png|jpe?g|webp|gif|bmp|tiff?|svg|avif|heic|mp4|mov|webm|mkv|m4v|mp3|wav|aac|flac|opus|ogg|m4a)$/i;
 
-/** Canonical per-kind home under `~/.koi` where ORIGINALS always live so the
+/** Canonical per-kind home in the project where ORIGINALS always live so the
  *  media library / creations drawer can always find them. `kind` is one of
  *  `images` / `videos` / `audio`. */
 export function defaultMediaDir(kind) {
-  return path.join(os.homedir(), '.koi', kind);
+  return docDir(kind);
 }
 
 /** True when `p` sits inside an ephemeral workflow workspace

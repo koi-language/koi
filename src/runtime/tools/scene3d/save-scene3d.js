@@ -3,6 +3,7 @@
  * every shot's preview with Blender (clay by default, ~1-3 s per shot).
  */
 
+import { physicsReport } from './_physics.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId } from './_store.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
@@ -62,6 +63,7 @@ export default {
       ...(failed.length ? { failed } : {}),
       ...(pv ? { previz3d: pv } : {}),
       ...buildReview(scene, null),
+      ...physicsReport(scene),
     };
   },
 };

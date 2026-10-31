@@ -283,7 +283,7 @@ function _islandSpans(sep) {
 }
 export async function contentIslands({ sharp, sheet }) {
   // MEASURE ONCE, THEN CACHE (user requirement): the island geometry is
-  // persisted at ~/.koi/panels/<base>/geometry.json and shared with the GUI
+  // persisted at <project>/panels/<base>/geometry.json and shared with the GUI
   // visor, keyed by the sheet's mtime (floor ms, matching Dart's integer
   // DateTime) + file size. A hit skips the pixel analysis entirely; any
   // mutation changes mtime/size AND the mutating tools delete the cache
@@ -633,6 +633,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { docDir } from '../../state/doc-root.js';
 /** Grid hint from the sheet creation's metadata (metadata.grid), tolerant of
  *  nesting and a missing MediaLibrary. Anchors detection on sheets whose black
  *  regions swallow gutters (e.g. after delete_panel blackens cells). */
@@ -648,21 +649,21 @@ export async function readGridHint(sheet) {
   return null;
 }
 
-/** Per-panel version store: ~/.koi/panels/<sheet-basename>/p<N>/ */
+/** Per-panel version store: <project>/panels/<sheet-basename>/p<N>/ */
 export function versionsDir(sheet, panel) {
   const home = process.env.HOME || os.homedir();
   const base = path.basename(sheet).replace(/\.[a-z0-9]+$/i, '');
-  return path.join(home, '.koi', 'panels', base, `p${panel}`);
+  return path.join(docDir('panels'), base, `p${panel}`);
 }
 
 /** Shared island-geometry cache file, read/written by BOTH the engine tools
  *  and the GUI visor so each sheet is measured exactly once until it changes:
- *  ~/.koi/panels/<sheet-basename>/geometry.json with
+ *  <project>/panels/<sheet-basename>/geometry.json with
  *  { algo, mtimeMs, fileSize, width, height, islands, analyzedAt }. */
 export function geometryCachePath(sheet) {
   const home = process.env.HOME || os.homedir();
   const base = path.basename(sheet).replace(/\.[a-z0-9]+$/i, '');
-  return path.join(home, '.koi', 'panels', base, 'geometry.json');
+  return path.join(docDir('panels'), base, 'geometry.json');
 }
 
 function _readGeometryCache(sheet, st) {

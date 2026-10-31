@@ -5,7 +5,7 @@
  * Why this exists:
  *   The auto-generated filenames used to be `image_${Date.now()}_${i}.png` —
  *   informative for the engine, useless for humans. The user has to
- *   scan their `~/.koi/images` directory and play "which timestamp
+ *   scan their `<project>/images` directory and play "which timestamp
  *   was the mouse with cheese?". Deriving the name from the prompt
  *   makes the file self-describing — `mouse-with-cheese-mh4n5p_0.png`
  *   tells you what's inside without opening it.

@@ -17,7 +17,7 @@
  * Auto-approve is PERSISTENT: once the user enables it on any media
  * confirmation we stop asking for EVERY future media generation — image,
  * video and audio — forever, across app restarts. The flag is stored in a
- * dedicated runtime-owned file (`~/.koi/media-cost-approve.json`) rather than
+ * dedicated runtime-owned file (`<project>/media-cost-approve.json`) rather than
  * koi-cli's shared `config.json`, because the latter is cached whole in
  * koi-cli's process and rewritten on every settings change — a direct write
  * there could be clobbered. The runtime owns this file outright (same pattern

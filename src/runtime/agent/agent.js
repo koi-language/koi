@@ -5256,10 +5256,8 @@ export class Agent {
             // No exported helper for read-only access — go through fs.
             const fs = (await import('fs')).default;
             const path = (await import('path')).default;
-            const _tlPath = path.join(
-              process.env.HOME || '',
-              '.koi', 'timelines', `${_tlId}.json`,
-            );
+            const { docDir } = await import('../state/doc-root.js');
+            const _tlPath = path.join(docDir('timelines'), `${_tlId}.json`);
             if (fs.existsSync(_tlPath)) {
               const _tl = JSON.parse(fs.readFileSync(_tlPath, 'utf8'));
               const _clip = (_tl.clips || []).find((c) => c.id === _clipId);

@@ -27,6 +27,7 @@ import { channel } from '../../io/channel.js';
 import { saveStoryboardEntry } from '../../state/media-library.js';
 import { _validate, _normalize, _editorialDiff, _isStr, _isObj } from './save-storyboard.js';
 
+import { docDir } from '../../state/doc-root.js';
 function _err(error) { return { success: false, error }; }
 
 // Field whitelists — what a patch may touch at each level. Anything
@@ -70,7 +71,7 @@ export default {
     'every other byte of the document is preserved verbatim on disk, so ONLY the panels your edit actually touches re-render their sketch. ' +
     'ALWAYS prefer this over save_storyboard for content edits: it is faster (no full-document round-trip) and cannot accidentally re-word untouched fields. ' +
     'Call shape: { id, set?: {…root fields…}, scenes?: [{ id, set: {…} }], shots?: [{ id, set: {…} }] }. ' +
-    'Root set fields: name, aspect, synopsis, characters (recurring-cast roster array), locations (reusable-SET roster: array of { name, description?, locationId? }), objects (recurring objects: array of { name, description?, image? }), lighting, stylePrompt, continuity (array of strings), references, seed. ' +
+    'Root set fields: name, aspect, synopsis, characters (recurring-cast roster array), locations (reusable-SET roster: array of { name, description?, locationId? }), objects (recurring objects: array of { name, description?, image?, objectId? }; objectId links a saved object card from save_object), lighting, stylePrompt, continuity (array of strings), references, seed. ' +
     'Scene set fields: title, location (free-text place), locationIds (array of saved location-card ids — a scene can span several sets), notes, synopsis, references. ' +
     'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
     'Set a field to null to remove it. ' +
@@ -93,7 +94,7 @@ export default {
   schema: {
     type: 'object',
     properties: {
-      id: { type: 'string', description: 'Storyboard id (filename under ~/.koi/storyboards/ without .json).' },
+      id: { type: 'string', description: 'Storyboard id (filename under <project>/storyboards/ without .json).' },
       set: { type: 'object', description: 'Root-level field changes (only the fields being changed).' },
       scenes: {
         type: 'array',
@@ -130,7 +131,7 @@ export default {
     if (!id) return _err('"id" is required — the storyboard to patch. Use list_storyboards to discover ids.');
 
     const home = process.env.HOME || os.homedir();
-    const filePath = path.join(home, '.koi', 'storyboards', `${id}.json`);
+    const filePath = path.join(docDir('storyboards'), `${id}.json`);
     if (!fs.existsSync(filePath)) {
       return _err(`No storyboard at ${filePath}. update_storyboard only PATCHES existing storyboards — to create one, use save_storyboard.`);
     }

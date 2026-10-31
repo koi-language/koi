@@ -26,7 +26,7 @@
  *                       turn" — the auto-retrieval the agent prompts
  *                       have always promised.
  *   - `conversations` — KNN over the per-session embeddings table built
- *                       earlier today (`~/.koi/media-library/vector-cache/
+ *                       earlier today (`<project>/media-library/vector-cache/
  *                       index.sqlite#conversations`). Surfaces past
  *                       sessions in the same project that talked about
  *                       similar things — cross-session continuity

@@ -133,7 +133,7 @@ async function _probeVideoMeta(filePath) {
  * the moment the workspace disappears the clip becomes a black
  * rectangle with no playback ("de repente un clip ha desaparecido"
  * incident). This helper copies any workspace-bound clip path to the
- * canonical home for its kind (`~/.koi/videos/` / `images/` / `audio/`)
+ * canonical home for its kind (`<project>/videos/` / `images/` / `audio/`)
  * so the timeline always references stable storage. Returns the
  * (possibly-rewritten) path. Silently passes through:
  *   - placeholder paths (`placeholder-image:N`, `title:<uuid>`,
@@ -182,7 +182,7 @@ function _stabilizeWorkspaceClipPath(clipPath) {
   const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
   const isAudio = ['.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus'].includes(ext);
   const kindDir = isImage ? 'images' : isAudio ? 'audio' : 'videos';
-  const canonicalDir = path.join(os.homedir(), '.koi', kindDir);
+  const canonicalDir = docDir(kindDir);
   try {
     if (!fs.existsSync(canonicalDir)) fs.mkdirSync(canonicalDir, { recursive: true });
   } catch (err) {

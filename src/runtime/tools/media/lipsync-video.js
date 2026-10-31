@@ -46,7 +46,7 @@ const lipsyncVideoAction = {
     '  - "audioFile": absolute file path to the new audio track (mp3 / wav / ogg / flac / aac / m4a / opus).\n' +
     '\n' +
     'Optional:\n' +
-    '  - "saveTo": directory (or full file path) where a COPY of the finished video is saved. The original always stays in ~/.koi/videos/.\n' +
+    '  - "saveTo": directory (or full file path) where a COPY of the finished video is saved. The original always stays in <project>/videos/.\n' +
     '  - "label": ranking hint for the model picker.\n' +
     '  - "timeoutMs" / "pollIntervalMs": tuning knobs for the internal poll loop (defaults: 1200000 ms / 8000 ms).\n' +
     '\n' +
@@ -59,7 +59,7 @@ const lipsyncVideoAction = {
     properties: {
       video:          { type: 'string', description: 'Absolute path to the source video whose lips get re-synced.' },
       audioFile:      { type: 'string', description: 'Absolute path to the new audio track the video should lip-sync to.' },
-      saveTo:         { type: 'string', description: 'Where to place a COPY of the final video (a directory, or a full video file path). The original always stays in ~/.koi/videos/ (returned as `savedTo`); the copy is returned as `exportedTo`.' },
+      saveTo:         { type: 'string', description: 'Where to place a COPY of the final video (a directory, or a full video file path). The original always stays in <project>/videos/ (returned as `savedTo`); the copy is returned as `exportedTo`.' },
       timeoutMs:      { type: 'number', description: 'Max wall-clock to wait for the provider in ms (default 1200000 = 20 min).' },
       pollIntervalMs: { type: 'number', description: 'Poll cadence in ms (default 8000, clamped to [2000, 30000]).' },
     },

@@ -97,7 +97,7 @@ export async function recordCreation(entry) {
   } catch {
     // Best-effort: failing the ledger must not fail the save.
   }
-  // GLOBAL cross-session index (~/.koi/creations-index.jsonl): same line,
+  // GLOBAL cross-session index (<project>/creations-index.jsonl): same line,
   // home-based like every other artefact store the GUI reads directly
   // (storyboards/characters/locations). The session ledger stays the
   // authority for per-session recall; this copy exists so the GUI's
@@ -105,7 +105,7 @@ export async function recordCreation(entry) {
   // sessions without knowing any engine project root. Append-only,
   // best-effort, never blocks the save.
   try {
-    const globalFp = path.join(os.homedir(), '.koi', 'creations-index.jsonl');
+    const globalFp = path.join(documentsRoot(), 'creations-index.jsonl');
     await fs.promises.appendFile(globalFp, line, 'utf8');
   } catch { /* best-effort */ }
 }

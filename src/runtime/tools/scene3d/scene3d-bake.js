@@ -5,6 +5,7 @@
  */
 
 import { bakeWindow, bakeStill, cleanId } from './_store.js';
+import { _join } from './prepare-scene3d-video.js';
 
 export default {
   type: 'scene3d_bake',
@@ -24,6 +25,7 @@ export default {
       width: { type: 'number' },
       height: { type: 'number' },
       still: { type: 'boolean' },
+      shots: { type: 'array', description: 'A continuous take: [{ id, startMs }] in order; each stretch through its own camera' },
     },
     required: ['sceneId', 'shotId', 'fromMs'],
   },
@@ -36,7 +38,21 @@ export default {
         return { success: true, path: await bakeStill(cleanId(params.sceneId), String(params.shotId), from, size) };
       }
       const to = Math.max(from + 50, Math.round(Number(params.toMs) || 0));
-      const out = await bakeWindow(cleanId(params.sceneId), String(params.shotId), from, to, size);
+      const sceneId = cleanId(params.sceneId);
+      const shots = (Array.isArray(params.shots) ? params.shots : [])
+        .filter((x) => x && typeof x.id === 'string')
+        .map((x) => ({ id: x.id, startMs: Math.round(Number(x.startMs) || 0) }));
+      const spans = [];
+      for (const [j, sh] of shots.entries()) {
+        const a = Math.max(from, j ? sh.startMs : from);
+        const b = Math.min(to, j < shots.length - 1 ? shots[j + 1].startMs : to);
+        if (b - a >= 1) spans.push([sh.id, a, b]);
+      }
+      if (spans.length > 1) {
+        const parts = await Promise.all(spans.map(([id, a, b]) => bakeWindow(sceneId, id, a, b, size)));
+        return { success: true, path: await _join(sceneId, parts) };
+      }
+      const out = await bakeWindow(sceneId, spans[0]?.[0] || String(params.shotId), from, to, size);
       return { success: true, path: out };
     } catch (e) {
       return { success: false, error: e.message };

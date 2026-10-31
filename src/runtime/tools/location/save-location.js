@@ -1,6 +1,6 @@
 /**
  * save_location — write a reusable "location" / set entity to
- * `~/.koi/locations/<id>.json` with structured args.
+ * `<project>/locations/<id>.json` with structured args.
  *
  * A location is the SET/PLATÓ analog of a character: a persisted, reusable
  * place (a dining room, a warehouse, a beach…) the user references across
@@ -25,6 +25,7 @@ import { channel } from '../../io/channel.js';
 import { saveLocationEntry } from '../../state/media-library.js';
 import { slugifyLocationId, locationViews } from '../../state/location-registry.js';
 
+import { docDir } from '../../state/doc-root.js';
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_location: ${msg}` }; }
@@ -181,7 +182,7 @@ export default {
   intent: 'save_location',
   description:
     'REQUIRED FIRST: activate the `locations` skill before creating or editing a location — it is the full contract (the location JSON schema and every field, and the establishing-plate flow). ' +
-    'Write a reusable LOCATION / set entity to ~/.koi/locations/<id>.json with STRUCTURED args (the location as an OBJECT, not a JSON string). ' +
+    'Write a reusable LOCATION / set entity to <project>/locations/<id>.json with STRUCTURED args (the location as an OBJECT, not a JSON string). ' +
     'A location is a persisted, reusable place (a dining room, a warehouse, a beach…) the user references across storyboards and video prompts. A scene = its characters + its location; both are first-class reusable identity anchors (a character has a turnaround sheet; a location has an establishing PLATE). ' +
     'Use for BOTH creating new locations and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
     'Call shape: { location: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, views? } }. ' +
@@ -194,7 +195,7 @@ export default {
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, location:<normalized> } on success, or { success:false, error } with the exact invalid field on failure.',
   instructions:
-    'save_location REPLACES write_file for ~/.koi/locations/*.json — never hand-serialize the JSON. ' +
+    'save_location REPLACES write_file for <project>/locations/*.json — never hand-serialize the JSON. ' +
     'Update flow: read the existing JSON, mutate the parsed object, then save_location with the whole mutated object (include its id). ' +
     'After a CREATE, call show_result with resourceType "file" and the returned filePath so the GUI opens the location tab.',
   thinkingHint: (action) => `Saving location ${action?.location?.id || action?.location?.name || ''}`.trim(),
@@ -231,7 +232,7 @@ export default {
     if (validationError) return _err(validationError);
 
     const home = process.env.HOME || os.homedir();
-    const dir = path.join(home, '.koi', 'locations');
+    const dir = path.join(docDir('locations'));
     let filePath = path.join(dir, `${loc.id}.json`);
 
     let existing = null;

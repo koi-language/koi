@@ -28,9 +28,13 @@ import { readScene, bakeWindow, bakeInFrame, isLivePath, storyboardPath, renderD
 import { sceneSpatialRefs } from './_previz-sync.js';
 import { getTimeline } from '../../state/timelines.js';
 import { readCharacter } from '../../state/character-registry.js';
+import { readObject, objectVideoImages, objectVideoDetails } from '../../state/object-registry.js';
 import { resolveTimelineId } from '../timeline/_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
 import { notePendingTake } from './_pending-takes.js';
+import { readModel } from './_models.js';
+import { clipShotIds } from './_story-timeline.js';
+import { physicsReport } from './_physics.js';
 
 /** The model 3D clips are generated with (user decision: Seedance 2.5). */
 export const SCENE3D_VIDEO_MODEL = 'bytedance/seedance-2.5/us/reference-to-video';
@@ -108,6 +112,60 @@ function _castKey(scene) {
     name: c.name || c.id,
     previz: `${_colourWord(c.color || _PALETTE[i % _PALETTE.length])} figure, ${Number(c.height || 1.75).toFixed(2)} m tall`,
   }));
+}
+
+/**
+ * The story's objects the take shows (a train, a motorbike): the props in
+ * frame that are tied to a storyboard `objects` entry (prop `object`) or to a
+ * modeled asset (prop `model`), with their reference images, so the real take
+ * keeps their look and the prompt can tie each grey shape to its object.
+ */
+function _objectRefs(scene, bakes, sb) {
+  const props = new Map(((scene.set && scene.set.props) || []).map((p) => [p.id, p]));
+  const seen = new Set();
+  for (const b of bakes) {
+    for (const smp of bakeInFrame(b)?.timeline || []) {
+      for (const e of smp.seen || []) {
+        if (e.off) continue;
+        if (props.has(e.id)) seen.add(e.id);
+        if (e.in && props.has(e.in)) seen.add(e.in);
+      }
+    }
+  }
+  const roster = Array.isArray(sb?.objects) ? sb.objects : [];
+  const isImg = (f) => typeof f === 'string' && path.isAbsolute(f) && fs.existsSync(f);
+  const out = [];
+  for (const id of seen) {
+    const p = props.get(id);
+    const entry = p.object
+      ? roster.find((o) => String(o?.name || '').toLowerCase() === String(p.object).toLowerCase())
+      : null;
+    // A roster entry linked to a saved object card: the card's sheet (one slot
+    // carrying its three views) or views, + photos, are the object's images, and
+    // its 3D model stands in when the prop has none.
+    const card = entry?.objectId ? readObject(entry.objectId) : null;
+    const modelId = p.model || card?.model || null;
+    const model = modelId ? readModel(modelId) : null;
+    const images = [];
+    if (card) for (const f of objectVideoImages(card)) if (isImg(f)) images.push(f);
+    if (!images.length && isImg(entry?.image)) images.push(entry.image);
+    if (!card) for (const r of model?.references || []) if (isImg(r?.image) && images.length < 2) images.push(r.image);
+    if (!entry && !model) continue;
+    const description = entry?.description || card?.description || model?.description;
+    // The card's story-critical details (close-ups, "Interior: ..." views),
+    // named by label so the prompt can point at them; their images are in
+    // `images` right after the sheet.
+    const details = card ? objectVideoDetails(card).filter((d) => isImg(d.path)) : [];
+    out.push({
+      id,
+      name: entry?.name || model?.name || p.object || id,
+      ...(description ? { description } : {}),
+      previz: `grey ${p.shape || 'shape'}`,
+      images,
+      ...(details.length ? { details } : {}),
+    });
+  }
+  return out;
 }
 
 /** Who the reference shows in a shot and where, read off its bake. */
@@ -249,7 +307,7 @@ function _run(bin, args) {
 }
 
 /** Join baked windows end to end into one reference (cached by content). */
-async function _join(sceneId, parts) {
+export async function _join(sceneId, parts) {
   if (parts.length === 1) return parts[0];
   const key = crypto.createHash('sha1').update(JSON.stringify(parts)).digest('hex').slice(0, 10);
   const out = path.join(renderDir(sceneId), `take-${key}.mp4`);
@@ -289,11 +347,11 @@ export default {
   description:
     'FIRST STEP to turn 3D previz timeline clips into REAL video ("pásalo a vídeo", "genera el vídeo de este/estos clips"). ' +
     'Consecutive clips of the same 3D set are joined into ONE take (better continuity than separate clips): per take it ' +
-    'bakes the clips\' exact 3D windows end to end into one mp4 (the motion reference: camera + characters\' blocking + the ' +
-    'cuts), and collects the pictures of what is in it (character sheets/photos, the place\'s plates, storyboard refs) plus ' +
+    'bakes the clips\' exact 3D windows end to end into one mp4 (the reference for camera + where the characters stand, travel and face + the ' +
+    'cuts; NOT for their body motion, which is a crude placeholder the model must never copy), and collects the pictures of what is in it (character sheets/photos, the place\'s plates, storyboard refs) plus ' +
     'each shot\'s script and where it falls in the take. `clipIds` omitted → every 3D clip of the timeline still showing its ' +
     'previz. Then per take: generate_video with the returned `model`, `referenceVideos: [referenceVideo]`, `referenceImages`, ' +
-    '`duration: durationSec`, and finally assign_scene3d_take — every clip keeps its length and the 3D stays one toggle away.',
+    '`duration: durationSec`, and finally assign_scene3d_take — the take keeps its place and total length and the 3D stays one toggle away.',
   thinkingHint: 'Preparing 3D references',
   permission: 'write',
 
@@ -342,8 +400,19 @@ export default {
       if (!shot) { failed.push({ clipId: c.id, error: `no 3D shot ${c.scene3d.sceneId}/${c.scene3d.shotId}` }); continue; }
       const sb = storyboard(scene.storyboard?.id);
       const sbScene = sb?.scenes?.find((x) => x?.id === (c.scene3d.storyboardSceneId || scene.storyboard?.sceneId));
-      const sbShot = sbScene?.shots?.find((x) => x?.id === (c.scene3d.storyboardShotId || shot.storyboardShotId));
-      items.push({ clip: c, scene, shot, sb, sbScene, sbShot, from: scene3dWindowStart(c, shot) });
+      const from = scene3dWindowStart(c, shot);
+      // A continuous take (one clip over several shots): one stretch per
+      // shot, each baked through its own camera, told as one unbroken take.
+      const shots = clipShotIds(c).map((id) => scene.shots.find((s) => s.id === id)).filter(Boolean);
+      const end = from + c.durationMs;
+      shots.forEach((sh, j) => {
+        const a = j ? Math.max(from, sh.startMs) : from;
+        const b = j < shots.length - 1 ? Math.min(end, shots[j + 1].startMs) : end;
+        if (b - a < 1) return;
+        const sbShot = sbScene?.shots?.find((x) => x?.id === ((j ? null : c.scene3d.storyboardShotId) || sh.storyboardShotId));
+        items.push({ clip: shots.length > 1 ? { ...c, startMs: c.startMs + a - from, durationMs: b - a } : c,
+          scene, shot: sh, sb, sbScene, sbShot, from: a, continues: j > 0 });
+      });
     }
 
     /** The reference's size: the canvas' shape (else the scene's) at the top resolution. */
@@ -366,7 +435,7 @@ export default {
           const len = i === g.length - 1
             ? Math.max(x.clip.durationMs, Math.min(x.clip.durationMs + takeMs - total, scene.durationMs - x.from))
             : x.clip.durationMs;
-          return bakeWindow(scene.id, x.shot.id, x.from, x.from + len, { ...referenceSize(scene), maxQuality: true });
+          return bakeWindow(scene.id, x.shot.id, x.from, x.from + len, { ...referenceSize(scene), maxQuality: true, flatSurfaces: true });
         }));
       } catch (e) {
         for (const x of g) failed.push({ clipId: x.clip.id, error: `3D bake failed: ${e.message}` });
@@ -390,6 +459,8 @@ export default {
       for (const ch of characters) ch.images.forEach(addImg);
       const place = g[0].sbScene ? sceneSpatialRefs(g[0].sb, g[0].sbScene).slice(0, 4) : [];
       place.forEach(addImg);
+      const objects = _objectRefs(scene, parts, g[0].sb);
+      for (const o of objects) o.images.forEach(addImg);
       let at = 0;
       const castKey = _castKey(scene);
       const shots = g.map((x, i) => {
@@ -400,6 +471,7 @@ export default {
           clipId: x.clip.id,
           shotId: x.shot.id,
           storyboardShotId: x.sbShot?.id || x.shot.storyboardShotId || null,
+          ...(x.continues ? { continuesWithoutCut: true } : {}),
           fromSec: Math.round(at) / 1000,
           toSec: Math.round(at + x.clip.durationMs) / 1000,
           // What the reference ACTUALLY shows: wins over the script's words.
@@ -415,10 +487,11 @@ export default {
       const prev = (tl.clips || [])
         .filter((x) => x.track === first.track && x.startMs + x.durationMs <= first.startMs + 1)
         .sort((a, b) => b.startMs - a.startMs)[0];
-      notePendingTake(referenceVideo, timelineId, g.map((x) => x.clip.id));
+      const clipIds = [...new Set(g.map((x) => x.clip.id))];
+      notePendingTake(referenceVideo, timelineId, clipIds);
       takes.push({
         startMs: first.startMs,
-        clipIds: g.map((x) => x.clip.id),
+        clipIds,
         sceneId: scene.id,
         model: SCENE3D_VIDEO_MODEL,
         referenceVideo,
@@ -428,6 +501,7 @@ export default {
         shots,
         castKey,
         characters,
+        ...(objects.length ? { objects } : {}),
         place,
         referenceImages: images,
         style: g[0].sb?.style || g[0].sb?.look || undefined,
@@ -437,29 +511,44 @@ export default {
     takes.sort((a, b) => a.startMs - b.startMs);
     if (failed.length) channel.log('scene3d', `prepare_scene3d_video: ${failed.map((f) => `${f.clipId}: ${f.error}`).join('; ')}`);
 
+    // The scene's motion in numbers: the take's script must say exactly that.
+    const physics = takes.length ? physicsReport(readScene(takes[0].sceneId)).physics : null;
     return {
       success: takes.length > 0,
       timelineId,
       takes,
+      ...(physics ? { physics } : {}),
       ...(failed.length ? { failed } : {}),
       next:
         'For EACH take (several → start them all with wait:false, then await): generate_video with `model` (always Seedance ' +
         '2.5 reference-to-video), `referenceVideos: [referenceVideo]` (a grey 3D previz: keep its camera moves, composition, ' +
-        'every character\'s blocking and timing, and its CUTS exactly, re-render it photographically), ALL its ' +
+        'where every character stands, travels and faces, the timing, and its CUTS exactly, re-render it photographically; ' +
+        'its figures\' BODY MOTION is a crude placeholder, never copied), ALL its ' +
         '`referenceImages` (who and where — never drop them), `duration: durationSec`, `aspectRatio`, and ONE prompt ' +
         'written SHOT BY SHOT: one block per entry of `shots` ("Shot 1 (0–3.2 s): …"), and between two blocks the words ' +
-        '"HARD CUT". Inside a block NO times at all (no "0–6 s", no "around 6 s": time marks read as more shots and the ' +
+        '"HARD CUT" (but before a block whose entry has `continuesWithoutCut`, write "NO CUT: the same take keeps rolling" ' +
+        'instead: the camera flows on from the previous block in one unbroken move). Inside a block NO times at all (no "0–6 s", no "around 6 s": time marks read as more shots and the ' +
         'model cuts there): one paragraph that says this shot follows the reference video\'s camera EXACTLY as ONE ' +
         'continuous move, then tells in order what happens — what the camera does (its moves, zoom, focus pulls, ' +
         'framing), who is who and what they look like, what they do and feel (acting, gestures, lines), what happens ' +
         'out of shot, light and sound — chained with "then", "as", "while", never with times. Say once, plainly: "Cut ONLY at HARD CUT; never anywhere else." Keep light, wardrobe, props and ' +
-        'sound continuous across the cuts. PICTURE QUALITY: the grey reference only carries motion and framing, never its ' +
+        'sound continuous across the cuts. SOUND: no music in the take, even in the background or from a source in the ' +
+        'scene (no score, song, humming or instrument sound); a band, radio or TV shown makes NO sound of its own; only ' +
+        'sound effects, ambience and voices. Say so explicitly at the end of the prompt, unless the user asked for music ' +
+        'in the clip. PICTURE QUALITY: the grey reference only carries motion and framing, never its ' +
         'look. Ask for the sharpest image the model can give: crisp focus on the subject, fine detail in skin, hair and ' +
         'fabric, clean high-resolution picture. Never ask for softness or degradation (no soft focus, soft contrast, haze, ' +
         'heavy film grain, low-res, VHS) unless the user asked for that look. Same framing as the reference: nothing tighter, ' +
-        'nothing wider, the headroom it has. THE REFERENCE IS THE MASTER: open the prompt ' +
-        'by saying the attached video\'s camera, framing, what is in and out of frame, positions, sides and timing override ' +
-        'anything in the text. Describe each moment with what `inFrameTimeline` says: `inFrame` is what the shot SHOWS, ' +
+        'nothing wider, the headroom it has. THE REFERENCE IS THE MASTER FOR CAMERA AND PLACEMENT ONLY: open the prompt ' +
+        'by saying the attached video\'s camera, framing, what is in and out of frame, positions, paths, sides and timing override ' +
+        'anything in the text, and right after that the grey figures are crude placeholders: take only where each one ' +
+        'is, moves to and faces, and their body pose (standing, seated, riding, lying, kneeling...), and do NOT copy their ' +
+        'stiff block shapes, limb movement or gestures; every person moves and acts ' +
+        'naturally, like a real actor, as the text says. The figures are abstract on purpose; a take that mimics the ' +
+        'mannequin\'s pose or movement is a failed take. Say also that the reference\'s SURFACES carry no information: its flat grey ' +
+        'materials and any shape or pattern on the ground, walls or objects are NOT rendered; the look of every surface ' +
+        'comes ONLY from the reference images and the text (the 3D is for focus, framing and placement, never for what ' +
+        'things look like). Describe each moment with what `inFrameTimeline` says: `inFrame` is what the shot SHOWS, ' +
         '`offFrame` is what is near but OUT of shot (side, distance). Something that happens off frame IS said — and said ' +
         'as off frame: "A\'s car overtakes on his right, entirely out of frame: we never see it, only its roar, the wash of ' +
         'its passing and B\'s eyes following it". Never write it as seen while the reference does not show it (the model ' +
@@ -467,16 +556,18 @@ export default {
         'tell them the 3D camera must frame it first. Say each figure\'s view EXACTLY as `inFrameTimeline` gives it (front / ' +
         'three-quarter front / side / three-quarter from behind / behind, and which of its sides): asking for a view the ' +
         'reference\'s camera does not have (e.g. "his face, sun full on it" while it shows the back of his head) makes the ' +
-        'model CUT to get it. Write every change of framing inside a shot as the camera MOVING there, never as a new shot. Spend the words on WHO and WHAT things look like (cast, cars, place, light, sound), not on re-staging ' +
-        'the motion the video already carries. SCREEN POSITIONS come from each shot\'s ' +
+        'model CUT to get it. Write every change of framing inside a shot as the camera MOVING there, never as a new shot. Spend the words on WHO and WHAT things look like (cast, cars, place, light, sound) and on the ACTING: per shot, ' +
+        'body language, gestures, expression and the manner of each movement, invented from the script and the beat\'s ' +
+        'emotion, never read off the grey figure; do not re-describe the camera or paths the video already carries. SCREEN POSITIONS come from each shot\'s ' +
         '`onScreen` (read off the 3D: who is left / centre / right), NEVER from the script\'s words when they disagree — ' +
         'a prompt that puts someone on the other side than the reference makes the model follow the text and mirror the ' +
         'shot. Name every character with its previz look from `castKey` ("the boy — the small blue figure in the ' +
-        'reference — …") so the model maps each grey figure to its character sheet. Review the take, then assign_scene3d_take ' +
+        'reference — …") so the model maps each grey figure to its character sheet, and every entry of `objects` the ' +
+        'same way ("the steam train — the long grey shape in the reference — matches its reference image"). When an `objects` entry has `details` ([{label, path}], its story-critical close-ups and "Interior:" views, already among its images), name each one by its label in the prompt of the shots that show it; an insert or close-up of that part, or a shot inside the object, uses that detail as its reference. Review the take, then assign_scene3d_take ' +
         '{ timelineId, clipIds, mediaPath } — it splits the take over the clips at its real cuts (generate_video already does ' +
         'this on its own when the take used this referenceVideo: its result says `scene3dTake`; only call it yourself to ' +
-        'put a DIFFERENT take on the clips). The clip LENGTHS ARE ' +
-        'PROTECTED: never trim, stretch or move a clip, and never generate shorter than durationSec.',
+        'put a DIFFERENT take on the clips). Only that landing moves ' +
+        'the boundaries between the take\'s clips, to its real cuts: never trim, stretch or move a clip yourself, and never generate shorter than durationSec.',
     };
   },
 };

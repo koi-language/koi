@@ -12,7 +12,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-const _file = () => path.join(process.env.HOME || os.homedir(), '.koi', 'scenes3d', '.pending-takes.json');
+import { docDir } from '../../state/doc-root.js';
+const _file = () => path.join(docDir('scenes3d'), '.pending-takes.json');
 const _TTL_MS = 7 * 24 * 3600 * 1000;
 
 function _read() {

@@ -4,14 +4,16 @@
  *
  * Each clip windows its own stretch of the take. The model rarely cuts on
  * the exact frame the previz did, so every boundary snaps to the take's REAL
- * cut (ffmpeg scene detection) when one lies near the expected time. The
- * clips' lengths never change: a clip's window starts at its cut and runs
- * for the clip's own duration. The 3D stays as each clip's placeholder.
+ * cut (ffmpeg scene detection) when one lies near the expected time. A clip
+ * runs from its cut to the next one, and the timeline boundary between them
+ * moves with the cut: a window of the previz's length would leak frames of
+ * the neighbouring shot. The whole take keeps its place and its total length.
+ * The 3D stays as each clip's placeholder.
  */
 
 import fs from 'fs';
 import { spawn } from 'child_process';
-import { assignGeneratedMedia, getTimeline } from '../../state/timelines.js';
+import { assignGeneratedMedia, getTimeline, updateTimeline } from '../../state/timelines.js';
 import { stampScene3dRender } from './_store.js';
 import { resolveTimelineId } from '../timeline/_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
@@ -54,12 +56,13 @@ async function _probe(file, bins) {
 /** Cut candidates in the take: [{ ms, score }] (frame-to-frame change). */
 async function _cuts(file, bins) {
   const out = await _out(bins.ffmpeg, ['-hide_banner', '-i', file, '-an',
-    '-vf', "select='gt(scene,0.12)',metadata=print:key=lavfi.scene_score", '-f', 'null', '-']);
+    '-vf', "select='gt(scene,0.05)',metadata=print:key=lavfi.scene_score", '-f', 'null', '-']);
   const cuts = [];
   let t = null;
   for (const line of out.split('\n')) {
     const pt = /pts_time:([\d.]+)/.exec(line);
-    if (pt) t = Math.round(parseFloat(pt[1]) * 1000);
+    // Rounded up: a window opening a hair before the frame shows the old shot.
+    if (pt) t = Math.ceil(parseFloat(pt[1]) * 1000);
     const sc = /scene_score=([\d.]+)/.exec(line);
     if (sc && t != null) cuts.push({ ms: t, score: parseFloat(sc[1]) });
   }
@@ -71,8 +74,8 @@ export default {
   intent: 'assign_scene3d_take',
   description:
     'Land ONE generated take on the 3D clips it was made for (prepare_scene3d_video `takes[].clipIds`, in order): each clip ' +
-    'shows its own stretch of the take, its start snapped to the take\'s real cut, and keeps its length. A single clip works ' +
-    'too. The 3D stays as each clip\'s source (clip menu: "Ver 3D" / "Ver vídeo real"). Returns { success, clips:[{ clipId, sourceInMs, snapped }] }.',
+    'shows its own stretch of the take, cut to cut at the take\'s real cuts, the boundaries between the clips moving to them while the take keeps its place and total length. A single clip works ' +
+    'too. The 3D stays as each clip\'s source (clip menu: "Ver 3D" / "Ver render"). Returns { success, clips:[{ clipId, sourceInMs, snapped }] }.',
   thinkingHint: 'Placing the take on the clips',
   permission: 'write',
 
@@ -127,18 +130,35 @@ export default {
         }
         // Never before the previous clip's start, never past the take's end.
         if (i > 0) start = Math.max(start, placed[i - 1].sourceInMs + 1);
-        if (takeMs > 0) start = Math.min(start, takeMs - c.durationMs);
+        if (i > 0) start = Math.min(start, placed[0].sourceInMs + total - (clips.length - i));
+        else if (takeMs > 0) start = Math.min(start, takeMs - total);
         start = Math.max(0, Math.round(start));
         placed.push({ clipId: c.id, sourceInMs: start, snapped, expectedMs: Math.round(expected) });
         expected += c.durationMs;
       }
+
+      // Cut to cut. Clips apart on the timeline only lose what would leak.
+      const joined = clips.every((c, i) => i === 0 || Math.abs(clips[i - 1].startMs + clips[i - 1].durationMs - c.startMs) <= 2);
+      placed.forEach((p, i) => {
+        const end = i + 1 < placed.length ? placed[i + 1].sourceInMs : placed[0].sourceInMs + total;
+        const c = clips[i];
+        p.startMs = joined ? clips[0].startMs + p.sourceInMs - placed[0].sourceInMs : c.startMs;
+        p.durationMs = joined ? end - p.sourceInMs : Math.min(c.durationMs, end - p.sourceInMs);
+      });
+      // Before any audio is linked: a clip's sound must not meet its neighbour's old place.
+      for (const p of placed) {
+        const c = tl.clips.find((x) => x.id === p.clipId);
+        const linked = c.linkId ? tl.clips.filter((x) => x.linkId === c.linkId) : [c];
+        for (const x of linked) Object.assign(x, { startMs: p.startMs, durationMs: p.durationMs });
+      }
+      updateTimeline(timelineId, tl);
 
       for (const p of placed) {
         assignGeneratedMedia(timelineId, p.clipId, {
           mediaPath, chatId, sourceInMs: p.sourceInMs, ...(typeof hasAudio === 'boolean' ? { hasAudio } : {}),
         });
         stampScene3dRender(timelineId, p.clipId, mediaPath);
-        channel.clipMediaGenerated({ clipId: p.clipId, mediaPath, chatId: chatId ?? null, sourceInMs: p.sourceInMs });
+        channel.clipMediaGenerated({ clipId: p.clipId, mediaPath, chatId: chatId ?? null, sourceInMs: p.sourceInMs, startMs: p.startMs, durationMs: p.durationMs });
       }
       return { success: true, timelineId, takeSec: takeMs / 1000, cutsSec: placed.filter((p) => p.snapped).map((p) => p.sourceInMs / 1000), clips: placed };
     } catch (e) {

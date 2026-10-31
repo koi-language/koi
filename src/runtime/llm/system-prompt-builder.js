@@ -694,7 +694,7 @@ export async function buildWorkingAreaBlock() {
           lines.push('');
           lines.push('Skipping step 1 makes generate_image hallucinate a plausible-but-wrong scene. Even with the frame as reference, an over-elaborate prompt at step 2 ALSO drifts away from the source — the model has to choose between your prose and the picture, and a wordy prose wins. Keep prose short, factual, scoped to the change.');
           lines.push('');
-          lines.push('**`extract_frame.video` MUST be a video file path** (`.mp4` / `.mov` / `.webm` / etc.) — one of the paths listed above. NEVER pass an audio file you just generated (`sfx_*.mp3`, `*.wav`), an image (`.png`/`.jpg`), or a timeline JSON (`.json`) here. ffmpeg will fail with "Output file does not contain any stream" and you\'ll loop. If unsure which is the source video, look for the `.mp4` under `~/.koi/videos/` or the path surfaced in the read_file result of the timeline.');
+          lines.push('**`extract_frame.video` MUST be a video file path** (`.mp4` / `.mov` / `.webm` / etc.) — one of the paths listed above. NEVER pass an audio file you just generated (`sfx_*.mp3`, `*.wav`), an image (`.png`/`.jpg`), or a timeline JSON (`.json`) here. ffmpeg will fail with "Output file does not contain any stream" and you\'ll loop. If unsure which is the source video, look for the `.mp4` under `<project>/videos/` or the path surfaced in the read_file result of the timeline.');
         }
       } catch { /* best-effort surfacing */ }
 

@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { docDir } from '../../state/doc-root.js';
 /**
  * show_result — Present a result to the user directly.
  * Opens the resource in whatever way the current channel/UI supports
@@ -110,13 +111,13 @@ Do NOT use for every file path mentioned in passing — only the primary result(
         return { success: false, error: 'resourceType=timeline requires "timelineId" (or "path" to the timeline JSON)' };
       }
       if (id && !resolvedPath) {
-        // Timelines live in ~/.koi/timelines/<id>.json (user-global, matches
+        // Timelines live in <project>/timelines/<id>.json (user-global, matches
         // timelines.js `_dir()` and the GUI's TimelineLibrary). Older engines
         // wrote <projectRoot>/.koi/timelines/ — probe home FIRST, then that
         // legacy dir. Do NOT hardcode <projectRoot>/.koi/timelines: new
         // timelines are NOT there, so this 404'd on every fresh timeline and
         // the agent then hunted the disk (the anti-pattern the skill forbids).
-        const homeFp = path.join(os.homedir(), '.koi', 'timelines', `${id}.json`);
+        const homeFp = path.join(docDir('timelines'), `${id}.json`);
         const projectRoot = process.env.KOI_PROJECT_ROOT || process.cwd() || os.homedir();
         const legacyFp = path.join(projectRoot, '.koi', 'timelines', `${id}.json`);
         resolvedPath = fs.existsSync(homeFp) ? homeFp : (fs.existsSync(legacyFp) ? legacyFp : homeFp);

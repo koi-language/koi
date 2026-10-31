@@ -65,7 +65,7 @@ const segmentImageAction = {
     const headers = getAuthHeaders();
     // Persistent masks directory (survives reboots, unlike /tmp)
     const home = os.homedir();
-    const masksDir = path.join(home, '.koi', 'media-library', 'masks');
+    const masksDir = path.join(docDir('media-library'), 'masks');
     fs.mkdirSync(masksDir, { recursive: true });
 
     const mode = params.mode || (params.points?.length > 0 ? 'point' : 'precompute');
@@ -262,7 +262,7 @@ const segmentImageAction = {
         }));
 
         // Mask filenames embed the source image stem + the concept so
-        // a `~/.koi/images/.masks/` listing reads as
+        // a `<project>/images/.masks/` listing reads as
         // `mouse-with-cheese-mask-helmet-<ts>_0.png` instead of an
         // opaque `mask_<ts>_<i>.png` you can't grep.
         for (const r of results) {

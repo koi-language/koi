@@ -282,7 +282,7 @@ async function _resumeVideoJob(job) {
     }
 
     // Export a COPY to the user's requested savePath now the path is final
-    // (the original stays in ~/.koi/videos and is what the timeline references).
+    // (the original stays in <project>/videos and is what the timeline references).
     if (job.savePath) {
       exportMediaCopy(mediaPath, job.savePath, { logTag: 'jobs' });
     }

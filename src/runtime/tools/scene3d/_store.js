@@ -1,8 +1,8 @@
 /**
  * 3D previz scenes ("scene3d").
  *
- * One JSON per scene in ~/.koi/scenes3d/<id>.json, renders beside it in
- * ~/.koi/scenes3d/<id>/. A scene is ONE shared set (place + characters +
+ * One JSON per scene in <project>/scenes3d/<id>.json, renders beside it in
+ * <project>/scenes3d/<id>/. A scene is ONE shared set (place + characters +
  * blocking on a single clock) covered by N shots; each shot is a camera
  * over a window [startMs, startMs + durationMs] of that clock. Shots that
  * overlap in time are coverage of the same action (plano / contraplano).
@@ -47,6 +47,7 @@ const _BUILDER_HASH = (() => {
 import { getTimeline, updateTimeline } from '../../state/timelines.js';
 import { channel } from '../../io/channel.js';
 
+import { docDir } from '../../state/doc-root.js';
 const ASPECTS = {
   '16:9': [960, 540], '9:16': [540, 960], '1:1': [720, 720], '4:5': [720, 900],
   '4:3': [960, 720], '3:4': [720, 960], '21:9': [1120, 480], '2.39:1': [1148, 480],
@@ -60,7 +61,7 @@ function _home() {
 }
 
 export function scenesDir() {
-  return path.join(_home(), '.koi', 'scenes3d');
+  return path.join(docDir('scenes3d'));
 }
 
 export function scenePath(id) {
@@ -583,7 +584,7 @@ export async function bakeStill(sceneId, shotId, ms, { width, height } = {}) {
  * for what needs a real file: exporting a timeline. Cached per scene state +
  * window + size, so a second export of an untouched montage is instant.
  */
-export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height, maxQuality = false } = {}) {
+export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height, maxQuality = false, flatSurfaces = false } = {}) {
   const scene = readScene(sceneId);
   const sh = scene?.shots?.find((x) => x.id === shotId);
   if (!sh) throw new Error(`scene3d bake: no shot ${sceneId}/${shotId}`);
@@ -592,7 +593,7 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height,
   fs.mkdirSync(dir, { recursive: true });
   const w = width ? Math.round(width / 2) * 2 : 0;
   const h = height ? Math.round(height / 2) * 2 : 0;
-  const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h, maxQuality])).digest('hex').slice(0, 10);
+  const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h, maxQuality, flatSurfaces])).digest('hex').slice(0, 10);
   const out = path.join(dir, `${sh.id}-${key}-bake-${Math.round(fromMs)}-${Math.round(toMs)}.mp4`);
   // Kept beside the bake: who the camera sees and where (bakeInFrame).
   if (_exists(out) && _exists(`${out}.inframe.json`)) return out;
@@ -605,6 +606,7 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height,
     try {
       await runBuilder(['--scene', snap, '--jobs', jf, '--pass', 'beauty', '--style', st, '--samples', maxQuality ? '64' : '8',
         ...(maxQuality ? ['--max-quality'] : []),
+        ...(flatSurfaces ? ['--flat-surfaces'] : []),
         ...(w && h ? ['--width', String(w), '--height', String(h)] : [])], { heavy: true });
       fs.renameSync(`${out}.part.mp4`, out);
       return out;
@@ -670,7 +672,7 @@ function _gc(scene) {
 // ──────────────────────────────────────────────────────────── links ──
 
 export function storyboardPath(id) {
-  return path.join(_home(), '.koi', 'storyboards', `${cleanId(id)}.json`);
+  return path.join(docDir('storyboards'), `${cleanId(id)}.json`);
 }
 
 /** Stamp `_preview3d` onto linked storyboard shots + repoint timeline clips. */
@@ -713,7 +715,7 @@ export async function syncLinks(scene) {
 
   // Timeline clips. Cheap text pre-filter so we only parse timelines that
   // mention this scene.
-  const tlDir = path.join(_home(), '.koi', 'timelines');
+  const tlDir = path.join(docDir('timelines'));
   let files = [];
   try { files = fs.readdirSync(tlDir).filter((f) => f.endsWith('.json')); } catch { /* none */ }
   const byId = new Map((scene.shots || []).map((s) => [s.id, s]));

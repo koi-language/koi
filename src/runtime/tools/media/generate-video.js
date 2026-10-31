@@ -348,7 +348,7 @@ function _canonicalKoiSaveDir(resolvedDir, kind) {
     }
   }
   if (!inWorkflowWorkspace) return resolvedDir;
-  const canonical = path.join(os.homedir(), '.koi', kind);
+  const canonical = docDir(kind);
   channel.log(
     'video',
     `saveTo "${resolvedDir}" is inside a workflow workspace (ephemeral); ` +
@@ -361,12 +361,12 @@ function _canonicalKoiSaveDir(resolvedDir, kind) {
 
 export async function saveVideoFromUrl(url, { provider, model, id, prompt } = {}) {
   if (!url) return { path: null, error: 'No video URL returned by provider.' };
-  // The ORIGINAL always streams to the canonical ~/.koi/videos home so the
+  // The ORIGINAL always streams to the canonical <project>/videos home so the
   // media library / creations drawer indexes it and timelines reference stable
   // storage (never an ephemeral workspace path). A caller-supplied saveTo gets
   // a COPY at the FINALIZED path (after recovery / edit-list stripping) — that
   // happens at the call sites via exportMediaCopy, not here.
-  const saveDir = _canonicalKoiSaveDir(path.join(os.homedir(), '.koi', 'videos'), 'videos');
+  const saveDir = _canonicalKoiSaveDir(path.join(docDir('videos')), 'videos');
 
   try {
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
@@ -488,7 +488,7 @@ const generateVideoAction = {
           },
         },
       },
-      saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in ~/.koi/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
+      saveTo:          { type: 'string',  description: 'Where to place a COPY of the final video (a directory, or a full .mp4/.mov/.webm file path). The ORIGINAL always stays in <project>/videos/ (returned as `savedTo`, what the library/timeline reference); the copy is returned as `exportedTo`. Relative paths resolve against cwd.' },
       timeoutMs:       { type: 'number',  description: 'Max wall-clock to wait for the provider (default 1200000 = 20 min). On timeout, success=false and status=pending — call generate_video again to retry.' },
       pollIntervalMs:  { type: 'number',  description: 'Poll cadence for the provider in milliseconds (default 8000, clamped to [2000, 30000]).' },
       audioFile:       { type: 'string',  description: 'ABSOLUTE path to a DRIVING AUDIO track — its presence switches the call to AVATAR mode: the output is a talking-head performance of the face photo speaking this audio (clip length follows the audio). Pair it with `startFrame` = the face photo and a `model` carrying the `video_avatar` category (see the Catalog). `prompt` becomes an optional scene/style hint (English) — it IS supported by the current avatar models (Creatify Aurora, OmniHuman v1.5, Kling AI Avatar v2 Pro all expose a `prompt` field), so pass a short one to steer expression / gesture / framing / background; do not leave it blank. Do NOT pass audioFile for any non-avatar generation — soundtrack/SFX come from `withAudio`, and dubbing an existing VIDEO is `lipsync_video`.' },
@@ -499,10 +499,10 @@ const generateVideoAction = {
       kind:            { type: 'string',  enum: ['edit', 'continuation', 'extend', 'bg-remove'], description: 'Routes to a curated model bucket on the backoffice. DEFAULT behaviour mirrors `generate_image`: OMIT for plain text-to-video generation; pass `referenceVideos` (without `kind`) and the request automatically routes to `video_editing` (v2v transform — restyle, colour grade, repaint, motion swap; pool = kling-style v2v slugs). The transformation replaces the source content; identity is anchored by the source itself. EXPLICIT VALUES — use ONLY when you want to override the default: "continuation" → opt OUT of editing when the previous clip is being passed in `referenceVideos` purely as a STYLE / IDENTITY carry-over (storyboard-to-video continuity, multi-shot character lock); routes back to `video_generation` so seedance reference-to-video and similar continuation-aware slugs stay in the pool. Use this when the prompt describes a NEW scene that should keep the look of the reference, not a transformation of the reference itself. "edit" → explicit alias for the default v2v editing path; redundant when `referenceVideos` is already present, but accepted for clarity. "extend" → continue / make-longer an existing video (`video_extend` bucket); pair with referenceVideos=[<source>] and pass `duration` as the EXTENSION length in seconds (NOT the total — e.g. to extend a 6 s clip by 4 s, send duration=4). The tool guarantees a unified return shape: the saved output is ALWAYS the full source+extension video, regardless of whether the chosen adapter natively returns the full stitched result (Veo3.1 extend, Kling extend) or only the new tail slice (Seedance reference-to-video — the tool concats the source on the front for you). "bg-remove" → strip the background out of the input video producing a transparent-background MP4 (`video_background_removal` bucket; e.g. Bria video matting). Combine with referenceVideos=[<source>].' },
       suppressPresent: { type: 'boolean', description: 'When true, the result is NOT auto-presented in the GUI work area (no tab opens, no preview takeover). Pass this when the generation is destined for a specific timeline AI clip — the assignment tool drops the media onto the clip directly and the user expects the timeline to stay focused. Default false (the GUI opens the result for inspection on free-form generations).' },
       summary:         { type: 'string',  description: 'OPTIONAL. One-line "what was this for" — pinned to this session\'s creations ledger so you can later list / recall it via `recall_creations` without searching the filesystem. Examples: "Ferrari pulling out of garage — opening shot", "Continuation of shot 2 with rain". Keep it short and self-evident; the agent is the one who will read it back later. When omitted, the ledger falls back to the prompt — usable but less semantic.' },
-      storyboardId:    { type: 'string',  description: 'OPTIONAL but STRONGLY recommended when this clip is a shot/scene of a storyboard (storyboard-to-video): the storyboard id (kebab filename under ~/.koi/storyboards without .json). Tags the rendered clip to its story in the creations ledger so the project browser nests it under that story. Pair with `sceneId` (and `shotId`/`shotIds`) so it lands under the right scene.' },
-      sceneId:         { type: 'string',  description: 'OPTIONAL. The scene id (e.g. "sc1") within `storyboardId` that this clip covers. Lets the project browser nest the rendered clip under its scene. Pass it for every storyboard-to-video clip.' },
+      storyboardId:    { type: 'string',  description: 'OPTIONAL but STRONGLY recommended when this clip is a shot/scene of a storyboard (previz-to-video): the storyboard id (kebab filename under <project>/storyboards without .json). Tags the rendered clip to its story in the creations ledger so the project browser nests it under that story. Pair with `sceneId` (and `shotId`/`shotIds`) so it lands under the right scene.' },
+      sceneId:         { type: 'string',  description: 'OPTIONAL. The scene id (e.g. "sc1") within `storyboardId` that this clip covers. Lets the project browser nest the rendered clip under its scene. Pass it for every previz-to-video take.' },
       shotId:          { type: 'string',  description: 'OPTIONAL. The single shot id this clip covers, when a clip is exactly one shot. For a clip spanning several shots use `shotIds` instead.' },
-      shotIds:         { type: 'array',   items: { type: 'string' }, description: 'OPTIONAL. The shot ids this clip covers when it groups several consecutive shots of one scene (the usual storyboard-to-video case). Recorded on the clip so it maps back to its planos.' },
+      shotIds:         { type: 'array',   items: { type: 'string' }, description: 'OPTIONAL. The shot ids this clip covers when it groups several consecutive shots of one scene (the usual previz-to-video case). Recorded on the clip so it maps back to its planos.' },
       seed:            { type: 'number',  description: 'OPTIONAL. Reproducibility seed — same seed + same prompt ⇒ the same clip on models that support it (Seedance, Veo, WAN, Kling). Use it to lock a look across regenerations / multi-shot continuity. Ignored by models that don\'t expose a seed.' },
       extraParams:     { type: 'object',  description: 'OPTIONAL. Model-specific parameters this tool does NOT expose as first-class fields — an escape hatch for per-model knobs (e.g. Seedance `bitrate_mode`). Use the EXACT provider field name as the key (snake_case, as in the model\'s API), value as its API expects: e.g. `{ "bitrate_mode": "..." }`. Which extra params each model accepts is documented per model in the `video-generator` skill (`references/models.md`); only send ones listed there. Keys travel verbatim to the provider; unknown keys are ignored. Does NOT override the first-class params (duration/resolution/aspectRatio/…) — use those directly.' },
     },
@@ -1665,7 +1665,7 @@ const generateVideoAction = {
       // save AND each multishot saveGeneratedVideo call below, so the
       // summary lands on every produced clip without per-call wiring.
       summary: typeof action.summary === 'string' ? action.summary : undefined,
-      // Story linkage (storyboard-to-video). These spread into the saved
+      // Story linkage (previz-to-video). These spread into the saved
       // metadata (saveGeneratedImage does metadata:{...generationParams}), and
       // the creations ledger reads metadata.storyboardId / sceneId / shotId(s)
       // to nest the clip under its story + scene in the project browser. Only
@@ -1863,7 +1863,7 @@ const generateVideoAction = {
 
     // ── status === 'completed' from here ────────────────────────────
     let savedTo = null;
-    let exportedTo = null; // copy at the caller's saveTo (original stays in ~/.koi/videos)
+    let exportedTo = null; // copy at the caller's saveTo (original stays in <project>/videos)
     let saveError = null;
     let saveDl = null; // classified download failure (network|http) when savedTo stays null
     let chainedExtend = false;
@@ -2058,7 +2058,7 @@ const generateVideoAction = {
         }
       }
       // Export a COPY to the caller's saveTo now the path is final & canonical
-      // (the original in ~/.koi/videos is what the library + timeline reference).
+      // (the original in <project>/videos is what the library + timeline reference).
       if (savedTo && action.saveTo) {
         exportedTo = exportMediaCopy(savedTo, action.saveTo, { logTag: 'video' });
       }
@@ -2116,7 +2116,7 @@ const generateVideoAction = {
           }
         }
         // Export a COPY of the finalized shot to the caller's saveTo (original
-        // stays in ~/.koi/videos). Each shot gets a distinct copy via index.
+        // stays in <project>/videos). Each shot gets a distinct copy via index.
         const shotExportedTo = (shotSavedTo && action.saveTo)
           ? exportMediaCopy(shotSavedTo, action.saveTo, { index: shot.index, logTag: 'video' })
           : null;
@@ -2459,7 +2459,7 @@ async function _runHybridExtendChain({
   // 5. Download the extend output to a temp path (no gallery — only
   //    the final concat goes there). Recover any padding we applied.
   const sr = await saveVideoFromUrl(final.url, {
-    // Intermediate extend output — lands in ~/.koi/videos; only the final
+    // Intermediate extend output — lands in <project>/videos; only the final
     // concat is registered/exported, so no saveTo handling here.
     provider: resolved.provider,
     model: submitted.model || final.model,
@@ -3023,6 +3023,7 @@ function _sanitiseCameraMovement(cameraMovement, caps, resolved) {
 import asyncCapable from '../_async-capable.js';
 import { formatModelCatalog } from './_format-model-catalog.js';
 
+import { docDir } from '../../state/doc-root.js';
 // Wrap FIRST so the catalog refresh below mutates the registered object.
 // asyncCapable spreads a fresh schema/description, so any in-place edit to
 // the source `generateVideoAction` would land on a copy nobody reads.
@@ -3109,7 +3110,7 @@ wrappedAction._descriptionReady = fetchMediaCapabilities('video').then((caps) =>
     'optional "numShots" — number of independent clips to emit in one call (multishot). Omit for a single shot. Ignored when "shots" is present.',
     'optional "shots" — array of per-shot overrides: {prompt?, duration?, cameraMovement?, startFrame?, endFrame?, referenceImages?, referenceVideos?, aspectRatio?}. Any field omitted inherits from the top level. When present, "shots.length" is the clip count and "numShots" is ignored. Whether a model cuts inside one generation, and how many shots it holds, is in the `video-generator` skill (and, for Seedance, its own skill).',
     'optional "kind" — routes to a curated specialist model bucket instead of the default generation/edit shop:\n  • "extend" — CONTINUE / EXTEND / make-longer an existing video (`video_extend` bucket). Combine with referenceVideos=[<source>] (or startFrame=<last frame>).\n  • "bg-remove" — strip the background out of the input video, returning a transparent-background MP4 (`video_background_removal` bucket). Pass referenceVideos=[<source>].\nOmit for fresh generations / restyles / regular edits.',
-    'optional "saveTo" — absolute directory path where a COPY of the final video is placed. The original always stays in ~/.koi/videos/.',
+    'optional "saveTo" — absolute directory path where a COPY of the final video is placed. The original always stays in <project>/videos/.',
     'optional "wait" — boolean (default true). When true, the call blocks until the video is ready and returns the final result inline. Set to false to start it as a background koi job and get back { jobId } immediately — use await_job(jobId) to retrieve the result.',
   ];
 

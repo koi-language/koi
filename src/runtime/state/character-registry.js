@@ -2,7 +2,7 @@
  * Character Registry — persist reusable "character" entities so the GUI
  * drawer can list them and prompts can reference them by @handle.
  *
- * Storage: ONE JSON file per character at `~/.koi/characters/<id>.json`
+ * Storage: ONE JSON file per character at `<project>/characters/<id>.json`
  * (same model as storyboards / timelines — NOT a single array file like
  * voices). Each file is shaped like:
  *
@@ -27,9 +27,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-/** Absolute path to the characters directory (`~/.koi/characters`). */
+import { docDir } from './doc-root.js';
+/** Absolute path to the characters directory (`<project>/characters`). */
 export function charactersDir() {
-  return path.join(os.homedir(), '.koi', 'characters');
+  return path.join(docDir('characters'));
 }
 
 /** Absolute path to a single character's JSON file. */

@@ -63,7 +63,7 @@ export default {
       label: { type: 'string', description: 'OPTIONAL short label for a view that has none. Labels the user wrote are never overwritten.' },
       prompt: { type: 'string', description: 'REQUIRED. The full image prompt YOU authored for THIS view — a precise, faithful, element-by-element description of the empty location. This tool NEVER writes the prompt itself.' },
       referenceImages: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute paths used as reference. For any view after the first, pass the location plate path here so the view stays the SAME room. Any reference forces an image-editing model.' },
-      locationId: { type: 'string', description: 'OPTIONAL id of a saved location (~/.koi/locations/<id>.json). The generated image is attached to its view in location.views.' },
+      locationId: { type: 'string', description: 'OPTIONAL id of a saved location (<project>/locations/<id>.json). The generated image is attached to its view in location.views.' },
       photos: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute paths to reference photos of the real place, added as references.' },
       model: { type: 'string', description: 'OPTIONAL image model slug. Omit to auto-pick.' },
       aspectRatio: { type: 'string', description: 'OPTIONAL aspect ratio. Defaults to 16:9 (a wide establishing view).' },

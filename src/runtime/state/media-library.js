@@ -2,7 +2,7 @@
  * Media Library — Global persistent storage for ALL user-visible assets:
  * images, videos, audio, voice samples, AND timelines.
  *
- * Uses SQLite at ~/.koi/media-library/ to store media with:
+ * Uses SQLite at <project>/media-library/ to store media with:
  *   - Binary data on disk; the row carries the path
  *   - Metadata (mime_type, filename, width, height, created_at, favorite,
  *     `categories[]` — multivalued user-visible tags / collections)
@@ -16,7 +16,7 @@
  *                   sample audio + provider metadata; the row points
  *                   at that sample, with the provider/model in metadata)
  *   - 'timeline'  — video editor timeline (the row's filePath is the
- *                   `~/.koi/timelines/<id>.json` document; metadata
+ *                   `<project>/timelines/<id>.json` document; metadata
  *                   carries clip count, duration, etc.)
  *   - 'unknown'   — fallback when the extension doesn't match
  *
@@ -45,9 +45,12 @@ import path from 'path';
 import crypto from 'crypto';
 import os from 'os';
 
+import { docDir } from './doc-root.js';
 const EMBEDDING_DIM = 1536;
-const DB_DIR = path.join(os.homedir(), '.koi', 'media-library');
-const EMPTY_CATEGORIES_FILE = path.join(DB_DIR, 'empty-categories.json');
+// The project's own library (see state/doc-root.js): resolved on use, the
+// session's project root may be set after this module loads.
+const _dbDir = () => docDir('media-library');
+const _emptyCategoriesFile = () => path.join(_dbDir(), 'empty-categories.json');
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.avi']);
 const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
@@ -192,8 +195,8 @@ export class MediaLibrary {
     // Schema is auto-derived from the seed row in _ensureTable.
     this._dbPromise = (async () => {
       const { connect } = await import('./_sqlite-vector-adapter.js');
-      fs.mkdirSync(DB_DIR, { recursive: true });
-      this._db = await connect(path.join(DB_DIR, 'vector-cache'));
+      fs.mkdirSync(_dbDir(), { recursive: true });
+      this._db = await connect(path.join(_dbDir(), 'vector-cache'));
     })();
     await this._dbPromise;
   }
@@ -233,7 +236,7 @@ export class MediaLibrary {
       // library. Runs every table open but is fully idempotent — the
       // upsert-by-path semantics on saveVoiceEntry mean a re-run is
       // equivalent to a refresh of the metadata. Timelines used to be
-      // imported here too via a directory scan of `~/.koi/timelines/`;
+      // imported here too via a directory scan of `<project>/timelines/`;
       // that scan has been removed — the DB is the only source of truth
       // for timelines now, fed by `_mirrorToMediaLibrary` on every save.
       this._migrateLegacyArtefacts().catch((e) => {
@@ -254,7 +257,7 @@ export class MediaLibrary {
    *  timelines directory. */
   async _migrateLegacyArtefacts() {
     let voices = 0;
-    const voicesJson = path.join(os.homedir(), '.koi', 'voices', 'voices.json');
+    const voicesJson = path.join(docDir('voices'), 'voices.json');
     if (fs.existsSync(voicesJson)) {
       try {
         const arr = JSON.parse(fs.readFileSync(voicesJson, 'utf8'));
@@ -279,14 +282,14 @@ export class MediaLibrary {
       process.stderr.write(`[MediaLibrary] migration: indexed ${voices} voice(s)\n`);
     }
 
-    // Storyboards: disk-only until now. Scan ~/.koi/storyboards/*.json
+    // Storyboards: disk-only until now. Scan <project>/storyboards/*.json
     // and index each one so existing storyboards become first-class
     // gallery rows (chronological in the drawer, searchable, deletable).
     // Idempotent — `saveStoryboardEntry` upserts by path, so re-running
     // on every startup just refreshes. New storyboards created after this
     // are mirrored live via the `storyboardSaved` WS message.
     let storyboards = 0;
-    const sbDir = path.join(os.homedir(), '.koi', 'storyboards');
+    const sbDir = path.join(docDir('storyboards'));
     if (fs.existsSync(sbDir)) {
       try {
         const { saveStoryboardEntry } = await import('./media-library.js');
@@ -309,13 +312,13 @@ export class MediaLibrary {
       process.stderr.write(`[MediaLibrary] migration: indexed ${storyboards} storyboard(s)\n`);
     }
 
-    // Characters: same model as storyboards. Scan ~/.koi/characters/*.json
+    // Characters: same model as storyboards. Scan <project>/characters/*.json
     // and index each one so existing characters become first-class gallery
     // rows (chronological in the drawer, searchable, deletable). Idempotent —
     // `saveCharacterEntry` upserts by path. New characters created after this
     // are mirrored live by save_character.
     let characters = 0;
-    const charDir = path.join(os.homedir(), '.koi', 'characters');
+    const charDir = path.join(docDir('characters'));
     if (fs.existsSync(charDir)) {
       try {
         const { saveCharacterEntry } = await import('./media-library.js');
@@ -338,11 +341,11 @@ export class MediaLibrary {
       process.stderr.write(`[MediaLibrary] migration: indexed ${characters} character(s)\n`);
     }
 
-    // Locations / sets: same model as characters. Scan ~/.koi/locations/*.json
+    // Locations / sets: same model as characters. Scan <project>/locations/*.json
     // and index each so existing locations become first-class gallery rows.
     // Idempotent — `saveLocationEntry` upserts by path.
     let locations = 0;
-    const locDir = path.join(os.homedir(), '.koi', 'locations');
+    const locDir = path.join(docDir('locations'));
     if (fs.existsSync(locDir)) {
       try {
         const { saveLocationEntry } = await import('./media-library.js');
@@ -363,6 +366,33 @@ export class MediaLibrary {
     }
     if (locations > 0) {
       process.stderr.write(`[MediaLibrary] migration: indexed ${locations} location(s)\n`);
+    }
+
+    // Objects / props: same model as locations. Scan <project>/objects/*.json
+    // and index each so existing objects become first-class gallery rows.
+    // Idempotent: `saveObjectEntry` upserts by path.
+    let objects = 0;
+    const objDir = path.join(docDir('objects'));
+    if (fs.existsSync(objDir)) {
+      try {
+        const { saveObjectEntry } = await import('./media-library.js');
+        for (const f of fs.readdirSync(objDir)) {
+          if (!f.endsWith('.json')) continue;
+          const fp = path.join(objDir, f);
+          try {
+            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            await saveObjectEntry(fp, body, null);
+            objects++;
+          } catch (e) {
+            process.stderr.write(`[MediaLibrary] migrate object ${f} skipped: ${e.message}\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[MediaLibrary] migrate objects skipped: ${e.message}\n`);
+      }
+    }
+    if (objects > 0) {
+      process.stderr.write(`[MediaLibrary] migration: indexed ${objects} object(s)\n`);
     }
   }
 
@@ -1349,8 +1379,8 @@ export class MediaLibrary {
 
   _readEmptyCategoriesFile() {
     try {
-      if (!fs.existsSync(EMPTY_CATEGORIES_FILE)) return [];
-      const arr = JSON.parse(fs.readFileSync(EMPTY_CATEGORIES_FILE, 'utf8'));
+      if (!fs.existsSync(_emptyCategoriesFile())) return [];
+      const arr = JSON.parse(fs.readFileSync(_emptyCategoriesFile(), 'utf8'));
       return Array.isArray(arr) ? arr.filter(s => typeof s === 'string' && s.trim()) : [];
     } catch {
       return [];
@@ -1359,8 +1389,8 @@ export class MediaLibrary {
 
   _writeEmptyCategoriesFile(arr) {
     try {
-      fs.mkdirSync(DB_DIR, { recursive: true });
-      fs.writeFileSync(EMPTY_CATEGORIES_FILE, JSON.stringify(arr, null, 2));
+      fs.mkdirSync(_dbDir(), { recursive: true });
+      fs.writeFileSync(_emptyCategoriesFile(), JSON.stringify(arr, null, 2));
       return true;
     } catch (e) {
       process.stderr.write(`[MediaLibrary] empty-categories write failed: ${e.message}\n`);
@@ -1602,12 +1632,12 @@ export async function saveGeneratedAudio(filePath, generationParams, llmProvider
 }
 
 /**
- * Save (or upsert) a TIMELINE entry — `~/.koi/timelines/<id>.json`.
+ * Save (or upsert) a TIMELINE entry — `<project>/timelines/<id>.json`.
  * Unlike images / videos, the file CONTENT changes over time at a
  * stable path, so this uses replace-by-path semantics: the row gets
  * rewritten on every save (new hash, new metadata, fresh embedding).
  *
- * @param {string} filePath - `~/.koi/timelines/<id>.json` path.
+ * @param {string} filePath - `<project>/timelines/<id>.json` path.
  * @param {Object} timeline - Parsed timeline JSON. Used to derive
  *   description (project name + clip count + duration) and metadata.
  * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
@@ -1665,7 +1695,7 @@ export async function saveTimelineEntry(filePath, timeline, llmProvider, opts = 
 
 /**
  * Save (or upsert) a STORYBOARD entry — points at the storyboard JSON
- * at `~/.koi/storyboards/<id>.json`. Mirrors `saveTimelineEntry`: the
+ * at `<project>/storyboards/<id>.json`. Mirrors `saveTimelineEntry`: the
  * JSON file is the authoritative artefact, the DB row is the index that
  * makes the storyboard a first-class creation (shows in the drawer with
  * a real `created_at`, interleaved chronologically; searchable; deletable
@@ -1725,7 +1755,7 @@ export async function saveStoryboardEntry(filePath, storyboard, llmProvider, opt
 
 /**
  * Save (or upsert) a CHARACTER entry — points at the character JSON at
- * `~/.koi/characters/<id>.json`. Mirrors `saveStoryboardEntry`: the JSON
+ * `<project>/characters/<id>.json`. Mirrors `saveStoryboardEntry`: the JSON
  * file is the authoritative artefact, the DB row is the index that makes
  * the character a first-class creation (shows in the drawer with a real
  * `created_at`, searchable, deletable). `replaceByPath` keeps one row per
@@ -1782,7 +1812,7 @@ export async function saveCharacterEntry(filePath, character, llmProvider, opts 
 
 /**
  * Save (or upsert) a LOCATION / set entry — points at the location JSON at
- * `~/.koi/locations/<id>.json`. The SET analog of saveCharacterEntry: the JSON
+ * `<project>/locations/<id>.json`. The SET analog of saveCharacterEntry: the JSON
  * file is authoritative, the DB row indexes it as a first-class creation.
  *
  * @param {string} filePath - Absolute path to the location JSON.
@@ -1823,6 +1853,59 @@ export async function saveLocationEntry(filePath, location, llmProvider, opts = 
   return lib.save({
     filePath,
     mediaType: 'location',
+    metadata,
+    description,
+    embedding,
+    replaceByPath: true,
+    createdAt,
+    summary: opts.summary,
+  });
+}
+
+/**
+ * Save (or upsert) an OBJECT / prop entry: points at the object JSON at
+ * `<project>/objects/<id>.json`. The prop analog of saveLocationEntry: the JSON
+ * file is authoritative, the DB row indexes it as a first-class creation.
+ *
+ * @param {string} filePath - Absolute path to the object JSON.
+ * @param {Object} object - Parsed object JSON (normalized shape).
+ * @param {import('../llm/llm-provider.js').LLMProvider} [llmProvider]
+ */
+export async function saveObjectEntry(filePath, object, llmProvider, opts = {}) {
+  const lib = MediaLibrary.global();
+  const name = object?.name || path.basename(filePath, '.json');
+  const photos = Array.isArray(object?.photos) ? object.photos : [];
+  const photoCount = photos.length;
+  const viewCount = Array.isArray(object?.views) ? object.views.filter((v) => v?.path).length : 0;
+  const description =
+    `Object "${name}"${object?.category ? ` (${object.category})` : ''}: ` +
+    `${photoCount} photo${photoCount === 1 ? '' : 's'}, ${viewCount} view${viewCount === 1 ? '' : 's'}.`;
+  let embedding = null;
+  if (llmProvider) {
+    try { embedding = await llmProvider.getEmbedding(description); } catch { /* tolerate */ }
+  }
+  const metadata = {
+    source: 'object',
+    objectId: object?.id,
+    name,
+    handle: object?.handle || null,
+    photoCount,
+    image: object?.image || null,
+    category: object?.category || null,
+    model: object?.model || null,
+    updatedAt: object?.updatedAt || null,
+  };
+  let createdAt = (typeof object?.createdAt === 'string' && object.createdAt)
+    ? object.createdAt
+    : (typeof object?.updatedAt === 'string' && object.updatedAt)
+        ? object.updatedAt
+        : null;
+  if (!createdAt) {
+    try { createdAt = fs.statSync(filePath).mtime.toISOString(); } catch { /* fall back to now */ }
+  }
+  return lib.save({
+    filePath,
+    mediaType: 'object',
     metadata,
     description,
     embedding,

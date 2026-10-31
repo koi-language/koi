@@ -42,7 +42,7 @@ export default {
     'same handle space, so a tag the agent sets is immediately usable in ' +
     'the chat input\'s `@` autocomplete and as a `referenceImages: ' +
     '["@name"]` argument to generate_image / generate_video. Mentions are ' +
-    'cross-project (the library lives at `~/.koi/media-library/`).\n\n' +
+    'cross-project (the library lives at `<project>/media-library/`).\n\n' +
     'WHEN TO CALL — pin a handle the moment a freshly-generated (or imported) ' +
     'asset will need to be re-referenced later. Examples:\n' +
     '  • You generated a hero portrait — tag it `@tom` so subsequent ' +
@@ -155,7 +155,7 @@ export default {
         error:
           'tag_media: media library is not available in this session. ' +
           'Mentions can only be pinned when the runtime has a writable ' +
-          'SQLite at `~/.koi/media-library`.',
+          'SQLite at `<project>/media-library`.',
       };
     }
 

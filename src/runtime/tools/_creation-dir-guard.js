@@ -36,14 +36,15 @@ export const CREATION_DIR_NAMES = [
 ];
 
 // Matches `…/.koi/<creationDir>` optionally followed by `/<deeper>`. Anchored
-// on the `.koi` segment so it fires for both `~/.koi/images/x.png` and
+// on the `.koi` segment so it fires for both `<project>/images/x.png` and
 // `<proj>/.koi/timelines/y.json`, but never for an unrelated `images/` dir.
-const _pathRe = new RegExp(`(?:^|/)\\.koi/(${CREATION_DIR_NAMES.join('|')})(?:/|$)`);
+// …and the same folders at the top of a `.braxil` project package.
+const _pathRe = new RegExp(`(?:^|/)(?:\\.koi|[^/]+\\.braxil)/(${CREATION_DIR_NAMES.join('|')})(?:/|$)`);
 
 // Looser scan for a raw shell command string, which can't be path.resolve()'d:
 // match the `.koi/<creationDir>` token anywhere in the text (covers
-// `~/.koi/images`, `$HOME/.koi/videos`, `./.koi/timelines`, absolute forms).
-const _cmdRe = new RegExp(`\\.koi/(${CREATION_DIR_NAMES.join('|')})(?:/|\\b)`);
+// `<project>/images`, `$HOME/.koi/videos`, `./.koi/timelines`, absolute forms).
+const _cmdRe = new RegExp(`(?:\\.koi|\\.braxil)/(${CREATION_DIR_NAMES.join('|')})(?:/|\\b)`);
 
 function _normalize(p) {
   if (typeof p !== 'string' || !p) return '';

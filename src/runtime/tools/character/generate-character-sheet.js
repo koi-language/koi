@@ -154,7 +154,7 @@ export default {
     properties: {
       description: { type: 'string', description: 'What the character looks like (physical traits, wardrobe, age, attitude). Used verbatim as the creative content of the sheet.' },
       photos: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute file paths to one or more reference photos of the character, used to preserve identity across the 8 views.' },
-      characterId: { type: 'string', description: 'OPTIONAL id of a saved character (~/.koi/characters/<id>.json). When description/photos are omitted they are sourced from this character.' },
+      characterId: { type: 'string', description: 'OPTIONAL id of a saved character (<project>/characters/<id>.json). When description/photos are omitted they are sourced from this character.' },
       model: { type: 'string', description: 'OPTIONAL image model slug. Omit to auto-pick a reference-capable (image-editing) model.' },
       aspectRatio: { type: 'string', description: 'OPTIONAL aspect ratio for the sheet. Defaults to 16:9 (a wide sheet).' },
     },
