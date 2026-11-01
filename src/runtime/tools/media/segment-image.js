@@ -16,6 +16,7 @@ import asyncCapable from '../_async-capable.js';
 import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-description.js';
 import { downloadAssetToFile } from '../../io/download-asset.js';
 
+import { docDir } from '../../state/doc-root.js';
 // SAM 3 — text-prompted for precompute, point+text for fallback clicks.
 const SAM3_MODEL = 'fal-ai/sam-3/image';
 

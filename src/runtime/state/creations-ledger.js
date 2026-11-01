@@ -33,6 +33,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { documentsRoot } from './doc-root.js';
 function _sessionDir() {
   const sessionId = process.env.KOI_SESSION_ID;
   if (!sessionId) return null;

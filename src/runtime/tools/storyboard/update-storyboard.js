@@ -25,7 +25,7 @@ import path from 'path';
 
 import { channel } from '../../io/channel.js';
 import { saveStoryboardEntry } from '../../state/media-library.js';
-import { _validate, _normalize, _editorialDiff, _isStr, _isObj } from './save-storyboard.js';
+import { _validate, _normalize, _editorialDiff, _isStr, _isObj, markScriptSynced } from './save-storyboard.js';
 
 import { docDir } from '../../state/doc-root.js';
 function _err(error) { return { success: false, error }; }
@@ -44,9 +44,10 @@ const SHOT_FIELDS = new Set([
   // v7: `camera` (was `movement`), + `composition` + per-shot `lighting`.
   // `movement` kept as an accepted legacy alias (read as `camera` downstream).
   'duration', 'shot', 'camera', 'composition', 'lighting', 'movement',
-  'action', 'dialogue', 'sfx', 'music',
+  'action', 'script', 'dialogue', 'sfx', 'music',
   'continuity', 'state', 'noCutBefore', 'references',
 ]);
+
 
 function _applySet(target, set, allowed, tag) {
   for (const [k, v] of Object.entries(set)) {
@@ -73,7 +74,7 @@ export default {
     'Call shape: { id, set?: {…root fields…}, scenes?: [{ id, set: {…} }], shots?: [{ id, set: {…} }] }. ' +
     'Root set fields: name, aspect, synopsis, characters (recurring-cast roster array), locations (reusable-SET roster: array of { name, description?, locationId? }), objects (recurring objects: array of { name, description?, image?, objectId? }; objectId links a saved object card from save_object), lighting, stylePrompt, continuity (array of strings), references, seed. ' +
     'Scene set fields: title, location (free-text place), locationIds (array of saved location-card ids — a scene can span several sets), notes, synopsis, references. ' +
-    'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action, dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
+    'Shot set fields: duration, shot (free text), camera (free text: movement + lens/focal + speed + focus; was `movement`), composition (free text), lighting (free text, per-shot), action (TECHNICAL layer, hidden from the user), script (the SCREENPLAY text the user reads: see save_storyboard), dialogue, sfx, music, continuity ({characters,objects,place}), noCutBefore, references. ' +
     'Set a field to null to remove it. ' +
     'STRUCTURE TOO: `addShots` / `removeShots` / `moveShots` insert, delete and reorder shots by id — renumbering across the whole document is done FOR you. '
     + 'So a normal script iteration (reword a line, add a shot, drop one, move one) NEVER needs the full document. '
@@ -103,7 +104,7 @@ export default {
       },
       shots: {
         type: 'array',
-        description: 'Shot-level patches: [{ id, set: { duration?, shot?, camera?, composition?, lighting?, action?, dialogue?, sfx?, music?, continuity?, noCutBefore?, references? } }].',
+        description: 'Shot-level patches: [{ id, set: { duration?, shot?, camera?, composition?, lighting?, action?, script?, dialogue?, sfx?, music?, continuity?, noCutBefore?, references? } }].',
         items: { type: 'object' },
       },
       addShots: {
@@ -188,6 +189,7 @@ export default {
       if (e) return _err(e);
     }
 
+    const _scriptSynced = new Set();
     for (const p of shotPatches) {
       if (!_isObj(p) || !_isStr(p.id) || !_isObj(p.set)) {
         return _err('Each shots[] entry must be { id, set: {…} }.');
@@ -196,6 +198,7 @@ export default {
       if (!sh) return _err(`No shot with id "${p.id}" (have: ${[...shotById.keys()].join(', ')}).`);
       const e = _applySet(sh, p.set, SHOT_FIELDS, `shot ${p.id}`);
       if (e) return _err(e);
+      if ('script' in p.set || 'action' in p.set) _scriptSynced.add(sh.id);
     }
 
     // ── STRUCTURAL OPS, applied after the field patches ───────────────
@@ -303,6 +306,9 @@ export default {
     }
 
     const normalized = _normalize(patched, existing);
+    for (const sc of normalized.scenes || []) {
+      for (const sh of sc.shots || []) if (_scriptSynced.has(sh.id)) markScriptSynced(sh);
+    }
     const serialized = JSON.stringify(normalized, null, 2) + '\n';
     try {
       const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;

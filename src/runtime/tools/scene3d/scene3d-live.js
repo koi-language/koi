@@ -29,7 +29,7 @@ const _sessions = new Map(); // "<sceneId>#<slot>" → { proc, port, ctl }
 function _ctlLink(s, sceneId) {
   if (s.ctl) return s.ctl;
   const sock = net.createConnection({ host: '127.0.0.1', port: s.port });
-  const ctl = { sock, waiting: new Map() }; // raw path → { shotId, plan }
+  const ctl = { sock, waiting: new Map(), pongAt: Date.now() }; // raw path → { shotId, plan }
   s.ctl = ctl;
   let buf = Buffer.alloc(0);
   sock.on('connect', () => sock.write(JSON.stringify({ cmd: 'ctl' }) + '\n'));
@@ -44,6 +44,7 @@ function _ctlLink(s, sceneId) {
       if (magic !== 'BRXJ') continue;
       let m;
       try { m = JSON.parse(body.toString('utf8')); } catch { continue; }
+      if (m.type === 'pong') ctl.pongAt = Date.now();
       if (m.type !== 'strip_done') continue;
       const w = ctl.waiting.get(m.out);
       if (!w) continue;
@@ -115,8 +116,59 @@ function _freePort() {
 const MAX_BLENDERS = 3;
 const _parked = []; // { proc, port, log }
 
+const _gone = (proc) => proc.exitCode != null || proc.signalCode != null;
+
+/** SIGTERM, then SIGKILL: a frozen Blender does not honour the polite one. */
 function _kill(proc) {
+  if (_gone(proc)) return;
   try { proc.kill('SIGTERM'); } catch { /* gone */ }
+  setTimeout(() => {
+    if (_gone(proc)) return;
+    channel.log('scene3d', `Blender ${proc.pid} ignored SIGTERM: SIGKILL`);
+    try { proc.kill('SIGKILL'); } catch { /* gone */ }
+  }, 3000).unref();
+}
+
+/** Does this Blender's loop answer? Parked ones are checked before reuse. */
+function _ping(port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+      sock.write(JSON.stringify({ cmd: 'ping' }) + '\n');
+    });
+    const done = (ok) => {
+      clearTimeout(t);
+      sock.destroy();
+      resolve(ok);
+    };
+    const t = setTimeout(() => done(false), timeoutMs);
+    sock.on('data', () => done(true));
+    sock.on('error', () => done(false));
+    sock.on('close', () => done(false));
+  });
+}
+
+/**
+ * A live session whose loop stops answering is frozen: no frames, no commands,
+ * and its socket stays open, so nothing else notices. Killed here, the views
+ * lose the socket, find nobody on the port and start a new Blender.
+ */
+const PING_EVERY_MS = 10000;
+const FROZEN_AFTER_MS = 60000; // a long shader compile is not a freeze
+let _watchdog = null;
+function _watchSessions() {
+  _watchdog ??= setInterval(() => {
+    for (const [key, s] of _sessions) {
+      if (!s.ready) continue;
+      const ctl = _ctlLink(s, key.split('#')[0]);
+      if (Date.now() - ctl.pongAt > FROZEN_AFTER_MS) {
+        channel.log('scene3d', `live ${key}: frozen (no answer in ${FROZEN_AFTER_MS / 1000} s): killing Blender ${s.proc.pid}`);
+        _stop(key, { park: false });
+        continue;
+      }
+      try { ctl.sock.write(JSON.stringify({ cmd: 'ping' }) + '\n'); } catch { /* reconnects next round */ }
+    }
+  }, PING_EVERY_MS);
+  _watchdog.unref();
 }
 
 function _stop(sceneId, { park = true } = {}) {
@@ -133,9 +185,14 @@ function _stop(sceneId, { park = true } = {}) {
   return true;
 }
 
+function _killNow(proc) {
+  try { proc.kill('SIGKILL'); } catch { /* gone */ }
+}
+
 process.on('exit', () => {
-  for (const id of [..._sessions.keys()]) _stop(id, { park: false });
-  for (const p of _parked.splice(0)) _kill(p.proc);
+  // No timers at exit: SIGKILL right away, or a frozen one outlives the app.
+  for (const s of _sessions.values()) _killNow(s.proc);
+  for (const p of _parked.splice(0)) _killNow(p.proc);
 });
 
 /** Wait for a (re)built live session: its "live on" line, or a failure. */
@@ -166,17 +223,23 @@ function _waitReady(proc, log, timeoutMs = 60000) {
 async function _fromPool(snap) {
   while (_parked.length) {
     const p = _parked.pop(); // the most recent: its shaders are the freshest
-    if (p.proc.exitCode != null || p.proc.killed) continue;
+    if (_gone(p.proc)) continue;
+    if (!await _ping(p.port)) {
+      channel.log('scene3d', `pooled Blender ${p.proc.pid} on :${p.port} does not answer: replaced`);
+      _kill(p.proc);
+      continue;
+    }
     // A reload takes well under a second: one that has not answered in 10 s
     // is not coming (a deaf process) — a fresh Blender beats a frozen stage.
     const ready = _waitReady(p.proc, p.log, 10000);
-    const sent = await new Promise((resolve) => {
-      const sock = net.createConnection({ host: '127.0.0.1', port: p.port }, () => {
-        sock.end(JSON.stringify({ cmd: 'load', scene: snap, script: builderScriptPath() }) + '\n', () => resolve(true));
-      });
-      sock.on('error', () => resolve(false));
+    // `ready` bounds the whole attempt: a process too frozen to take the
+    // request must not leave this waiting forever (the GUI's start times out).
+    const sock = net.createConnection({ host: '127.0.0.1', port: p.port }, () => {
+      sock.end(JSON.stringify({ cmd: 'load', scene: snap, script: builderScriptPath() }) + '\n');
     });
-    const r = sent ? await ready : { ok: false };
+    const refused = new Promise((resolve) => sock.on('error', () => resolve({ ok: false })));
+    const r = await Promise.race([ready, refused]);
+    sock.destroy();
     if (r.ok) return p;
     channel.log('scene3d', `pooled Blender could not load: ${String(r.log || '').slice(-400)} | before: ${String(p.log?.tail || '').slice(-1500)}`);
     _kill(p.proc);
@@ -375,6 +438,9 @@ export default {
 };
 
 function _started(key, id, scene, port, surfaceLib) {
+  const session = _sessions.get(key);
+  if (session) session.ready = true;
+  _watchSessions();
   // Shots without a filmstrip (new, edited, or from before it existed):
   // this session draws them when idle.
   if (key.endsWith('#main')) requestStrips(id);

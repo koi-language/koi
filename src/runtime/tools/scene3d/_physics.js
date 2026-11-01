@@ -39,6 +39,15 @@ const POSE_FROM_LYING_TO_STANDING = 1500;
 const COAST_TURN = 25;
 const COAST_GAIN = 1.25;
 const COAST_SPIN = 30;
+// A tumble stops by friction (m/s²): rough roof or asphalt about 0.5 g, ice
+// about 0.1 g; above ~1.2 g something must be stopping it.
+const TUMBLE_DECEL_MAX = 12;
+const TUMBLE_DECEL_MIN = 1;
+// Landing speed against the surface (m/s) a person cannot just stand up from.
+const IMPACT_HARD = 7;
+// Hardest believable change of speed (m/s²) by vehicle, between legs.
+const VEHICLE_ACCEL = { train: 1.5, bus: 4, truck: 4, van: 8, bicycle: 5, horse: 6, boat: 4 };
+const VEHICLE_ACCEL_DEFAULT = 8;
 const _poseOf = (type, a) => (type === 'sit' || type === 'sit_down' ? 'sitting'
   : type === 'stand' || type === 'stand_up' || type === 'get_up' ? 'standing'
     : type === 'lie' || type === 'lie_down' ? (a.pose || 'lying') : type === 'pose' ? String(a.pose || 'standing') : null);
@@ -105,6 +114,8 @@ function _analyse(scene) {
     .map((a, i) => ({ a, i })).sort((x, y) => (x.a.startMs || 0) - (y.a.startMs || 0));
   const where = new Map((scene.characters || []).map((c) => [c.id, _xyz(c.position)]));
   const riding = new Set();
+  const impacts = [];
+  const pendingImpact = new Map();
 
   // Displacement of the vehicle someone stands on, over [s, e]: their own
   // effort is what is left once it is taken off.
@@ -143,6 +154,35 @@ function _analyse(scene) {
     const s = a.startMs || 0;
     const e = Math.max(s + 1, a.endMs ?? s + 1500);
     const secs = (e - s) / 1000;
+
+    const impact = a.character && pendingImpact.get(a.character);
+    if (impact && s - impact.e > 400) {
+      impacts.push(impact);
+      pendingImpact.delete(a.character);
+    }
+    if (type === 'tumble' && a.character) {
+      const from = where.get(a.character);
+      const dst = Array.isArray(a.to) ? _xyz(a.to, from ? from[2] : 0) : from;
+      if (dst) where.set(a.character, dst);
+      pose.set(a.character, String(a.pose || 'lying_front'));
+      coasting.delete(a.character);
+      if (!from || !dst) continue;
+      const on = vehicleUnder(a, from, dst, s, e);
+      const c = (on && shift(on, s, e)) || [0, 0, 0];
+      const d = Math.hypot(dst[0] - from[0] - c[0], dst[1] - from[1] - c[1]);
+      const rel = on ? ` relative to ${on}` : '';
+      // Constant friction down to zero: starts at twice the average speed.
+      const v0 = 2 * d / secs, dec = v0 / secs;
+      motion.push(`${a.character} tumble ${_r(s / 1000, 2)}-${_r(e / 1000, 2)} s: ${_r(d)} m${rel}, from ${_r(v0)} m/s to a stop (${_r(dec)} m/s²)`);
+      if (dec > TUMBLE_DECEL_MAX) out.push(`${tag}: stops ${_r(v0)} m/s in ${_r(secs, 2)} s (${_r(dec)} m/s²), harder than friction can (rough surface ~5, at most ~${TUMBLE_DECEL_MAX}). Give it more distance and time, or show what stops it.`);
+      else if (d > 0.5 && dec < TUMBLE_DECEL_MIN) out.push(`${tag}: slows at only ${_r(dec)} m/s², as on ice; on an ordinary surface ~5 m/s². Shorten the duration.`);
+      if (impact && s - impact.e <= 400) {
+        const expected = impact.v * impact.v / (2 * 5);
+        if (v0 < impact.v * 0.5) out.push(`${tag}: starts at ${_r(v0)} m/s but the impact gave ${_r(impact.v)} m/s${impact.rel}: at ~5 m/s² that is ~${_r(expected, 0)} m over ~${_r(impact.v / 5)} s. Give the tumble that distance and time, or stage what stops it (a hand gripping, an obstacle).`);
+        pendingImpact.delete(a.character);
+      }
+      continue;
+    }
 
     const next = a.character && _poseOf(type, a);
     if (next) {
@@ -227,6 +267,24 @@ function _analyse(scene) {
         if (vh > RUN_MAX) out.push(`${tag}: flies at ${_r(vh)} m/s${rel}, faster than any sprinter (10 m/s).`);
         if (-dz > DROP_DEADLY) out.push(`${tag}: lands ${_r(-dz)} m lower, a deadly fall.`);
         else if (-dz > DROP_HURTS) out.push(`${tag}: lands ${_r(-dz)} m lower: a person gets hurt from that height (keep drops under ~${DROP_HURTS} m unless the script wants the injury).`);
+        // What the landing surface does to the body: its speed against the
+        // surface, a moving vehicle's included.
+        let hit = a.aboard && veh.at.has(a.aboard) ? a.aboard : null;
+        if (!hit && dst[2] > 0.5) {
+          for (const pid of veh.at.keys()) {
+            const p = veh.pos(pid, e), m = shift(pid, e - 200, e);
+            const vd = m && Math.hypot(m[0], m[1]);
+            if (!vd) continue;
+            const off = [dst[0] - p[0], dst[1] - p[1]];
+            if (Math.abs(off[0] * m[1] - off[1] * m[0]) / vd <= 2.5 && p[2] <= dst[2]) { hit = pid; break; }
+          }
+        }
+        const m = hit && shift(hit, e - 200, e);
+        const vs = m ? [m[0] / 0.2, m[1] / 0.2] : [0, 0];
+        const vRel = Math.hypot((dst[0] - from[0]) / air - vs[0], (dst[1] - from[1]) / air - vs[1]);
+        if (Math.max(vRel, Math.sqrt(2 * G * Math.max(0, -dz))) >= IMPACT_HARD) {
+          pendingImpact.set(a.character, { who: a.character, e, v: Math.max(vRel, 3), rel: hit ? ` against ${hit}` : '', tag });
+        }
         continue;
       }
       const v = d / secs;
@@ -260,6 +318,10 @@ function _analyse(scene) {
     ].filter(Boolean).join(', ');
     out.push(`${b.tag}: ${b.who} is ${b.held} and coasting, yet ${what}, ${b.n} time${b.n > 1 ? 's' : ''} between ${_r(b.s / 1000, 2)} and ${_r(b.e / 1000, 2)} s. A sliding, rolling or falling body keeps its direction and only slows down until something acts on it: make the path one straight, steadily slowing line and the heading one slow turn, and let it change only at an event the script states and shows (a blow, an obstacle, a hand gripping). Never weave a body to fake "swinging" or "tumbling".`);
   }
+  impacts.push(...pendingImpact.values());
+  for (const h of impacts) {
+    out.push(`${h.tag}: ${h.who} lands at ${_r(h.v)} m/s${h.rel}, yet no tumble follows: a body that hits that hard does not just land. Follow it within 0.4 s with { type:"tumble", to, startMs, endMs } (at ~5 m/s² that is ~${_r(h.v * h.v / 10, 0)} m over ~${_r(h.v / 5)} s), or stage what stops it, and say so in the script.`);
+  }
   const motionLines = motion.map((m) => {
     if (typeof m === 'string') return m;
     const secs = (m.e - m.s) / 1000;
@@ -274,12 +336,21 @@ function _analyse(scene) {
   for (const [pid, t] of veh.at) {
     const kind = String(t.prop.shape || t.prop.kind || '').toLowerCase();
     const max = VEHICLE_MAX[kind] ?? (kind.includes('train') ? VEHICLE_MAX.train : null);
+    const accelMax = VEHICLE_ACCEL[kind] ?? (kind.includes('train') ? VEHICLE_ACCEL.train : VEHICLE_ACCEL_DEFAULT);
+    let before = null;
     for (let j = 1; j < t.pts.length; j++) {
       const [t0, a] = t.pts[j - 1], [t1, b] = t.pts[j];
       if (t1 - t0 < 1) continue;
       const secs = (t1 - t0) / 1000;
       const d = _h(a, b), dz = b[2] - a[2];
       const tag = `${pid} (${_r(t0 / 1000)}-${_r(t1 / 1000)}s)`;
+      if (before) {
+        // Each leg holds one speed, so the change happens at the join: at
+        // best it reads as spread over about a second.
+        const dv = Math.abs(d / secs - before.v), acc = dv / Math.min(1, (secs + before.secs) / 2);
+        if (acc > accelMax) out.push(`${tag}: ${kind || 'it'} changes speed from ${_r(before.v)} to ${_r(d / secs)} m/s at once (${_r(acc)} m/s², its real limit ~${accelMax}). Keep one speed, or spread the change over ~${_r(dv / accelMax)} s of legs. Slow motion slows everything in the shot, never the vehicle alone.`);
+      }
+      before = { v: d / secs, secs };
       if (max && d / secs > max) {
         out.push(`${tag}: a ${kind} at ${_r(d / secs)} m/s (${_r(d / secs * 3.6, 0)} km/h); its real top is ~${max} m/s.`);
       }
@@ -303,7 +374,7 @@ export function physicsReport(scene) {
       ...(warnings.length ? { warnings } : {}),
       motion,
       rule: 'People, animals, vehicles and objects must move as they really can (gravity, human speed and strength, inertia: ' +
-        'with no footing a body keeps its direction and only slows down until a stated event acts on it). ' +
+        'with no footing a body keeps its direction and only slows down until a stated event acts on it; a hard impact gets a reaction). ' +
         'Fix every warning with update_scene3d before delivering, unless the script explicitly asks for that exact ' +
         'superhuman feat; then say so to the user. Then reconcile `motion` (each movement\'s distance, time, speed, ' +
         'natural step count; each pose change and how long it takes) with what the story script SAYS for those ' +

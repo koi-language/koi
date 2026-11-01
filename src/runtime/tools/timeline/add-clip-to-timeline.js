@@ -14,6 +14,7 @@ import { addClip, getTimeline, setTimelineSettings } from '../../state/timelines
 import { resolveTimelineId } from './_resolve-timeline-id.js';
 import { channel } from '../../io/channel.js';
 
+import { docDir } from '../../state/doc-root.js';
 /**
  * Best-effort: does the source file have an audio stream?
  * The renderer needs this to know which clips contribute an audio chain

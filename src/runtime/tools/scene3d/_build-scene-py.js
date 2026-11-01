@@ -1232,6 +1232,35 @@ def _switch_pose(ch, f0, f1, pose, side=None):
     _key_pose(ch, f1)
 
 
+def _prop_track(pid):
+    """Where a driven prop is at a frame, before its "drive" legs are baked
+    (the same legs, waits and steady speed); zero when nobody is aboard."""
+    ob = bpy.data.objects.get(f"prop_{pid}") if pid else None
+    legs = sorted([d for d in (S.get("actions") or []) if (d.get("type") or "").lower() == "drive"
+                   and d.get("prop") == pid and isinstance(d.get("to"), (list, tuple)) and len(d["to"]) >= 2],
+                  key=lambda d: int(d.get("startMs") or 0))
+    if ob is None or not legs:
+        here = ob.location.copy() if ob is not None else Vector((0, 0, 0))
+        return lambda fr: here.copy()
+    pts = [(ms_to_frame(legs[0].get("startMs") or 0), ob.location.copy())]
+    for d in legs:
+        f0 = ms_to_frame(d.get("startMs") or 0)
+        f1 = max(f0 + 1, ms_to_frame(d.get("endMs") or (int(d.get("startMs") or 0) + 1000)))
+        if f0 > pts[-1][0]:
+            pts.append((f0, pts[-1][1].copy()))
+        to = d["to"]
+        pts.append((f1, Vector((float(to[0]), float(to[1]), float(to[2]) if len(to) > 2 else ob.location.z))))
+
+    def at(fr):
+        if fr <= pts[0][0]:
+            return pts[0][1].copy()
+        for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+            if fr <= t1:
+                return p0.lerp(p1, (fr - t0) / max(1, t1 - t0))
+        return pts[-1][1].copy()
+    return at
+
+
 # Per-character state machine baked as keyframes, sorted by start time.
 for i, c in enumerate(S.get("characters") or []):
     cid = c.get("id") or f"char{i}"
@@ -1310,6 +1339,57 @@ for a in acts:
             p.z += 0.5 * 9.81 * air * air * u * (1 - u)
             root.location = p
             key(root, "location", fr)
+
+    elif typ == "tumble":
+        # A body thrown along a surface: a constant-friction stop (speed dies
+        # linearly, none left at f1), turning head over heels (or log-rolling,
+        # roll:"side") in step with the distance, the lowest point on the
+        # surface. Aboard a vehicle the stop is relative to it.
+        src = root.location.copy()
+        dst = resolve_point(a.get("to"), src)
+        to = a.get("to")
+        dst = Vector((dst.x, dst.y, dst.z if isinstance(to, (list, tuple)) and len(to) > 2 else src.z))
+        span = f1 - f0
+        track = _prop_track(a.get("aboard"))
+        at_f0, at_f1 = track(f0), track(f1)
+        rel0, rel1 = src - at_f0, dst - at_f1
+        path = rel1 - rel0
+        yaw = yaw_to((0, 0), path) if path.to_2d().length > 1e-3 else root.rotation_euler.z
+        side = str(a.get("roll") or "forward").lower() == "side"
+        back = str(a.get("roll") or "forward").lower() == "backward"
+        if back:
+            yaw += math.pi
+        elif side:
+            yaw += math.pi / 2
+        end = _pose_name(a.get("pose") or "lying_front")
+        turns = a.get("turns")
+        turns = max(0.5, float(turns)) if isinstance(turns, (int, float)) else max(1, round(path.to_2d().length / (1.4 if side else 2.8)))
+        _key_pose(ch, max(1, f0 - 1))
+        key(root, "location", max(1, f0 - 1))
+        key(root, "rotation_euler", max(1, f0 - 1))
+        _set_pose(ch, "lying" if side else "crouching")
+        root.rotation_euler.z = root.rotation_euler.z + (yaw - root.rotation_euler.z + math.pi) % (2 * math.pi) - math.pi
+        key(root, "rotation_euler", f0)
+        start = hips.rotation_euler.copy()
+        goal = POSES[end].get("hips", (0, 0, 0))
+        spin0 = start.y if side else start.x
+        # Lands on the end pose's own trunk angle, so the last switch barely shows.
+        spin1 = (math.radians(goal[1]) + 2 * math.pi * round(turns)) if side or back else (math.radians(goal[0]) - 2 * math.pi * round(turns))
+        if back:
+            spin1 += math.radians(goal[0] - goal[1])
+        for fr in range(f0, f1):
+            u = (fr - f0) / span
+            s = 1 - (1 - u) ** 2
+            root.location = track(fr) + rel0.lerp(rel1, s)
+            key(root, "location", fr)
+            ang = spin0 + (spin1 - spin0) * s
+            hips.rotation_euler = (start.x, ang, start.z) if side else (ang, start.y, start.z)
+            hips.location.z = 0
+            hips.location.z = -_lowest_z(ch)
+            _key_pose(ch, fr)
+        root.location = dst
+        key(root, "location", f1)
+        _switch_pose(ch, f1, f1, end, a.get("side"))
 
     elif typ in ("turn", "face", "look_at", "look"):
         tgt = a.get("target") if a.get("target") is not None else a.get("facing")
@@ -3958,6 +4038,9 @@ if args.live:
             LIVE["free"] = {"pos": Vector(c["pos"]), "tgt": Vector(c["target"]), "lens": float(c.get("lens") or 35)}
         elif k == "load":  # pooled Blender: drop this scene, build another in this process
             LIVE["reload"] = {"scene": c.get("scene"), "script": c.get("script")}
+            return False
+        elif k == "ping":  # the engine's health check: this loop is alive
+            _send_json({"type": "pong"}, only=conn)
             return False
         elif k == "ctl":  # the engine's control link: never a view, never the stage
             LIVE.setdefault("ctl", set()).add(conn)

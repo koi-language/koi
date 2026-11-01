@@ -18,6 +18,7 @@ import path from 'path';
 import os from 'os';
 import { channel } from '../../../io/channel.js';
 
+import { docDir } from '../../../state/doc-root.js';
 // Extensions that mean `saveTo` names a FILE rather than a directory. Kept as
 // an explicit allow-list (not "any dotted last segment") so a directory called
 // e.g. `my.assets` or `v1.2` isn't mistaken for a file.

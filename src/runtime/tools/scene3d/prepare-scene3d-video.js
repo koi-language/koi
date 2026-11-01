@@ -283,7 +283,7 @@ function _script(sbScene, sbShot) {
     lighting: pick(sbShot?.lighting),
     action: pick(sbShot?.action),
     dialogue: sbShot?.dialogue || undefined,
-    sound: pick(sbShot?.sound),
+    sound: pick(sbShot?.sfx || sbShot?.sound),
   };
 }
 
