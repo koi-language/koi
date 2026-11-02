@@ -30,6 +30,7 @@ import { spawn } from 'child_process';
 import { runBuilder } from './_blender.js';
 import { BUILD_SCENE_PY } from './_build-scene-py.js';
 import { modelStamps } from './_models.js';
+import { layoutShots } from './_clock.js';
 
 // Builder version: a change to the Blender script must invalidate every
 // cached render, or old previews would survive a fix forever.
@@ -44,7 +45,7 @@ const _BUILDER_HASH = (() => {
   const renderPart = a > 0 && b > a ? BUILD_SCENE_PY.slice(0, a) + BUILD_SCENE_PY.slice(b) : BUILD_SCENE_PY;
   return crypto.createHash('sha1').update(renderPart).digest('hex').slice(0, 8);
 })();
-import { getTimeline, updateTimeline } from '../../state/timelines.js';
+import { getTimeline, lockedClips, updateTimeline } from '../../state/timelines.js';
 import { channel } from '../../io/channel.js';
 
 import { docDir } from '../../state/doc-root.js';
@@ -95,7 +96,26 @@ export function readScene(id) {
   return scene;
 }
 
+/**
+ * Lay the shots along the action as the montage orders them. A hand-keyed camera
+ * that moved may no longer frame what it was placed for: `cameraCheck` keeps it
+ * listed until the agent has looked. Returns the shots moved.
+ */
+export function relayShots(scene) {
+  const frozen = new Set(lockedClips()
+    .filter(({ clip }) => clip.scene3d?.sceneId === scene.id && isLivePath(clip.path))
+    .flatMap(({ clip }) => (clip.scene3d.shots?.length ? clip.scene3d.shots.map((x) => x.id) : [clip.scene3d.shotId])));
+  const moved = layoutShots(scene, storyOrder(scene), frozen);
+  const keyed = moved.filter((id) => {
+    const sh = scene.shots.find((x) => x.id === id);
+    return sh.keyframes?.length || sh.camera?.keyframes?.length;
+  });
+  if (keyed.length) scene.cameraCheck = [...new Set([...(scene.cameraCheck || []), ...keyed])];
+  return moved;
+}
+
 export function writeScene(scene) {
+  relayShots(scene);
   scene.updatedAt = new Date().toISOString();
   _atomicWrite(scenePath(scene.id), scene);
   return scene;
@@ -584,6 +604,10 @@ export async function bakeStill(sceneId, shotId, ms, { width, height } = {}) {
  * for what needs a real file: exporting a timeline. Cached per scene state +
  * window + size, so a second export of an untouched montage is instant.
  */
+// Bump when the figure's geometry changes: a take's reference is then re-baked.
+// Not part of shotHash, or every generated take would read as out of date.
+const FIGURE_LOOK = 2;
+
 export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height, maxQuality = false, flatSurfaces = false } = {}) {
   const scene = readScene(sceneId);
   const sh = scene?.shots?.find((x) => x.id === shotId);
@@ -593,7 +617,7 @@ export async function bakeWindow(sceneId, shotId, fromMs, toMs, { width, height,
   fs.mkdirSync(dir, { recursive: true });
   const w = width ? Math.round(width / 2) * 2 : 0;
   const h = height ? Math.round(height / 2) * 2 : 0;
-  const key = crypto.createHash('sha1').update(JSON.stringify([shotHash(scene, sh, st), fromMs, toMs, w, h, maxQuality, flatSurfaces])).digest('hex').slice(0, 10);
+  const key = crypto.createHash('sha1').update(JSON.stringify([FIGURE_LOOK, shotHash(scene, sh, st), fromMs, toMs, w, h, maxQuality, flatSurfaces])).digest('hex').slice(0, 10);
   const out = path.join(dir, `${sh.id}-${key}-bake-${Math.round(fromMs)}-${Math.round(toMs)}.mp4`);
   // Kept beside the bake: who the camera sees and where (bakeInFrame).
   if (_exists(out) && _exists(`${out}.inframe.json`)) return out;
@@ -730,7 +754,7 @@ export async function syncLinks(scene) {
       if (!tl) continue;
       let changed = false;
       for (const c of tl.clips || []) {
-        if (c.scene3d?.sceneId !== scene.id) continue;
+        if (c.scene3d?.sceneId !== scene.id || c.locked === true) continue;
         const sh = byId.get(c.scene3d.shotId);
         if (!sh) continue;
         // Only a clip still SHOWING the previz is live 3D; once the real shot
@@ -805,6 +829,32 @@ export function stampScene3dRender(timelineId, clipId, mediaPath) {
   updateTimeline(timelineId, tl);
 }
 
+/** Story shot ids in script order ([] with no story). */
+export function storyOrder(scene) {
+  if (!scene.storyboard?.id) return [];
+  try {
+    const sb = JSON.parse(fs.readFileSync(storyboardPath(scene.storyboard.id), 'utf8'));
+    return (sb.scenes || []).flatMap((sc) => (sc.shots || []).map((sh) => sh.id));
+  } catch { return []; }
+}
+
+/** What the agent must weigh after the shots moved along the action. */
+export function timingReport(scene) {
+  const shots = (scene.shots || []).filter((sh) => sh.inMontage !== false);
+  const camerasEnd = Math.max(0, ...shots.map((sh) => sh.startMs + sh.durationMs));
+  const actionEnd = Math.max(0, ...(scene.actions || []).map((a) => a.endMs || a.startMs || 0));
+  return {
+    ...(scene.cameraCheck?.length ? {
+      cameraCheck: scene.cameraCheck,
+      cameraCheckNote: 'These shots now watch another stretch of the action because clips were reordered, removed or resized. The action is right and stays as it is: '
+        + 'look at each one and adapt its camera if it no longer frames what it should; confirmShots (or a new camera) clears it.',
+    } : {}),
+    ...(camerasEnd > actionEnd + 1000 ? {
+      camerasOutlastAction: `The cameras run to ${camerasEnd} ms and the action ends at ${actionEnd} ms: the last shots watch a world that has stopped. Tell the user, and change the action only if they want more of it.`,
+    } : {}),
+  };
+}
+
 /** What the agent reviews after a render: per shot, the 3-frame sheet next
  *  to the storyboard text it must match. `_reviewImages` is turned into
  *  real images by the MCP layer. */
@@ -827,14 +877,21 @@ export function buildReview(scene, shotIds) {
       shotId: sh.id,
       storyboardShotId: sh.storyboardShotId,
       sheet: pv.sheet,
+      ...(pv.inFrame?.bodySnaps?.length ? { bodySnaps: pv.inFrame.bodySnaps } : {}),
       script: {
         shot: cut(s.shot), camera: cut(s.camera || s.movement), composition: cut(s.composition),
         lighting: cut(s.lighting), action: cut(s.action), seconds: s.duration,
       },
     });
   }
+  const snapped = review.filter((r) => r.bodySnaps);
   return {
     review,
+    ...(snapped.length ? {
+      bodySnapsNote: `Measured in the 3D: in ${snapped.map((r) => r.shotId).join(', ')} a body's trunk jumps in one frame or swings round on itself (bodySnaps: when, how many degrees, over: when it took longer than a frame), `
+        + 'and a video generated from it copies the jump. Fix it before delivering or generating: remove the pose switch or the overlapping action, '
+        + 'or put it on a cut. Tell the user about any jump you leave.',
+    } : {}),
     _reviewImages: review.slice(0, 16).map((r) => r.sheet),
     reviewNote: review.length
       ? 'LOOK at each attached sheet (start | middle | end of the shot, in order of `review`) and compare it with its `script`: '

@@ -26,6 +26,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { BUILD_SCENE_PY } from './_build-scene-py.js';
 import { BUILD_MODEL_PY } from './_build-model-py.js';
+import { RAGDOLL_PY } from './_ragdoll-py.js';
 import { LIVE_SURFACE_C } from './_live-surface-c.js';
 
 export const BLENDER_VERSION = '4.5.15';
@@ -373,6 +374,11 @@ export function builderScriptPath() {
 /** The modeler script (build_model3d), materialised the same way. */
 export function modelerScriptPath() {
   return _materialise('build_model', BUILD_MODEL_PY);
+}
+
+/** The impact solver, materialised the same way. */
+export function ragdollScriptPath() {
+  return _materialise('ragdoll', RAGDOLL_PY);
 }
 
 // Previz renders are short and mostly Blender start-up + scene build, but

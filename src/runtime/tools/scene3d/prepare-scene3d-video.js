@@ -346,6 +346,7 @@ export default {
   intent: 'prepare_scene3d_video',
   description:
     'FIRST STEP to turn 3D previz timeline clips into REAL video ("pásalo a vídeo", "genera el vídeo de este/estos clips"). ' +
+    'Call it ONLY when the user asks for video in their latest request, never as the next step after changing the 3D. ' +
     'Consecutive clips of the same 3D set are joined into ONE take (better continuity than separate clips): per take it ' +
     'bakes the clips\' exact 3D windows end to end into one mp4 (the reference for camera + where the characters stand, travel and face + the ' +
     'cuts; NOT for their body motion, which is a crude placeholder the model must never copy), and collects the pictures of what is in it (character sheets/photos, the place\'s plates, storyboard refs) plus ' +
@@ -379,8 +380,12 @@ export default {
         return { success: false, error: `prepare_scene3d_video: not 3D clips of ${timelineId}: ${missing.join(', ')}` };
       }
       clips = params.clipIds.map((id) => byId.get(id));
+      const locked = clips.filter((c) => c.locked === true).map((c) => c.id);
+      if (locked.length) {
+        return { success: false, error: `prepare_scene3d_video: the user locked these clips: ${locked.join(', ')}. Leave them out, or ask the user to unlock them.` };
+      }
     } else {
-      clips = all.filter((c) => isLivePath(c.path));
+      clips = all.filter((c) => isLivePath(c.path) && c.locked !== true);
     }
     if (!clips.length) return { success: false, error: 'prepare_scene3d_video: no 3D clips to turn into video on this timeline.' };
     clips.sort((a, b) => String(a.track).localeCompare(String(b.track)) || a.startMs - b.startMs);
@@ -542,7 +547,8 @@ export default {
         'nothing wider, the headroom it has. THE REFERENCE IS THE MASTER FOR CAMERA AND PLACEMENT ONLY: open the prompt ' +
         'by saying the attached video\'s camera, framing, what is in and out of frame, positions, paths, sides and timing override ' +
         'anything in the text, and right after that the grey figures are crude placeholders: take only where each one ' +
-        'is, moves to and faces, and their body pose (standing, seated, riding, lying, kneeling...), and do NOT copy their ' +
+        'is, moves to and faces, and their body pose (standing, seated, riding, lying, kneeling...). Say that each figure\'s two dark eyes, ' +
+        'pale chest panel, dark back panel and dark toes only mark which way the body faces (front or back, face up or face down), must be obeyed for that, and are NOT rendered. Do NOT copy their ' +
         'stiff block shapes, limb movement or gestures; every person moves and acts ' +
         'naturally, like a real actor, as the text says. The figures are abstract on purpose; a take that mimics the ' +
         'mannequin\'s pose or movement is a failed take. Say also that the reference\'s SURFACES carry no information: its flat grey ' +

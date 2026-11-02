@@ -2,7 +2,7 @@
  * Delete a timeline file from the project.
  */
 
-import { deleteTimeline } from '../../state/timelines.js';
+import { deleteTimeline, lockedClips } from '../../state/timelines.js';
 
 export default {
   type: 'delete_timeline',
@@ -20,6 +20,9 @@ export default {
 
   async execute(params) {
     try {
+      if (lockedClips().some(({ timelineId }) => timelineId === params.id)) {
+        return { success: false, error: 'delete_timeline: this timeline has clips the user locked. Ask the user first.' };
+      }
       const removed = deleteTimeline(params.id);
       return { success: true, removed };
     } catch (e) {

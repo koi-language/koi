@@ -6,10 +6,12 @@
  * re-renders that shot, trimming a static shot only re-cuts its card.
  */
 
-import { mergeShots } from './_story-timeline.js';
+import { lockedSceneViolation, lockedShotIds, mergeShots } from './_story-timeline.js';
 import { physicsReport } from './_physics.js';
+import { resolveImpacts } from './_ragdoll.js';
 import { requestStrips } from './scene3d-live.js';
-import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId } from './_store.js';
+import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId, timingReport } from './_store.js';
+import { insertSceneTime } from './_clock.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
@@ -38,11 +40,15 @@ export default {
   intent: 'update_scene3d',
   description:
     'Patch an existing 3D previz scene (from save_scene3d) and re-render only the affected shot previews. ' +
+    'Finishing 3D work never leads to a video: show the 3D and stop, even when existing takes are now out of date (say so in one line). ' +
     '`set` replaces root fields (name, aspect, style, storyboard, set, lighting, characters, actions). ' +
     '`shots:[{ id, set:{…} }]` patches shots (camera is merged one level deep; null deletes a key), ' +
     '`characters:[{ id, set }]` / `props:[{ id, set }]` patch one character / prop, ' +
     '`addShots:[shot]`, `removeShots:["id"]`, `addActions:[action]`, `removeActions:[index]`, ' +
     '`confirmShots:["id"]` (storyboard change reviewed, blocking still right → mark up to date). ' +
+    'Action and cameras are separate. The action (`actions`) is what happens, on the scene clock; a shot is only a camera, and the stretch it watches follows from story order and durations, one after the other: its startMs is set for you. ' +
+    'So changing a shot\'s durationMs, order or removing it never changes what happens: the later shots just watch later moments. Weigh what that does to their framing and adapt cameras, listed in `cameraCheck`, never the action. ' +
+    '`insertTime:[{ atMs, ms }]` adds time to the action itself: use it only when what happens must really take longer; moving vehicles keep their speed, and `timeMoved` gives how far each moved: check anything that must meet it later. ' +
     '`mergeShots:["sh4","sh5"]` turns consecutive shots into ONE (the user: "fusiona estos planos"): the first keeps ' +
     'its camera over the whole window, the others disappear from the scene and the story, whose first shot absorbs ' +
     'their action / dialogue / sound (rewrite that merged wording with the cinematic skill afterwards). ' +
@@ -65,6 +71,7 @@ export default {
       removeActions: { type: 'array', items: { type: 'number' } },
       confirmShots: { type: 'array', items: { type: 'string' }, description: 'Shot ids whose storyboard change does NOT affect the blocking (e.g. only dialogue wording) — marks them up to date without changes.' },
       mergeShots: { type: 'array', items: { type: 'string' }, description: 'Consecutive shot ids to merge into the first (keeps its camera); applied before the rest of the patch.' },
+      insertTime: { type: 'array', items: { type: 'object' }, description: '[{ atMs, ms }]: add time to the action at a moment; moving vehicles keep their speed.' },
       render: { type: 'boolean', description: 'Re-render now (default true)' },
     },
     required: ['id'],
@@ -73,6 +80,11 @@ export default {
   async execute(params) {
     const id = cleanId(params?.id);
     if (Array.isArray(params?.mergeShots) && params.mergeShots.length > 1) {
+      const locked = lockedShotIds(id);
+      const hit = params.mergeShots.map(String).filter((s) => locked.has(s));
+      if (hit.length) {
+        return { success: false, error: `update_scene3d: mergeShots: shots ${hit.join(', ')} belong to clips the user locked on the timeline.` };
+      }
       try {
         mergeShots(id, params.mergeShots.map(String));
       } catch (e) {
@@ -82,6 +94,12 @@ export default {
     const existing = id ? readScene(id) : null;
     if (!existing) return { success: false, error: `update_scene3d: no scene "${params?.id}". Use get_scene3d to list scenes.` };
     const next = JSON.parse(JSON.stringify(existing));
+    const timeMoved = {};
+    const addTime = (atMs, ms) => {
+      for (const [pid, d] of Object.entries(insertSceneTime(next, atMs, ms))) {
+        timeMoved[pid] = d.map((v, i) => Math.round(((timeMoved[pid]?.[i] || 0) + v) * 100) / 100);
+      }
+    };
     try {
       if (_isObj(params.set)) {
         for (const [k, v] of Object.entries(params.set)) {
@@ -89,6 +107,10 @@ export default {
           if (v === null) delete next[k]; else next[k] = v;
         }
       }
+      // Latest moment first, so each insert's atMs still means the current clock.
+      const inserts = (Array.isArray(params.insertTime) ? params.insertTime : []).map((x) => [Number(x?.atMs), Number(x?.ms)]);
+      if (inserts.some(([a, m]) => !(a >= 0) || !(m > 0))) throw new Error('each insertTime needs { atMs >= 0, ms > 0 }');
+      for (const [a, m] of inserts.sort((x, y) => y[0] - x[0])) addTime(a, m);
       if (Array.isArray(params.characters)) _mergeById(next.characters || [], params.characters, 'character');
       if (Array.isArray(params.props)) {
         next.set = next.set || {};
@@ -125,6 +147,8 @@ export default {
     } catch (e) {
       return { success: false, error: `update_scene3d: ${e.message}` };
     }
+    const lockedBy = lockedSceneViolation(existing, scene);
+    if (lockedBy) return { success: false, error: `update_scene3d: ${lockedBy}` };
     // Which shots this edit re-blocked: a world change (set, cast, blocking)
     // re-examines every shot; otherwise only the patched / added / confirmed ones.
     const world = _isObj(params.set) || Array.isArray(params.characters) || Array.isArray(params.props)
@@ -134,6 +158,16 @@ export default {
       ...(params.addShots || []).map((p) => p?.id),
       ...(Array.isArray(params.confirmShots) ? params.confirmShots : []),
     ].filter(Boolean));
+    // Looked at: a camera the agent re-framed or confirmed leaves the list.
+    if (scene.cameraCheck?.length) {
+      const seen = new Set([
+        ...(params.confirmShots || []),
+        ...(params.shots || []).filter((p) => { const x = _isObj(p?.set) ? p.set : (p || {}); return 'camera' in x || 'keyframes' in x || 'move' in x; }).map((p) => p.id),
+      ]);
+      scene.cameraCheck = scene.cameraCheck.filter((x) => !seen.has(x));
+      if (!scene.cameraCheck.length) delete scene.cameraCheck;
+    }
+    await resolveImpacts(scene, existing);
     stampSources(scene, touched);
     writeScene(scene);
     // Filmstrips of the changed shots from the live session, when it already
@@ -152,9 +186,11 @@ export default {
       success: r.failed.length === 0,
       scene: summarize(scene),
       rendered: r.rendered,
+      ...(Object.keys(timeMoved).length ? { timeMoved } : {}),
       ...(r.failed.length ? { failed: r.failed } : {}),
       ...(pv ? { previz3d: pv } : {}),
       ...(r.rendered.length ? buildReview(scene, r.rendered) : {}),
+      ...timingReport(scene),
       ...physicsReport(scene),
     };
   },

@@ -28,12 +28,14 @@ proxy covers the whole scene so the timeline can trim / slip a shot without
 re-rendering: outside its window the camera simply holds.
 """
 
+import base64
 import bpy
 import bmesh
 import json
 import math
 import sys
 import argparse
+import struct
 import zlib
 from mathutils import Vector, Euler, Matrix, Quaternion
 
@@ -1040,10 +1042,16 @@ def build_block_figure(c, idx):
     hips = empty(f"{cid}_hips", K(0, 0, 0.95), root)
     instance("box", f"{cid}_torso", K(0, 0, 1.215), K(0.36, 0.2, 0.53), clay, hips)
     instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, hips)
+    # Front and back must read at a glance, also lying down: eyes and a pale
+    # chest in front, a dark back behind, feet pointing forward.
+    dark, pale = material("figure_dark", "#17171a", 0.7), material("figure_pale", "#f2efe8", 0.7)
+    instance("box", f"{cid}_chestmark", K(0, 0.104, 1.27), K(0.28, 0.012, 0.32), pale, hips)
+    instance("box", f"{cid}_backmark", K(0, -0.104, 1.215), K(0.3, 0.012, 0.46), dark, hips)
     neck = empty(f"{cid}_neck", K(0, 0, 1.49), hips)
     parts = {"root": root, "hips": hips, "neck": neck}
     for side, sx in (("L", -1), ("R", 1)):
         x = sx * 0.225 * k
+        instance("box", f"{cid}_eye{side}", K(sx * 0.04, 0.108, 1.645), K(0.04, 0.02, 0.035), dark, hips)
         sh = empty(f"{cid}_shoulder{side}", (x, 0, 1.45 * k), hips)
         el = empty(f"{cid}_elbow{side}", (x, 0, 1.11 * k), sh)
         instance("box", f"{cid}_upperarm{side}", (x, 0, 1.28 * k), K(0.09, 0.1, 0.34), clay, sh)
@@ -1052,6 +1060,7 @@ def build_block_figure(c, idx):
         kn = empty(f"{cid}_knee{side}", (sx * 0.09 * k, 0, 0.5 * k), hp)
         instance("box", f"{cid}_thigh{side}", (sx * 0.09 * k, 0, 0.725 * k), K(0.15, 0.18, 0.45), clay, hp)
         instance("box", f"{cid}_shin{side}", (sx * 0.09 * k, 0, 0.25 * k), K(0.15, 0.18, 0.5), clay, kn)
+        instance("box", f"{cid}_toe{side}", (sx * 0.09 * k, 0.15 * k, 0.04 * k), K(0.15, 0.13, 0.08), dark, kn)
         parts.update({f"shoulder{side}": sh, f"elbow{side}": el, f"hip{side}": hp, f"knee{side}": kn})
     parts.update(height=h, k=k, idx=idx, id=cid, mask=MASK_PALETTE[idx % len(MASK_PALETTE)], rigid=True,
                  meshes=[o for o in bpy.data.objects if o.type == "MESH" and o.name.startswith(f"{cid}_")])
@@ -1272,6 +1281,7 @@ for i, c in enumerate(S.get("characters") or []):
     _set_pose(ch, c.get("pose"), c.get("poseSide"))
     _key_pose(ch, 1)
 
+_HELD_SHAPE = ("turn", "face", "pose", "lie", "lie_down", "sit", "sit_down", "stand", "stand_up", "get_up")
 acts = sorted(S.get("actions") or [], key=lambda a: int(a.get("startMs") or 0))
 for a in acts:
     cid = a.get("character")
@@ -1283,6 +1293,13 @@ for a in acts:
     f0 = ms_to_frame(a.get("startMs"))
     f1 = max(f0 + 1, ms_to_frame(a.get("endMs") or (int(a.get("startMs") or 0) + 1500)))
     scn.frame_set(f0)
+
+    # A falling body answers to its fall alone: _physics.js warns about these.
+    if typ in _HELD_SHAPE and any((b.get("type") or "").lower() in ("tumble", "impact") and b.get("character") == cid
+                                  and ms_to_frame(b.get("startMs")) <= f0
+                                  and f1 <= max(ms_to_frame(b.get("startMs")) + 1, ms_to_frame(b.get("endMs") or 0)) for b in acts):
+        print(f"[scene3d] ignored {typ} of {cid} at {a.get('startMs')} ms: inside its fall", flush=True)
+        continue
 
     if typ in ("walk", "run", "move"):
         src = root.location.copy()
@@ -1367,29 +1384,123 @@ for a in acts:
         _key_pose(ch, max(1, f0 - 1))
         key(root, "location", max(1, f0 - 1))
         key(root, "rotation_euler", max(1, f0 - 1))
-        _set_pose(ch, "lying" if side else "crouching")
-        root.rotation_euler.z = root.rotation_euler.z + (yaw - root.rotation_euler.z + math.pi) % (2 * math.pi) - math.pi
-        key(root, "rotation_euler", f0)
+        # A tumble right after another is the same fall going on: the body keeps
+        # its shape. Only a leg that really rolls lines the body up across its
+        # path; one that does not roll (still in the air, sliding) keeps its
+        # heading, since nothing pushes it round, and leans over its whole length.
+        chained = abs((ch.get("tumble_end") or -99) - f0) <= 1
+        rolls = round(turns) >= 1
+        yaw0 = root.rotation_euler.z
+        yaw1 = yaw0 + (yaw - yaw0 + math.pi) % (2 * math.pi) - math.pi if rolls else yaw0
+        was = {j: ch[j].rotation_euler.to_quaternion() for j in JOINTS}
+        was_hips = hips.rotation_euler.to_quaternion()
+        if not chained:
+            _set_pose(ch, "lying" if side else "crouching")
+        limbs = {j: ch[j].rotation_euler.to_quaternion() for j in JOINTS}
         start = hips.rotation_euler.copy()
         goal = POSES[end].get("hips", (0, 0, 0))
         spin0 = start.y if side else start.x
-        # Lands on the end pose's own trunk angle, so the last switch barely shows.
-        spin1 = (math.radians(goal[1]) + 2 * math.pi * round(turns)) if side or back else (math.radians(goal[0]) - 2 * math.pi * round(turns))
-        if back:
-            spin1 += math.radians(goal[0] - goal[1])
+        if side:
+            # A log roll keeps the head where it is: face down is half a turn
+            # about the long axis, not the head-swapped trunk of the end pose.
+            target = math.pi if goal[0] < 0 else math.radians(goal[1])
+            spin1 = spin0 + (target - spin0 + math.pi) % (2 * math.pi) - math.pi + 2 * math.pi * round(turns)
+        else:
+            # Lands on the end pose's own trunk angle, so the last switch barely shows.
+            spin1 = (math.radians(goal[1]) + 2 * math.pi * round(turns)) if back else (math.radians(goal[0]) - 2 * math.pi * round(turns))
+            if back:
+                spin1 += math.radians(goal[0] - goal[1])
+        settle = 0 if chained else (float(span) if not rolls else max(1.0, 0.2 * FPS))
         for fr in range(f0, f1):
             u = (fr - f0) / span
             s = 1 - (1 - u) ** 2
             root.location = track(fr) + rel0.lerp(rel1, s)
             key(root, "location", fr)
+            w = min(1.0, (fr - f0) / settle) if settle else 1.0
+            root.rotation_euler.z = yaw0 + (yaw1 - yaw0) * (u if chained or side else w)
+            key(root, "rotation_euler", fr)
             ang = spin0 + (spin1 - spin0) * s
-            hips.rotation_euler = (start.x, ang, start.z) if side else (ang, start.y, start.z)
+            trunk = (start.x, ang, start.z) if side else (ang, start.y, start.z)
+            if w < 1:
+                hips.rotation_euler = was_hips.slerp(Euler(trunk, "XYZ").to_quaternion(), w).to_euler("XYZ", hips.rotation_euler)
+                for j in JOINTS:
+                    ch[j].rotation_euler = was[j].slerp(limbs[j], w).to_euler("XYZ", ch[j].rotation_euler)
+            else:
+                hips.rotation_euler = trunk
+                for j in JOINTS:
+                    ch[j].rotation_euler = limbs[j].to_euler("XYZ", ch[j].rotation_euler)
             hips.location.z = 0
             hips.location.z = -_lowest_z(ch)
             _key_pose(ch, fr)
         root.location = dst
         key(root, "location", f1)
-        _switch_pose(ch, f1, f1, end, a.get("side"))
+        root.rotation_euler.z = yaw1
+        key(root, "rotation_euler", f1)
+        if side:
+            hips.rotation_euler = (start.x, spin1, start.z)
+            _set_trunk = hips.rotation_euler.copy()
+            _set_pose(ch, end, a.get("side"))
+            hips.rotation_euler = _set_trunk
+            hips.location.z = 0
+            hips.location.z = -_lowest_z(ch)
+            _key_pose(ch, f1)
+        else:
+            _switch_pose(ch, f1, f1, end, a.get("side"))
+        ch["tumble_end"] = f1
+
+    elif typ == "impact":
+        # A simulated body (_ragdoll-py.js): plays the stored run on the figure.
+        # Slow motion only spreads the same run over more frames.
+        sim = a.get("sim") or {}
+        raw = base64.b64decode(sim.get("data") or "")
+        if not raw:
+            continue
+        vals = struct.unpack("<%df" % (len(raw) // 4), raw)
+        width, count, rate = int(sim["width"]), int(sim["n"]), float(sim["fps"])
+        slow = max(1.0, float(a.get("slowMotion") or 1))
+        order = sim["parts"]
+        links = {"upperarmL": ("trunk", "shoulderL"), "forearmL": ("upperarmL", "elbowL"),
+                 "upperarmR": ("trunk", "shoulderR"), "forearmR": ("upperarmR", "elbowR"),
+                 "thighL": ("trunk", "hipL"), "shinL": ("thighL", "kneeL"),
+                 "thighR": ("trunk", "hipR"), "shinR": ("thighR", "kneeR")}
+
+        def _sim_row(i):
+            row = vals[i * width:(i + 1) * width]
+            return Vector(row[:3]), {n: Quaternion(row[3 + 4 * j:7 + 4 * j]) for j, n in enumerate(order)}
+
+        track = _prop_track(a.get("aboard"))
+        src = root.location.copy()
+        rel0 = src - track(f0)
+        floor_z = a.get("surfaceZ")
+        drop = float(floor_z) - src.z if floor_z is not None else 0.0
+        f_end = f0 + max(1, int(math.ceil((count - 1) / rate * slow * FPS)))
+        yaw_q = Euler((0, 0, root.rotation_euler.z), "XYZ").to_quaternion()
+        was = {j: ch[j].rotation_euler.to_quaternion() for _, j in links.values()}
+        was["hips"] = hips.rotation_euler.to_quaternion()
+        was_z = hips.location.z
+        blend = 0.12 * slow * FPS
+        _key_pose(ch, max(1, f0 - 1))
+        key(root, "location", max(1, f0 - 1))
+        for fr in range(f0, f_end + 1):
+            pos = min(count - 1.0, (fr - f0) / FPS / slow * rate)
+            i = min(count - 2, int(pos)) if count > 1 else 0
+            u = pos - i
+            p0, q0 = _sim_row(i)
+            p1, q1 = _sim_row(min(count - 1, i + 1))
+            p = p0.lerp(p1, u)
+            q = {n: q0[n].slerp(q1[n], u) for n in order}
+            w = min(1.0, (fr - f0) / blend) if blend > 0 else 1.0
+            w = w * w * (3 - 2 * w)
+            root.location = track(fr) + rel0 + Vector((p.x, p.y, drop * w))
+            key(root, "location", fr)
+            hq = was["hips"].slerp(yaw_q.inverted() @ q["trunk"], w)
+            hips.rotation_euler = hq.to_euler("XYZ", hips.rotation_euler)
+            hips.location = (0, 0, was_z + (p.z - was_z) * w)
+            for part, (parent, joint) in links.items():
+                jq = was[joint].slerp(q[parent].inverted() @ q[part], w)
+                ch[joint].rotation_euler = jq.to_euler("XYZ", ch[joint].rotation_euler)
+            _key_pose(ch, fr)
+        ch["pose"] = _pose_name((a.get("simReport") or {}).get("rest") or "lying")
 
     elif typ in ("turn", "face", "look_at", "look"):
         tgt = a.get("target") if a.get("target") is not None else a.get("facing")
@@ -2577,6 +2688,7 @@ if args.live:
             _PERF[k_] = [0, 0.0, 0.0]
         print("[live-perf] " + " | ".join(parts), flush=True)
     import gpu
+    import blf
 
     LIVE = {"w": 960, "h": 540, "shot": JOBS[0]["shot"], "ms": 0.0, "playing": True, "seq": False,
             "free": None, "clients": [], "buf": {}, "last": time.time(), "frames": 0, "t0": time.time(),
@@ -2607,6 +2719,19 @@ if args.live:
     ORDER = [j["shot"] for j in JOBS]
     from gpu_extras.batch import batch_for_shader
 
+    def _near_active_cam(who):
+        """Who the overview takes into account: those near the active camera.
+        Someone very far off (left behind on a train) would shrink everything
+        to specks, so they no longer count. A camera far from everyone (a long
+        shot) keeps the nearest and whoever is close to them."""
+        cam = CAMS.get(LIVE.get("stage_shot"))
+        if cam is None or not who:
+            return who
+        p = cam.matrix_world.translation
+        dist = {cid: (CHARS[cid]["root"].matrix_world.translation - p).length for cid in who}
+        limit = max(30.0, min(dist.values()) + 10.0)
+        return [cid for cid in who if dist[cid] <= limit]
+
     def _stage_home():
         """The stage's opening view: framed on the ACTION, not the whole set
         (an exterior set is tens of metres — framing it left everything
@@ -2622,7 +2747,7 @@ if args.live:
         now_ms = float(LIVE.get("stage_ms") or 0)
         for k in range(5):
             scn.frame_set(ms_to_frame(min(max(0.0, now_ms - 1500 + 750 * k), float(DUR_MS))))
-            for cid in who:
+            for cid in _near_active_cam(who):
                 root = CHARS[cid]["root"].matrix_world.translation
                 hgt = float(CHARS[cid].get("height") or 1.7)
                 pts += [root.copy(), root + Vector((0, 0, hgt))]
@@ -2900,6 +3025,22 @@ if args.live:
         return hits
 
     _POLY = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
+    _FILL = gpu.shader.from_builtin("UNIFORM_COLOR")
+
+    def _frame_font():
+        """A fine monospace with a cursive f-stop sign, once; Blender's own
+        monospace where the system has none, its default font as a last resort."""
+        fid = LIVE.get("frame_font")
+        if fid is None:
+            fid = -1
+            for path_ in ("/System/Library/Fonts/Menlo.ttc", "C:/Windows/Fonts/consola.ttf",
+                          os.path.join(bpy.utils.system_resource("DATAFILES", path="fonts"), "bmonofont-i18n.ttf")):
+                if os.path.exists(path_):
+                    fid = blf.load(path_)
+                    if fid >= 0:
+                        break
+            fid = LIVE["frame_font"] = fid if fid >= 0 else 0
+        return fid
 
     def _hull2d(pts):
         """Convex hull of 2D points (monotone chain), counter-clockwise."""
@@ -2969,6 +3110,8 @@ if args.live:
         """The active shot camera only, amber (white while selected) with its
         frustum (+ its move as a path); the other cameras stay hidden."""
         active = LIVE["stage_shot"]
+        if LIVE.get("stage_noshot"):
+            return
         gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("ALPHA")
         with gpu.matrix.push_pop():
@@ -2981,31 +3124,28 @@ if args.live:
                     cam = CAMS[sid]
                     mw = cam.matrix_world
                     apex = mw.translation
-                    # A film camera (body, two reels, lens hood) in wireframe...
-                    seg = []
-                    for a_, b_ in _CAM_MODEL[1]:
-                        seg += [mw @ _CAM_MODEL[0][a_], mw @ _CAM_MODEL[0][b_]]
-                    _lines(seg, (1.0, 1.0, 1.0, 1.0) if LIVE.get("stage_sel") else (1.0, 0.62, 0.25, 1.0), 1.8, w, h)
-                    # ...and its field of view, out to where it focuses (the
-                    # focus distance with depth of field, else its aim point).
-                    cd_ = cam.data
-                    fwd = -(mw.to_3x3() @ Vector((0, 0, 1)))
-                    tob = bpy.data.objects.get(f"cam_target_{sid}")
-                    if cd_.dof.use_dof:
-                        fo = cd_.dof.focus_object
-                        fd = (fo.matrix_world.translation - apex).dot(fwd) if fo is not None else float(cd_.dof.focus_distance)
-                    elif tob is not None:
-                        fd = (tob.matrix_world.translation - apex).dot(fwd)
+                    # Behind the camera the frame overlay (_draw_frame) stands
+                    # for it. Otherwise a film camera (body, two reels, lens
+                    # hood) in wireframe, and its field of view.
+                    if not LIVE.get("stage_follow"):
+                        seg = []
+                        for a_, b_ in _CAM_MODEL[1]:
+                            seg += [mw @ _CAM_MODEL[0][a_], mw @ _CAM_MODEL[0][b_]]
+                        _lines(seg, (1.0, 1.0, 1.0, 1.0) if LIVE.get("stage_sel") else (1.0, 0.62, 0.25, 1.0), 1.8, w, h)
+                        fp, _fd = _frame_at(sid)
+                        segf, segr = [], []
+                        for i in range(4):
+                            segf += [apex, fp[i]]
+                            segr += [fp[i], fp[(i + 1) % 4]]
+                        _lines(segf, (0.92, 0.92, 0.9, 0.55), 1.1, w, h)
+                        _lines(segr, (0.92, 0.92, 0.9, 0.8), 1.4, w, h)
                     else:
-                        fd = 5.0
-                    fd = max(0.3, min(80.0, fd))
-                    fp = [mw @ (v * (fd / max(1e-4, -v.z))) for v in cd_.view_frame(scene=scn)]
-                    segf, segr = [], []
-                    for i in range(4):
-                        segf += [apex, fp[i]]
-                        segr += [fp[i], fp[(i + 1) % 4]]
-                    _lines(segf, (0.92, 0.92, 0.9, 0.55), 1.1, w, h)
-                    _lines(segr, (0.92, 0.92, 0.9, 0.8), 1.4, w, h)
+                        # No camera, but the rays from where it stands to its
+                        # frame's corners: which way it points.
+                        segf = []
+                        for v_ in _frame_at(sid)[0]:
+                            segf += [apex, v_]
+                        _lines(segf, (1.0, 1.0, 1.0, 0.35), 1.0 / LIVE.get("px", 1.0), w, h)
                     if not LIVE.get("stage_sel"):  # the move shows only on the selected camera
                         continue
                     pts = LIVE["paths"].get(sid) or []
@@ -3023,13 +3163,169 @@ if args.live:
                         _lines([apex, tob.matrix_world.translation.copy()], (1.0, 0.62, 0.25, 0.35), 1.0, w, h)
         gpu.state.blend_set("NONE")
 
+    def _frame_at(sid):
+        """The camera's frame in the world, out to where it focuses (the focus
+        distance with depth of field, else its aim point): (top right, bottom
+        right, bottom left, top left), distance."""
+        cam = CAMS[sid]
+        mw = cam.matrix_world
+        apex = mw.translation
+        cd_ = cam.data
+        fwd = -(mw.to_3x3() @ Vector((0, 0, 1)))
+        tob = bpy.data.objects.get(f"cam_target_{sid}")
+        if cd_.dof.use_dof:
+            fo = cd_.dof.focus_object
+            fd = (fo.matrix_world.translation - apex).dot(fwd) if fo is not None else float(cd_.dof.focus_distance)
+        elif tob is not None:
+            fd = (tob.matrix_world.translation - apex).dot(fwd)
+        else:
+            fd = 5.0
+        fd = max(0.3, min(80.0, fd))
+        return [mw @ (v * (fd / max(1e-4, -v.z))) for v in cd_.view_frame(scene=scn)], fd
+
+    def _fit_frame(sid, view, proj, w, h):
+        """Through the camera: a projection showing its whole frame with room
+        around it, whatever the stage's shape, clear of the stage's tool column
+        on the right. It only changes what surrounds the frame."""
+        m = proj @ view
+        xs, ys = [], []
+        for v in _frame_at(sid)[0]:
+            q = m @ Vector((v.x, v.y, v.z, 1.0))
+            if q.w <= 1e-4:
+                return proj
+            xs.append(q.x / q.w)
+            ys.append(q.y / q.w)
+        bw, bh = max(xs) - min(xs), max(ys) - min(ys)
+        if bw <= 1e-4 or bh <= 1e-4:
+            return proj
+        px = LIVE.get("px", 1.0)
+        pad, tools = 28.0 * px, 96.0 * px
+        if w - pad - tools < w * 0.4:  # too narrow to give the tools a column
+            tools = pad
+        lo_x, hi_x = -1 + 2 * pad / w, 1 - 2 * tools / w
+        lo_y, hi_y = -1 + 2 * pad / h, 1 - 2 * pad / h
+        s_ = min((hi_x - lo_x) / bw, (hi_y - lo_y) / bh)
+        tx = (lo_x + hi_x) / 2 - s_ * (max(xs) + min(xs)) / 2
+        ty = (lo_y + hi_y) / 2 - s_ * (max(ys) + min(ys)) / 2
+        return Matrix(((s_, 0, 0, tx), (0, s_, 0, ty), (0, 0, 1, 0), (0, 0, 0, 1))) @ proj
+
+    def _draw_frame(sid, view, proj, w, h):
+        """What the camera captures, as a viewfinder: outside darkened, rounded
+        corners, thirds, centre cross, lens and aperture. Screen space, on the
+        stage image, so it never lags behind the frame it marks."""
+        fp, fd = _frame_at(sid)
+        m = proj @ view
+
+        def ndc(v):
+            q = m @ Vector((v.x, v.y, v.z, 1.0))
+            return None if q.w <= 1e-4 else (q.x / q.w, q.y / q.w)
+
+        def mix(a, b, u):
+            return a + (b - a) * u
+
+        corners = [ndc(v) for v in fp]
+        if any(c_ is None for c_ in corners):
+            return
+        # Where it is on the stage (0..1, y down; top left first, clockwise).
+        LIVE["frame_at"] = [round(q_, 4) for c_ in (corners[3], corners[0], corners[1], corners[2])
+                            for q_ in ((c_[0] + 1) / 2, (1 - c_[1]) / 2)]
+        px = LIVE.get("px", 1.0)
+        pix = [Vector(((c_[0] + 1) * w / 2, (c_[1] + 1) * h / 2)) for c_ in corners]
+        sides = [(pix[(i + 1) % 4] - pix[i]).length for i in range(4)]
+        rad = min(12.0 * px, min(sides) * 0.2)
+        ring = []
+        for i in range(4):  # each corner, rounded with a quadratic curve
+            at = pix[i]
+            a_ = at + (pix[i - 1] - at).normalized() * rad
+            b_ = at + (pix[(i + 1) % 4] - at).normalized() * rad
+            for k_ in range(7):
+                u = k_ / 6
+                ring.append(a_ * (1 - u) ** 2 + at * (2 * u * (1 - u)) + b_ * (u * u))
+        rc = sum(pix, Vector((0.0, 0.0))) / 4
+        far = [p_ + (p_ - rc).normalized() * (4.0 * (w + h)) for p_ in ring]
+
+        def to3(p_):
+            return (p_.x * 2 / w - 1, p_.y * 2 / h - 1, 0.0)
+
+        tris = []
+        n_ = len(ring)
+        for i in range(n_):
+            j = (i + 1) % n_
+            tris += [to3(ring[i]), to3(ring[j]), to3(far[i]), to3(ring[j]), to3(far[j]), to3(far[i])]
+        ln_ = []
+        for i in range(n_):
+            ln_ += [to3(ring[i]), to3(ring[(i + 1) % n_])]
+        guides = []
+        for u in (1 / 3, 2 / 3):
+            for a_, b_ in ((mix(fp[3], fp[0], u), mix(fp[2], fp[1], u)), (mix(fp[3], fp[2], u), mix(fp[0], fp[1], u))):
+                qa, qb = ndc(a_), ndc(b_)
+                if qa and qb:
+                    guides += [(qa[0], qa[1], 0.0), (qb[0], qb[1], 0.0)]
+        ctr = ndc(sum(fp, Vector((0.0, 0.0, 0.0))) / 4)
+        cross = []
+        if ctr:
+            cx_, cy_ = 5.0 * px * 2 / w, 5.0 * px * 2 / h
+            cross = [(ctr[0] - cx_, ctr[1], 0.0), (ctr[0] + cx_, ctr[1], 0.0), (ctr[0], ctr[1] - cy_, 0.0), (ctr[0], ctr[1] + cy_, 0.0)]
+        gpu.state.depth_test_set("NONE")
+        gpu.state.blend_set("ALPHA")
+        with gpu.matrix.push_pop():
+            gpu.matrix.load_identity()
+            with gpu.matrix.push_pop_projection():
+                gpu.matrix.load_projection_matrix(Matrix.Identity(4))
+                _FILL.bind()
+                _FILL.uniform_float("color", (0.0, 0.0, 0.0, 0.3))
+                batch_for_shader(_FILL, "TRIS", {"pos": tris}).draw(_FILL)
+                # Hairlines: one physical pixel, whatever the screen's density.
+                _lines(guides, (1.0, 1.0, 1.0, 0.22), 1.0 / px, w, h)
+                _lines(cross, (1.0, 1.0, 1.0, 0.9), 1.0 / px, w, h)
+                # Hovered or selected (it stands for the camera): brighter.
+                lit = LIVE.get("frame_hover") or LIVE.get("stage_sel")
+                _lines(ln_, (1.0, 1.0, 1.0, 0.95 if lit else 0.5), (1.6 if lit else 1.0) / px, w, h)
+                # The readout, in the frame's top corners, kept on screen.
+                gpu.matrix.load_projection_matrix(Matrix(((2 / w, 0, 0, -1), (0, 2 / h, 0, -1), (0, 0, 1, 0), (0, 0, 0, 1))))
+                cd_ = CAMS[sid].data
+                fid = _frame_font()
+                # Sized to the frame: full size on a large frame, smaller on a
+                # small one, gone when it would only cover what it frames.
+                fw_ = min((pix[0] - pix[3]).length, (pix[1] - pix[2]).length)
+                fh_ = min((pix[3] - pix[2]).length, (pix[0] - pix[1]).length)
+                k_ = min(1.0, fw_ / (520.0 * px), fh_ / (290.0 * px))
+                pad = 10.0 * px * k_
+                big_, small_ = 10.5 * px * k_, 8.0 * px * k_
+
+                def text(s_, x_, y_, size, alpha, right=False):
+                    blf.size(fid, size)
+                    blf.color(fid, 1.0, 1.0, 1.0, alpha)
+                    tw = blf.dimensions(fid, s_)[0]
+                    x0 = x_ - tw if right else x_
+                    blf.position(fid, max(4.0, min(w - tw - 4.0, x0)), max(4.0, min(h - size - 4.0, y_)), 0)
+                    blf.draw(fid, s_)
+
+                if k_ < 0.55:
+                    gpu.state.blend_set("NONE")
+                    return
+                blf.enable(fid, blf.SHADOW)
+                blf.shadow(fid, 3, 0.0, 0.0, 0.0, 0.45)
+                blf.shadow_offset(fid, 1, -1)
+                tl, tr_ = pix[3], pix[0]
+                text(f"{cd_.lens:.0f}mm", tl.x + pad, tl.y - pad - big_, big_, 1.0)
+                text(f"FOV {math.degrees(cd_.angle_x):.0f}" + chr(176), tl.x + pad, tl.y - pad - big_ - small_ - 4 * px * k_, small_, 0.6)
+                if cd_.dof.use_dof:
+                    text(chr(402) + f"/{cd_.dof.aperture_fstop:g}", tr_.x - pad, tr_.y - pad - big_, big_, 1.0, right=True)
+                    text(f"AF {fd:.1f}m", tr_.x - pad, tr_.y - pad - big_ - small_ - 4 * px * k_, small_, 0.6, right=True)
+                label = LIVE.get("stage_label")
+                if label:  # the take, named by the app (its number and language)
+                    text(str(label), pix[1].x - pad, pix[1].y + pad, small_, 0.6, right=True)
+                blf.disable(fid, blf.SHADOW)
+        gpu.state.blend_set("NONE")
+
     def _track_cast():
         """What the overview keeps centred: what the home view frames — the
         cast (characters with a sheet; else everyone) — where it is NOW:
         (centre, points). Falls back to the active camera's aim."""
         cast = [c.get("id") for c in S.get("characters") or [] if c.get("characterId") and c.get("id") in CHARS]
         pts = []
-        for cid in cast or list(CHARS):
+        for cid in _near_active_cam(cast or list(CHARS)):
             root = CHARS[cid]["root"].matrix_world.translation
             pts += [root.copy(), root + Vector((0, 0, float(CHARS[cid].get("height") or 1.7)))]
         if not pts:
@@ -3123,7 +3419,8 @@ if args.live:
         m = proj @ view
         out = []
         for sid in ORDER:
-            if sid != LIVE["stage_shot"]:
+            # Not drawn behind the camera: nothing to pick, no number beside it.
+            if sid != LIVE["stage_shot"] or LIVE.get("stage_follow") or LIVE.get("stage_noshot"):
                 continue
             cam = CAMS[sid]
             p = cam.matrix_world.translation
@@ -3886,6 +4183,18 @@ if args.live:
             LIVE["stage_pov"] = bool(c.get("on"))
             LIVE["cut_dirty"] = True
             LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        elif k == "stage_frame_hover":  # the pointer is on the frame's edge
+            LIVE["frame_hover"] = bool(c.get("on"))
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        elif k == "stage_noshot":  # the playhead is off every 3D clip: no camera drawn
+            LIVE["stage_noshot"] = bool(c.get("on"))
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        elif k == "stage_label":  # what the frame's corner says about the take
+            LIVE["stage_label"] = c.get("text")
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
         elif k == "stage_sel":  # the active camera is selected: draw its path
             LIVE["stage_sel"] = bool(c.get("on"))
             LIVE["cut_dirty"] = True
@@ -3938,6 +4247,16 @@ if args.live:
             o_ = pos
             if ortho:
                 o_, d, _hh = _screen_ray(float(c.get("x", 0.5)), float(c.get("y", 0.5)))
+            # Through the camera, the stage shows the shot camera (framed to
+            # fit), not the free view: the ray and the outline go through the
+            # very matrix it was drawn with.
+            pov_m = LIVE.get("stage_m") if LIVE["stage"] and LIVE.get("stage_pov") else None
+            if pov_m is not None:
+                inv_ = pov_m.inverted()
+                n_ = inv_ @ Vector((x, y, -1.0, 1.0))
+                f_ = inv_ @ Vector((x, y, 1.0, 1.0))
+                o_ = n_.xyz / n_.w
+                d = (f_.xyz / f_.w - o_).normalized()
             if LIVE["stage"]:
                 # Against what the stage SHOWS: its own layer, walls cut away
                 # there only. The main layer's walls stood invisibly in the
@@ -3971,6 +4290,11 @@ if args.live:
                     mw = o2.matrix_world
                     pts2 = []
                     for vx in o2.data.vertices:
+                        if pov_m is not None:
+                            q_ = pov_m @ (mw @ vx.co).to_4d()
+                            if q_.w > 0.05:
+                                pts2.append(((q_.x / q_.w + 1) / 2, (1 - q_.y / q_.w) / 2))
+                            continue
                         v = mw @ vx.co - pos
                         z = v.dot(fwd)
                         if z <= 0.05:
@@ -4388,8 +4712,9 @@ void main() {
             _DOF["batches"][me.name] = b
         return b
 
-    def _linear_depth(cam, w, h, dg, used):
-        """Distance to the camera per pixel (metres) in an RGBA32F offscreen."""
+    def _linear_depth(cam, w, h, dg, used, proj=None):
+        """Distance to the camera per pixel (metres) in an RGBA32F offscreen;
+        through [proj] when the image was drawn with one of its own."""
         zs = _zshader()
         key = ("z", w, h)
         oz = offscreen.get(key)
@@ -4397,7 +4722,8 @@ void main() {
             oz = offscreen[key] = gpu.types.GPUOffScreen(w, h, format="RGBA32F")
         used.add(key)
         view = cam.matrix_world.inverted()
-        proj = cam.calc_matrix_camera(dg, x=w, y=h)
+        if proj is None:
+            proj = cam.calc_matrix_camera(dg, x=w, y=h)
         with oz.bind():
             fb = gpu.state.active_framebuffer_get()
             fb.clear(color=(1.0e5, 0.0, 0.0, 1.0), depth=1.0)
@@ -4418,9 +4744,11 @@ void main() {
             gpu.state.depth_mask_set(False)
         return oz
 
-    def _dof_pass(o, cam, w, h, used, tag=""):
+    def _dof_pass(o, cam, w, h, used, tag="", proj=None):
         """Lens blur over offscreen o when the shot camera has DOF on;
-        returns the offscreen to ship (o itself when there is none)."""
+        returns the offscreen to ship (o itself when there is none). [proj]:
+        the projection o was drawn with, when not the camera's own (the stage
+        through the camera, framed to fit): depth and blur size follow it."""
         cd = cam.data
         if not cd.dof.use_dof:
             return o
@@ -4436,7 +4764,9 @@ void main() {
             # Circle of confusion: (f^2 / (N (S - f))) * |D - S| / D, in mm on
             # the sensor -> pixels; the shader multiplies by |D - S| / D.
             kpx = (f_mm * f_mm / (n_stop * max(S - f_mm, 1.0))) / sensor * w * 0.5
-            dtex = _linear_depth(cam, w, h, bpy.context.evaluated_depsgraph_get(), used).texture_color
+            if proj is not None:  # pixels per sensor mm as this image shows it
+                kpx = (f_mm * f_mm / (n_stop * max(S - f_mm, 1.0))) * abs(proj[0][0]) * w / (2.0 * f_mm) * 0.5
+            dtex = _linear_depth(cam, w, h, bpy.context.evaluated_depsgraph_get(), used, proj).texture_color
             sh, batch = _dof_shader()
             o2 = _offscreen_k(("dof", tag, w, h), w, h, used)
             with o2.bind():
@@ -4519,7 +4849,11 @@ void main() {
         # waited ~17 ms per frame for the GPU, serialising everything.
         pend = LIVE.setdefault("pend", {})
         for key, (po, pw, ph, pconns) in list(pend.items()):
-            pconns = [c_ for c_ in pconns if c_ in LIVE["clients"]]
+            # A client that became a view after this stage frame was queued must
+            # not get it: at the stage's size, it replaced the view's own surface
+            # and a paused player, never redrawn, kept the wrong aspect.
+            is_view_frame = isinstance(key, tuple) and key[0] == "v"
+            pconns = [c_ for c_ in pconns if c_ in LIVE["clients"] and (is_view_frame or c_ not in LIVE["views"])]
             if pconns:
                 t0_ = time.perf_counter()
                 _ship(po, pw, ph, pconns)
@@ -4624,21 +4958,37 @@ void main() {
             cam = live
         view = cam.matrix_world.inverted()
         proj = cam.calc_matrix_camera(dg, x=w, y=h)
+        pov_ = LIVE["stage"] and not f and LIVE.get("stage_pov")
+        if pov_:
+            proj = _fit_frame(sh["id"], view, proj, w, h)
         o = _offscreen_k(("st", w, h), w, h, used)
         t0_ = time.perf_counter()
         o.draw_view3d(scn, _stage_layer() if LIVE["stage"] else ctx.view_layer, sp, reg, view, proj,
                       do_color_management=True)
         _perf("stage_view3d", t0_)
+        if pov_:  # through the camera: its focus, as the player's preview shows it
+            o = _dof_pass(o, cam, w, h, used, "st", proj)
         if LIVE["stage"]:
             t0_ = time.perf_counter()
             with o.bind():
                 _draw_cams(view, proj, w, h)
+                fsid = sh["id"] if pov_ else LIVE["stage_shot"]
+                LIVE["frame_at"] = None
+                LIVE["stage_m"] = (proj @ view).copy() if pov_ else None
+                if (pov_ or LIVE.get("stage_follow")) and fsid in CAMS and not LIVE.get("stage_noshot"):
+                    _draw_frame(fsid, view, proj, w, h)
             _perf("stage_cams", t0_)
             now = time.time()
-            if now - LIVE["proj_at"] > 0.08:
+            # Throttled only while playing (frames keep coming). Paused, a
+            # skipped message was never resent: after switching view the app
+            # kept the previous mode's camera and frame (a stray number, no
+            # hover on the frame).
+            if now - LIVE["proj_at"] > 0.08 or not LIVE.get("playing"):
                 LIVE["proj_at"] = now
                 msg = {"type": "stage", "ms": LIVE["stage_ms"], "cams": _stage_proj(view, proj),
                        "active": LIVE["stage_shot"], **_cam_handles(LIVE["stage_shot"], proj @ view)}
+                if LIVE.get("frame_at"):
+                    msg["frame"] = LIVE["frame_at"]  # the frame stands for the camera (behind / through it)
                 if (LIVE.get("stage_follow") or LIVE.get("stage_track")) and LIVE["stage_view"]:
                     sv = LIVE["stage_view"]
                     msg["follow"] = {"pos": list(sv["pos"]), "target": list(sv["tgt"]), "lens": sv["lens"],
@@ -4957,6 +5307,48 @@ if _STILL_PENDING:
     print(f"[scene3d] still → {JOBS[0]['out']}")
     sys.exit(0)
 
+def body_snaps(f0, f1):
+    """Frames where a body's trunk jumps faster than any body can turn (60
+    degrees in one frame at 24 fps is 4 turns a second), read from the keys."""
+    limit = math.radians(60) * 24.0 / FPS
+
+    def at(ob, fr):
+        vals = list(ob.rotation_euler)
+        act = ob.animation_data.action if ob.animation_data else None
+        for fc in (act.fcurves if act else []):
+            if fc.data_path == "rotation_euler":
+                vals[fc.array_index] = fc.evaluate(fr)
+        return Euler(vals, "XYZ").to_quaternion()
+
+    out = []
+    for cid, parts in CHARS.items():
+        prev = None
+        for fr in range(f0, f1 + 1):
+            q = at(parts["root"], fr) @ at(parts["hips"], fr)
+            if prev is not None:
+                ang = prev.rotation_difference(q).angle
+                ang = min(ang, 2 * math.pi - ang)
+                if ang > limit:
+                    out.append({"character": cid, "ms": int(round((fr - 1) * 1000.0 / FPS)), "degrees": round(math.degrees(ang))})
+            prev = q
+        # A body swinging round on itself: quicker than a sharp turn on the
+        # feet, spread over several frames so no single one shows it.
+        win = max(1, int(round(0.2 * FPS)))
+        limit_yaw = math.radians(75)
+        yaw = [at(parts["root"], fr).to_euler("XYZ").z for fr in range(f0, f1 + 1)]
+        peak, peak_fr = 0.0, None
+        for i in range(win, len(yaw) + 1):
+            turn = 0.0
+            if i < len(yaw):
+                turn = abs((yaw[i] - yaw[i - win] + math.pi) % (2 * math.pi) - math.pi)
+            if turn > limit_yaw and turn > peak:
+                peak, peak_fr = turn, f0 + i
+            elif turn <= limit_yaw and peak_fr is not None:
+                out.append({"character": cid, "ms": int(round((peak_fr - 1) * 1000.0 / FPS)), "degrees": round(math.degrees(peak)), "over": "0.2 s"})
+                peak, peak_fr = 0.0, None
+    return out
+
+
 def in_frame(cam, f0, f1):
     """Who and what this camera actually SEES over [f0, f1] — the per-shot
     continuity (which references a generation needs), derived from the 3D
@@ -5092,6 +5484,7 @@ def in_frame(cam, f0, f1):
         timeline.append({"ms": int(round((fr - 1) * 1000.0 / FPS)), "seen": seen})
     return {
         "timeline": timeline,
+        "bodySnaps": body_snaps(f0, f1),
         "characters": [{"id": cid, "name": (names.get(cid) or {}).get("name") or cid,
                         "characterId": (names.get(cid) or {}).get("characterId"),
                         "share": v["share"], "x": round(sum(v["xs"]) / len(v["xs"]), 2),

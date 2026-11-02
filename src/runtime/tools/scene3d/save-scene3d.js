@@ -3,8 +3,10 @@
  * every shot's preview with Blender (clay by default, ~1-3 s per shot).
  */
 
+import { lockedSceneViolation } from './_story-timeline.js';
 import { physicsReport } from './_physics.js';
-import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId } from './_store.js';
+import { resolveImpacts } from './_ragdoll.js';
+import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId, timingReport } from './_store.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
@@ -13,6 +15,7 @@ export default {
   type: 'save_scene3d',
   intent: 'save_scene3d',
   description:
+    'Finishing 3D work never leads to a video: show the 3D and stop, even when existing takes are now out of date (say so in one line). ' +
     'Create (or fully replace, when `scene.id` exists) a 3D PREVIZ scene: one shared set with characters and blocking, ' +
     'covered by N camera shots, rendered by Blender into animated previews. Every shot gets a proxy video; when the scene ' +
     'is linked to a storyboard (`storyboard:{id,sceneId}` + per-shot `storyboardShotId`) each storyboard card becomes that ' +
@@ -37,12 +40,16 @@ export default {
       return { success: false, error: 'save_scene3d: `scene` (object) is required.' };
     }
     let scene;
+    let lockedBy = null;
     try {
       const existing = input.id ? readScene(cleanId(input.id)) : null;
       scene = normalizeScene(input, existing);
+      lockedBy = lockedSceneViolation(existing, scene);
     } catch (e) {
       return { success: false, error: `save_scene3d: ${e.message}` };
     }
+    if (lockedBy) return { success: false, error: `save_scene3d: ${lockedBy}` };
+    await resolveImpacts(scene, input.id ? readScene(cleanId(input.id)) : null);
     stampSources(scene);
     writeScene(scene);
     let failed = [];
@@ -63,6 +70,7 @@ export default {
       ...(failed.length ? { failed } : {}),
       ...(pv ? { previz3d: pv } : {}),
       ...buildReview(scene, null),
+      ...timingReport(scene),
       ...physicsReport(scene),
     };
   },

@@ -13,14 +13,15 @@
  *     signature so the edit never reads as "previz out of date".
  *
  * Clips the user generated a real video onto keep their media; they only
- * move with the script order.
+ * move with the script order. Clips the user LOCKED do not change at all: the
+ * rest of the montage is laid around them.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { listScenes, readScene, writeScene, storyboardPath, renderDir, renderScene, livePath, isLivePath } from './_store.js';
-import { createTimeline, getTimeline, updateTimeline } from '../../state/timelines.js';
+import { listScenes, readScene, writeScene, storyboardPath, renderDir, renderScene, livePath, isLivePath, sceneDurationMs, relayShots } from './_store.js';
+import { createTimeline, getTimeline, lockedClips, updateTimeline } from '../../state/timelines.js';
 import { stampSources } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
 
@@ -114,6 +115,12 @@ const _isPreviz = (p, sceneId) => isLivePath(p) || (typeof p === 'string' && p.s
 export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
   const sb = _readJson(storyboardPath(storyboardId));
   if (!sb) return { timelineId: null, changed: false };
+  // The story's order may have changed: cameras follow it along the action.
+  for (const meta of listScenes()) {
+    if (meta.storyboard?.id !== sb.id) continue;
+    const scene = readScene(meta.id);
+    if (scene && relayShots(scene).length) writeScene(scene);
+  }
   const items = _scriptOrder(sb);
   let id = findStoryTimeline(storyboardId);
   if (!id) {
@@ -135,26 +142,38 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
   const old = new Map();
   for (const c of (tl.clips || []).filter(_managed)) for (const k of _keys(c)) if (!old.has(k)) old.set(k, c);
   const others = (tl.clips || []).filter((c) => !_managed(c));
-  const placed = [];
+  const frozen = [...new Set(old.values())].filter((c) => c.locked === true);
+  // The next start at or after [from] where [dur] ms fit between locked clips.
+  const freeStart = (from, dur) => {
+    let start = from;
+    for (const c of [...frozen].sort((a, b) => a.startMs - b.startMs)) {
+      if (start < c.startMs + c.durationMs && c.startMs < start + dur) start = c.startMs + c.durationMs;
+    }
+    return start;
+  };
+  const placed = [...frozen];
   let at = 0;
   for (const it of items) {
     const { scene, shot, sbScene, sbShot } = it;
     // The user took this camera out of the montage: it stays out.
     if (shot.inMontage === false) continue;
     let prev = old.get(`${scene.id}/${shot.id}`);
+    if (prev?.locked === true) continue;
     // A continuous take (the script's noCutBefore): the shot joins the clip
     // before it, one clip for the whole take, while both still show the
     // previz and their windows meet on the scene clock.
-    const last = placed[placed.length - 1];
+    const last = placed.filter((c) => c.locked !== true).at(-1);
     const lastShots = last?.scene3d?.shots;
     const lastEnd = lastShots ? lastShots[lastShots.length - 1] : null;
     if (sbShot.noCutBefore === true && last && last.scene3d.sceneId === scene.id && isLivePath(last.path)
         && (!prev || prev === last || _isPreviz(prev.path, scene.id))
         && lastEnd && lastEnd.startMs + lastEnd.durationMs === shot.startMs) {
-      lastShots.push({ id: shot.id, storyboardShotId: sbShot.id, startMs: shot.startMs, durationMs: shot.durationMs });
-      last.durationMs += shot.durationMs;
-      at += shot.durationMs;
-      continue;
+      if (freeStart(last.startMs, last.durationMs + shot.durationMs) === last.startMs) {
+        lastShots.push({ id: shot.id, storyboardShotId: sbShot.id, startMs: shot.startMs, durationMs: shot.durationMs });
+        last.durationMs += shot.durationMs;
+        at += shot.durationMs;
+        continue;
+      }
     }
     if (prev && placed.some((x) => x.id === prev.id)) {
       // Already laid: a generated take that spans this shot too keeps it;
@@ -186,11 +205,13 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
         scene3d: { ...link, shots: [{ id: shot.id, storyboardShotId: sbShot.id, startMs: shot.startMs, durationMs: shot.durationMs }] },
       };
     }
+    c.startMs = freeStart(at, c.durationMs);
     placed.push(c);
-    at += c.durationMs;
+    at = c.startMs + c.durationMs;
   }
+  placed.sort((a, b) => a.startMs - b.startMs);
   // One shot per clip needs no list (the clip's own window says it all).
-  for (const c of placed) if (c.scene3d.shots?.length === 1) { const { shots: _, ...rest } = c.scene3d; c.scene3d = rest; }
+  for (const c of placed) if (c.locked !== true && c.scene3d.shots?.length === 1) { const { shots: _, ...rest } = c.scene3d; c.scene3d = rest; }
   _writeLaid(id, placed.flatMap(_keys));
   // A clip that moved takes its linked clips with it (the take's own sound
   // on an audio track), or they would play out of sync.
@@ -205,6 +226,54 @@ export function ensureStoryTimeline(storyboardId, { create = true } = {}) {
   if (strip([...new Set(old.values())].sort((a, b) => a.startMs - b.startMs)) === strip(placed)) return { timelineId: id, changed: false };
   updateTimeline(id, { ...tl, clips: [...others, ...placed] });
   return { timelineId: id, changed: true };
+}
+
+const _stable = (v) => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x)
+  ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b)))
+  : x));
+
+/** What a 3D shot plays, without what renders and sync checks stamp on it. */
+const _shotContent = ({ preview: _p, sourceSig: _s, ...rest }) => _stable(rest);
+
+// Scene fields every shot shares: changing them changes what a live clip shows.
+const _WORLD_FIELDS = ['aspect', 'style', 'set', 'lighting', 'characters', 'actions', 'resolution', 'fps'];
+
+function _lockedOfScene(sceneId) {
+  return lockedClips().filter(({ clip }) => clip.scene3d?.sceneId === sceneId).map(({ clip }) => clip);
+}
+
+/** Ids of the shots of [sceneId] that a locked clip plays. */
+export function lockedShotIds(sceneId) {
+  return new Set(_lockedOfScene(sceneId).flatMap(clipShotIds));
+}
+
+/**
+ * The 3D behind locked clips stays as it is: their shots always, and the shared
+ * world too while one of them still plays the live previz (a generated video no
+ * longer depends on it).
+ * @returns {string|null} why [next] may not be saved over [existing]
+ */
+export function lockedSceneViolation(existing, next) {
+  if (!existing) return null;
+  const locked = _lockedOfScene(existing.id);
+  if (!locked.length) return null;
+  const after = new Map((next.shots || []).map((s) => [s.id, s]));
+  const changed = (existing.shots || [])
+    .filter((s) => locked.some((c) => clipShotIds(c).includes(s.id)))
+    .filter((s) => !after.has(s.id) || _shotContent(after.get(s.id)) !== _shotContent(s))
+    .map((s) => s.id);
+  if (changed.length) {
+    return `shots ${changed.join(', ')} belong to clips the user locked on the timeline and cannot be changed. `
+      + 'Leave them as they are, or ask the user to unlock those clips.';
+  }
+  const world = locked.some((c) => isLivePath(c.path))
+    ? _WORLD_FIELDS.filter((f) => _stable(existing[f] ?? null) !== _stable(next[f] ?? null))
+    : [];
+  if (world.length) {
+    return `changing ${world.join(', ')} would alter the live 3D of clips the user locked on the timeline. `
+      + 'Ask the user to unlock those clips, or to generate their video first.';
+  }
+  return null;
 }
 
 /**
@@ -403,7 +472,10 @@ export function applyStoryTimelineEdits(tl) {
   })();
   const scenes = new Map();
   const sceneOf = (sid) => {
-    if (!scenes.has(sid)) scenes.set(sid, { s: readScene(sid), touched: new Set() });
+    if (!scenes.has(sid)) {
+      const s = readScene(sid);
+      scenes.set(sid, { s, touched: new Set() });
+    }
     return scenes.get(sid);
   };
   const sbShots = new Map();
@@ -424,8 +496,8 @@ export function applyStoryTimelineEdits(tl) {
     shots.forEach((x, j) => { if (x.storyboardShotId) rank.set(x.storyboardShotId, i + j / 100); });
     const dur = Math.max(200 * shots.length, Math.round(c.durationMs));
     let start = sh.startMs;
-    if (isLivePath(c.path)) start = Math.round(c.sourceInMs || 0);
-    start = Math.max(0, Math.min(start, Math.max(0, (e.s.durationMs || start + dur) - dur)));
+    const live = isLivePath(c.path);
+    if (live) start = Math.round(c.sourceInMs || 0);
     // Joined on the timeline ("Delete Through Edit") — not a take the script
     // already glues: ONE shot from now on, with the first one's camera.
     const joined = shots.length > 1 && shots.slice(1).some((x) => sbShots.get(x.storyboardShotId)?.noCutBefore !== true);
@@ -486,7 +558,22 @@ export function applyStoryTimelineEdits(tl) {
   }
   if (removed.length) _writeLaid(tl.id, laid.keys.filter((k) => !removed.includes(k)));
   for (const [sid, e] of scenes) {
-    if (!e.s || !e.touched.size) continue;
+    if (!e.s) continue;
+    // The clips decide which stretch of the action each camera watches; the
+    // action itself is not touched. The saved clips follow.
+    for (const id of relayShots(e.s)) e.touched.add(id);
+    for (const c of clips) {
+      if (c.scene3d.sceneId !== sid) continue;
+      const ids = clipShotIds(c);
+      const first = e.s.shots.find((x) => x.id === ids[0]);
+      if (first && isLivePath(c.path)) c.sourceInMs = first.startMs;
+      for (const x of c.scene3d.shots || []) {
+        const sh = e.s.shots.find((y) => y.id === x.id);
+        if (sh) { x.startMs = sh.startMs; x.durationMs = sh.durationMs; }
+      }
+    }
+    if (!e.touched.size) continue;
+    e.s.durationMs = sceneDurationMs(e.s);
     // Built from the storyboard as it is NOW (the edit came from here).
     stampSources(e.s, e.touched);
     writeScene(e.s);

@@ -277,24 +277,9 @@ async function _addCamera(params) {
   if (!position || !target) return { success: false, error: 'scene3d_live: camera needs position and target.' };
   const lens = Number(cam.lens) || 35;
   const newId = `sh${Date.now().toString(36)}`;
-  // Room for the new shot: push what comes after the cut shot forward.
+  // The new shot's minimum length: the shots after it watch later moments.
   const grow = Math.max(0, NEW_CAM_MIN_MS - (end - at));
   const resized = new Map(); // storyboard shot id → new durationMs
-  if (grow) {
-    for (const x of next.shots || []) {
-      if (x === sh) continue;
-      const xs = x.startMs || 0, xe = xs + (x.durationMs || 3000);
-      if (xs >= end) x.startMs = xs + grow;
-      else if (xe > end) {
-        x.durationMs = xe - xs + grow; // coverage running across the cut
-        if (x.storyboardShotId) resized.set(x.storyboardShotId, x.durationMs);
-      }
-    }
-    for (const a of next.actions || []) {
-      if (typeof a.startMs === 'number' && a.startMs >= end) a.startMs += grow;
-      if (typeof a.endMs === 'number' && a.endMs > end) a.endMs += grow;
-    }
-  }
   sh.durationMs = at - start;
   const shot = {
     id: newId,

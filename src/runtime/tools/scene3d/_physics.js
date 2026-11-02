@@ -96,6 +96,8 @@ function _vehicleTracks(scene) {
 }
 
 /** @returns {string[]} one line per implausible motion (empty = all real). */
+const HELD_SHAPE = new Set(['turn', 'face', 'pose', 'lie', 'lie_down', 'sit', 'sit_down', 'stand', 'stand_up', 'get_up']);
+
 export function physicsWarnings(scene) {
   return _analyse(scene).warnings;
 }
@@ -148,6 +150,14 @@ function _analyse(scene) {
   };
 
   for (const { a, i } of acts) {
+    const kind = String(a.type || '').toLowerCase();
+    if (!a.character || !HELD_SHAPE.has(kind)) continue;
+    const fall = acts.find(({ a: b }) => ['tumble', 'impact'].includes(String(b.type || '').toLowerCase()) && b.character === a.character
+      && (b.startMs || 0) <= (a.startMs || 0) && (a.endMs ?? (a.startMs || 0) + 1500) <= (b.endMs ?? 0));
+    if (fall) out.push(`actions[${i}] (${kind} ${a.character}, ${_r((a.startMs || 0) / 1000)}s): inside the ${fall.a.type} at ${_r((fall.a.startMs || 0) / 1000)}s, so it is ignored. A falling body takes its orientation and shape from the fall: remove this action; end the ${fall.a.type} with pose:<how it rests>.`);
+  }
+
+  for (const { a, i } of acts) {
     const type = String(a.type || '').toLowerCase();
     const tag = `actions[${i}] (${type}${a.character ? ` ${a.character}` : a.prop ? ` ${a.prop}` : ''}, ${_r((a.startMs || 0) / 1000)}s)`;
     if (type === 'ride') { riding.add(a.character); continue; }
@@ -159,6 +169,23 @@ function _analyse(scene) {
     if (impact && s - impact.e > 400) {
       impacts.push(impact);
       pendingImpact.delete(a.character);
+    }
+    if (type === 'impact' && a.character) {
+      const r = a.simReport || {};
+      if (r.restsAt) where.set(a.character, r.restsAt);
+      pose.set(a.character, String(r.rest || 'lying'));
+      coasting.delete(a.character);
+      pendingImpact.delete(a.character);
+      if (r.error) {
+        out.push(`${tag}: the impact could not be simulated (${r.error}).`);
+      } else if (r.stopS != null) {
+        const slow = Math.max(1, Number(a.slowMotion) || 1);
+        motion.push(`${a.character} impact (simulated, ${r.contact} first) ${_r(s / 1000, 2)}-${_r(e / 1000, 2)} s${slow > 1 ? ` at slow motion x${slow}` : ''}: ${_r(r.speed)} m/s, ${_r(r.travelM)} m in ${_r(r.stopS, 2)} s of real time, ${_r(r.revLongAxis, 1)} turns along the body and ${_r(r.revHeadOverHeels, 1)} head over heels, rests ${r.rest} at [${r.restsAt}]`);
+        if (r.reached === false) out.push(`${tag}: from ${_r(r.speed)} m/s the body cannot rest at the requested spot: it stops ${_r(r.missM)} m away after ${r.runs} simulations. Change the destination or the speed, or stage what stops or carries it.`);
+        if (r.restMatches === false) out.push(`${tag}: this impact rests ${r.rest}, not ${a.restPose || 'flat on the surface'}, after ${r.runs} simulations. Change the contact or stage what turns the body.`);
+        if (r.peakRevS > 4) out.push(`${tag}: the body turns at ${_r(r.peakRevS)} rev/s at its peak: too fast to read as real. Lower the speed or change the contact.`);
+      }
+      continue;
     }
     if (type === 'tumble' && a.character) {
       const from = where.get(a.character);
@@ -320,7 +347,7 @@ function _analyse(scene) {
   }
   impacts.push(...pendingImpact.values());
   for (const h of impacts) {
-    out.push(`${h.tag}: ${h.who} lands at ${_r(h.v)} m/s${h.rel}, yet no tumble follows: a body that hits that hard does not just land. Follow it within 0.4 s with { type:"tumble", to, startMs, endMs } (at ~5 m/s² that is ~${_r(h.v * h.v / 10, 0)} m over ~${_r(h.v / 5)} s), or stage what stops it, and say so in the script.`);
+    out.push(`${h.tag}: ${h.who} lands at ${_r(h.v)} m/s${h.rel}, yet no reaction follows: a body that hits that hard does not just land. Follow it within 0.4 s with { type:"impact", contact, speed:${_r(h.v)}, startMs } (simulated; at ~5 m/s² about ~${_r(h.v * h.v / 10, 0)} m over ~${_r(h.v / 5)} s), or stage what stops it, and say so in the script.`);
   }
   const motionLines = motion.map((m) => {
     if (typeof m === 'string') return m;

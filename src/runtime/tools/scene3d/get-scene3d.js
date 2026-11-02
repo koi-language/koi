@@ -2,8 +2,9 @@
  * get_scene3d — read one 3D previz scene (full JSON), or list them.
  */
 
-import { readScene, listScenes, summarize, cleanId } from './_store.js';
+import { readScene, listScenes, summarize, cleanId, timingReport } from './_store.js';
 import { refreshPrevizFlags, previzDirective } from './_previz-sync.js';
+import { withoutSimFrames } from './_ragdoll.js';
 import { ensureStoryTimeline } from './_story-timeline.js';
 import os from 'os';
 import path from 'path';
@@ -54,6 +55,6 @@ export default {
     }
     const scene = readScene(id);
     if (!scene) return { success: false, error: `get_scene3d: no scene "${params.id}".` };
-    return { success: true, scene, summary: summarize(scene) };
+    return { success: true, scene: withoutSimFrames(scene), summary: summarize(scene), ...timingReport(scene) };
   },
 };

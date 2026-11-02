@@ -104,6 +104,8 @@ export default {
       const clips = ids.map((id) => tl.clips.find((c) => c.id === id));
       const missing = ids.filter((_, i) => !clips[i]);
       if (missing.length) throw new Error(`clips not on ${timelineId}: ${missing.join(', ')}`);
+      const locked = clips.filter((c) => c.locked === true).map((c) => c.id);
+      if (locked.length) throw new Error(`the user locked these clips: ${locked.join(', ')}`);
 
       const bins = await _bins();
       const { durationMs: takeMs, hasAudio } = await _probe(mediaPath, bins);

@@ -37,6 +37,8 @@
  *       "offsetX":       number? // visual transform — pan X (default 0)
  *       "offsetY":       number? // visual transform — pan Y (default 0)
  *       "scale":         number? // visual transform — uniform scale (default 1)
+ *       "locked":        bool?   // set by the user in the GUI: no engine write
+ *                                // may change or remove this clip (see _write)
  *
  *       // Optional transitions. transitionIn fires at startMs; transitionOut
  *       // fires at startMs+durationMs. When a same-track neighbour exists at
@@ -390,6 +392,7 @@ function _validateClip(c, settings) {
   // or stale key from an old project file doesn't accidentally
   // sneak through and pollute the canonical schema.
   const _passthrough = [
+    'locked',
     'aiState',
     'aiStartFrameClipId',
     'aiEndFrameClipId',
@@ -565,7 +568,56 @@ function _read(id) {
   }
 }
 
+/// What a locked clip must keep. `shotCuts` is cached analysis and `scene3d`
+/// only links the clip to its 3D shot: neither changes what the clip shows.
+function _lockSignature({ shotCuts: _s, scene3d: _d, ...rest }) {
+  return JSON.stringify(rest);
+}
+
+/// The single guard behind every engine write: the user's locked clips stay
+/// exactly as they are. Unlocking happens only in the GUI, which saves its file
+/// directly.
+function _assertLockedClipsIntact(state) {
+  let prev;
+  try {
+    const raw = _read(state.id);
+    if (!raw) return;
+    prev = _normalise(raw);
+  } catch {
+    return;
+  }
+  const next = new Map((state.clips || []).map((c) => [c.id, c]));
+  const broken = prev.clips
+    .filter((c) => c.locked === true)
+    .filter((c) => !next.has(c.id) || _lockSignature(next.get(c.id)) !== _lockSignature(c))
+    .map((c) => c.id);
+  if (broken.length) {
+    throw new Error(
+      `Clips locked by the user cannot be changed or removed: ${broken.join(', ')}. `
+      + 'Leave them as they are, or ask the user to unlock them on the timeline.',
+    );
+  }
+}
+
+/// Every clip the user locked, across the project's timelines.
+export function lockedClips() {
+  const dir = _dir();
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    try {
+      const tl = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      for (const clip of tl.clips || []) {
+        if (clip?.locked === true) out.push({ timelineId: f.slice(0, -5), clip });
+      }
+    } catch { /* unreadable timeline: nothing to protect */ }
+  }
+  return out;
+}
+
 function _write(state) {
+  _assertLockedClipsIntact(state);
   _ensureDir();
   // Preserve the file's existing location: if a row already lives in
   // the legacy project dir, keep writing there (avoids duplicating

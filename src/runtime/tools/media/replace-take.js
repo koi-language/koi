@@ -35,6 +35,7 @@
  * take was encoded with.
  */
 
+import { lockedClips } from '../../state/timelines.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -154,6 +155,9 @@ export default {
     if (!fs.existsSync(videoPath)) return { success: false, error: `Video not found: ${action.video}` };
     if (!_VIDEO_EXTS.has(path.extname(videoPath).toLowerCase())) {
       return { success: false, error: `replace_take: "video" must be a video file, got "${path.basename(videoPath)}"` };
+    }
+    if (op !== 'history' && lockedClips().some(({ clip }) => clip.path === videoPath)) {
+      return { success: false, error: 'replace_take: this video plays on a clip the user locked on the timeline. Ask the user to unlock it.' };
     }
 
     const dir = _takesDir(videoPath);
