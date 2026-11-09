@@ -5259,7 +5259,8 @@ export class Agent {
             const { docDir } = await import('../state/doc-root.js');
             const _tlPath = path.join(docDir('timelines'), `${_tlId}.json`);
             if (fs.existsSync(_tlPath)) {
-              const _tl = JSON.parse(fs.readFileSync(_tlPath, 'utf8'));
+              const { readDocJson } = await import('../state/project-paths.js');
+              const _tl = readDocJson(_tlPath);
               const _clip = (_tl.clips || []).find((c) => c.id === _clipId);
               if (_clip && typeof _clip.path === 'string' && _clip.path.startsWith('placeholder-')) {
                 channel.log(

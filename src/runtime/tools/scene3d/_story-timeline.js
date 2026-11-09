@@ -26,15 +26,16 @@ import { stampSources } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const _home = () => process.env.HOME || os.homedir();
 
 function _readJson(fp) {
-  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+  try { return readDocJson(fp); } catch { return null; }
 }
 
 function _writeJson(fp, obj) {
   const tmp = `${fp}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(tmp, stringifyDocJson(obj, fp) + '\n', 'utf8');
   fs.renameSync(tmp, fp);
 }
 

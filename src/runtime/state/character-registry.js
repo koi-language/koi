@@ -28,6 +28,7 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from './doc-root.js';
+import { readDocJson, stringifyDocJson } from './project-paths.js';
 /** Absolute path to the characters directory (`<project>/characters`). */
 export function charactersDir() {
   return path.join(docDir('characters'));
@@ -56,7 +57,7 @@ export function listCharacters() {
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.json')) continue;
       try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+        const raw = readDocJson(path.join(dir, f));
         if (raw && typeof raw === 'object' && typeof raw.id === 'string') out.push(raw);
       } catch { /* skip malformed file */ }
     }
@@ -71,7 +72,7 @@ export function readCharacter(id) {
   try {
     const file = characterPathFor(id);
     if (!fs.existsSync(file)) return null;
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const raw = readDocJson(file);
     if (raw && typeof raw === 'object' && typeof raw.id === 'string') return raw;
     return null;
   } catch {
@@ -89,7 +90,7 @@ export function saveCharacter(entry) {
   _ensureDir();
   const file = characterPathFor(entry.id);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n');
+  fs.writeFileSync(tmp, stringifyDocJson(entry, file) + '\n');
   fs.renameSync(tmp, file);
   return entry;
 }

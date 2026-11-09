@@ -13,11 +13,12 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const _file = () => path.join(docDir('scenes3d'), '.pending-takes.json');
 const _TTL_MS = 7 * 24 * 3600 * 1000;
 
 function _read() {
-  try { return JSON.parse(fs.readFileSync(_file(), 'utf8')) || {}; } catch { return {}; }
+  try { return readDocJson(_file()) || {}; } catch { return {}; }
 }
 
 function _write(all) {
@@ -25,7 +26,7 @@ function _write(all) {
   try {
     fs.mkdirSync(path.dirname(fp), { recursive: true });
     const tmp = `${fp}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(all), 'utf8');
+    fs.writeFileSync(tmp, stringifyDocJson(all, fp, 0), 'utf8');
     fs.renameSync(tmp, fp);
   } catch { /* best-effort */ }
 }

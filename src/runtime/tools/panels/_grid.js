@@ -634,6 +634,7 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 /** Grid hint from the sheet creation's metadata (metadata.grid), tolerant of
  *  nesting and a missing MediaLibrary. Anchors detection on sheets whose black
  *  regions swallow gutters (e.g. after delete_panel blackens cells). */
@@ -702,14 +703,14 @@ export function invalidateGeometryCache(sheet) {
 }
 
 export function readVersions(dir) {
-  try { return JSON.parse(fs.readFileSync(path.join(dir, 'versions.json'), 'utf8')); }
+  try { return readDocJson(path.join(dir, 'versions.json')); }
   catch { return { current: null, order: [] }; }
 }
 
 export function writeVersions(dir, state) {
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.versions-${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.writeFileSync(tmp, stringifyDocJson(state, path.join(dir, 'versions.json')));
   fs.renameSync(tmp, path.join(dir, 'versions.json'));
 }
 

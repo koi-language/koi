@@ -9,6 +9,7 @@ import { getBuiltinSlotMap } from '../prompt/builtin-slot-maps.js';
 import { channel } from '../io/channel.js';
 import * as memory from '../memory/index.js';
 import { listWorkflowsCatalog } from '../state/workflows-catalog.js';
+import { readDocJson, parseDocJson } from '../state/project-paths.js';
 import { isNonInteractive, isYoloMode } from '../util/interactivity.js';
 
 // ── Active-document kind classifier ─────────────────────────────────────────
@@ -532,7 +533,7 @@ export async function buildWorkingAreaBlock() {
         if (active.type === 'timeline' && active.path) {
           try {
             const _tlRaw = fs.readFileSync(active.path, 'utf8');
-            const _tlJson = JSON.parse(_tlRaw);
+            const _tlJson = parseDocJson(_tlRaw, active.path);
             const _clips = Array.isArray(_tlJson?.clips) ? _tlJson.clips : [];
             const _selId = typeof active.selectedClipId === 'string' ? active.selectedClipId : null;
             const _selClip = _selId ? _clips.find((c) => c?.id === _selId) : null;
@@ -603,7 +604,7 @@ export async function buildWorkingAreaBlock() {
           lines.push('');
           lines.push(`The storyboard is on its TIMELINE view: the 3D scenes (free camera, every shot camera in place) beside the montage timeline \`${active.montage.timelinePath}\` (one 3D shot per storyboard shot, in script order; trims / reorders there are written back to the storyboard automatically).`);
           try {
-            const _tl = JSON.parse(fs.readFileSync(active.montage.timelinePath, 'utf8'));
+            const _tl = readDocJson(active.montage.timelinePath);
             const _sel = typeof active.montage.selectedClipId === 'string'
               ? (_tl.clips || []).find((c) => c?.id === active.montage.selectedClipId) : null;
             if (_sel?.scene3d) {
@@ -941,7 +942,7 @@ saveTo: "${saveDir}"`);
         if (active.type === 'timeline' && typeof active.selectedClipId === 'string') {
           try {
             const _tlRaw = fs.readFileSync(active.path, 'utf8');
-            const _tlJson = JSON.parse(_tlRaw);
+            const _tlJson = parseDocJson(_tlRaw, active.path);
             const _clip = Array.isArray(_tlJson?.clips)
               ? _tlJson.clips.find((c) => c?.id === active.selectedClipId)
               : null;

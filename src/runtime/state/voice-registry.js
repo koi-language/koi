@@ -27,6 +27,7 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from './doc-root.js';
+import { readDocJson, stringifyDocJson } from './project-paths.js';
 function _voicesDir() {
   return path.join(docDir('voices'));
 }
@@ -48,7 +49,7 @@ export function listVoices() {
   try {
     const file = _voicesJson();
     if (!fs.existsSync(file)) return [];
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const raw = readDocJson(file);
     if (!Array.isArray(raw)) return [];
     return raw.filter((e) => e && typeof e === 'object' && typeof e.id === 'string');
   } catch {
@@ -99,7 +100,7 @@ export function saveVoice(entry) {
   if (idx >= 0) all[idx] = entry; else all.push(entry);
   const file = _voicesJson();
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2));
+  fs.writeFileSync(tmp, stringifyDocJson(all, file));
   fs.renameSync(tmp, file);
   // Mirror into the media library (single source of truth for the GUI
   // drawer / strip). The voice's `samplePath` IS the row's filePath —
@@ -121,7 +122,7 @@ export function deleteVoice(id) {
   _ensureDir();
   const file = _voicesJson();
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.writeFileSync(tmp, stringifyDocJson(next, file));
   fs.renameSync(tmp, file);
   // Best-effort removal of the matching media-library row.
   if (removed?.samplePath) {

@@ -35,6 +35,7 @@ import { notePendingTake } from './_pending-takes.js';
 import { readModel } from './_models.js';
 import { clipShotIds } from './_story-timeline.js';
 import { physicsReport } from './_physics.js';
+import { readDocJson } from '../../state/project-paths.js';
 
 /** The model 3D clips are generated with (user decision: Seedance 2.5). */
 export const SCENE3D_VIDEO_MODEL = 'bytedance/seedance-2.5/us/reference-to-video';
@@ -50,7 +51,7 @@ const _IMG = /\.(png|jpe?g|webp)$/i;
 const _file = (p) => typeof p === 'string' && path.isAbsolute(p) && _IMG.test(p) && fs.existsSync(p);
 
 function _readJson(fp) {
-  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+  try { return readDocJson(fp); } catch { return null; }
 }
 
 /** Scene-clock ms where the clip's window starts, whichever side it shows. */

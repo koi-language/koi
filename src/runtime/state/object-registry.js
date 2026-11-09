@@ -47,6 +47,7 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from './doc-root.js';
+import { readDocJson, stringifyDocJson } from './project-paths.js';
 /** Absolute path to the objects directory (`<project>/objects`). */
 export function objectsDir() {
   return path.join(docDir('objects'));
@@ -154,7 +155,7 @@ export function listObjects() {
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.json')) continue;
       try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+        const raw = readDocJson(path.join(dir, f));
         if (raw && typeof raw === 'object' && typeof raw.id === 'string') out.push(raw);
       } catch { /* skip malformed file */ }
     }
@@ -169,7 +170,7 @@ export function readObject(id) {
   try {
     const file = objectPathFor(path.basename(String(id || '')));
     if (!fs.existsSync(file)) return null;
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const raw = readDocJson(file);
     if (raw && typeof raw === 'object' && typeof raw.id === 'string') return raw;
     return null;
   } catch {
@@ -186,7 +187,7 @@ export function saveObject(entry) {
   _ensureDir();
   const file = objectPathFor(entry.id);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n');
+  fs.writeFileSync(tmp, stringifyDocJson(entry, file) + '\n');
   fs.renameSync(tmp, file);
   return entry;
 }

@@ -475,7 +475,7 @@ const generateImageAction = {
       let _sb = null;
       try {
         if (fs.existsSync(_sbPath)) {
-          _sb = JSON.parse(fs.readFileSync(_sbPath, 'utf8'));
+          _sb = readDocJson(_sbPath);
         } else {
           channel.log('image',
             `Storyboard auto-attach skipped: ${_sbPath} does not exist on disk.`);
@@ -1741,6 +1741,7 @@ import asyncCapable from '../_async-capable.js';
 import { formatModelCatalog } from './_format-model-catalog.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson } from '../../state/project-paths.js';
 // Wrap FIRST so the catalog refresh below mutates the registered object —
 // asyncCapable spreads a fresh schema/description, so any in-place edit
 // to the source `generateImageAction` would land on a copy nobody reads.

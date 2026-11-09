@@ -32,6 +32,7 @@ import { channel } from '../../io/channel.js';
 import { saveStoryboardEntry } from '../../state/media-library.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { parseDocJson, stringifyDocJson } from '../../state/project-paths.js';
 // TWO LAYERS per shot: `script` is the screenplay the user reads and edits
 // (plain prose, no numbers); `action` + the cinematography fields are the
 // hidden technical layer. `scriptOf` records which `script` that layer was
@@ -736,7 +737,7 @@ export default {
       if (fs.existsSync(filePath)) {
         existed = true;
         const raw = fs.readFileSync(filePath, 'utf8');
-        try { existing = JSON.parse(raw); } catch { /* corrupted prior file — overwrite */ }
+        try { existing = parseDocJson(raw, filePath); } catch { /* corrupted prior file — overwrite */ }
       }
     } catch { /* ignore — fall through to write */ }
 
@@ -856,7 +857,7 @@ export default {
     }
 
     const normalized = _normalize(sb, existing);
-    const serialized = JSON.stringify(normalized, null, 2) + '\n';
+    const serialized = stringifyDocJson(normalized, filePath) + '\n';
 
     try {
       fs.mkdirSync(dir, { recursive: true });

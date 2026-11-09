@@ -49,6 +49,7 @@ import { getTimeline, lockedClips, updateTimeline } from '../../state/timelines.
 import { channel } from '../../io/channel.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const ASPECTS = {
   '16:9': [960, 540], '9:16': [540, 960], '1:1': [720, 720], '4:5': [720, 900],
   '4:3': [960, 720], '3:4': [720, 960], '21:9': [1120, 480], '2.39:1': [1148, 480],
@@ -84,14 +85,14 @@ export function newSceneId() {
 function _atomicWrite(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.writeFileSync(tmp, stringifyDocJson(obj, file), 'utf8');
   fs.renameSync(tmp, file);
 }
 
 export function readScene(id) {
   const fp = scenePath(cleanId(id));
   if (!fs.existsSync(fp)) return null;
-  const scene = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  const scene = readDocJson(fp);
   scene.style = 'lit'; // single look
   return scene;
 }
@@ -121,14 +122,18 @@ export function writeScene(scene) {
   return scene;
 }
 
-export function listScenes() {
+/** The project's 3D scenes. A card's preview scene (the 3D view of a
+ *  location / object card, `cardPreview`) is internal: listed only with
+ *  `{ previews: true }`. */
+export function listScenes({ previews = false } = {}) {
   const dir = scenesDir();
   if (!fs.existsSync(dir)) return [];
   const out = [];
   for (const f of fs.readdirSync(dir)) {
     if (!f.endsWith('.json')) continue;
     try {
-      const s = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      const s = readDocJson(path.join(dir, f));
+      if (s.cardPreview && !previews) continue;
       out.push({
         id: s.id,
         name: s.name,
@@ -665,7 +670,7 @@ function _gc(scene) {
   // have reloaded the new paths yet).
   if (scene.storyboard?.id) {
     try {
-      const sb = JSON.parse(fs.readFileSync(storyboardPath(scene.storyboard.id), 'utf8'));
+      const sb = readDocJson(storyboardPath(scene.storyboard.id));
       for (const sc of sb.scenes || []) {
         for (const sh of sc.shots || []) {
           for (const k of ['video', 'poster']) {
@@ -707,7 +712,7 @@ export async function syncLinks(scene) {
     const fp = storyboardPath(sbId);
     try {
       if (fs.existsSync(fp)) {
-        const sb = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        const sb = readDocJson(fp);
         const byShot = new Map();
         for (const sh of scene.shots || []) if (sh.storyboardShotId) byShot.set(sh.storyboardShotId, sh);
         let changed = false;
@@ -833,7 +838,7 @@ export function stampScene3dRender(timelineId, clipId, mediaPath) {
 export function storyOrder(scene) {
   if (!scene.storyboard?.id) return [];
   try {
-    const sb = JSON.parse(fs.readFileSync(storyboardPath(scene.storyboard.id), 'utf8'));
+    const sb = readDocJson(storyboardPath(scene.storyboard.id));
     return (sb.scenes || []).flatMap((sc) => (sc.shots || []).map((sh) => sh.id));
   } catch { return []; }
 }
@@ -862,7 +867,7 @@ export function buildReview(scene, shotIds) {
   let sbShots = new Map();
   if (scene.storyboard?.id) {
     try {
-      const sb = JSON.parse(fs.readFileSync(storyboardPath(scene.storyboard.id), 'utf8'));
+      const sb = readDocJson(storyboardPath(scene.storyboard.id));
       for (const sc of sb.scenes || []) for (const sh of sc.shots || []) sbShots.set(sh.id, sh);
     } catch { sbShots = new Map(); }
   }

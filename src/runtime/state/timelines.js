@@ -72,6 +72,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { docDir } from './doc-root.js';
+import { readDocJson, stringifyDocJson } from './project-paths.js';
 const SCHEMA_VERSION = 2;
 
 // ── Filesystem helpers ───────────────────────────────────────────────
@@ -562,7 +563,7 @@ function _read(id) {
   const fp = _findExistingFile(id);
   if (fp == null) return null;
   try {
-    return JSON.parse(fs.readFileSync(fp, 'utf8'));
+    return readDocJson(fp);
   } catch (e) {
     throw new Error(`Failed to parse timeline ${id}: ${e.message}`);
   }
@@ -607,7 +608,7 @@ export function lockedClips() {
   const out = [];
   for (const f of files) {
     try {
-      const tl = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      const tl = readDocJson(path.join(dir, f));
       for (const clip of tl.clips || []) {
         if (clip?.locked === true) out.push({ timelineId: f.slice(0, -5), clip });
       }
@@ -635,7 +636,7 @@ function _write(state) {
   // Atomic replace: write to .tmp then rename so a crashed write
   // never leaves a half-flushed JSON file behind.
   const tmp = `${fp}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.writeFileSync(tmp, stringifyDocJson(state, fp));
   fs.renameSync(tmp, fp);
   // Mirror the timeline into the media-library. The library is the
   // single source of truth for the GUI's drawer / creations strip,

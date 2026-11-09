@@ -26,6 +26,7 @@ import { saveLocationEntry } from '../../state/media-library.js';
 import { slugifyLocationId, locationViews } from '../../state/location-registry.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { parseDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_location: ${msg}` }; }
@@ -172,6 +173,13 @@ function _normalize(loc, existing) {
     // preserved so old docs round-trip without dropping the fields).
     plateCells: Array.isArray(loc.plateCells) ? loc.plateCells : null,
     layout: (loc.layout && typeof loc.layout === 'object' && !Array.isArray(loc.layout)) ? loc.layout : null,
+    // The set's 3D model (a build_model3d id): every previz scene in this
+    // place uses it.
+    // Omitted = keep the card's (a GUI edit must not drop the agent's model);
+    // null clears it.
+    model: loc.model === undefined
+      ? (existing?.model ?? null)
+      : ((_isStr(loc.model) && loc.model.trim()) ? loc.model.trim() : null),
     createdAt,
     updatedAt: now,
   };
@@ -185,12 +193,13 @@ export default {
     'Write a reusable LOCATION / set entity to <project>/locations/<id>.json with STRUCTURED args (the location as an OBJECT, not a JSON string). ' +
     'A location is a persisted, reusable place (a dining room, a warehouse, a beach…) the user references across storyboards and video prompts. A scene = its characters + its location; both are first-class reusable identity anchors (a character has a turnaround sheet; a location has an establishing PLATE). ' +
     'Use for BOTH creating new locations and updating existing ones — same call shape; the tool detects which and preserves createdAt across edits. ' +
-    'Call shape: { location: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, views? } }. ' +
+    'Call shape: { location: { id?, name, handle?, description?, locationType?, timeOfDay?, palette?, lighting?, tags?, photos?, views?, model? } }. ' +
     'location.locationType is a short canonical string ("interior" / "exterior" / "mixed"); location.timeOfDay (e.g. "night", "golden hour"), location.palette (color/mood note) and location.lighting (the set\'s default light) are optional strings; location.tags an optional string array. ' +
     'Required: location.name (non-empty). location.id is OPTIONAL — a kebab-case slug that MUST match the on-disk filename; when omitted it is derived from the name. ' +
     'location.handle is the BARE @mention WITHOUT the leading "@" (e.g. "comedor") — when set together with at least one photo, the first photo is registered under `@handle` so `@handle` resolves in prompts. ' +
     'location.description is what the place looks like. location.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, bytes never copied; photos[0] is the hero image. ' +
     'location.views is the list of establishing views, [{ id, label, path }]: labels are free text owned by the user, and there are no fixed angles. They are usually added by generate_location_plate, not by hand. location.plate is READ-ONLY, derived from the first view with an image. ' +
+    'location.model is the set\'s 3D model (a build_model3d id, normally attached by build_model3d with locationId): every 3D previz scene in this place uses it. ' +
     'location.details is an OPTIONAL array of ABSOLUTE paths to close-up / detail shots of the place (pointers only) — distinct from location.photos, which are the INPUT reference photos that DEFINE the location. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, location:<normalized> } on success, or { success:false, error } with the exact invalid field on failure.',
@@ -241,7 +250,7 @@ export default {
       if (fs.existsSync(filePath)) {
         existed = true;
         const raw = fs.readFileSync(filePath, 'utf8');
-        try { existing = JSON.parse(raw); } catch { /* corrupted prior file — overwrite */ }
+        try { existing = parseDocJson(raw, filePath); } catch { /* corrupted prior file — overwrite */ }
       }
     } catch { /* ignore */ }
 
@@ -267,7 +276,7 @@ export default {
     }
 
     const normalized = _normalize(loc, existing);
-    const serialized = JSON.stringify(normalized, null, 2) + '\n';
+    const serialized = stringifyDocJson(normalized, filePath) + '\n';
 
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -314,6 +323,12 @@ export default {
       const { previzForLocation } = await import('../scene3d/_previz-sync.js');
       previz3d = previzForLocation(normalized.id);
     } catch { /* advisory */ }
+    // Its 3D model is the one every previz scene uses: a new / changed
+    // model reaches them now.
+    try {
+      const { syncCardModels } = await import('../scene3d/_card-models.js');
+      syncCardModels();
+    } catch { /* best effort */ }
     return {
       ...(previz3d.length ? { previz3d } : {}),
       success: true,

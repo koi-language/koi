@@ -27,6 +27,7 @@ import { saveObjectEntry } from '../../state/media-library.js';
 import { slugifyObjectId } from '../../state/object-registry.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { parseDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 // Detail ids: kebab-case or camelCase (letters, digits, hyphens).
 const _DETAIL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
@@ -242,7 +243,11 @@ function _normalize(obj, existing) {
     sheet: (_isStr(obj.sheet) && obj.sheet.trim()) ? obj.sheet.trim() : null,
     sheetCells: _normSheetCells(obj.sheetCells),
     // The object's 3D model (a build_model3d id), reused by the previz.
-    model: (_isStr(obj.model) && obj.model.trim()) ? obj.model.trim() : null,
+    // Omitted = keep the card's (a GUI edit must not drop the agent's model);
+    // null clears it.
+    model: obj.model === undefined
+      ? (existing?.model ?? null)
+      : ((_isStr(obj.model) && obj.model.trim()) ? obj.model.trim() : null),
     createdAt,
     updatedAt: now,
   };
@@ -314,7 +319,7 @@ export default {
       if (fs.existsSync(filePath)) {
         existed = true;
         const raw = fs.readFileSync(filePath, 'utf8');
-        try { existing = JSON.parse(raw); } catch { /* corrupted prior file: overwrite */ }
+        try { existing = parseDocJson(raw, filePath); } catch { /* corrupted prior file: overwrite */ }
       }
     } catch { /* ignore */ }
 
@@ -340,7 +345,7 @@ export default {
     }
 
     const normalized = _normalize(obj, existing);
-    const serialized = JSON.stringify(normalized, null, 2) + '\n';
+    const serialized = stringifyDocJson(normalized, filePath) + '\n';
 
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -388,6 +393,12 @@ export default {
       const { previzForObject } = await import('../scene3d/_previz-sync.js');
       previz3d = previzForObject(normalized.id);
     } catch { /* advisory */ }
+    // Its 3D model is the one every previz scene uses: a new / changed
+    // model reaches them now.
+    try {
+      const { syncCardModels } = await import('../scene3d/_card-models.js');
+      syncCardModels();
+    } catch { /* best effort */ }
     return {
       ...(previz3d.length ? { previz3d } : {}),
       success: true,

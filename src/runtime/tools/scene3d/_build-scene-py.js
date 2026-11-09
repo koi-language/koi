@@ -194,7 +194,9 @@ def material(name, color="#b8b8b8", rough=0.65, emission=None, cull=False, image
     if STYLE == "sketch" and image is None and emission is None:
         color = "#f4f1ea"
     bsdf.inputs["Base Color"].default_value = hex_rgba(color)
-    bsdf.inputs["Roughness"].default_value = rough
+    # Matte, always: a highlight slides over the surface as the camera moves.
+    bsdf.inputs["Roughness"].default_value = 1.0
+    bsdf.inputs["Specular IOR Level"].default_value = 0.0
     if image:
         try:
             img = bpy.data.images.load(image, check_existing=True)
@@ -268,6 +270,13 @@ def _unit_mesh(kind, taper=None):
                 t = max(0.0, -z)
                 tp = 1.0 - 0.28 * t
                 v.co = Vector((x * tp, y * tp + 0.22 * t, z))
+    elif kind == "capsule":  # pill, unit size; taper = length / diameter
+        aspect = max(1.0, float(taper) if taper is not None else 2.0)
+        bmesh.ops.create_uvsphere(bm, u_segments=20, v_segments=12, radius=0.5)
+        half = (aspect - 1.0) / 2.0
+        for v in bm.verts:  # pull the hemispheres apart, then back to unit height
+            z = v.co.z + (half if v.co.z > 1e-6 else -half if v.co.z < -1e-6 else 0.0)
+            v.co.z = z / aspect
     elif kind == "cone":
         bmesh.ops.create_cone(bm, cap_ends=True, segments=16, radius1=0.5, radius2=0.0, depth=1.0)
     else:  # cylinder (optionally tapered)
@@ -404,6 +413,16 @@ def import_model(ref, name, parent=None):
                 b_ = m_.node_tree.nodes.get("Principled BSDF")
                 if b_:
                     m_.diffuse_color = tuple(b_.inputs["Base Color"].default_value)
+                    # A photo crop (poster, picture): its average colour.
+                    for l_ in b_.inputs["Base Color"].links:
+                        im_ = getattr(l_.from_node, "image", None)
+                        if im_ is not None and im_.size[0] > 0:
+                            try:
+                                import numpy as np
+                                a_ = np.array(im_.pixels[:], dtype=np.float32).reshape(-1, 4)[::97, :3].mean(axis=0)
+                                m_.diffuse_color = (float(a_[0]), float(a_[1]), float(a_[2]), 1.0)
+                            except Exception:
+                                pass
     bpy.context.view_layer.update()
     mn = Vector((1e9, 1e9, 1e9))
     mx = Vector((-1e9, -1e9, -1e9))
@@ -1026,41 +1045,44 @@ def build_character(c, idx):
 
 
 def build_block_figure(c, idx):
-    """Abstract BLOCK FIGURE (default look): a faceted head, a slab trunk,
-    block arms and legs. It shows WHERE someone is, where they go, which way
-    they face and the exact BODY POSE of the moment (POSES), held still and
-    switched in one step. It never performs: no walk cycle, no crouch before a
-    jump, no gesture or strike, because the video model copies any limb motion
-    it sees. Arms move only to hold, take or hand over an object."""
+    """Abstract RIGID FIGURE (default look, user rule): a faceted head with
+    two eyes on a body that is ONE round column, a touch wider at the top
+    than at the foot. No arms, no legs, nothing bends: it shows WHERE someone
+    is, where they go and which way they look (the eyes), and a pose only
+    tilts / lowers the whole column (sitting sinks it into the seat, lying
+    lays it down). The body is a short pill with round ends that stops well
+    above the ground (the figure floats a little): a long floor-to-neck
+    column read as a post, not a person. The video model copies any limb motion it sees, so there
+    are no limbs to copy. The shoulder / elbow / hip / knee pivots stay as
+    bare empties: held props still hang where the hand would be."""
     cid = c.get("id") or f"char{idx}"
     h = float(c.get("height") or 1.75)
     k = h / 1.75
     tint = c.get("color") or CHAR_PALETTE[idx % len(CHAR_PALETTE)]
     clay = material(f"clay_{cid}", _mix_hex("#d2d0cc", tint, 0.38), 0.6)
+    dark = material("figure_dark", "#17171a", 0.7)
     K = lambda *v: tuple(x * k for x in v)
     root = empty(f"char_{cid}", v3(c.get("position")))
     hips = empty(f"{cid}_hips", K(0, 0, 0.95), root)
-    instance("box", f"{cid}_torso", K(0, 0, 1.215), K(0.36, 0.2, 0.53), clay, hips)
+    # The body: a pill from 0.62 m up to the neck, radius 0.17, round ends.
+    body_r, body_lo, body_hi = 0.17, 0.62, 1.49
+    body_len = body_hi - body_lo
+    instance("capsule", f"{cid}_torso", K(0, 0, (body_lo + body_hi) / 2), K(body_r * 2, body_r * 2, body_len), clay,
+             hips, taper=round(body_len / (body_r * 2), 3))
+    # Where the feet would be: the floor contact (_lowest_z) of a figure
+    # whose body floats, so standing / falling still lands it on the ground.
+    foot = empty(f"{cid}_foot", K(0, 0, 0), hips)
     instance("facet", f"{cid}_head", K(0, 0.01, 1.625), K(0.105, 0.105, 0.115), clay, hips)
-    # Front and back must read at a glance, also lying down: eyes and a pale
-    # chest in front, a dark back behind, feet pointing forward.
-    dark, pale = material("figure_dark", "#17171a", 0.7), material("figure_pale", "#f2efe8", 0.7)
-    instance("box", f"{cid}_chestmark", K(0, 0.104, 1.27), K(0.28, 0.012, 0.32), pale, hips)
-    instance("box", f"{cid}_backmark", K(0, -0.104, 1.215), K(0.3, 0.012, 0.46), dark, hips)
     neck = empty(f"{cid}_neck", K(0, 0, 1.49), hips)
-    parts = {"root": root, "hips": hips, "neck": neck}
+    parts = {"root": root, "hips": hips, "neck": neck, "foot": foot}
     for side, sx in (("L", -1), ("R", 1)):
-        x = sx * 0.225 * k
+        # The eyes: which way the figure looks, read at a glance.
         instance("box", f"{cid}_eye{side}", K(sx * 0.04, 0.108, 1.645), K(0.04, 0.02, 0.035), dark, hips)
+        x = sx * 0.225 * k
         sh = empty(f"{cid}_shoulder{side}", (x, 0, 1.45 * k), hips)
         el = empty(f"{cid}_elbow{side}", (x, 0, 1.11 * k), sh)
-        instance("box", f"{cid}_upperarm{side}", (x, 0, 1.28 * k), K(0.09, 0.1, 0.34), clay, sh)
-        instance("box", f"{cid}_forearm{side}", (x, 0, 0.94 * k), K(0.08, 0.09, 0.34), clay, el)
         hp = empty(f"{cid}_hip{side}", (sx * 0.09 * k, 0, 0.95 * k), hips)
         kn = empty(f"{cid}_knee{side}", (sx * 0.09 * k, 0, 0.5 * k), hp)
-        instance("box", f"{cid}_thigh{side}", (sx * 0.09 * k, 0, 0.725 * k), K(0.15, 0.18, 0.45), clay, hp)
-        instance("box", f"{cid}_shin{side}", (sx * 0.09 * k, 0, 0.25 * k), K(0.15, 0.18, 0.5), clay, kn)
-        instance("box", f"{cid}_toe{side}", (sx * 0.09 * k, 0.15 * k, 0.04 * k), K(0.15, 0.13, 0.08), dark, kn)
         parts.update({f"shoulder{side}": sh, f"elbow{side}": el, f"hip{side}": hp, f"knee{side}": kn})
     parts.update(height=h, k=k, idx=idx, id=cid, mask=MASK_PALETTE[idx % len(MASK_PALETTE)], rigid=True,
                  meshes=[o for o in bpy.data.objects if o.type == "MESH" and o.name.startswith(f"{cid}_")])
@@ -1070,8 +1092,9 @@ def build_block_figure(c, idx):
 
 CHARACTER_STYLE = (S.get("characterStyle") or "block").lower()
 for i, c in enumerate(S.get("characters") or []):
-    # Always the rigid figure (user rule): any limb on screen gets copied by
-    # the video model. The articulated mannequin stays only for reference.
+    # Always the rigid figure (user rule): head + one rigid column, no limbs;
+    # any limb on screen gets copied by the video model. The articulated
+    # mannequin stays only for reference.
     build_block_figure(c, i)
 
 
@@ -1176,6 +1199,11 @@ POSE_ALIASES = {
 }
 
 
+# A rigid figure has no legs to fold: on the ground poses the whole column
+# sinks (hips height, metres for 1.75 m) so the head sits where it really is.
+RIGID_SINK = {"kneeling": 0.58, "kneeling_both": 0.53, "crouching": 0.4, "sitting_ground": 0.25}
+
+
 def _pose_name(p):
     p = str(p or "standing").lower().strip().replace(" ", "_").replace("-", "_")
     p = POSE_ALIASES.get(p, p)
@@ -1199,6 +1227,10 @@ def _lowest_z(ch):
         for corner in ob.bound_box:
             z = (m @ Vector(corner)).z
             low = z if low is None or z < low else low
+    foot = ch.get("foot")
+    if foot is not None:  # a floating body: the feet it doesn't draw touch down
+        z = (_local_chain(foot, root) @ Vector((0, 0, 0))).z
+        low = z if low is None or z < low else low
     return low or 0.0
 
 
@@ -1220,7 +1252,9 @@ def _set_pose(ch, pose, side=None):
         for joint, rest in (("hip", (0, 0, 0)), ("knee", (0, 0, 0)), ("shoulder", (0, 0, 0)), ("elbow", (6, 0, 0))):
             v = per.get(joint, P.get(joint, rest))
             ch[f"{joint}{s}"].rotation_euler = (R(v[0]), R(v[1]) * mirror, R(v[2]) * mirror)
-    if "seat" not in P:
+    if ch.get("rigid") and name in RIGID_SINK:
+        hips.location.z = RIGID_SINK[name] * k
+    elif "seat" not in P:
         hips.location.z += -_lowest_z(ch)
     ch["pose"] = name
 
@@ -2394,7 +2428,10 @@ def eevee_clean(live=False):
     viewport never gets), temporal reprojection on, soft shadows by FILTERING.
     Reads as a clean, softly lit 3D scene at real-time rates."""
     e = scn.eevee
+    # No view-dependent shading at all (screen-space AO = patches that move
+    # with the camera).
     for attr, val in (("use_shadow_jitter_viewport", False), ("use_fast_gi", False), ("use_raytracing", False),
+                      ("use_gtao", False),
                       ("use_bokeh_jittered", False), ("use_taa_reprojection", True), ("use_shadows", True),
                       ("shadow_ray_count", 1), ("shadow_step_count", 16), ("shadow_resolution_scale", 1.0),
                       ("clamp_surface_indirect", 10.0), ("gi_diffuse_bounces", 2)):
@@ -2458,7 +2495,8 @@ def eevee_clean(live=False):
 
 def workbench_studio():
     """The clean "Blender previz" look: Solid/Workbench with studio light,
-    specular highlights, cavity edges, soft shadows that the room shell
+    no specular highlights (they swim across surfaces as the camera moves),
+    cavity edges, soft shadows that the room shell
     (walls / ceiling) does NOT cast, light true colours. Real-time fast."""
     set_engine("BLENDER_WORKBENCH")
     sh = scn.display.shading
@@ -2469,7 +2507,7 @@ def workbench_studio():
         pass
     sh.color_type = "MATERIAL"
     sh.show_backface_culling = True
-    sh.show_specular_highlight = True
+    sh.show_specular_highlight = False
     sh.show_shadows = True
     sh.shadow_intensity = 0.25
     sh.show_cavity = True
@@ -2526,6 +2564,27 @@ def override_material(mat):
             slot.link = "OBJECT"
             slot.material = mat
 
+
+# Everything matte: highlights slide over the surfaces whenever the camera
+# moves and read as flicker. Covers imported / built models too.
+for m_ in bpy.data.materials:
+    try:
+        m_.roughness, m_.metallic, m_.specular_intensity = 1.0, 0.0, 0.0
+        b_ = m_.node_tree.nodes.get("Principled BSDF") if m_.use_nodes else None
+        if b_:
+            b_.inputs["Roughness"].default_value = 1.0
+            b_.inputs["Metallic"].default_value = 0.0
+            for k_ in ("Specular IOR Level", "Specular", "Coat Weight", "Sheen Weight"):
+                if k_ in b_.inputs:
+                    b_.inputs[k_].default_value = 0.0
+    except Exception:
+        pass
+# Lights give no highlights either.
+for ld_ in bpy.data.lights:
+    try:
+        ld_.specular_factor = 0.0
+    except Exception:
+        pass
 
 if PASS == "depth":
     # View-space distance → white (near) … black (far), the convention
@@ -2783,6 +2842,11 @@ if args.live:
             hs = LIVE["home_side"] = ((S.get("id"), DUR_MS), side)
         scn.frame_set(keep)
         if not pts:
+            # No cast (a card's 3D view): frame what the set holds — a
+            # single object fills the view, a room shows whole.
+            for _ob, lo_, hi_ in _stage_boxes():
+                pts += [lo_.copy(), hi_.copy()]
+        if not pts:
             pts = [Vector((-3, -3, 0)), Vector((3, 3, 1.8))]
         lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
         hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
@@ -2798,12 +2862,12 @@ if args.live:
         tan_v = tan_h * 0.7               # the panel is about 10:7
         # Distance at which every point fits, measured in the view itself
         # (a point nearer the lens needs more room than the centre).
-        dist = 3.0
+        dist = 3.0 if who else 0.3
         for p in pts:
             q = p - c
             along = q.dot(d)
             dist = max(dist, abs(q.dot(right)) / tan_h + along, abs(q.dot(up)) / tan_v + along)
-        dist = dist * 1.25 + 0.8          # a little air around the cast
+        dist = dist * 1.25 + (0.8 if who else 0.05)  # a little air around it
         return c + d * dist, c, lens
 
     def _stage_boxes():
@@ -2845,6 +2909,23 @@ if args.live:
                 under = under or m[2] < lo.z
         return on_top, under
 
+    def _view_inside(pos):
+        """Is the stage view inside the set's walls? The box the wall slabs
+        enclose (procedural or modeled), below their top."""
+        if "walls_box" not in LIVE:
+            box = None
+            for _ob, lo, hi in _stage_boxes():
+                d = hi - lo
+                if d.z >= 2.2 and ((d.x <= 1.2 and d.y >= 3.0) or (d.y <= 1.2 and d.x >= 3.0)):
+                    box = (lo.copy(), hi.copy()) if box is None else (
+                        Vector((min(box[0].x, lo.x), min(box[0].y, lo.y), min(box[0].z, lo.z))),
+                        Vector((max(box[1].x, hi.x), max(box[1].y, hi.y), max(box[1].z, hi.z))))
+            if box is None and set_kind == "room":
+                box = (Vector((-W / 2, -D / 2, 0.0)), Vector((W / 2, D / 2, H)))
+            LIVE["walls_box"] = box
+        box = LIVE["walls_box"]
+        return box is not None and box[0].x < pos.x < box[1].x and box[0].y < pos.y < box[1].y and pos.z < box[1].z
+
     def _stage_cutaway(on):
         """Dollhouse cut: hide the walls between the stage camera and the set
         and whatever roofs it from above (awnings, ceilings) — never in a shot."""
@@ -2853,6 +2934,11 @@ if args.live:
             return
         LIVE.pop("cut_dirty", None)
         want = set()
+        if on and LIVE["stage_view"] and _view_inside(LIVE["stage_view"]["pos"]):
+            # Standing in the room: it is seen as it is, every wall in place.
+            LIVE["cut_want"] = set()
+            _apply_cut(set())
+            return
         if on and LIVE["stage_view"]:
             pos, tgt = LIVE["stage_view"]["pos"], LIVE["stage_view"]["tgt"]
             for ob, lo, hi in _stage_boxes():

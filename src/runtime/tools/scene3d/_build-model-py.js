@@ -94,6 +94,59 @@ def pbr(name, color="#888888", rough=0.5, metal=0.0, coat=0.0, transmission=0.0,
     return m
 
 
+_PHOTOS = {}
+
+
+def photo_material(name, photo, corners, size=512):
+    """A material that shows a piece of a reference photo — for flat printed
+    things (a poster, a framed picture, a screen, a rug's pattern, a book
+    cover). corners: the thing's four corners in the photo, 0..1 with y
+    DOWN, in order top-left, top-right, bottom-right, bottom-left: the crop
+    is un-warped to a straight rectangle, so a poster seen at an angle comes
+    out flat. Put it on a plane (primitive_plane_add: UVs 0..1) sized and
+    turned like the real thing. The image travels inside the model."""
+    import numpy as np
+    if photo not in _PHOTOS:
+        src = bpy.data.images.load(photo, check_existing=True)
+        w_, h_ = src.size
+        px = np.array(src.pixels[:], dtype=np.float32).reshape(h_, w_, 4)[::-1]  # rows top-down
+        _PHOTOS[photo] = px
+    px = _PHOTOS[photo]
+    H_, W_ = px.shape[:2]
+    pts = [(float(x) * (W_ - 1), float(y) * (H_ - 1)) for x, y in corners]
+    # Homography from the unit square to the four photo points.
+    A, bv = [], []
+    for (u, v), (x, y) in zip([(0, 0), (1, 0), (1, 1), (0, 1)], pts):
+        A.append([u, v, 1, 0, 0, 0, -u * x, -v * x]); bv.append(x)
+        A.append([0, 0, 0, u, v, 1, -u * y, -v * y]); bv.append(y)
+    h = np.linalg.solve(np.array(A, dtype=np.float64), np.array(bv, dtype=np.float64))
+    Hm = np.array([[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]])
+    # Output keeps the crop's own proportions.
+    top = math.dist(pts[0], pts[1]); side = math.dist(pts[0], pts[3])
+    ow = max(8, int(size if top >= side else size * top / max(side, 1e-6)))
+    oh = max(8, int(size if side >= top else size * side / max(top, 1e-6)))
+    uu, vv = np.meshgrid((np.arange(ow) + 0.5) / ow, (np.arange(oh) + 0.5) / oh)
+    q = Hm @ np.stack([uu.ravel(), vv.ravel(), np.ones(uu.size)])
+    xs = np.clip(q[0] / q[2], 0, W_ - 1).astype(np.int32)
+    ys = np.clip(q[1] / q[2], 0, H_ - 1).astype(np.int32)
+    out = px[ys, xs].reshape(oh, ow, 4)[::-1].copy()  # back to Blender's bottom-up rows
+    out[..., 3] = 1.0
+    img = bpy.data.images.new(f"{name}_img", ow, oh, alpha=False)
+    img.pixels.foreach_set(out.ravel())
+    img.pack()
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    nt = m.node_tree
+    b = nt.nodes.get("Principled BSDF")
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    nt.links.new(tex.outputs["Color"], b.inputs["Base Color"])
+    b.inputs["Roughness"].default_value = 1.0
+    mean = out[..., :3].reshape(-1, 3).mean(axis=0)
+    m.diffuse_color = (float(mean[0]), float(mean[1]), float(mean[2]), 1.0)
+    return m
+
+
 def assign(obj, mat):
     """Give a mesh object exactly one material."""
     obj.data.materials.clear()
@@ -141,6 +194,7 @@ with open(args.script, "r", encoding="utf-8") as f:
 _ns = {
     "__name__": "__braxil_model__", "bpy": bpy, "math": math, "Vector": Vector, "Matrix": Matrix,
     "pbr": pbr, "assign": assign, "hex_rgba": hex_rgba, "KIND": KIND, "REF_CAMS": REF_CAMS,
+    "photo_material": photo_material,
 }
 import bmesh  # noqa: E402
 _ns["bmesh"] = bmesh

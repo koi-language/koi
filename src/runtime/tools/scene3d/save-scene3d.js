@@ -7,6 +7,8 @@ import { lockedSceneViolation } from './_story-timeline.js';
 import { physicsReport } from './_physics.js';
 import { resolveImpacts } from './_ragdoll.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId, timingReport } from './_store.js';
+import { withPhotoCheck } from './_photo-check.js';
+import { applyCardModels } from './_card-models.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
@@ -51,6 +53,7 @@ export default {
     if (lockedBy) return { success: false, error: `save_scene3d: ${lockedBy}` };
     await resolveImpacts(scene, input.id ? readScene(cleanId(input.id)) : null);
     stampSources(scene);
+    applyCardModels(scene); // the cards' models, always
     writeScene(scene);
     let failed = [];
     if (params.render !== false) {
@@ -64,7 +67,7 @@ export default {
       }
     }
     const pv = scene.storyboard?.id ? previzDirective(refreshPrevizFlags(scene.storyboard.id)) : null;
-    return {
+    return withPhotoCheck(params.render === false ? null : scene, {
       success: failed.length === 0,
       scene: summarize(scene),
       ...(failed.length ? { failed } : {}),
@@ -72,6 +75,6 @@ export default {
       ...buildReview(scene, null),
       ...timingReport(scene),
       ...physicsReport(scene),
-    };
+    });
   },
 };

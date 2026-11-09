@@ -34,6 +34,7 @@ import os from 'os';
 import path from 'path';
 
 import { documentsRoot } from './doc-root.js';
+import { toStoredPaths } from './project-paths.js';
 function _sessionDir() {
   const sessionId = process.env.KOI_SESSION_ID;
   if (!sessionId) return null;
@@ -78,7 +79,7 @@ export async function recordCreation(entry) {
   const fp = _ledgerPath();
   if (!fp) return;
   const dir = path.dirname(fp);
-  const line = JSON.stringify({
+  const record = {
     id: entry.id,
     kind: entry.kind,
     summary: entry.summary || '',
@@ -91,7 +92,8 @@ export async function recordCreation(entry) {
     scene: entry.scene || '',
     shot: entry.shot || '',
     ts: typeof entry.ts === 'number' ? entry.ts : Date.now(),
-  }) + '\n';
+  };
+  const line = JSON.stringify(record) + '\n';
   try {
     await fs.promises.mkdir(dir, { recursive: true });
     await fs.promises.appendFile(fp, line, 'utf8');
@@ -106,8 +108,11 @@ export async function recordCreation(entry) {
   // sessions without knowing any engine project root. Append-only,
   // best-effort, never blocks the save.
   try {
-    const globalFp = path.join(documentsRoot(), 'creations-index.jsonl');
-    await fs.promises.appendFile(globalFp, line, 'utf8');
+    // A project document: its paths are stored project-relative (see
+    // state/project-paths.js); the session ledger above is not.
+    const root = documentsRoot();
+    const globalFp = path.join(root, 'creations-index.jsonl');
+    await fs.promises.appendFile(globalFp, JSON.stringify(toStoredPaths(record, root)) + '\n', 'utf8');
   } catch { /* best-effort */ }
 }
 

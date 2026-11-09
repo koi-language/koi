@@ -45,12 +45,52 @@ import path from 'path';
 import crypto from 'crypto';
 import os from 'os';
 
-import { docDir } from './doc-root.js';
+import { docDir, DOC_KINDS } from './doc-root.js';
+import { toStoredPath, fromStoredPath, toStoredPaths, fromStoredPaths, readDocJson } from './project-paths.js';
 const EMBEDDING_DIM = 1536;
 // The project's own library (see state/doc-root.js): resolved on use, the
 // session's project root may be set after this module loads.
 const _dbDir = () => docDir('media-library');
 const _emptyCategoriesFile = () => path.join(_dbDir(), 'empty-categories.json');
+
+// ── Stored paths ─────────────────────────────────────────────────────────
+// The index lives inside the project, so its rows keep project-relative
+// paths (`images/a.png`) on disk and absolute ones in memory — see
+// state/project-paths.js. Applied as a row codec on the table, so every
+// add / update / read goes through it.
+const _HAS_REL_RE = new RegExp(`"(?:${DOC_KINDS.join('|')})/`);
+
+function _mapMetaJson(raw, fn) {
+  if (typeof raw !== 'string' || !raw) return raw;
+  try { return JSON.stringify(fn(JSON.parse(raw))); } catch { return raw; }
+}
+
+function _rowCodec(root) {
+  return {
+    encode(row) {
+      if (typeof row.file_path === 'string') row.file_path = toStoredPath(row.file_path, root);
+      if (typeof row.metadata_json === 'string' && row.metadata_json.includes('"/')) {
+        row.metadata_json = _mapMetaJson(row.metadata_json, (m) => toStoredPaths(m, root));
+      }
+      return row;
+    },
+    decode(row) {
+      if (typeof row.file_path === 'string') row.file_path = fromStoredPath(row.file_path, root);
+      if (typeof row.metadata_json === 'string' && _HAS_REL_RE.test(row.metadata_json)) {
+        row.metadata_json = _mapMetaJson(row.metadata_json, (m) => fromStoredPaths(m, root));
+      }
+      return row;
+    },
+  };
+}
+
+/** WHERE clause matching a row by its (absolute, in-memory) path, in either
+ *  stored form — relative, or absolute from before paths were relativized. */
+function _wherePath(filePath, root) {
+  const abs = String(filePath);
+  const forms = [...new Set([toStoredPath(abs, root), abs])];
+  return '(' + forms.map((f) => `file_path = '${f.replace(/'/g, "''")}'`).join(' OR ') + ')';
+}
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.avi']);
 const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
@@ -209,6 +249,8 @@ export class MediaLibrary {
       const names = await this._db.tableNames();
       if (names.includes('media')) {
         this._table = await this._db.openTable('media');
+        this._root = path.dirname(_dbDir());
+        this._table.setCodec(_rowCodec(this._root));
         // Clean up duplicates on first open
         this.deduplicate().catch(() => {});
       } else {
@@ -229,8 +271,13 @@ export class MediaLibrary {
           sam2_masks_json: '',
           embedding: new Array(EMBEDDING_DIM).fill(0),
         }]);
+        this._root = path.dirname(_dbDir());
+        this._table.setCodec(_rowCodec(this._root));
         // Delete seed
         try { await this._table.delete('id = "__seed__"'); } catch {}
+      }
+      try { await this._relativizeStoredRows(); } catch (e) {
+        process.stderr.write(`[MediaLibrary] path relativize skipped: ${e.message}\n`);
       }
       // One-shot migration of the cloned-voice registry into the media
       // library. Runs every table open but is fully idempotent — the
@@ -248,6 +295,26 @@ export class MediaLibrary {
     return this._table;
   }
 
+  /** Rows written before paths were stored relative (or by a copy of this
+   *  project that lived elsewhere): rewrite their file_path / metadata to
+   *  the stored form. Idempotent; only touches rows that change. */
+  async _relativizeStoredRows() {
+    const table = this._table;
+    const raw = await table.rawAllUndecoded(
+      `SELECT id, file_path, metadata_json FROM ${table.tableId} WHERE file_path LIKE '/%' OR metadata_json LIKE '%"/%'`,
+    );
+    for (const r of raw) {
+      const decoded = { file_path: r.file_path, metadata_json: r.metadata_json };
+      const enc = _rowCodec(this._root).encode({ ...decoded });
+      if (enc.file_path === r.file_path && enc.metadata_json === r.metadata_json) continue;
+      // update() runs the codec itself: hand it the in-memory values.
+      await table.update({
+        values: { file_path: r.file_path, metadata_json: r.metadata_json },
+        where: `id = '${String(r.id).replace(/'/g, "''")}'`,
+      });
+    }
+  }
+
   /** Pull voice registry entries into the library so the GUI drawer
    *  can rely on a single source of truth. Idempotent — upserts by
    *  file_path. Reads a single known JSON registry file, not a
@@ -260,7 +327,7 @@ export class MediaLibrary {
     const voicesJson = path.join(docDir('voices'), 'voices.json');
     if (fs.existsSync(voicesJson)) {
       try {
-        const arr = JSON.parse(fs.readFileSync(voicesJson, 'utf8'));
+        const arr = readDocJson(voicesJson);
         if (Array.isArray(arr)) {
           const { saveVoiceEntry } = await import('./media-library.js');
           for (const entry of arr) {
@@ -297,7 +364,7 @@ export class MediaLibrary {
           if (!f.endsWith('.json')) continue;
           const fp = path.join(sbDir, f);
           try {
-            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            const body = readDocJson(fp);
             await saveStoryboardEntry(fp, body, null);
             storyboards++;
           } catch (e) {
@@ -326,7 +393,7 @@ export class MediaLibrary {
           if (!f.endsWith('.json')) continue;
           const fp = path.join(charDir, f);
           try {
-            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            const body = readDocJson(fp);
             await saveCharacterEntry(fp, body, null);
             characters++;
           } catch (e) {
@@ -353,7 +420,7 @@ export class MediaLibrary {
           if (!f.endsWith('.json')) continue;
           const fp = path.join(locDir, f);
           try {
-            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            const body = readDocJson(fp);
             await saveLocationEntry(fp, body, null);
             locations++;
           } catch (e) {
@@ -380,7 +447,7 @@ export class MediaLibrary {
           if (!f.endsWith('.json')) continue;
           const fp = path.join(objDir, f);
           try {
-            const body = JSON.parse(fs.readFileSync(fp, 'utf8'));
+            const body = readDocJson(fp);
             await saveObjectEntry(fp, body, null);
             objects++;
           } catch (e) {
@@ -439,7 +506,6 @@ export class MediaLibrary {
     const table = await this._ensureTable();
     const buffer = fs.readFileSync(filePath);
     const hash = contentHash(buffer);
-    const escPath = String(filePath).replace(/'/g, "''");
 
     // `visible` defaults to true for any user-visible creation. The
     // composite-snapshot the GUI bakes on every annotation submit
@@ -479,11 +545,11 @@ export class MediaLibrary {
     if (replaceByPath) {
       try {
         const existing = await table.query()
-          .where(`file_path = '${escPath}'`).limit(1).toArray();
+          .where(_wherePath(filePath, this._root)).limit(1).toArray();
         wasReplacement = existing.length > 0;
       } catch { /* table empty — treat as fresh */ }
       try {
-        await table.delete(`file_path = '${escPath}'`);
+        await table.delete(_wherePath(filePath, this._root));
       } catch { /* nothing to delete */ }
     }
 
@@ -541,7 +607,7 @@ export class MediaLibrary {
       // hash) between the original save and this one. Still preserves the
       // original row and its metadata.
       try {
-        const byPath = await table.query().where(`file_path = '${escPath}'`).limit(1).toArray();
+        const byPath = await table.query().where(_wherePath(filePath, this._root)).limit(1).toArray();
         if (byPath.length > 0) {
           await mergeCategoriesInto(byPath[0].id);
           return { id: byPath[0].id, isNew: false };
@@ -653,8 +719,7 @@ export class MediaLibrary {
   async getByPath(filePath) {
     const table = await this._ensureTable();
     try {
-      const escaped = filePath.replace(/'/g, "''");
-      const rows = await table.query().where(`file_path = '${escaped}'`).limit(1).toArray();
+      const rows = await table.query().where(_wherePath(filePath, this._root)).limit(1).toArray();
       return rows.length > 0 ? this._deserialize(rows[0]) : null;
     } catch {
       return null;
@@ -1069,9 +1134,8 @@ export class MediaLibrary {
    *  voice-registry.js when their on-disk artefact is deleted. */
   async removeByPath(filePath) {
     const table = await this._ensureTable();
-    const escPath = String(filePath).replace(/'/g, "''");
     try {
-      await table.delete(`file_path = '${escPath}'`);
+      await table.delete(_wherePath(filePath, this._root));
       return true;
     } catch {
       return false;

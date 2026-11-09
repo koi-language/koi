@@ -22,6 +22,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn, spawnSync } from 'child_process';
+import { takeSlot } from './_blender-pool.js';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { BUILD_SCENE_PY } from './_build-scene-py.js';
@@ -425,7 +426,10 @@ export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 
   // UI draw on, and everything froze for half a minute.
   const releaseHeavy = heavy ? await _heavySlot() : null;
   await _slot();
+  // A slot of THE Blender pool (live + renders never pass its cap).
+  let releasePool = null;
   try {
+    releasePool = await takeSlot('render');
     return await new Promise((resolve, reject) => {
       const argv = ['-b', '--factory-startup', '-noaudio', '--python-exit-code', '1', '-P', script, '--', ...args];
       // macOS: utility QoS — the scheduler (CPU, I/O, GPU queue) serves the
@@ -434,6 +438,7 @@ export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 
       const p = spawn(bg ? '/usr/sbin/taskpolicy' : bin, bg ? ['-c', 'utility', bin, ...argv] : argv, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      releasePool.launched();
       // Renders run behind the live previz: never steal its time slices.
       try { os.setPriority(p.pid, 10); } catch { /* not permitted */ }
       let log = '';
@@ -477,6 +482,7 @@ export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 
       });
     });
   } finally {
+    releasePool?.();
     _release();
     releaseHeavy?.();
   }

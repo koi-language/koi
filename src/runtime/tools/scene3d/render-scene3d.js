@@ -8,6 +8,7 @@
 import { readScene, writeScene, renderScene, summarize, buildReview, cleanId, STYLES, PASSES } from './_store.js';
 import { channel } from '../../io/channel.js';
 import { refreshPrevizFlags } from './_previz-sync.js';
+import { withPhotoCheck } from './_photo-check.js';
 
 export default {
   type: 'render_scene3d',
@@ -56,14 +57,14 @@ export default {
         onProgress: (_p, label) => label && channel.log('scene3d', label),
       });
       if (scene.storyboard?.id) refreshPrevizFlags(scene.storyboard.id);
-      return {
+      return withPhotoCheck(scene, {
         success: r.failed.length === 0,
         scene: summarize(scene),
         rendered: r.rendered,
         reused: r.reused,
         ...buildReview(scene, Array.isArray(params.shots) && params.shots.length ? params.shots : null),
         ...(r.failed.length ? { failed: r.failed } : {}),
-      };
+      });
     } catch (e) {
       return { success: false, error: `render_scene3d: ${e.message}` };
     }

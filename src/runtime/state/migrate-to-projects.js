@@ -16,6 +16,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import { DOC_KINDS, PROJECT_EXT } from './doc-root.js';
 import { createProject, freePackagePath } from './project-package.js';
+import { toStoredPaths } from './project-paths.js';
 
 const _require = createRequire(import.meta.url);
 const _Database = () => _require('better-sqlite3');
@@ -171,16 +172,28 @@ export function migrateLegacyDocuments({ destDir, log = (m) => process.stderr.wr
   plan.push({ name: 'Archivo', set: rest, voices, archive: true });
 
   // ── Write packages ─────────────────────────────────────────────────────
-  const rewrite = (s, pkg) => {
+  // Legacy paths → into the package, then stored project-relative (see
+  // state/project-paths.js). Text that does not parse keeps the absolute
+  // in-package paths (still readable: absolute stays absolute).
+  const rewrite = (s, pkg, file = '') => {
     let out = s;
     for (const k of DOC_KINDS) out = out.split(`${LEG}/${k}/`).join(`${pkg}/${k}/`);
-    return out;
+    if (/\.jsonl$/i.test(file)) {
+      return out.split('\n').map((l) => {
+        if (!l.trim()) return l;
+        try { return JSON.stringify(toStoredPaths(JSON.parse(l), pkg)); } catch { return l; }
+      }).join('\n');
+    }
+    try {
+      const indent = /^[[{]\s*\n( +)/.exec(out)?.[1]?.length ?? (out.includes('\n') ? 2 : 0);
+      return JSON.stringify(toStoredPaths(JSON.parse(out), pkg), null, indent || undefined) + (out.endsWith('\n') ? '\n' : '');
+    } catch { return out; }
   };
   const place = (src, dst, pkg) => {
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     if (fs.existsSync(dst)) return;
     if (/\.(json|jsonl)$/i.test(src)) {
-      fs.writeFileSync(dst, rewrite(fs.readFileSync(src, 'utf8'), pkg), 'utf8');
+      fs.writeFileSync(dst, rewrite(fs.readFileSync(src, 'utf8'), pkg, src), 'utf8');
       return;
     }
     try { fs.linkSync(src, dst); } catch { fs.copyFileSync(src, dst); }
@@ -212,7 +225,7 @@ export function migrateLegacyDocuments({ destDir, log = (m) => process.stderr.wr
     // The cast's voices: only this project's entries.
     if (p.voices.length) {
       fs.mkdirSync(path.join(pkg, 'voices'), { recursive: true });
-      fs.writeFileSync(path.join(pkg, 'voices', 'voices.json'), rewrite(JSON.stringify(p.voices, null, 2), pkg), 'utf8');
+      fs.writeFileSync(path.join(pkg, 'voices', 'voices.json'), rewrite(JSON.stringify(p.voices, null, 2), pkg, 'voices.json'), 'utf8');
     }
     // Story-project file → the package's projects/ (the sequence list).
     // Root files: the creations ledger lines and drawer ordering.
@@ -224,7 +237,7 @@ export function migrateLegacyDocuments({ destDir, log = (m) => process.stderr.wr
         s = s.split('\n').filter((l) => [...files].some((x) => l.includes(x)) || p.storyboards?.some((id) => l.includes(`"${id}"`))).join('\n');
         if (s) s += '\n';
       }
-      fs.writeFileSync(path.join(pkg, f), rewrite(s, pkg), 'utf8');
+      fs.writeFileSync(path.join(pkg, f), rewrite(s, pkg, f), 'utf8');
     }
     // The drawer index: its rows only, paths moved inside the package.
     if (fs.existsSync(legacyDb)) {

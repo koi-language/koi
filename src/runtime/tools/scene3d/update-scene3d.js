@@ -11,6 +11,8 @@ import { physicsReport } from './_physics.js';
 import { resolveImpacts } from './_ragdoll.js';
 import { requestStrips } from './scene3d-live.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId, timingReport } from './_store.js';
+import { withPhotoCheck } from './_photo-check.js';
+import { applyCardModels } from './_card-models.js';
 import { insertSceneTime } from './_clock.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
@@ -169,6 +171,7 @@ export default {
     }
     await resolveImpacts(scene, existing);
     stampSources(scene, touched);
+    applyCardModels(scene); // the cards' models, always
     writeScene(scene);
     // Filmstrips of the changed shots from the live session, when it already
     // shows this version (a camera edit made on the stage).
@@ -182,7 +185,7 @@ export default {
       }
     }
     const pv = scene.storyboard?.id ? previzDirective(refreshPrevizFlags(scene.storyboard.id)) : null;
-    return {
+    return withPhotoCheck(params.render === false ? null : scene, {
       success: r.failed.length === 0,
       scene: summarize(scene),
       rendered: r.rendered,
@@ -192,6 +195,6 @@ export default {
       ...(r.rendered.length ? buildReview(scene, r.rendered) : {}),
       ...timingReport(scene),
       ...physicsReport(scene),
-    };
+    });
   },
 };

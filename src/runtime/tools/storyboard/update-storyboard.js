@@ -28,6 +28,7 @@ import { saveStoryboardEntry } from '../../state/media-library.js';
 import { _validate, _normalize, _editorialDiff, _isStr, _isObj, markScriptSynced } from './save-storyboard.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 function _err(error) { return { success: false, error }; }
 
 // Field whitelists — what a patch may touch at each level. Anything
@@ -138,7 +139,7 @@ export default {
     }
     let existing;
     try {
-      existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      existing = readDocJson(filePath);
     } catch (e) {
       return _err(`Could not parse ${filePath}: ${e.message}. Fix or re-create it with save_storyboard.`);
     }
@@ -309,7 +310,7 @@ export default {
     for (const sc of normalized.scenes || []) {
       for (const sh of sc.shots || []) if (_scriptSynced.has(sh.id)) markScriptSynced(sh);
     }
-    const serialized = JSON.stringify(normalized, null, 2) + '\n';
+    const serialized = stringifyDocJson(normalized, filePath) + '\n';
     try {
       const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
       fs.writeFileSync(tmp, serialized, 'utf8');

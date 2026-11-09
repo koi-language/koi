@@ -17,6 +17,8 @@ import { readScene, writeScene, normalizeScene, renderScene, renderDir, cleanId,
 import { stampSources, refreshPrevizFlags } from './_previz-sync.js';
 import { channel } from '../../io/channel.js';
 import { ensureBlender, builderScriptPath, liveSurfaceLib } from './_blender.js';
+import { takeSlot, LIVE_SLOTS } from './_blender-pool.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 
 const _sessions = new Map(); // "<sceneId>#<slot>" → { proc, port, ctl }
 
@@ -111,9 +113,12 @@ function _freePort() {
  * Pool of Blenders. A stopped session's process is PARKED instead of killed,
  * and the next start of any scene takes it over (`load`: the builder runs
  * again in that process on the new scene — no launch, shaders already
- * compiled). At most MAX_BLENDERS processes in all, live + parked.
+ * compiled). Every one of them, live or parked, holds a slot of THE
+ * Blender pool (_blender-pool.js) from its launch until it exits: at most
+ * LIVE_SLOTS processes in all, live + parked, and never past the pool's
+ * machine-wide cap.
  */
-const MAX_BLENDERS = 3;
+const MAX_BLENDERS = LIVE_SLOTS;
 const _parked = []; // { proc, port, log }
 
 const _gone = (proc) => proc.exitCode != null || proc.signalCode != null;
@@ -183,6 +188,36 @@ function _stop(sceneId, { park = true } = {}) {
     _kill(s.proc);
   }
   return true;
+}
+
+/**
+ * The pool is full: free a live slot. A parked Blender goes first, else the
+ * live session started longest ago (killed, not parked: its views find nobody
+ * on the port and reconnect when they show it again). Resolves once that
+ * process has exited (its slot is back); false when there is nothing to stop.
+ */
+function _evictFor(key) {
+  return () => {
+    let proc = null;
+    while (_parked.length && !proc) {
+      const p = _parked.shift();
+      if (!_gone(p.proc)) proc = p.proc;
+    }
+    if (proc) {
+      channel.log('scene3d', `pool full: parked Blender ${proc.pid} stopped for ${key}`);
+    } else {
+      const oldest = [..._sessions.keys()].find((k) => k !== key);
+      if (!oldest) return Promise.resolve(false);
+      proc = _sessions.get(oldest).proc;
+      channel.log('scene3d', `pool full: live ${oldest} stopped for ${key}`);
+      _stop(oldest, { park: false });
+    }
+    return new Promise((resolve) => {
+      if (_gone(proc)) return resolve(true);
+      proc.once('exit', () => resolve(true));
+      _kill(proc);
+    });
+  };
 }
 
 function _killNow(proc) {
@@ -293,7 +328,7 @@ async function _addCamera(params) {
   if (sh.storyboardShotId && next.storyboard?.id) {
     const fp = storyboardPath(next.storyboard.id);
     try {
-      const sb = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      const sb = readDocJson(fp);
       for (const sc of sb.scenes || []) {
         const i = (sc.shots || []).findIndex((x) => x.id === sh.storyboardShotId);
         if (i < 0) continue;
@@ -320,7 +355,7 @@ async function _addCamera(params) {
         let n = 0;
         for (const sc of sb.scenes || []) for (const x of sc.shots || []) x.number = ++n;
         const tmp = `${fp}.${process.pid}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(sb, null, 2) + '\n', 'utf8');
+        fs.writeFileSync(tmp, stringifyDocJson(sb, fp) + '\n', 'utf8');
         fs.renameSync(tmp, fp);
       }
     } catch (e) {
@@ -388,7 +423,15 @@ export default {
       _sessions.set(key, { proc: reused.proc, port: reused.port, log: reused.log });
       return _started(key, id, scene, reused.port, surfaceLib);
     }
-    const port = await _freePort();
+    // A slot of the Blender pool, held until this process exits.
+    const release = await takeSlot('live', { evict: _evictFor(key) });
+    let port;
+    try {
+      port = await _freePort();
+    } catch (e) {
+      release();
+      throw e;
+    }
     const proc = spawn(bin, [
       '--factory-startup', '--no-window-focus', '--window-geometry', '-4000', '-4000', '48', '48', '-noaudio',
       '-P', builderScriptPath(), '--', '--scene', snap, '--live', String(port),
@@ -397,7 +440,10 @@ export default {
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     const log = { tail: '' };
     _sessions.set(key, { proc, port, log });
+    release.launched();
+    proc.once('error', release);
     proc.on('exit', (code, signal) => {
+      release();
       channel.log('scene3d', `live :${port}: Blender exited (code ${code}, signal ${signal}): ${log.tail.slice(-400)}`);
       for (const [k, s] of _sessions) if (s.proc === proc) _sessions.delete(k);
       const i = _parked.findIndex((p) => p.proc === proc);

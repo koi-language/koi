@@ -22,6 +22,7 @@ import { locationViews } from '../../state/location-registry.js';
 import { readObject, objectImages } from '../../state/object-registry.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 /** Editorial inputs of a storyboard shot that change its 3D blocking. */
 export function storyboardShotSig(sb, sc, sh) {
   const payload = [
@@ -45,7 +46,7 @@ function _locationImages(locId) {
   if (typeof locId !== 'string' || !locId.trim()) return [];
   const fp = path.join(docDir('locations'), `${path.basename(locId)}.json`);
   try {
-    const loc = JSON.parse(fs.readFileSync(fp, 'utf8'));
+    const loc = readDocJson(fp);
     return [...locationViews(loc).map((v) => v?.path), ...(loc.photos || [])];
   } catch {
     return [];
@@ -98,7 +99,7 @@ export function sceneObjectRefs(sb, scene) {
 function _readStoryboard(id) {
   const fp = storyboardPath(id);
   if (!fs.existsSync(fp)) return null;
-  try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+  try { return readDocJson(fp); } catch { return null; }
 }
 
 function _sbShotIndex(sb) {
@@ -201,7 +202,7 @@ export function refreshPrevizFlags(storyboardId, { markPending = false } = {}) {
   const fp = storyboardPath(storyboardId);
   if (!fs.existsSync(fp)) return status;
   let sb;
-  try { sb = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return status; }
+  try { sb = readDocJson(fp); } catch { return status; }
   const stale = new Set(status.stale.map((x) => x.storyboardShotId));
   const missing = new Set(status.missing.map((x) => x.storyboardShotId));
   let changed = false;
@@ -229,7 +230,7 @@ export function refreshPrevizFlags(storyboardId, { markPending = false } = {}) {
   }
   if (changed) {
     const tmp = `${fp}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(sb, null, 2) + '\n', 'utf8');
+    fs.writeFileSync(tmp, stringifyDocJson(sb, fp) + '\n', 'utf8');
     fs.renameSync(tmp, fp);
   }
   return status;

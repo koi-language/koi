@@ -10,6 +10,34 @@ import path from 'path';
 import { runBuilder, modelerScriptPath } from './_blender.js';
 import { readModel, writeModel, modelDir, newModelId, cleanModelId } from './_models.js';
 import { channel } from '../../io/channel.js';
+import { stringifyDocJson } from '../../state/project-paths.js';
+
+/** Makes [model] THE model of its location / object card, then brings every
+ *  previz scene up to date with the cards. */
+async function attachToCards(model) {
+  const out = [];
+  try {
+    if (model.kind === 'set' && model.locationId) {
+      const { readLocation, saveLocation } = await import('../../state/location-registry.js');
+      const loc = readLocation(model.locationId);
+      if (loc) {
+        if (loc.model !== model.id) saveLocation({ ...loc, model: model.id, updatedAt: new Date().toISOString() });
+        out.push(`location ${loc.id}`);
+      }
+    }
+    if (model.kind !== 'set' && model.objectId) {
+      const { readObject, saveObject } = await import('../../state/object-registry.js');
+      const obj = readObject(model.objectId);
+      if (obj) {
+        if (obj.model !== model.id) saveObject({ ...obj, model: model.id, updatedAt: new Date().toISOString() });
+        out.push(`object ${obj.id}`);
+      }
+    }
+    const { syncCardModels } = await import('./_card-models.js');
+    syncCardModels();
+  } catch { /* best effort: the model itself is saved */ }
+  return out;
+}
 
 export default {
   type: 'build_model3d',
@@ -40,7 +68,8 @@ export default {
         items: { type: 'object' },
         description: '[{ image: <abs path>, camera: { position, target, lens, roll? } }]',
       },
-      locationId: { type: 'string', description: 'Saved location this set is (kind "set").' },
+      locationId: { type: 'string', description: 'Saved location this set is (kind "set"): the model becomes THE 3D set of that location card, and every previz scene in that place uses it.' },
+      objectId: { type: 'string', description: 'Saved object card this object is (kind "object"): the model becomes THE 3D model of that card, and every previz prop that is this object uses it.' },
       characterId: { type: 'string', description: 'Saved character this belongs to, if any.' },
     },
   },
@@ -91,7 +120,10 @@ export default {
     let stats = {};
     try { stats = JSON.parse(fs.readFileSync(path.join(stage, 'stats.json'), 'utf8')); } catch { /* */ }
     for (const f of ['model.glb', 'build.py', 'refs.json']) {
-      fs.copyFileSync(path.join(stage, f), path.join(dir, `${f}.tmp`));
+      // Blender read the stage's refs.json (absolute paths); the model's own
+      // copy is a project document: paths stored project-relative.
+      if (f === 'refs.json') fs.writeFileSync(path.join(dir, `${f}.tmp`), stringifyDocJson(refs, path.join(dir, f), 0), 'utf8');
+      else fs.copyFileSync(path.join(stage, f), path.join(dir, `${f}.tmp`));
       fs.renameSync(path.join(dir, `${f}.tmp`), path.join(dir, f));
     }
     for (const d of fs.readdirSync(dir)) {
@@ -107,16 +139,22 @@ export default {
       kind,
       description: params.description ?? existing?.description,
       locationId: params.locationId ?? existing?.locationId,
+      objectId: params.objectId ?? existing?.objectId,
       characterId: params.characterId ?? existing?.characterId,
       dims: stats.dims,
       triangles: stats.triangles,
       materials: stats.materials,
       references: refs,
       rev,
+      // The 2×2 review views of this build: the cards' 3D preview.
+      turnaround: stats.review?.turnaround || null,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
     };
     writeModel(model);
+    // THE model of its card(s), and every scene follows the card.
+    const attached = await attachToCards(model);
+
 
     const review = stats.review || {};
     const images = [review.turnaround, ...(review.references || []).map((r) => r.compare)].filter(Boolean);
@@ -127,6 +165,7 @@ export default {
         dims: stats.dims, triangles: stats.triangles, objects: stats.objects, materials: stats.materials,
         recentredBy: stats.recentredBy, rev,
       },
+      ...(attached.length ? { attachedTo: attached } : {}),
       review: {
         turnaround: review.turnaround,
         references: (review.references || []).map((r) => ({ index: r.index, photo: r.image, compare: r.compare })),

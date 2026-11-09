@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 
 import { docDir } from '../../state/doc-root.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 function _home() {
   return process.env.HOME || os.homedir();
 }
@@ -38,7 +39,7 @@ export function newModelId(name) {
 
 export function readModel(id) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(modelDir(id), 'model.json'), 'utf8'));
+    return readDocJson(path.join(modelDir(id), 'model.json'));
   } catch {
     return null;
   }
@@ -47,7 +48,7 @@ export function readModel(id) {
 export function writeModel(model) {
   const file = path.join(modelDir(model.id), 'model.json');
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(model, null, 2), 'utf8');
+  fs.writeFileSync(tmp, stringifyDocJson(model, file), 'utf8');
   fs.renameSync(tmp, file);
 }
 

@@ -158,6 +158,22 @@ class SqliteTable {
     this._db = db;
     this._name = name;
     this._schema = schema;
+    this._codec = null;
+  }
+
+  /**
+   * Optional per-row codec: `encode(partialRow) → partialRow` runs on every
+   * value written (add / update), `decode(row) → row` on every row read. Lets
+   * a consumer keep a column's STORED form (e.g. project-relative paths)
+   * different from its in-memory form without touching each call site.
+   */
+  setCodec(codec) {
+    this._codec = codec && typeof codec === 'object' ? codec : null;
+  }
+
+  /** Raw rows straight from SQLite: no schema decode, no codec. */
+  async rawAllUndecoded(sql, params = []) {
+    return this._db.prepare(sql).all(...params);
   }
 
   async add(rows) {
@@ -168,7 +184,7 @@ class SqliteTable {
       `INSERT OR REPLACE INTO ${_qid(this._name)} (${cols.map(_qid).join(', ')}) VALUES (${placeholders})`,
     );
     const tx = this._db.transaction((batch) => {
-      for (const row of batch) stmt.run(...this._encodeRow(row));
+      for (const row of batch) stmt.run(...this._encodeRow(this._codec ? this._codec.encode({ ...row }) : row));
     });
     tx(rows);
   }
@@ -201,6 +217,7 @@ class SqliteTable {
       where = null;
     }
 
+    if (this._codec) values = this._codec.encode({ ...values });
     const keys = Object.keys(values);
     if (keys.length === 0) return;
 
@@ -278,7 +295,7 @@ class SqliteTable {
     for (const c of this._schema.columns) {
       out[c.name] = _decodeValue(row[c.name], c.kind);
     }
-    return out;
+    return this._codec ? this._codec.decode(out) : out;
   }
 }
 

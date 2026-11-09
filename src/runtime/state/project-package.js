@@ -1,9 +1,12 @@
 /**
  * Project packages (`Mi peli.braxil/`): create one, and open one wherever it
- * now is. Documents keep ABSOLUTE paths (the tools need them); a package
- * remembers where it lived (`project.json` → `path`), and opening it after a
- * move or a copy to another machine rewrites the old root to the new one in
- * every JSON document and in the drawer's index.
+ * now is. Documents store their paths RELATIVE to the package (see
+ * state/project-paths.js), so a moved / copied package needs no rewrite and
+ * `project.json` no longer records where the package lives (its place is
+ * wherever the file is). Packages written before that still carry an
+ * absolute `path`: opening one that moved rewrites the old root to the new
+ * one in every JSON document and in the drawer's index once, then drops the
+ * field.
  */
 
 import fs from 'fs';
@@ -56,7 +59,7 @@ export function createProject(pkg, { name } = {}) {
     name: name || path.basename(pkg, PROJECT_EXT),
     createdAt: now,
   };
-  proj.path = path.resolve(pkg);
+  delete proj.path; // the package's place is wherever it is
   proj.updatedAt = now;
   _writeProject(pkg, proj);
   return pkg;
@@ -122,12 +125,15 @@ export function openProject(root = projectRoot()) {
     createProject(pkg);
     return readProject(pkg);
   }
-  if (proj.path && proj.path !== pkg) {
-    const r = relocateProject(pkg, proj.path, pkg);
-    process.stderr.write(`[project] moved from ${proj.path}: rewrote ${r.files} documents, ${r.rows} drawer rows\n`);
-  }
-  if (proj.path !== pkg) {
-    proj = { ...proj, path: pkg, updatedAt: new Date().toISOString() };
+  // Legacy `path` (absolute documents from before relative storage): a
+  // package that moved since gets its old absolute paths rewritten once.
+  if ('path' in proj) {
+    if (typeof proj.path === 'string' && proj.path && proj.path !== pkg) {
+      const r = relocateProject(pkg, proj.path, pkg);
+      process.stderr.write(`[project] moved from ${proj.path}: rewrote ${r.files} documents, ${r.rows} drawer rows\n`);
+    }
+    const { path: _legacy, ...rest } = proj;
+    proj = { ...rest, updatedAt: new Date().toISOString() };
     _writeProject(pkg, proj);
   }
   return proj;

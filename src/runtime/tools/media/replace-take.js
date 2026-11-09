@@ -41,6 +41,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ensureFfmpeg } from '../../media/ffmpeg-installer.js';
 import { channel } from '../../io/channel.js';
+import { readDocJson, stringifyDocJson } from '../../state/project-paths.js';
 
 const _VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v']);
 
@@ -84,12 +85,13 @@ function _takesDir(videoPath) {
 function _loadManifest(dir) {
   const p = path.join(dir, 'manifest.json');
   if (!fs.existsSync(p)) return { versions: [] };
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return { versions: [] }; }
+  try { return readDocJson(p); } catch { return { versions: [] }; }
 }
 
 function _saveManifest(dir, manifest) {
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+  const fp = path.join(dir, 'manifest.json');
+  fs.writeFileSync(fp, stringifyDocJson(manifest, fp));
 }
 
 /** Copy the CURRENT clip into the history as the next vNNN and append the
