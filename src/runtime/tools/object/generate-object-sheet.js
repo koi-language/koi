@@ -176,6 +176,7 @@ export default {
       prompt: { type: 'string', description: 'REQUIRED. YOUR precise, element-by-element description of the OBJECT itself (shape, proportions, materials, colours, markings, wear). No layout, panel or camera words: the tool adds the fixed sheet layout.' },
       objectId: { type: 'string', description: 'OPTIONAL id of a saved object (<project>/objects/<id>.json). The sheet, its cells and the three cropped views are saved onto it, and its photos (+ previous sheet) are attached as references when referenceImages is omitted.' },
       referenceImages: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute paths used as reference (e.g. photos of the object). Any reference forces an image-editing model.' },
+      model: { type: 'string', description: 'Image model slug, as the objects skill says (GPT Image 2.6: the /edit variant when references are given).' },
     },
     required: ['prompt'],
   },
@@ -206,7 +207,7 @@ export default {
       } catch { /* object may not exist yet */ }
     }
 
-    const model = await resolveObjectImageModel(null, refs.length > 0, 'generate_object_sheet');
+    const model = await resolveObjectImageModel(action?.model, refs.length > 0, 'generate_object_sheet');
 
     const genAction = {
       prompt: _buildSheetPrompt(prompt),

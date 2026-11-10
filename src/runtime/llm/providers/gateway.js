@@ -291,6 +291,7 @@ function _aggregateVideo(models) {
     hasAvatar:          cats.has('video_avatar'),
     hasLipsync:         cats.has('video_lipsync'),
     hasBackgroundRemove: cats.has('video_background_removal'),
+    hasUpscale:         cats.has('video_upscaling'),
   };
 }
 

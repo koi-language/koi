@@ -108,9 +108,9 @@ export default {
       }
     }
     if (!model) {
-      model = refs.length ? 'openai/gpt-image-2/edit' : 'openai/gpt-image-2';
-    } else if (refs.length && model === 'openai/gpt-image-2') {
-      model = 'openai/gpt-image-2/edit';
+      model = refs.length ? 'openai/gpt-image-2.6/sunburst/edit' : 'openai/gpt-image-2.6/sunburst/text-to-image';
+    } else if (refs.length && /^openai\/gpt-image-2(\.\d+\/[a-z]+)?(\/text-to-image)?$/.test(model)) {
+      model = model.replace(/\/text-to-image$/, '') + '/edit';
     }
 
     const aspectRatio = (_isStr(action?.aspectRatio) && action.aspectRatio.trim())

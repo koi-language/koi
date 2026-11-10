@@ -229,7 +229,7 @@ export default {
       }
     }
     if (!model) {
-      model = photos.length ? 'openai/gpt-image-2/edit' : 'openai/gpt-image-2';
+      model = photos.length ? 'openai/gpt-image-2.6/sunburst/edit' : 'openai/gpt-image-2.6/sunburst/text-to-image';
     }
 
     const aspectRatio = (_isStr(action?.aspectRatio) && action.aspectRatio.trim())

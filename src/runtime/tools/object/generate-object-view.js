@@ -41,9 +41,9 @@ export async function resolveObjectImageModel(explicit, hasRefs, logTag = 'gener
     }
   }
   if (!model) {
-    model = hasRefs ? 'openai/gpt-image-2/edit' : 'openai/gpt-image-2';
-  } else if (hasRefs && model === 'openai/gpt-image-2') {
-    model = 'openai/gpt-image-2/edit';
+    model = hasRefs ? 'openai/gpt-image-2.6/sunburst/edit' : 'openai/gpt-image-2.6/sunburst/text-to-image';
+  } else if (hasRefs && /^openai\/gpt-image-2(\.\d+\/[a-z]+)?(\/text-to-image)?$/.test(model)) {
+    model = model.replace(/\/text-to-image$/, '') + '/edit';
   }
   return model;
 }

@@ -741,6 +741,7 @@ function _wrapWithBanner(action) {
       // Non-null when an MCP media provider is handling this (e.g. "Magnific").
       // The GUI shows it under the banner so the user knows whose quota is used.
       provider: _mcpProviderLabel,
+      input: act,
     });
     // Make the banner id + a fal-status emitter available to the wrapped
     // tool so its polling loop can pipe IN_QUEUE / IN_PROGRESS through to

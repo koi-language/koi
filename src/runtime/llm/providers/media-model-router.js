@@ -85,6 +85,7 @@ const _CATEGORY_ALIASES = {
   video_lipsync: ['lipsync'],
   video_extend: ['video-extend'],
   video_background_removal: ['video-background-removal'],
+  video_upscaling: ['video-upscale', 'video-upscaling', 'video-upscaler'],
   video_editing: ['video-edit', 'video-to-video'],
   video_generation: ['video-generate', 'text-to-video'],
 };
@@ -159,6 +160,7 @@ export function wantedCategoryFor(mediaKind, req = {}) {
       : kind === 'lipsync' ? 'video_lipsync'
       : kind === 'extend' ? 'video_extend'
       : (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal'
+      : kind === 'upscale' ? 'video_upscaling'
       : kind === 'continuation' ? 'video_generation'
       : (kind === 'edit' || hasVideoRefs) ? 'video_editing'
       : 'video_generation';
@@ -606,6 +608,7 @@ function _filterByRequires(models, presence) {
  *   • `kind: 'avatar'`              → video_avatar
  *   • `kind: 'extend'`              → video_extend
  *   • `kind: 'bg-remove' | …`       → video_background_removal
+ *   • `kind: 'upscale'`             → video_upscaling
  *   • `kind: 'continuation'`        → video_generation (carry-over opt-out)
  *   • `kind: 'edit'` OR `videoRefsCount > 0` → video_editing (v2v)
  *   • else                          → video_generation
@@ -635,6 +638,7 @@ export function peekVideoModel(models, req = {}) {
  *   • `kind: 'avatar'`              → video_avatar
  *   • `kind: 'extend'`              → video_extend
  *   • `kind: 'bg-remove' | …`       → video_background_removal
+ *   • `kind: 'upscale'`             → video_upscaling
  *   • `kind: 'continuation'`        → video_generation (carry-over with
  *                                     refs — explicit opt-out of editing)
  *   • `kind: 'edit'`                → video_editing  (pure v2v transform)
@@ -674,6 +678,7 @@ function _resolveVideoBucketAndPool(models, req) {
     kind === 'avatar' ? 'video_avatar' :
     kind === 'extend' ? 'video_extend' :
     (kind === 'bg-remove' || kind === 'background-removal' || kind === 'background_removal') ? 'video_background_removal' :
+    kind === 'upscale' ? 'video_upscaling' :
     kind === 'continuation' ? 'video_generation' :
     (kind === 'edit' || hasVideoRefs) ? 'video_editing' :
     'video_generation';

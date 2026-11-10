@@ -108,6 +108,7 @@ export default {
       label: { type: 'string', description: 'OPTIONAL short label of what the detail shows, e.g. "number 4417 painted on the boxcar door", "Interior: cabin toward the windshield". A label the user wrote on the slot is never overwritten.' },
       detailId: { type: 'string', description: 'OPTIONAL id of the detail in object.details this image fills or replaces (e.g. an empty slot the user added). Omit to add a new detail.' },
       framing: { type: 'string', enum: FRAMINGS, description: 'OPTIONAL. "closeup" (default): macro / insert of one part on the neutral background. "interior": a wide 16:9 view inside the object.' },
+      model: { type: 'string', description: 'Image model slug, as the objects skill says (GPT Image 2.6: the /edit variant when references are given).' },
     },
     required: ['prompt', 'objectId'],
   },
@@ -136,7 +137,7 @@ export default {
         'generate its sheet with generate_object_sheet first, so the detail is the SAME object.');
     }
 
-    const model = await resolveObjectImageModel(null, true, 'generate_object_detail');
+    const model = await resolveObjectImageModel(action?.model, true, 'generate_object_detail');
 
     const genAction = {
       prompt: _buildDetailPrompt(prompt, framing, !!replacing),
