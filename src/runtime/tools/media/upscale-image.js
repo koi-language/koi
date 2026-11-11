@@ -29,6 +29,7 @@ import { exportMediaCopy } from './util/export-copy.js';
 import { downloadAssetToFile, undownloadableResult } from '../../io/download-asset.js';
 
 import { docDir } from '../../state/doc-root.js';
+const _isPinnedModel = (m) => typeof m === 'string' && m.trim() !== '' && m.trim() !== 'auto';
 const IMAGE_EXT_TO_MIME = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -47,6 +48,7 @@ const upscaleImageAction = {
   schema: {
     type: 'object',
     properties: {
+      model: { type: 'string', description: 'Exact `image_upscaling` model slug (the image-generator skill names it). Omit to auto-route.' },
       image: {
         type: 'string',
         description: 'Input image — either an absolute file path or an attachment id ("att-1"). This image will be upscaled.',
@@ -164,7 +166,7 @@ const upscaleImageAction = {
     const clients = agent?.llmProvider?.getClients?.() || {};
     let resolved;
     try {
-      resolved = resolveModel({ type: 'image', clients });
+      resolved = resolveModel({ type: 'image', clients, model: _isPinnedModel(action.model) ? action.model.trim() : undefined });
     } catch (err) {
       return { success: false, error: err.message };
     }

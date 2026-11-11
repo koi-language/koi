@@ -24,7 +24,6 @@ import { channel } from '../../io/channel.js';
 import { readCharacter } from '../../state/character-registry.js';
 import { contentIslands } from '../panels/_grid.js';
 import generateImage from '../media/generate-image.js';
-import { mediaModelsByLabel } from '../../llm/providers/gateway.js';
 
 function _err(msg) { return { success: false, error: `generate_character_sheet: ${msg}` }; }
 function _isStr(v) { return typeof v === 'string'; }
@@ -40,8 +39,8 @@ function _buildSheetPrompt(description) {
   return [
     'Character turnaround reference sheet: ONE single image, a strict grid of 4 columns by 2 rows (8 cells total).',
     'TOP ROW — four FULL-BODY views, head to toe, standing in a neutral relaxed pose: (1) front, (2) left-side profile, (3) right-side profile, (4) back.',
-    'BOTTOM ROW — four HEAD-AND-SHOULDERS portrait views of the SAME face: (1) front, (2) three-quarter, (3) side profile, (4) back of head.',
-    'It is the SAME character in every cell: identical face, hairstyle, wardrobe, body proportions and colors — ONLY the camera angle changes between cells.',
+    'BOTTOM ROW — four HEAD-AND-SHOULDERS portrait views of the SAME face: (1) front, neutral expression, (2) three-quarter, SMILING broadly with the mouth open so the TEETH are clearly visible (the real upper and lower teeth of this character, the reference for every later shot where they speak or smile), (3) side profile, (4) back of head.',
+    'It is the SAME character in every cell: identical face, hairstyle, wardrobe, body proportions and colors. Only the camera angle changes between cells, plus the smile of bottom-row cell (2).',
     'Even, neutral studio lighting; plain light-grey seamless background; photorealistic unless the description says otherwise.',
     `CHARACTER: ${desc}.`,
     'GRID LAYOUT (CRITICAL, machine-read): separate every cell with SOLID PURE-BLACK (#000000) gutter bars — clearly THICK (about 1% of the image width, a bold bar, never a thin hairline), perfectly straight, continuous and uniform. Every column the same width, every row the same height. The black bars must run fully edge to edge so the grid is cleanly croppable. NEVER gray, never thin; no inner borders, no frames, no text, no numbers, no labels, no watermark, no drop shadows between cells.',
@@ -143,7 +142,7 @@ export default {
     'Generate a character TURNAROUND SHEET: one image with a 4-columns x 2-rows grid (top row = 4 full-body views front/left/right/back; bottom row = 4 face portraits) of the SAME character, drawn with thick pure-black gutter bars, then auto-detect the 8 cell rectangles. ' +
     'Inputs: a DESCRIPTION and/or one or more reference PHOTOS of the character (either is enough; both is best). When only `characterId` is given, the description + photos are read from that saved character. ' +
     'Call shape: { description?, photos?: [absolute paths], characterId?, model?, aspectRatio? }. ' +
-    'model AUTO-SELECTS by whether the character has reference photos: WITH photos (a real person) → the `characters`-label identity model (else GPT Image 2 edit); NO photos (a 100% invented character) → the `characters-synthetic`-label model (Seedream text-to-image, so the turnaround is Seedance-native — passes the reference-to-video likeness filter with no laundering), else base GPT Image 2. Do NOT override `model` unless the user asks. ' +
+    'model: pass the one the characters skill names (GPT Image 2.6 Sunburst: edit WITH reference photos, text-to-image for an invented character); omitted → that same default. ' +
     'Returns: { success, sheet: <absolute path to the generated sheet>, sheetCells: [{x,y,w,h} normalized, row-major], cols: 4, rows: 2, model, attached }. ' +
     'When a characterId is passed, the sheet is AUTOMATICALLY attached to that character (sheet + sheetCells saved onto its doc) — no follow-up save_character needed. Without a characterId, attach it yourself with save_character { id, sheet, sheetCells }.',
   thinkingHint: () => 'Generating character turnaround sheet',
@@ -184,50 +183,13 @@ export default {
       return _err('need at least a description or one reference photo to generate a sheet.');
     }
 
-    // Resolve a reference-capable image model. A pinned slug wins; otherwise
-    // auto-pick from the live catalog (refsCount > 0 → the image-editing bucket,
-    // where reference/identity models live).
-    // MODEL: the catalog model tagged with the `characters` label; else default
-    // to GPT Image 2 (the EDIT variant when we have reference photos, else base
-    // text-to-image). An explicit `model` overrides both. (Seedance video does
-    // its OWN Seedream conversion of the sheet, so the sheet model is free to be
-    // the best character/identity model — GPT Image 2.)
+    // MODEL: the caller's `model` (the characters skill passes it). Otherwise
+    // GPT Image 2.6 Sunburst (user choice: the best image model): the EDIT
+    // variant when there are reference photos, text-to-image for an invented
+    // character. No backoffice-label routing: the skill decides defaults.
     let model = (_isStr(action?.model) && action.model.trim() && action.model.trim() !== 'auto')
       ? action.model.trim()
       : null;
-    // NO reference photo → the character is 100% INVENTED. Render its turnaround
-    // with the SEEDANCE-NATIVE model (Seedream text-to-image): a synthesised
-    // face clears the reference-to-video likeness filter with NO later
-    // laundering pass, so an invented character is Seedance-ready from birth.
-    // Resolved via the catalog label `characters-synthetic` (never a hardcoded
-    // slug — tag the Seedream TEXT-TO-IMAGE model with it). Untagged → falls
-    // through to the plain text-to-image fallback below.
-    if (!model && photos.length === 0) {
-      try {
-        const rows = await mediaModelsByLabel('image', 'characters-synthetic');
-        if (Array.isArray(rows) && rows.length && _isStr(rows[0]?.slug)) {
-          model = rows[0].slug;
-        }
-      } catch (e) {
-        channel.log('generate_character_sheet', `label 'characters-synthetic' resolve failed: ${e.message}`);
-      }
-    }
-    // The `characters` label tags REFERENCE/identity models — image-EDITING
-    // variants (e.g. bytedance/seedream/v5/pro/edit) that REQUIRE an input
-    // image. With NO reference photo there is nothing to edit, so calling that
-    // model with an empty `referenceImages` fails instantly ("Error generating
-    // image", 0 s). Only use the label-resolved model when we actually have a
-    // photo; otherwise fall through to a text-to-image model below.
-    if (!model && photos.length) {
-      try {
-        const rows = await mediaModelsByLabel('image', 'characters');
-        if (Array.isArray(rows) && rows.length && _isStr(rows[0]?.slug)) {
-          model = rows[0].slug;
-        }
-      } catch (e) {
-        channel.log('generate_character_sheet', `label 'characters' resolve failed: ${e.message}`);
-      }
-    }
     if (!model) {
       model = photos.length ? 'openai/gpt-image-2.6/sunburst/edit' : 'openai/gpt-image-2.6/sunburst/text-to-image';
     }
@@ -243,8 +205,9 @@ export default {
       prompt: _buildSheetPrompt(description),
       model,
       aspectRatio,
-      // The turnaround sheet renders at 2K (2048). User decision: 2K is enough.
-      resolution: '2k',
+      // The turnaround sheet renders at 4K (4096), ALWAYS, never less (Antonio, 11/11/2026): each of the 8 cells is
+      // a reference cropped out of it, and at 2K a face cell is too small to hold the detail a video model copies.
+      resolution: '4k',
       quality: 'high',
       outputFormat: 'png',
       _internalDelegate: true,

@@ -892,7 +892,11 @@ const generateImageAction = {
           // the in-memory pad still happens so fal accepts the ref, the
           // model emits at the caller's chosen dim, and there's no
           // recovery crop because there's no base canvas to recover to.
-          if (!_outputRecoveryGeom && !_callerSetExplicitOutputDim) {
+          // ONLY the base ref (index 0) is the canvas being edited. A padded
+          // SECONDARY ref (a small crop given as a style / detail guide) must
+          // never set the output size: it did, and a 2336×3520 photo edited
+          // with a 454×674 detail crop as ref[1] came back 454×674.
+          if (i === 0 && !_outputRecoveryGeom && !_callerSetExplicitOutputDim) {
             _outputRecoveryGeom = geom;
             // Pass the padded dims as the explicit target so any
             // adapter that supports `{width, height}` (seedream family,
@@ -929,7 +933,13 @@ const generateImageAction = {
             channel.log('image', `Auto-detected aspectRatio=${autoAspectRatio} from base ref (${meta.width}x${meta.height})`);
           }
           if (!action.resolution) {
-            autoResolution = _closestResolution(Math.max(meta.width, meta.height), caps.resolutions);
+            // A catalog entry without a resolutions list (e.g. GPT Image 2.6)
+            // still takes the semantic labels: without this fallback the edit
+            // went out with NO resolution and the provider rendered its small
+            // default (a 3520px master came back ~1500px).
+            const resList = Array.isArray(caps.resolutions) && caps.resolutions.length
+              ? caps.resolutions : ['low', 'medium', 'high', 'ultra'];
+            autoResolution = _closestResolution(Math.max(meta.width, meta.height), resList);
             if (autoResolution) {
               channel.log('image', `Auto-detected resolution=${autoResolution} from base ref (max=${Math.max(meta.width, meta.height)}px)`);
             }
