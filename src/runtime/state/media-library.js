@@ -547,6 +547,21 @@ export class MediaLibrary {
         const existing = await table.query()
           .where(_wherePath(filePath, this._root)).limit(1).toArray();
         wasReplacement = existing.length > 0;
+        // The re-insert below rebuilds metadata from the artefact, so carry
+        // over the state the USER put on the row (collections, @mention,
+        // hidden-from-Latest, favourite). Without this, re-indexing a
+        // character / object / location (every save + every startup
+        // backfill) wiped the drawer section it had been moved to.
+        if (wasReplacement) {
+          let prev = {};
+          try { prev = JSON.parse(existing[0].metadata_json || '{}') || {}; } catch { /* corrupt row */ }
+          const carried = {};
+          for (const k of ['categories', 'mention', 'hidden_from_latest']) {
+            if (prev[k] !== undefined && metadata[k] === undefined) carried[k] = prev[k];
+          }
+          metadata = { ...carried, ...metadata };
+          if (!favorite && existing[0].favorite) favorite = true;
+        }
       } catch { /* table empty — treat as fresh */ }
       try {
         await table.delete(_wherePath(filePath, this._root));

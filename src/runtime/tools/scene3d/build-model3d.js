@@ -39,6 +39,31 @@ async function attachToCards(model) {
   return out;
 }
 
+/** While the modeler iterates, its card says so (`modelBuilding`): the card's 3D view shows
+ *  "building" (the model blurred) instead of a half-done model. The LAST build (`final: true`)
+ *  clears it; a forgotten final call expires in the GUI after a few minutes without builds. */
+async function markCardsBuilding({ kind, locationId, objectId, modelId, rev }, building) {
+  try {
+    const now = new Date().toISOString();
+    const apply = (doc) => {
+      const next = { ...doc };
+      if (building) next.modelBuilding = { modelId: modelId || null, rev: rev || null, updatedAt: now };
+      else delete next.modelBuilding;
+      return next;
+    };
+    if (kind === 'set' && locationId) {
+      const { readLocation, saveLocation } = await import('../../state/location-registry.js');
+      const loc = readLocation(locationId);
+      if (loc && (building || loc.modelBuilding)) saveLocation(apply(loc));
+    }
+    if (kind !== 'set' && objectId) {
+      const { readObject, saveObject } = await import('../../state/object-registry.js');
+      const obj = readObject(objectId);
+      if (obj && (building || obj.modelBuilding)) saveObject(apply(obj));
+    }
+  } catch { /* best effort: only the card's "building" badge */ }
+}
+
 export default {
   type: 'build_model3d',
   intent: 'build_model3d',
@@ -71,6 +96,7 @@ export default {
       locationId: { type: 'string', description: 'Saved location this set is (kind "set"): the model becomes THE 3D set of that location card, and every previz scene in that place uses it.' },
       objectId: { type: 'string', description: 'Saved object card this object is (kind "object"): the model becomes THE 3D model of that card, and every previz prop that is this object uses it.' },
       characterId: { type: 'string', description: 'Saved character this belongs to, if any.' },
+      final: { type: 'boolean', description: 'true on the LAST build, once the review matches every reference: the card stops showing "building" and shows the model. Every iteration before it: omit (the card shows "building" meanwhile).' },
     },
   },
 
@@ -91,6 +117,20 @@ export default {
     const refs = Array.isArray(params.references) ? params.references : existing?.references || [];
     const missing = refs.filter((r) => !r?.image || !fs.existsSync(r.image)).map((r) => r?.image);
     if (missing.length) return { success: false, error: `build_model3d: reference images not found: ${missing.join(', ')}` };
+    // A photo was taken from ONE camera. The same image under a second
+    // camera (e.g. the front elevation reused as a "top view") makes the
+    // review fit the model to an outline that view never shows.
+    const seen = new Set();
+    const dup = [];
+    for (const r of refs) {
+      const k = path.resolve(r.image);
+      if (seen.has(k)) dup.push(r.image);
+      seen.add(k);
+    }
+    if (dup.length) {
+      return { success: false, error: `build_model3d: the same reference image appears more than once (${[...new Set(dup)].join(', ')}). ` +
+        'Each photo was taken from ONE camera: pass it once, with that camera. A view no image shows (e.g. the top) has no reference.' };
+    }
 
     const id = existing?.id || newModelId(params.name);
     const dir = modelDir(id);
@@ -105,6 +145,14 @@ export default {
     fs.writeFileSync(refsFile, JSON.stringify(refs), 'utf8');
     const kind = params.kind === 'set' || (!params.kind && existing?.kind === 'set') ? 'set' : 'object';
 
+    const cardRef = {
+      kind,
+      locationId: params.locationId ?? existing?.locationId,
+      objectId: params.objectId ?? existing?.objectId,
+      modelId: id,
+      rev,
+    };
+    await markCardsBuilding(cardRef, true);
     try {
       await runBuilder(['--script', script, '--out', stage, '--kind', kind, '--refs', refsFile], {
         script: modelerScriptPath(),
@@ -154,6 +202,7 @@ export default {
     writeModel(model);
     // THE model of its card(s), and every scene follows the card.
     const attached = await attachToCards(model);
+    await markCardsBuilding(cardRef, params.final !== true);
 
 
     const review = stats.review || {};
@@ -176,7 +225,10 @@ export default {
         + 'the photo, outline over outline. Check proportions first (overall length : width : height, where each part '
         + 'starts and ends, sizes of parts relative to each other), then that every object reads as what it is, then '
         + 'colours. If the blend is off everywhere the same way, fix the reference camera; if one part is off, fix the '
-        + 'model. Edit the script and call build_model3d again with this id until it matches.',
+        + 'model. Edit the script and call build_model3d again with this id until it matches. '
+        + (params.final === true
+          ? 'This was the FINAL build: the card now shows it.'
+          : 'The card shows "building" until you call build_model3d with `final: true` on the build that matches.'),
     };
   },
 };

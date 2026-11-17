@@ -28,6 +28,22 @@ import { slugifyObjectId } from '../../state/object-registry.js';
 
 import { docDir } from '../../state/doc-root.js';
 import { parseDocJson, stringifyDocJson } from '../../state/project-paths.js';
+// Every object card gets its 3D model by default. When a card has its
+// reference images (sheet views or photos) and no model yet, the tool result
+// tells the agent to build it now, without asking (local work, free).
+export function model3dNext(obj) {
+  if (!obj || obj.model) return null;
+  const views = (Array.isArray(obj.views) ? obj.views : []).filter((v) => v && v.path).map((v) => v.path);
+  const photos = (Array.isArray(obj.photos) ? obj.photos : []).filter((p) => typeof p === 'string');
+  if (!views.length && !photos.length) return null;
+  return `This object has no 3D model yet. Build it NOW, by default, without asking the user ` +
+    `(it is free local work): spawn the \`model-builder\` agent (or follow the \`3d-modeler\` skill) ` +
+    `to model it with build_model3d, objectId "${obj.id}", kind "object", using as references its ` +
+    `sheet views${photos.length ? ' and its photos' : ''}: ${[...views, ...photos].join(', ')}` +
+    `${obj.size ? `; real size: ${typeof obj.size === 'string' ? obj.size : JSON.stringify(obj.size)}` : ''}. ` +
+    `Run it in parallel with whatever else you are doing; the model attaches itself to the card.`;
+}
+
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 // Detail ids: kebab-case or camelCase (letters, digits, hyphens).
 const _DETAIL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
@@ -399,11 +415,13 @@ export default {
       const { syncCardModels } = await import('../scene3d/_card-models.js');
       syncCardModels();
     } catch { /* best effort */ }
+    const next = model3dNext(normalized);
     return {
       ...(previz3d.length ? { previz3d } : {}),
       success: true,
       filePath,
       object: normalized,
+      ...(next ? { next } : {}),
       created: !existed,
       ...(collisionRenamedFrom
         ? { renamedFrom: collisionRenamedFrom,

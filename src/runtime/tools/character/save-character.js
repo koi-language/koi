@@ -35,10 +35,55 @@ import { saveCharacterEntry } from '../../state/media-library.js';
 import { slugifyCharacterId } from '../../state/character-registry.js';
 
 import { docDir } from '../../state/doc-root.js';
+
+/** Marks generate_character_sheet's own save: the only one allowed to set a sheet. */
+export const SHEET_TOOL = Symbol('generate_character_sheet');
 import { parseDocJson, stringifyDocJson } from '../../state/project-paths.js';
 const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_character: ${msg}` }; }
+
+// The cells of [candidate] when it is one of this character's OWN sheets in the current layout:
+// the current sheet, an earlier one (`sheetHistory`, or a sheet generate_character_sheet tagged
+// with this character), or a composite_partial_edit made on top of any of those (walking the
+// chain of edits). null otherwise. So the user can go back to a sheet they approved, or keep an
+// edit made on it, after the sheet was regenerated (17/11/2026: the agent edited the approved
+// sheet, the save was refused because a newer sheet existed, and it offered to bypass the guard).
+async function _ownSheetCells(candidate, existing) {
+  if (!candidate || !existing) return null;
+  const { SHEET_VIEWS } = await import('./generate-character-sheet.js');
+  const okCells = (c) => (Array.isArray(c) && c.length === SHEET_VIEWS.length ? c : null);
+  const own = new Map();
+  const cur = (_isStr(existing.sheet) ? existing.sheet : '').trim();
+  if (cur) own.set(path.resolve(cur), existing.sheetCells);
+  for (const h of Array.isArray(existing.sheetHistory) ? existing.sheetHistory : []) {
+    if (_isStr(h?.sheet) && h.sheet.trim() && !own.has(path.resolve(h.sheet.trim()))) own.set(path.resolve(h.sheet.trim()), h.sheetCells);
+  }
+  try {
+    const { MediaLibrary } = await import('../../state/media-library.js');
+    const lib = MediaLibrary.global();
+    let p = candidate;
+    for (let hop = 0; p && hop < 16; hop++) {
+      if (!fs.existsSync(p)) return null;
+      if (own.has(path.resolve(p))) return okCells(own.get(path.resolve(p)));
+      const meta = (await lib.getByPath(p))?.metadata || {};
+      if (meta.characterSheet?.characterId === existing.id) return okCells(meta.characterSheet.sheetCells);
+      p = meta.partialEdit === true && typeof meta.compositeMasterPath === 'string' ? meta.compositeMasterPath : null;
+    }
+  } catch { /* unknown lineage: not accepted */ }
+  return null;
+}
+
+// The sheets this character had before, newest first: the sheet being replaced is added.
+function _nextSheetHistory(existing, newSheet) {
+  const hist = (Array.isArray(existing?.sheetHistory) ? existing.sheetHistory : [])
+    .filter((h) => _isStr(h?.sheet) && h.sheet.trim());
+  const prev = (_isStr(existing?.sheet) ? existing.sheet : '').trim();
+  if (prev && prev !== newSheet && !hist.some((h) => h.sheet === prev)) {
+    hist.unshift({ sheet: prev, sheetCells: existing.sheetCells || null, replacedAt: new Date().toISOString() });
+  }
+  return hist.filter((h) => h.sheet !== newSheet).slice(0, 20);
+}
 
 function _isStr(v) { return typeof v === 'string'; }
 function _isObj(v) { return v && typeof v === 'object' && !Array.isArray(v); }
@@ -70,8 +115,9 @@ function _validate(ch) {
     }
   }
   // `sheetCells` is the detected cell geometry of the turnaround `sheet`
-  // (a black-band grid): an array of normalized { x, y, w, h } rects in
-  // reading order (row-major). Optional; when present each entry is an object
+  // (a black-band grid): an array of normalized { x, y, w, h } rects, 7 in the
+  // order hero, faceFront, faceSmile, faceProfile, bodySide, bodyBack, detail
+  // (8, row-major four bodies then four faces, on a sheet made before 16/11/2026). Optional; when present each entry is an object
   // of finite numbers in 0..1.
   if (ch.sheetCells !== undefined && ch.sheetCells !== null) {
     if (!Array.isArray(ch.sheetCells)) {
@@ -133,7 +179,7 @@ function _normSheetCells(v) {
   return out.length ? out : null;
 }
 
-function _normalize(ch, existing) {
+function _normalize(ch, existing, fromSheetTool = false) {
   // Carry forward the original createdAt across saves so the MediaLibrary
   // "Latest" ordering stays anchored to when the character was first
   // authored, not when it was last touched.
@@ -157,10 +203,12 @@ function _normalize(ch, existing) {
     weight: (typeof ch.weight === 'number' && Number.isFinite(ch.weight)) ? ch.weight : null,
     build: (_isStr(ch.build) && ch.build.trim()) ? ch.build.trim() : null,
     photos: _normPhotos(ch.photos),
-    // Generated turnaround sheet (a 4-col x 2-row grid of the character) + the
+    // Generated turnaround sheet (7 cells: hero, three faces, side, back, wardrobe detail) + the
     // detected cell geometry the visor crops into the rotating card view.
-    sheet: (_isStr(ch.sheet) && ch.sheet.trim()) ? ch.sheet.trim() : null,
-    sheetCells: _normSheetCells(ch.sheetCells),
+    // Only generate_character_sheet sets them; any other save keeps what the file has.
+    ...(fromSheetTool
+      ? { sheet: (_isStr(ch.sheet) && ch.sheet.trim()) ? ch.sheet.trim() : null, sheetCells: _normSheetCells(ch.sheetCells) }
+      : { sheet: (_isStr(existing?.sheet) && existing.sheet.trim()) ? existing.sheet.trim() : null, sheetCells: _normSheetCells(existing?.sheetCells) }),
     voiceId: (_isStr(ch.voiceId) && ch.voiceId.trim()) ? ch.voiceId.trim() : null,
     // TTS model slug to synthesize this character's voice with (provider-scoped
     // to the voice); null = let the audio pipeline pick a default.
@@ -187,7 +235,7 @@ export default {
     'character.photos is an OPTIONAL array of ABSOLUTE file paths — POINTERS only, the bytes are never copied; photos[0] is the hero image the drawer shows. ' +
     'character.voiceId is an OPTIONAL string: a voice-registry id ("voice-...") or a voice display name. character.ttsModel is an OPTIONAL TTS model slug to speak this character with (provider-scoped to the voice). ' +
     'When you CREATE a character, ASSIGN A FITTING VOICE: call list_voices (default provider ElevenLabs) and pick a preset whose gender matches the character\'s sex, then set voiceId to that preset name and ttsModel to the model slug — a character with no voice cannot speak in a video. ' +
-    'character.sheet is an OPTIONAL absolute path to a generated TURNAROUND sheet (a 4-col x 2-row grid of the character) and character.sheetCells its detected normalized cell rects — usually set by the generate_character_sheet tool, not by hand. ' +
+    'character.sheet is an OPTIONAL absolute path to a generated TURNAROUND sheet (7 cells: hero, three faces, side, back, wardrobe detail) and character.sheetCells its detected normalized cell rects — set ONLY by generate_character_sheet (to change part of it: generate_character_sheet with characterId + `change`); also accepted here: one of this character\'s own earlier sheets (listed in its sheetHistory: going BACK to a sheet the user approved) and a composite_partial_edit made on top of the current sheet or an earlier one; anything else is refused (never write the character file directly to get past it), and a save without `sheet` keeps the sheet the character has. To APPLY such an edited sheet to the character (the user asks to put the change on the character / actor) call just save_character({ character: { id, sheet } }): every other field is kept. ' +
     'Auto-set by the tool: updatedAt=now (UTC ISO), createdAt preserved from the existing file or set to now, id slugged from name when omitted. ' +
     'Returns: { success:true, filePath, character:<normalized> } on success, or { success:false, error } with the exact invalid field on validation failure.',
   instructions:
@@ -225,6 +273,18 @@ export default {
       ch.id = slug;
     }
 
+    // Sheet-only update ({ id, sheet } with an edit of the current sheet, as composite_partial_edit
+    // hands it): every field the call leaves out keeps the character's current value.
+    try {
+      const preFile = path.join(docDir('characters'), `${ch.id}.json`);
+      const pre = fs.existsSync(preFile) ? parseDocJson(fs.readFileSync(preFile, 'utf8'), preFile) : null;
+      const preSheet = (_isStr(pre?.sheet) ? pre.sheet : '').trim();
+      if (pre && _isStr(ch.sheet) && ch.sheet.trim() !== preSheet &&
+          await _ownSheetCells(ch.sheet.trim(), { ...pre, id: ch.id })) {
+        for (const [k, v] of Object.entries(pre)) if (ch[k] === undefined) ch[k] = v;
+      }
+    } catch { /* unreadable file: the normal path decides */ }
+
     const validationError = _validate(ch);
     if (validationError) return _err(validationError);
 
@@ -243,6 +303,33 @@ export default {
         try { existing = parseDocJson(raw, filePath); } catch { /* corrupted prior file — overwrite */ }
       }
     } catch { /* ignore — fall through to write */ }
+
+    // A character's sheet is set ONLY by generate_character_sheet, so it is always the current
+    // layout (Antonio, 16/11/2026: asked to put one character in another's uniform, the agent
+    // edited that one's old sheet and saved it, and the character kept the old layout). The
+    // tool marks its own call with SHEET_TOOL, a symbol no JSON tool call can carry; any other
+    // save keeps the sheet the file already has, and one that tries to change it is refused.
+    const fromSheetTool = action?.[SHEET_TOOL] === true;
+    const askedSheet = _isStr(ch.sheet) ? ch.sheet.trim() : '';
+    const currentSheet = (_isStr(existing?.sheet) ? existing.sheet : '').trim();
+    // The exceptions: one of this character's own sheets (current or earlier) or an edit made on one.
+    // That is exactly what generate_character_sheet's `change` mode produces (same pixels outside
+    // the changed areas, same size, same cells), so it is accepted and the cells are kept.
+    let editedSheet = null;
+    let editedCells = null;
+    if (!fromSheetTool && askedSheet && askedSheet !== currentSheet) {
+      editedCells = await _ownSheetCells(askedSheet, existing ? { ...existing, id: existing.id || ch.id } : null);
+      if (editedCells) {
+        editedSheet = askedSheet;
+      } else {
+        return _err('a character\'s sheet is made ONLY by generate_character_sheet (pass characterId and it attaches by itself). ' +
+          'To CHANGE part of the current sheet (a collar, a badge, a colour) call generate_character_sheet with characterId + ' +
+          '`change` (+ optional `photos` as the reference for the change and `regions`): only the changed areas are repainted, ' +
+          'the rest stays pixel for pixel. Accepted here: one of this character\'s own sheets (the current one or an earlier one ' +
+          'listed in its sheetHistory, to go back to it) or a composite_partial_edit made on top of one of them. ' +
+          'Never save a whole redraw made with generate_image or by hand, and never write the character file directly to get past this.');
+      }
+    }
 
     // CREATE-vs-UPDATE collision guard. The normal, wanted case is "iterate MY
     // character": the agent saves under the SAME id to UPDATE it in place. We
@@ -273,7 +360,14 @@ export default {
       existed = false;
     }
 
-    const normalized = _normalize(ch, existing);
+    const normalized = _normalize(ch, existing, fromSheetTool);
+    if (editedSheet) { normalized.sheet = editedSheet; normalized.sheetCells = _normSheetCells(editedCells); }
+    // Every sheet replaced stays in the history, so going back to it is a plain save.
+    if (existing && normalized.sheet && normalized.sheet !== currentSheet) {
+      normalized.sheetHistory = _nextSheetHistory(existing, normalized.sheet);
+    } else if (Array.isArray(existing?.sheetHistory) && existing.sheetHistory.length) {
+      normalized.sheetHistory = existing.sheetHistory;
+    }
     const serialized = stringifyDocJson(normalized, filePath) + '\n';
 
     try {

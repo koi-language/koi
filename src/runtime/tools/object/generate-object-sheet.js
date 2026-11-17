@@ -26,6 +26,19 @@ import { contentIslands, geometryCachePath } from '../panels/_grid.js';
 import generateImage from '../media/generate-image.js';
 import { resolveObjectImageModel } from './generate-object-view.js';
 
+// Every object card gets its 3D model by default: once the sheet is attached
+// and the card has no model, the agent builds it right away (never waits for
+// the card's Generate 3D button).
+async function _modelNext(objectId, attached) {
+  if (!objectId || !attached) return {};
+  try {
+    const { model3dNext } = await import('./save-object.js');
+    const obj = readObject(objectId);
+    const next = obj ? model3dNext(obj) : null;
+    return next ? { next } : {};
+  } catch { return {}; }
+}
+
 function _err(msg) { return { success: false, error: `generate_object_sheet: ${msg}` }; }
 
 function _isStr(v) { return typeof v === 'string'; }
@@ -303,6 +316,7 @@ export default {
       views,
       model: r.model || model,
       ...(objectId ? { objectId, attached } : {}),
+      ...(await _modelNext(objectId, attached)),
     };
   },
 };

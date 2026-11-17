@@ -442,6 +442,10 @@ def import_model(ref, name, parent=None):
 # ─────────────────────────────────────────────────────────────── set ──
 
 SETD = S.get("set") or {}
+# An object card's own 3D view: the object alone in a photo studio (soft
+# key / fill / rim lights, an even grey surround), with NO floor, so it can
+# be turned and seen from any side, underneath included.
+CARD_OBJ = (S.get("cardPreview") or {}).get("kind") == "object"
 set_kind = SETD.get("type") or "room"
 W, D, H = (list(SETD.get("size") or [8, 8, 3]) + [3])[:3]
 floor_col = SETD.get("floorColor") or ("#8a8884" if set_kind != "exterior" else "#7d8a6a")
@@ -452,7 +456,7 @@ SET_MODEL = import_model(SETD.get("model"), "set_model") if SETD.get("model") el
 
 # Floor (large for exteriors so the horizon never shows an edge).
 fw, fd = (W, D) if set_kind == "room" else (max(W, 80), max(D, 80))
-if not SET_MODEL:
+if not SET_MODEL and not CARD_OBJ:
     mesh_obj("floor", [(-fw / 2, -fd / 2, 0), (fw / 2, -fd / 2, 0), (fw / 2, fd / 2, 0), (-fw / 2, fd / 2, 0)],
              [(0, 1, 2, 3)], material("floor", floor_col, 0.9))
 
@@ -2348,7 +2352,28 @@ bg.inputs["Strength"].default_value = ws
 DAYLIGHT = {"day", "overcast", "golden_hour", "sunset", "studio"}
 SKY = None
 hdri = L.get("hdri") or SETD.get("hdri")
-if preset in DAYLIGHT and not hdri:
+if CARD_OBJ:
+    # The camera sees an even grey surround; reflections see a near-black
+    # studio, so a dark glossy object stays dark with crisp highlights from
+    # the softboxes (as in a product photo) instead of mirroring the grey.
+    bg.inputs["Color"].default_value = hex_rgba("#9c9c9c")
+    bg.inputs["Strength"].default_value = 0.9
+    try:
+        wnt = world.node_tree
+        dark = wnt.nodes.new("ShaderNodeBackground")
+        dark.inputs["Color"].default_value = hex_rgba("#202020")
+        dark.inputs["Strength"].default_value = 0.35
+        lp = wnt.nodes.new("ShaderNodeLightPath")
+        mix = wnt.nodes.new("ShaderNodeMixShader")
+        wout = wnt.nodes.get("World Output")
+        wnt.links.new(lp.outputs["Is Camera Ray"], mix.inputs[0])
+        wnt.links.new(dark.outputs["Background"], mix.inputs[1])
+        wnt.links.new(bg.outputs["Background"], mix.inputs[2])
+        wnt.links.new(mix.outputs[0], wout.inputs["Surface"])
+    except Exception as e:
+        print(f"[scene3d] card world: {e}", file=sys.stderr)
+    sun_d.energy = 1.5
+if preset in DAYLIGHT and not hdri and not CARD_OBJ:
     try:
         SKY = world.node_tree.nodes.new("ShaderNodeTexSky")
         SKY.sky_type = "NISHITA"
@@ -2396,6 +2421,45 @@ if preset.startswith("interior") or set_kind == "room":
     area = bpy.data.objects.new("fill", area_d)
     link(area)
     area.location = (0, 0, H - 0.05)
+
+if CARD_OBJ:
+    # Product-shot lighting sized to the object: a big soft key, a fill on
+    # the other side, a rim from behind and a soft light from below so the
+    # underside never goes black. Dark, glossy objects read through these
+    # reflections.
+    bpy.context.view_layer.update()
+    lo_c, hi_c = [1e9] * 3, [-1e9] * 3
+    for ob in scn.objects:
+        if ob.type != "MESH":
+            continue
+        for c in ob.bound_box:
+            w = ob.matrix_world @ Vector(c)
+            for k in range(3):
+                lo_c[k] = min(lo_c[k], w[k])
+                hi_c[k] = max(hi_c[k], w[k])
+    if lo_c[0] > hi_c[0]:
+        lo_c, hi_c = [-0.5, -0.5, 0.0], [0.5, 0.5, 1.0]
+    ctr = Vector([(lo_c[k] + hi_c[k]) / 2 for k in range(3)])
+    rad = max(0.05, max(hi_c[k] - lo_c[k] for k in range(3)) / 2)
+    for name, (az, el, dist, power, size) in {
+        "key":   (35, 40, 3.0, 1.0, 1.6),
+        "fill":  (-60, 20, 3.2, 0.45, 2.2),
+        "rim":   (170, 35, 3.0, 0.7, 1.2),
+        "under": (0, -60, 3.0, 0.45, 2.0),
+    }.items():
+        ld = bpy.data.lights.new(f"card_{name}", "AREA")
+        ld.size = rad * size
+        ld.energy = power * 60 * (rad * dist) ** 2  # same light at any object size; low, so a black object stays black
+        ld.color = (1.0, 1.0, 1.0)
+        try:
+            ld.use_shadow = name == "key"
+        except Exception:
+            pass
+        lo = bpy.data.objects.new(f"card_{name}", ld)
+        link(lo)
+        a, e = math.radians(az), math.radians(el)
+        lo.location = ctr + Vector((math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e))) * rad * dist
+        lo.rotation_euler = (ctr - lo.location).to_track_quat("-Z", "Y").to_euler()
 
 for i, extra in enumerate(L.get("lights") or []):
     ld = bpy.data.lights.new(f"light{i}", (extra.get("type") or "POINT").upper())
@@ -2566,8 +2630,10 @@ def override_material(mat):
 
 
 # Everything matte: highlights slide over the surfaces whenever the camera
-# moves and read as flicker. Covers imported / built models too.
-for m_ in bpy.data.materials:
+# moves and read as flicker. Covers imported / built models too. Not on an
+# object card's own view: there the object must look as it is (a patent
+# leather hat shines, its highlights are what show its shape).
+for m_ in ([] if CARD_OBJ else bpy.data.materials):
     try:
         m_.roughness, m_.metallic, m_.specular_intensity = 1.0, 0.0, 0.0
         b_ = m_.node_tree.nodes.get("Principled BSDF") if m_.use_nodes else None
@@ -2580,7 +2646,7 @@ for m_ in bpy.data.materials:
     except Exception:
         pass
 # Lights give no highlights either.
-for ld_ in bpy.data.lights:
+for ld_ in ([] if CARD_OBJ else bpy.data.lights):
     try:
         ld_.specular_factor = 0.0
     except Exception:

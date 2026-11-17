@@ -147,6 +147,152 @@ def photo_material(name, photo, corners, size=512):
     return m
 
 
+def _photo_px(photo):
+    import numpy as np
+    if photo not in _PHOTOS:
+        src = bpy.data.images.load(photo, check_existing=True)
+        w_, h_ = src.size
+        _PHOTOS[photo] = np.array(src.pixels[:], dtype=np.float32).reshape(h_, w_, 4)[::-1]
+    return _PHOTOS[photo]
+
+
+def photo_color(photo, points, radius=0.012):
+    """The colour of ONE surface as the photo shows it, as "#hex" for pbr():
+    the median of small patches around each point (x, y in 0..1, y DOWN)
+    picked ON that surface (several points spread over it, avoiding edges,
+    highlights and objects in front). Measure every surface, never guess:
+    two neighbouring surfaces (a brick arch and the floor) get their own."""
+    import numpy as np
+    px = _photo_px(photo)
+    H_, W_ = px.shape[:2]
+    if points and isinstance(points[0], (int, float)):
+        points = [points]
+    r = max(1, int(radius * max(W_, H_)))
+    samples = []
+    for x, y in points:
+        cx, cy = int(float(x) * (W_ - 1)), int(float(y) * (H_ - 1))
+        patch = px[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1, :3]
+        samples.append(patch.reshape(-1, 3))
+    med = np.median(np.concatenate(samples), axis=0)
+    return "#%02x%02x%02x" % tuple(int(max(0, min(1, v)) * 255 + 0.5) for v in med)
+
+
+_PROJ_MATS = {}
+
+
+def _subdivide_world(ob, max_len):
+    """Split ob's faces until no edge is longer than max_len metres (world),
+    so the photo projection follows the perspective (UVs are interpolated
+    linearly inside a face) and occlusion is judged per small piece."""
+    me = ob.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    mw = ob.matrix_world
+    for _ in range(8):
+        long_ = [e for e in bm.edges if ((mw @ e.verts[0].co) - (mw @ e.verts[1].co)).length > max_len]
+        if not long_ or len(bm.faces) > 60000:
+            break
+        bmesh.ops.subdivide_edges(bm, edges=long_, cuts=1, use_grid_fill=True)
+    bm.to_mesh(me)
+    bm.free()
+
+
+def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle=72):
+    """Paint objects with the reference photo itself, projected from the
+    camera it was taken from (REF_CAMS[ref]): every face that camera SEES
+    shows exactly the photo's pixels (the bricks of the arch, the floor
+    tiles, the wood of the beams), so the set looks like the photo, not a
+    diagram. Faces turned away or HIDDEN behind something else (the floor
+    under the table) keep 'fallback' (a pbr() material, e.g. with
+    photo_color) instead of the occluder's pixels. Call it at the END of the
+    script, once every object exists, on the big surfaces the photo shows
+    well (walls, arch, floor, ceiling and beams, stairs, doors). Get that
+    reference's camera right first: a wrong camera smears the photo."""
+    from bpy_extras.object_utils import world_to_camera_view
+    import numpy as np
+    if not REF_CAMS:
+        return
+    rc = REF_CAMS[ref]
+    cam = rc["obj"]
+    if ref not in _PROJ_MATS:
+        src = rc["image"]
+        w_, h_ = src.size
+        img = src
+        if max(w_, h_) > max_px:
+            img = src.copy()
+            k = max_px / max(w_, h_)
+            img.scale(max(8, int(w_ * k)), max(8, int(h_ * k)))
+        img.pack()
+        m = bpy.data.materials.new(f"photo_proj_{ref}")
+        m.use_nodes = True
+        nt = m.node_tree
+        bsdf = nt.nodes.get("Principled BSDF")
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        tex.extension = "EXTEND"
+        uvn = nt.nodes.new("ShaderNodeUVMap")
+        uvn.uv_map = "proj"
+        nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
+        nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        bsdf.inputs["Roughness"].default_value = 0.85
+        px = np.array(src.pixels[:], dtype=np.float32).reshape(-1, 4)[:, :3].mean(axis=0)
+        m.diffuse_color = (float(px[0]), float(px[1]), float(px[2]), 1.0)
+        _PROJ_MATS[ref] = m
+    pm = _PROJ_MATS[ref]
+    # world_to_camera_view frames by the render size: use the photo's own.
+    r_ = scn.render
+    old_res = (r_.resolution_x, r_.resolution_y, r_.pixel_aspect_x, r_.pixel_aspect_y)
+    r_.resolution_x, r_.resolution_y = int(rc["w"]), int(rc["h"])
+    r_.pixel_aspect_x = r_.pixel_aspect_y = 1.0
+    bpy.context.view_layer.update()
+    dg = bpy.context.evaluated_depsgraph_get()
+    cpos = cam.matrix_world.translation
+    for ob in (objs if isinstance(objs, (list, tuple)) else [objs]):
+        if ob is None or ob.type != "MESH":
+            continue
+        _subdivide_world(ob, piece)
+        me = ob.data
+        for uv in list(me.uv_layers):
+            me.uv_layers.remove(uv)
+        uvl = me.uv_layers.new(name="proj")
+        mats = [mm for mm in me.materials if mm is not None]
+        fb = fallback or (mats[0] if mats else pbr(f"{ob.name}_fb", "#808080"))
+        me.materials.clear()
+        me.materials.append(pm)
+        me.materials.append(fb)
+        mw = ob.matrix_world
+        nmat = mw.to_3x3().inverted().transposed()
+        for poly in me.polygons:
+            c = mw @ poly.center
+            n = (nmat @ poly.normal).normalized()
+            # Seen at a grazing angle the photo has almost no pixels for it: the
+            # texture would smear, so that face keeps its colour instead.
+            to_cam = (cpos - c)
+            seen = n.dot(to_cam.normalized()) > math.cos(math.radians(max_angle))
+            if seen:
+                d = (c - cpos)
+                dist = d.length
+                hit, loc, _n, _i, hob, _m = scn.ray_cast(dg, cpos, d.normalized(), distance=dist + 0.01)
+                seen = (not hit) or (hob is not None and hob.original == ob) or ((loc - cpos).length >= dist - 0.02)
+            if seen:
+                uvs = []
+                for li in poly.loop_indices:
+                    v = me.vertices[me.loops[li].vertex_index].co
+                    q = world_to_camera_view(scn, cam, mw @ v)
+                    if q.z <= 0:
+                        seen = False
+                        break
+                    uvs.append((q.x, q.y))
+            if seen:
+                for li, uv in zip(poly.loop_indices, uvs):
+                    uvl.data[li].uv = uv
+                poly.material_index = 0
+            else:
+                poly.material_index = 1
+    r_.resolution_x, r_.resolution_y, r_.pixel_aspect_x, r_.pixel_aspect_y = old_res
+    return pm
+
+
 def assign(obj, mat):
     """Give a mesh object exactly one material."""
     obj.data.materials.clear()
@@ -194,7 +340,7 @@ with open(args.script, "r", encoding="utf-8") as f:
 _ns = {
     "__name__": "__braxil_model__", "bpy": bpy, "math": math, "Vector": Vector, "Matrix": Matrix,
     "pbr": pbr, "assign": assign, "hex_rgba": hex_rgba, "KIND": KIND, "REF_CAMS": REF_CAMS,
-    "photo_material": photo_material,
+    "photo_material": photo_material, "photo_color": photo_color, "photo_project": photo_project,
 }
 import bmesh  # noqa: E402
 _ns["bmesh"] = bmesh

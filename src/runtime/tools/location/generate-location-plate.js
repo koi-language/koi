@@ -25,6 +25,16 @@ import { mediaModelsByLabel } from '../../llm/providers/gateway.js';
 
 function _err(msg) { return { success: false, error: `generate_location_plate: ${msg}` }; }
 
+// The location's 3D set is built by default as soon as it has an image: the order for it.
+async function _setModelNext(locationId, attached) {
+  if (!locationId || !attached) return {};
+  try {
+    const { setModel3dNext } = await import('./save-location.js');
+    const next = setModel3dNext(readLocation(locationId));
+    return next ? { next } : {};
+  } catch { return {}; }
+}
+
 function _isStr(v) { return typeof v === 'string'; }
 
 // Normalize referenceImages: accept a plain path array OR [{alias, path}].
@@ -186,6 +196,7 @@ export default {
       ...(attachedViewId ? { viewId: attachedViewId } : {}),
       model: r.model || model,
       ...(locationId ? { locationId, attached } : {}),
+      ...(await _setModelNext(locationId, attached)),
     };
   },
 };

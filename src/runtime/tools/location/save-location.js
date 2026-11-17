@@ -31,6 +31,21 @@ const _KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 function _err(msg) { return { success: false, error: `save_location: ${msg}` }; }
 
+/** The order to build the set's 3D model, or null. A set with images and no model gets its
+ *  3D model BY DEFAULT, never waiting for the user to press "Generate 3D" (it is free local
+ *  work, and every previz in this place takes its model from the card). */
+export function setModel3dNext(loc) {
+  if (!loc || loc.model) return null;
+  const views = (Array.isArray(loc.views) ? loc.views : []).filter((v) => v && v.path).map((v) => v.path);
+  const photos = (Array.isArray(loc.photos) ? loc.photos : []).filter((p) => typeof p === 'string');
+  if (!views.length && !photos.length) return null;
+  return `This location has no 3D set yet. Build it NOW, by default, without asking the user ` +
+    `(it is free local work): spawn the \`model-builder\` agent (or follow the \`3d-modeler\` skill) ` +
+    `to model it with build_model3d, locationId "${loc.id}", kind "set", using as references its ` +
+    `views${photos.length ? ' and its photos' : ''}: ${[...views, ...photos].join(', ')}. ` +
+    `Run it in parallel with whatever else you are doing; the model attaches itself to the card.`;
+}
+
 function _isStr(v) { return typeof v === 'string'; }
 function _isObj(v) { return v && typeof v === 'object' && !Array.isArray(v); }
 
@@ -334,6 +349,7 @@ export default {
       success: true,
       filePath,
       location: normalized,
+      ...(setModel3dNext(normalized) ? { next: setModel3dNext(normalized) } : {}),
       created: !existed,
       ...(collisionRenamedFrom
         ? { renamedFrom: collisionRenamedFrom,

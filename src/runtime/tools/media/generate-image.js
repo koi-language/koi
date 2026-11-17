@@ -32,6 +32,62 @@ import { autoAttachMentions, assignPositionalAliases, listAvailableMentions } fr
 import { wasRead, isGatedLocalPath, markRead } from '../../state/read-tracker.js';
 import { fetchAssetBuffer, undownloadableResult } from '../../io/download-asset.js';
 
+/**
+ * Master edit mode: for each output that has the size of one of the references, paste ONLY the
+ * areas the model changed onto that reference (composite_partial_edit) and make the composite the
+ * result (savedTo), keeping the whole edit as wholeEdit. Mutates [savedImages].
+ */
+export async function applyMasterEditMode(savedImages, refPathsIn, action, agent) {
+  const sharp = (await import('sharp')).default;
+  const refPaths = refPathsIn.filter((p) => fs.existsSync(p));
+  for (const img of savedImages) {
+    if (!img.savedTo) continue;
+    try {
+      const outMeta = await sharp(img.savedTo).metadata();
+      let master = null;
+      for (const rp of refPaths) {
+        const m = await sharp(rp).metadata().catch(() => null);
+        if (m && m.width === outMeta.width && m.height === outMeta.height) { master = rp; break; }
+      }
+      if (!master) {
+        img.editMode = 'master: no reference has the output size (resolution change), so this whole edit is the result and the new master';
+        continue;
+      }
+      const { default: cpe } = await import('./composite-partial-edit.js');
+      const r = await cpe.execute({ masterImage: master, editImage: img.savedTo, summary: action.summary }, agent);
+      if (!r?.success) {
+        img.editMode = `master: partial edit not built (${r?.error || 'unknown error'}); do not deliver the whole edit, retry the edit or ask the user`;
+        continue;
+      }
+      img.wholeEdit = img.savedTo;
+      img.savedTo = r.savedTo;
+      if (img.exportedTo) { try { fs.copyFileSync(r.savedTo, img.exportedTo); } catch { /* keep the copy as is */ } }
+      img.partialEdit = {
+        master, regions: r.regions, coverage: r.coverage, checkImage: r.checkImage,
+        selfCheck: r.selfCheck, ...(r.ghosts ? { ghosts: r.ghosts } : {}),
+        ...(r.characterSheetOf ? { characterSheetOf: r.characterSheetOf } : {}),
+      };
+      img.editMode = r.selfCheck === 'ghosts'
+        ? 'master: savedTo is the partial edit but its SELF-CHECK FAILED (semi-transparent spots, see partialEdit.ghosts). ' + (r.note || '')
+        : 'master: savedTo is ALREADY the partial edit (master + only the changed areas) and passed the self-check for semi-transparent spots; do NOT call composite_partial_edit on it again. ' + (r.note || '');
+    } catch (e) {
+      img.editMode = `master: partial edit failed (${e?.message || e}); do not deliver the whole edit, retry or ask the user`;
+    }
+  }
+}
+
+// The user's image edit mode (chat options, `imageEditMode` in ~/.koi/config.json, owned by
+// koi-cli's config-manager.js): 'master' (default) or 'normal'. Read per call so a change in the
+// chat options applies to the very next edit.
+function _imageEditMode() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.koi', 'config.json'), 'utf8'));
+    return cfg?.imageEditMode === 'normal' ? 'normal' : 'master';
+  } catch {
+    return 'master';
+  }
+}
+
 // NOTE on the "label" parameter: intentionally NOT declared in the static
 // schema or description below. It is injected at import time by the
 // fetchMediaCapabilities('image') block at the bottom of this file — and ONLY when
@@ -962,6 +1018,26 @@ const generateImageAction = {
     const effectiveAspect = action.aspectRatio || autoAspectRatio;
     const effectiveResolution = action.resolution || autoResolution;
 
+    // EDITING KEEPS THE RESOLUTION, always. The base ref (index 0) is the canvas being edited, so
+    // the model is asked for EXACTLY its pixels: a bucket alone let an 848x1280 master come back
+    // at 1696x2560, and the master edit mode could not paste the change, so the user got the
+    // whole redrawn picture. A resolution the caller passes ALWAYS wins over the base's size:
+    // the lock applies only when no resolution was given. Internal delegates build NEW canvases
+    // (sheets, plates, views, outpaint) and size them themselves.
+    if (action._internalDelegate !== true && referenceImages?.length && !action.resolution
+      && !(action.targetSize?.width && action.targetSize?.height)) {
+      try {
+        const sharp = (await import('sharp')).default;
+        const meta = await sharp(referenceImages[0].data).metadata();
+        if (meta?.width && meta?.height) {
+          action.targetSize = { width: meta.width, height: meta.height };
+          channel.log('image', `Edit keeps the base resolution: targetSize=${meta.width}x${meta.height}`);
+        }
+      } catch (err) {
+        channel.log('image', `Edit same-resolution lock skipped: ${err?.message || err}`);
+      }
+    }
+
     // ── Payload-size guard: shrink fat reference images ──────────────
     // The gateway POSTs `reference_images: [{data: <base64>, mime_type}]`
     // and the surrounding HTTP layer caps payload at ~10 MB. 4K PNG
@@ -1700,6 +1776,17 @@ const generateImageAction = {
         });
       }
     } catch { /* lineage is best-effort — never fail the tool on it */ }
+
+    // IMAGE EDIT MODE "master" (user setting, default): an edit model re-renders
+    // the WHOLE picture, so its whole output is never the result. When this call
+    // edited an image at the same size, the tool itself pastes ONLY the areas the
+    // model changed onto that image (composite_partial_edit) and returns THAT as
+    // savedTo; the whole edit stays available as wholeEdit. Left to the agent it
+    // was skipped and the user got the redrawn image. A different size is a
+    // resolution change: the whole edit is the result (the new master).
+    if (action._internalDelegate !== true && action.label !== 'storyboard_card' && _imageEditMode() === 'master') {
+      await applyMasterEditMode(savedImages, Object.keys(_savedRefIds), action, agent);
+    }
 
     // Queue the generated image(s) into the NEXT turn's vision so the agent
     // SEES what it just produced. Without this it stays BLIND to its own
