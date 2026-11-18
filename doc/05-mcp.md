@@ -51,6 +51,22 @@ export agent OrderClerk : OrderDesk {
 - The agent discovers the tools of each server (`open_mcp`), reads a tool's parameters when it needs them
   (`get_mcp_tool_info`) and calls it (`call_mcp`). You don't list the tools: you describe the job in the
   playbook, and the agent works out which tools to use and in what order.
+
+What the agent does with that playbook, step by step (the tool names are whatever the servers offer;
+these are examples):
+
+1. It opens `mail` and sees its tools: `search_messages`, `get_message`, `send_message`.
+2. It calls `search_messages` with `{ since: "2026-11-17" }` and gets 12 emails. It reads each one with
+   `get_message` and decides which are purchase orders: 4 are, 8 are not (an invoice, two newsletters...).
+3. For the first order it opens `erp`, finds `find_customer` and calls it with the sender's email. The customer
+   exists. It calls `search_products` for each line: "tornillo M6 inox caja 100" matches the reference
+   TM6-100.
+4. It creates the order with `create_order`, status `pending_approval`.
+5. It repeats for the other orders, and returns the list.
+
+None of those steps is written in the `.koi` file: the playbook says what to achieve and which rules to keep,
+and the agent chains the tools. If tomorrow the ERP adds a tool, the agent can use it without a code change.
+
 - If a server cannot connect, the agent is told and continues without it. Called from TypeScript, the error
   also reaches your `onEvent` (see [TypeScript](08-typescript.md)).
 - Write in the playbook the rules the agent must never break ("never confirm an order"); limit at the server

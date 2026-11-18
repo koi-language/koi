@@ -62,10 +62,12 @@ What happens when you call `Writer.write({ topic: "solar panels for SMEs" })`:
 1. The agent starts. The event `invoked` fires, and the transition `when invoked` starts the phase `drafting`.
 2. The agent thinks with medium effort and sees only the drafting instructions:
    ```
-   Topic: solar panels for SMEs
    Write a first draft of 300 words. Do not polish it yet.
    When the draft is complete, call phase_done.
+   Topic: solar panels for SMEs
    ```
+   (Koi places the parts that change on every call, like the topic, after the fixed ones, so the model
+   provider can cache the fixed part.)
 3. It writes the draft. If it tried to `return` now, it would be refused: the phase says `cant return`.
 4. It calls `phase_done`. The event `phase('drafting').done` fires, and its transition starts `reviewing`.
 5. The agent now thinks with high effort and sees only the reviewing instructions. It checks, corrects, and
@@ -168,7 +170,7 @@ export agent Lead : LeadRole {
     }
   }
 
-  on run(args: { goal: string }) {
+  on achieve(args: { goal: string }) {
     playbook LeadPlaybook
   }
 }
@@ -181,8 +183,7 @@ Goal: {{args.goal}}
 Ask the planner for a plan to reach the goal.
 }
 @if (phase.name == 'executing') {
-The planner returned a plan: {{planner.result.data}}
-Carry it out step by step.
+Carry out, step by step, the plan the planner returned.
 }
 @if (phase.name == 'giving_up') {
 The planner could not make a plan. Return { success: false, reason } explaining why.
@@ -192,7 +193,8 @@ The planner could not make a plan. Return { success: false, reason } explaining 
 ```
 
 - `when planner.result` fires the moment the team member `planner` returns. `planner.result.success` and
-  `planner.result.data` are what it returned.
+  `planner.result.data` are what it returned. They are set only at that moment: in later steps the agent finds
+  the plan in its own conversation, which is why the `executing` instructions just refer to it.
 - The phase changes without the lead calling `phase_done`: the planner's answer is what moves it forward.
 - `when any.result { ... }` catches the return of any member that has no clause of its own.
 
@@ -206,8 +208,8 @@ transitions {
     if (error.count < 3) {
       bump(reasoning, +20, max: 85)
     } else {
-      effort(high)
       phase('planning').start()
+      effort(high)
     }
   }
 }
@@ -216,7 +218,8 @@ transitions {
 - `error.count` is how many model calls have failed in a row.
 - The first two times, `bump` raises the reasoning score by 20 (scores go from 0 to 100), up to 85: the next
   attempt thinks harder, or moves to a stronger model.
-- The third time, it sets high effort and starts over from `planning`.
+- The third time, it starts over from `planning` with high effort. Order matters: starting a phase resets the
+  settings to that phase's own, so `effort(high)` goes after `phase('planning').start()`.
 
 | Action | Effect |
 |---|---|

@@ -50,6 +50,26 @@ export agent Editor : Lead {
 - What a member returns comes back to the lead as the result of the delegation. The lead can delegate
   several tasks in parallel.
 
+## What happens, step by step
+
+When your code calls `Editor.brief({ topic: "heat pumps", audience: "hotel owners" })`:
+
+1. The Editor starts. Besides its playbook, it sees its team: `researcher` can `research(topic)` ("Finds facts
+   about a topic, with sources") and `writer` can `write(facts, audience)` ("Writes a clear one-page brief...").
+2. It decides to start with the research and delegates to `researcher` with `{ topic: "heat pumps" }`.
+3. The Researcher runs on its own: its own role (`web_access`, but not `delegate`), its own playbook, its own
+   reasoning loop. It searches, reads, and returns `[{ fact, source }, ...]`.
+4. That list comes back to the Editor as the result of its delegation. It now delegates to `writer` with
+   `{ facts: [...], audience: "hotel owners" }`.
+5. The Writer returns the draft. The Editor checks that every claim has a source (it may send it back to the
+   writer, or ask the researcher for a missing source) and returns the brief to your code.
+
+Each member works with only what the lead gives it: it does not see the lead's conversation. Write the lead's
+playbook so that it passes everything a member needs.
+
+When steps don't depend on each other, the lead can start several delegations at once: three researchers for
+three topics, for example, and wait for all of them.
+
 ## Questions back to the lead
 
 A member whose role has `can ask_parent` can ask the lead a question instead of guessing; the lead answers
