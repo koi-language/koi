@@ -10,6 +10,8 @@ about it, plan, use your company's systems, delegate to other agents and return 
 You import those agents **straight into TypeScript** and call them as async functions, to build agentic
 software for your business.
 
+An agent is defined in a `.koi` file: what it can use and what it must do.
+
 ```python
 export agent OrderClerk : OrderDesk {
   uses mcp mail, erp
@@ -28,6 +30,8 @@ export agent OrderClerk : OrderDesk {
   }
 }
 ```
+
+And TypeScript calls it like any async function:
 
 ```ts
 import { OrderClerk } from "#agents/orders.koi";
