@@ -13,7 +13,8 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'pac
 const COMMANDS = {
   compile: 'Compile Koi files to JavaScript',
   build: 'Build an npm package that TypeScript imports and calls (agents as async functions)',
-  types: 'Write the TypeScript types (<name>.d.koi.ts) of .koi files imported from TypeScript',
+  setup: 'Set up this TypeScript project so `import { X } from "./x.koi"` just works',
+  types: 'Write the TypeScript types (<name>.d.koi.ts) of the .koi files given, or of every .koi file in the project',
   run: 'Compile and run Koi files',
   serve: 'Start an agent as an MCP server (stdio)',
   init: 'Initialize a new Koi project',
@@ -507,6 +508,39 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
     console.log('✅ Compilation complete!\n');
   }
   return outputPath;
+}
+
+/**
+ * Write <name>.d.koi.ts beside each .koi file. `targets`: files and folders
+ * (default: the current folder); folders are searched, skipping node_modules,
+ * dot-folders and build output. Returns true when a file failed to compile.
+ */
+async function writeKoiTypes(targets = []) {
+  const SKIP = new Set(['node_modules', 'dist', 'build']);
+  const findKoi = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    if (e.name.startsWith('.') || SKIP.has(e.name)) return [];
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) return findKoi(p);
+    return e.name.endsWith('.koi') ? [p] : [];
+  });
+  const list = targets.length ? targets : ['.'];
+  const files = list.flatMap((t) => (fs.existsSync(t) && fs.statSync(t).isDirectory() ? findKoi(t) : [t]));
+  if (files.length === 0) {
+    console.log('No .koi files yet.');
+    return false;
+  }
+  const { compileKoiModule, typesPathFor } = await import('../compiler/compile-module.js');
+  let failed = false;
+  for (const f of files) {
+    try {
+      const { exported } = await compileKoiModule(path.resolve(f));
+      console.log(`✅ ${path.relative(process.cwd(), typesPathFor(path.resolve(f)))}  (${exported.join(', ') || 'no `export agent`'})`);
+    } catch (err) {
+      failed = true;
+      console.error(`❌ ${err.message}`);
+    }
+  }
+  return failed;
 }
 
 async function buildPackage(sourcePath, flags) {
@@ -1169,24 +1203,78 @@ if (command === 'serve') {
   });
 }
 
-// Handle types: <name>.d.koi.ts beside each .koi file, for `import ... from "./<name>.koi"`
-if (command === 'types') {
-  const files = positional.slice(1);
-  if (files.length === 0) {
-    console.error('⚠️ Please provide one or more Koi files\n\nUsage: koi types <file.koi> [more.koi ...]');
+// Handle setup: make the current TypeScript project import .koi files with no flags
+if (command === 'setup') {
+  const LOADER = '--import=@koi-language/koi/register';
+
+  // 0. The project depends on Koi (the loader and the runtime are imported from it).
+  const pkgPath = path.resolve('package.json');
+  if (!fs.existsSync(pkgPath)) {
+    console.error('⚠️ Run `koi setup` in the folder of your project\'s package.json.');
     process.exit(1);
   }
-  const { compileKoiModule, typesPathFor } = await import('../compiler/compile-module.js');
-  let failed = false;
-  for (const f of files) {
-    try {
-      const { exported } = await compileKoiModule(path.resolve(f));
-      console.log(`✅ ${path.relative(process.cwd(), typesPathFor(path.resolve(f)))}  (${exported.join(', ') || 'no `export agent`'})`);
-    } catch (err) {
-      failed = true;
-      console.error(`❌ ${err.message}`);
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  if (pkg.dependencies?.['@koi-language/koi'] || pkg.devDependencies?.['@koi-language/koi']) {
+    console.log('✓ @koi-language/koi is a dependency');
+  } else {
+    console.log('📦 npm install @koi-language/koi');
+    const { execSync } = await import('child_process');
+    execSync('npm install @koi-language/koi', { stdio: 'inherit' });
+  }
+
+  // 1. .npmrc: every npm script and npx gets the Koi loader through NODE_OPTIONS.
+  const npmrc = path.resolve('.npmrc');
+  const lines = fs.existsSync(npmrc) ? fs.readFileSync(npmrc, 'utf8').split('\n') : [];
+  const i = lines.findIndex((l) => /^\s*node-options\s*=/.test(l));
+  if (i >= 0 && lines[i].includes('@koi-language/koi/register')) {
+    console.log('✓ .npmrc already loads the Koi loader');
+  } else {
+    if (i >= 0) lines[i] = `${lines[i].trimEnd()} ${LOADER}`;
+    else lines.splice(lines.length && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length, 0, `node-options=${LOADER}`);
+    fs.writeFileSync(npmrc, lines.join('\n').replace(/\n*$/, '\n'));
+    console.log('✅ .npmrc: npm scripts and npx now import .koi files');
+  }
+
+  // 2. tsconfig.json: let TypeScript read <name>.d.koi.ts for "./<name>.koi".
+  const tsconfig = path.resolve('tsconfig.json');
+  if (!fs.existsSync(tsconfig)) {
+    console.log('ℹ️  No tsconfig.json here. In yours, set: "compilerOptions": { "allowArbitraryExtensions": true }');
+  } else {
+    let cfg = null;
+    try { cfg = JSON.parse(fs.readFileSync(tsconfig, 'utf8')); } catch { /* has comments: do not rewrite it */ }
+    if (!cfg) {
+      console.log('ℹ️  tsconfig.json has comments, so it was not rewritten. Add to "compilerOptions": "allowArbitraryExtensions": true');
+    } else if (cfg.compilerOptions?.allowArbitraryExtensions === true) {
+      console.log('✓ tsconfig.json already allows .koi types');
+    } else {
+      cfg.compilerOptions = { ...(cfg.compilerOptions || {}), allowArbitraryExtensions: true };
+      fs.writeFileSync(tsconfig, JSON.stringify(cfg, null, 2) + '\n');
+      console.log('✅ tsconfig.json: "allowArbitraryExtensions": true');
     }
   }
+
+  // 3. An agents/ folder for the .koi files, importable from anywhere as "#agents/<file>.koi".
+  fs.mkdirSync(path.resolve('agents'), { recursive: true });
+  const pkgNow = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  if (pkgNow.imports?.['#agents/*']) {
+    console.log('✓ package.json already maps #agents/*');
+  } else {
+    pkgNow.imports = { ...(pkgNow.imports || {}), '#agents/*': './agents/*' };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkgNow, null, 2) + '\n');
+    console.log('✅ agents/ is importable as "#agents/<file>.koi"');
+  }
+
+  // 4. Types of the .koi files already in the project.
+  await writeKoiTypes();
+
+  console.log('\nDone. Write your agents in agents/ and import them from TypeScript:');
+  console.log('  import { MyAgent } from "#agents/my-agent.koi";');
+  process.exit(0);
+}
+
+// Handle types: <name>.d.koi.ts beside each .koi file, for `import ... from "./<name>.koi"`
+if (command === 'types') {
+  const failed = await writeKoiTypes(positional.slice(1));
   process.exit(failed ? 1 : 0);
 }
 

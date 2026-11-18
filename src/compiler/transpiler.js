@@ -224,6 +224,10 @@ export class KoiTranspiler {
     // e.g. when both an imported file and the main file declare the same role name)
     this._validateNoDuplicates(sortableDecls);
 
+    // `uses skill X`: a skill declared in this program is a code skill; any
+    // other name is a SKILL.md skill, activated when the agent starts a task.
+    this.declaredSkillNames = new Set(skillDecls.map((d) => d.name.name));
+
     // Generate declarations in dependency order using topological sort.
     // Dependencies:
     //   AgentDecl  → depends on teams from "uses team X" body items
@@ -360,9 +364,12 @@ export class KoiTranspiler {
       if (functionNames.length === 0) continue;
       const cached = this.cacheData?.skillAffordances?.[skillName];
       code += this.emit(`const ${skillName}Functions = [${functionNames.map(fn => `{ name: '${fn}', fn: ${fn}, description: SkillRegistry.get('${skillName}', '${fn}')?.metadata?.affordance || 'Function from ${skillName}' }`).join(', ')}];\n`);
+      // Registering computes embeddings for semantic skill selection. Importing a
+      // module must never fail (or call a model) for that: without a provider the
+      // skill is simply not offered by semantic selection.
       code += this.emit(cached
-        ? `await skillSelector.register('${skillName}', ${skillName}Functions, CACHED_SKILL_AFFORDANCES['${skillName}']);\n`
-        : `await skillSelector.register('${skillName}', ${skillName}Functions);\n`);
+        ? `try { await skillSelector.register('${skillName}', ${skillName}Functions, CACHED_SKILL_AFFORDANCES['${skillName}']); } catch { /* no embedding provider at import time */ }\n`
+        : `try { await skillSelector.register('${skillName}', ${skillName}Functions); } catch { /* no embedding provider at import time */ }\n`);
     }
     code += this.emit(`\n// Public API: each agent is an object with one async method per public handler\n`);
     const marked = agentDecls.filter((d) => d.exported).map((d) => d.name.name);
@@ -1292,8 +1299,14 @@ export class KoiTranspiler {
       code += this.emit(`${this.getIndent()}description: ${JSON.stringify(desc)},\n`);
     }
 
-    if (skills.length > 0) {
-      code += this.emit(`${this.getIndent()}skills: [${skills.map(s => `'${s.skill.name}'`).join(', ')}],\n`);
+    const declared = this.declaredSkillNames || new Set();
+    const codeSkills = skills.filter(s => !s.quoted && declared.has(s.skill.name));
+    const mdSkills = skills.filter(s => !codeSkills.includes(s));
+    if (codeSkills.length > 0) {
+      code += this.emit(`${this.getIndent()}skills: [${codeSkills.map(s => `'${s.skill.name}'`).join(', ')}],\n`);
+    }
+    if (mdSkills.length > 0) {
+      code += this.emit(`${this.getIndent()}autoActivateSkills: ${JSON.stringify(mdSkills.map(s => s.skill.name))},\n`);
     }
 
     if (usesTeams.length > 0) {

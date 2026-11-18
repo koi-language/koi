@@ -24,7 +24,7 @@ export agent OrderClerk : OrderDesk {
 ```
 
 ```ts
-import { OrderClerk } from "./orders.koi";
+import { OrderClerk } from "#agents/orders.koi";
 
 const orders = await OrderClerk.processInbox({ since: "2026-11-17" });
 ```
@@ -42,9 +42,20 @@ const orders = await OrderClerk.processInbox({ since: "2026-11-17" });
 
 ## Install
 
+In your TypeScript project:
+
 ```bash
-npm install @koi-language/koi        # in your project
-npm install -g @koi-language/koi     # the `koi` command
+npx @koi-language/koi setup
+```
+
+That is all. Your agents go in `agents/`, and your code imports them:
+
+```
+my-app/
+├── agents/
+│   └── orders.koi        # export agent OrderClerk ...
+└── src/
+    └── main.ts           # import { OrderClerk } from "#agents/orders.koi"
 ```
 
 ## An agent that handles orders
@@ -71,12 +82,12 @@ mcp erp = {
 
 export agent OrderClerk : OrderDesk {
   uses mcp mail, erp
+  uses skill "order-policy"
 
   on processInbox(args: { since: string, approvalLimit: number }) {
     affordance "Turn order emails into ERP orders pending approval"
     playbook """
       Read the emails received since {{args.since}} and keep only the purchase orders.
-      Follow the order-policy skill for every decision.
 
       For each order:
       1. Find the customer in the ERP by email or tax id. If there is none, do not create it:
@@ -109,7 +120,8 @@ Koi reads the same Markdown formats as Claude Code, from the project's `.koi/` f
 └── agents/credit-checker.md         # a subagent: any agent that `can delegate` can use it
 ```
 
-A **skill** is instructions an agent loads when it needs them:
+A **skill** is instructions an agent works with. `uses skill "order-policy"` loads it every time the agent
+starts a task; without it, the agent can still find any skill of the catalog and load it when it needs it.
 
 ```markdown
 ---
@@ -173,16 +185,11 @@ export agent Editor : Lead {
 
 ## Call your agents from TypeScript
 
-`export agent` makes an agent importable. Start your app with the Koi loader and import the `.koi` file like
-any module: it is compiled when it is imported.
-
-```bash
-tsx --import @koi-language/koi/register main.ts      # or: node --import @koi-language/koi/register main.js
-```
+`export agent` makes an agent importable, and every public `on` handler becomes a typed async method:
 
 ```ts
 import "dotenv/config";                       // IMAP_*, ERP_TOKEN and the model keys
-import { OrderClerk } from "./orders.koi";
+import { OrderClerk } from "#agents/orders.koi";
 
 const orders = await OrderClerk.processInbox(
   { since: "2026-11-17", approvalLimit: 5000 },
@@ -199,18 +206,13 @@ for (const order of orders) {
 }
 ```
 
-Each import writes the types beside the file (`orders.d.koi.ts`), and `koi types orders.koi` writes them
-without running anything. TypeScript needs one line in `tsconfig.json`:
-
-```json
-{ "compilerOptions": { "allowArbitraryExtensions": true } }
-```
-
 A call never prints to the terminal and never waits for a user: questions go to `onQuestion`, and permissions
 (shell commands, file writes, paid media) are denied unless you pass `autoApprove: true`. Errors reject with a
 `code`: `KOI_TIMEOUT`, `KOI_ABORTED` (via `signal`), `KOI_MAX_STEPS`, `KOI_AGENT_FAILED`, `KOI_NO_PROVIDER`.
 
-To ship agents as their own npm package instead, `koi build orders.koi` writes one to `dist/orders`.
+It works in anything you start with npm or npx (`npm run dev`, `npm test`, `npx tsx src/main.ts`). The types
+of each agent are written beside it (`agents/orders.d.koi.ts`) when it is imported; `koi types` writes them
+without running anything, e.g. before `tsc` in CI.
 
 ## Models
 

@@ -488,9 +488,20 @@ AmnesiaDecl
     }
 
 UsesSkill
-  = "uses" _ "skill" _ names:IdentifierList _ {
-      return names.map(name => ({ type: 'UsesSkill', skill: name, location: location() }));
+  = "uses" _ "skill" _ refs:SkillRefList _ {
+      return refs.map(ref => ({ type: 'UsesSkill', skill: ref.name, quoted: ref.quoted, location: location() }));
     }
+
+// A skill by name: a `skill` declared in Koi code, or a SKILL.md skill
+// (quoted when its name has dashes: uses skill "order-policy").
+SkillRefList
+  = first:SkillRef rest:(_ "," _ SkillRef)* {
+      return [first, ...rest.map(r => r[3])];
+    }
+
+SkillRef
+  = s:StringLiteral { return { name: { type: 'Identifier', name: s.value }, quoted: true }; }
+  / id:Identifier { return { name: id, quoted: false }; }
 
 UsesTeam
   = "uses" _ "team" _ names:IdentifierList _ {
