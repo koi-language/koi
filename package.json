@@ -16,11 +16,8 @@
   },
   "files": [
     "src/",
-    "examples/",
-    "README.md",
-    "QUICKSTART.md",
-    "SETUP_LLM.md",
-    "LICENSE"
+    "doc/",
+    "README.md"
   ],
   "scripts": {
     "build:grammar": "peggy --format es -o src/compiler/parser.js src/grammar/koi.pegjs",

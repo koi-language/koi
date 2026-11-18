@@ -22,8 +22,8 @@ Put a model key in `.env` (see `.env.example`): a provider's key (`ANTHROPIC_API
 
 ```bash
 npm test                                   # the test suite
-koi run examples/hello-world.koi           # an example
-koi compile examples/hello-world.koi       # see the generated code in examples/.build/
+koi run my-agent.koi                       # run a .koi file (its `run` statements)
+koi compile my-agent.koi                   # see the generated code in .build/
 ```
 
 ## Releasing to npm
@@ -43,7 +43,7 @@ staged publishing on, approve the version under **Staged Packages** on npmjs.com
 
 ## Pull Request Guidelines
 
-1. Test your changes with multiple examples
+1. Test your changes with `npm test` and a few real agents
 2. Update documentation if adding features
 3. Follow existing code style
 4. Add tests for new functionality

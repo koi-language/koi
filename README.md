@@ -231,7 +231,7 @@ KOI_API_URL=https://api.braxil.ai   # default; any server that speaks the Koi AP
 KOI_API_KEY=...
 ```
 
-Image, video and audio generation always go through the Koi API. More in [LLM Integration](doc/06-llm-integration.md).
+Image, video and audio generation always go through the Koi API. More in [Models](doc/09-models.md).
 
 ## Run from the terminal
 
@@ -242,10 +242,19 @@ koi serve my-agent.koi      # serves an agent marked `expose mcp` as an MCP serv
 
 ## Documentation
 
-- [Getting Started](doc/00-getting-started.md) and [Core Concepts](doc/01-core-concepts.md)
-- [Agents](doc/03-agents.md), [Roles & Teams](doc/04-roles-and-teams.md), [Skills](doc/05-skills.md)
-- [LLM Integration](doc/06-llm-integration.md), [MCP](doc/10-mcp-integration.md)
-- [Editor Setup](doc/00-editor-setup.md) (VS Code and Cursor) and [Examples](examples/)
+From the first agent to multi-phase systems: [the guides](doc/README.md).
+
+1. [Getting started](doc/01-getting-started.md)
+2. [Agents and roles](doc/02-agents-and-roles.md)
+3. [Prompts](doc/03-prompts.md)
+4. [Teams and delegation](doc/04-teams-and-delegation.md)
+5. [MCP](doc/05-mcp.md)
+6. [Skills and subagents](doc/06-skills-and-subagents.md)
+7. [Phases and transitions](doc/07-phases-and-transitions.md)
+8. [Calling agents from TypeScript](doc/08-typescript.md)
+9. [Models](doc/09-models.md)
+
+Writing Koi with an AI assistant? Give it [doc/llms.md](doc/llms.md), a one-page summary of the language.
 
 ## Contributing
 

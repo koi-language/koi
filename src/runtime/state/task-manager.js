@@ -69,10 +69,12 @@ class TaskManager {
     return list;
   }
 
+  /** The session's tasks file, or null outside a session (e.g. agents called from code): in memory only. */
   _getFilePath() {
+    const sessionId = process.env.KOI_SESSION_ID;
+    if (!sessionId) return null;
     if (!this._filePath) {
       const root = process.env.KOI_PROJECT_ROOT || process.cwd();
-      const sessionId = process.env.KOI_SESSION_ID;
       this._filePath = path.join(root, '.koi', 'sessions', sessionId, 'tasks.json');
     }
     return this._filePath;
@@ -86,7 +88,7 @@ class TaskManager {
     if (this._loaded) return;
     this._loaded = true;
     const fp = this._getFilePath();
-    if (!fs.existsSync(fp)) return;
+    if (!fp || !fs.existsSync(fp)) return;
     try {
       const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
       if (data && data.tasks) {
@@ -106,6 +108,7 @@ class TaskManager {
     const root = process.env.KOI_PROJECT_ROOT || process.cwd();
     const koiDir = path.join(root, '.koi');
     if (!fs.existsSync(koiDir)) return; // onboarding hasn't created .koi yet
+    if (!this._getFilePath()) return; // no session: nothing to persist
     const dir = path.dirname(this._getFilePath());
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -128,6 +131,7 @@ class TaskManager {
   _save() {
     this._ensureDir();
     try {
+      if (!this._getFilePath()) throw new Error('no session'); // in memory only
       fs.writeFileSync(this._getFilePath(), JSON.stringify({
         nextId: this._nextId,
         tasks: this._tasks,
@@ -174,7 +178,7 @@ class TaskManager {
     this._loaded = true; // Mark as loaded so _loadIfNeeded won't restore deleted tasks
     this._restoredFromDisk = false;
     const fp = this._getFilePath();
-    if (fs.existsSync(fp)) {
+    if (fp && fs.existsSync(fp)) {
       try { fs.unlinkSync(fp); } catch { /* non-fatal */ }
     }
     channel.setTaskPanel([]);

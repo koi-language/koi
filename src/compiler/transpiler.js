@@ -347,6 +347,8 @@ export class KoiTranspiler {
     if (runStatements.length > 0) {
       code += this.emit(`\n// ${runStatements.length} \`run\` statement(s) left out: a library is called, not run.\n`);
     }
+    // Imported as a library: the runtime stays quiet on the host's console.
+    code += this.emit(`globalThis.__koiLibraryMode = true;\n`);
     if (agentDecls.length > 0) {
       code += this.emit(`\n// Register agents with router (local, no model call)\n`);
       code += this.emit(`const { agentRouter } = await import('${this.routerImportPath}');\n`);
@@ -461,7 +463,18 @@ export class KoiTranspiler {
       const name = decl.name?.name;
       if (!name) continue;
 
-      const key = `${decl.type}:${name}`;
+      // Agents, prompts, teams and skills become JavaScript constants named after
+      // them, so they share one namespace: `prompt Main` and `agent Main` clash.
+      const SHARED = ['AgentDecl', 'PromptDecl', 'TeamDecl', 'SkillDecl'];
+      const key = SHARED.includes(decl.type) ? `shared:${name}` : `${decl.type}:${name}`;
+      if (seen.has(key) && seen.get(key).type !== decl.type) {
+        const kind = (d) => d.type.replace('Decl', '').toLowerCase();
+        throw new KoiSemanticError(
+          `'${name}' is declared both as ${kind(seen.get(key))} and as ${kind(decl)}. ` +
+          `Agents, prompts, teams and skills share one namespace: rename one of them.`,
+          decl.location
+        );
+      }
       if (seen.has(key)) {
         const typeName = decl.type.replace('Decl', '').toLowerCase();
         throw new KoiSemanticError(
