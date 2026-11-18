@@ -1,1 +1,9 @@
 /node_modules
+
+# Local secrets and runtime state: never commit
+.env
+.env.local
+.env.*.local
+.koi/
+.koi-config.json
+koi.log
