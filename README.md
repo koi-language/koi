@@ -16,8 +16,14 @@ export agent OrderClerk : OrderDesk {
 
   on processInbox(args: { since: string }) {
     playbook """
-      Read the emails since {{args.since}}, keep the purchase orders, match each one to a customer
-      and to the ERP catalogue, check stock and credit, and create it in the ERP as "pending approval".
+      Read the emails received since {{args.since}}.
+      Keep only the purchase orders.
+      For each order:
+        - Find the customer in the ERP.
+        - Match every line to a product in the ERP catalogue.
+        - Check the stock and the customer's credit.
+        - Create the order in the ERP as "pending approval".
+      Never confirm an order yourself.
     """
   }
 }
