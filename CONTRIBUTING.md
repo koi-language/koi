@@ -73,6 +73,21 @@ koi compile examples/simple.koi
 cat examples/.build/simple.js
 ```
 
+## Releasing to npm
+
+One command publishes `@koi-language/koi`, from a clean working tree (commit your changes first):
+
+```bash
+npm run release          # 1.2.0 → 1.2.1   fixes
+npm run release:minor    # 1.2.0 → 1.3.0   new features
+npm run release:major    # 1.2.0 → 2.0.0   breaking changes
+```
+
+Each one bumps the version from the one in `package.json`, commits it as `Release <version>` with the tag
+`v<version>`, runs the tests (`prepublishOnly`; a failure stops the release), publishes (npm asks for your
+two-factor confirmation in the browser) and pushes the commit and the tag to GitHub. If the npm account has
+staged publishing on, approve the version under **Staged Packages** on npmjs.com afterwards.
+
 ## Pull Request Guidelines
 
 1. Test your changes with multiple examples

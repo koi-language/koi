@@ -27,7 +27,11 @@
     "compile": "node src/cli/koi.js compile",
     "run": "node src/cli/koi.js run",
     "dev": "node --inspect src/cli/koi.js run",
-    "test": "node src/cli/koi.js test"
+    "test": "node tests/run-all-tests.js",
+    "prepublishOnly": "npm test",
+    "release": "npm version patch -m \"Release %s\" && npm publish && git push --follow-tags",
+    "release:minor": "npm version minor -m \"Release %s\" && npm publish && git push --follow-tags",
+    "release:major": "npm version major -m \"Release %s\" && npm publish && git push --follow-tags"
   },
   "keywords": [
     "koi",
