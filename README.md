@@ -5,14 +5,13 @@
 # Koi - Next-Generation Programming Language for AI Agents
 
 Koi is a programming language for building **agents that do real work**: they take a complex task, reason
-about it, plan, use tools, delegate to other agents and return a result. You write what the agent must do in
-plain language and what must be exact in code, in the same file.
+about it, plan, use your company's systems, delegate to other agents and return a result.
 
-Then you **call those agents from TypeScript**, as async functions, to build agentic software for your
-business.
+You import those agents **straight into TypeScript** and call them as async functions, to build agentic
+software for your business.
 
 ```python
-agent OrderClerk : OrderDesk {
+export agent OrderClerk : OrderDesk {
   uses mcp mail, erp
 
   on processInbox(args: { since: string }) {
@@ -25,7 +24,7 @@ agent OrderClerk : OrderDesk {
 ```
 
 ```ts
-import { OrderClerk } from "orders";
+import { OrderClerk } from "./orders.koi";
 
 const orders = await OrderClerk.processInbox({ since: "2026-11-17" });
 ```
@@ -36,17 +35,17 @@ const orders = await OrderClerk.processInbox({ since: "2026-11-17" });
   around prompts.
 - **Built for complex tasks.** Every agent runs a reasoning loop: it decides one step at a time, sees the
   result and adapts until the task is done.
-- **Safe by design.** A role says what an agent may do (read, write, run commands, browse, delegate), and
-  nothing else is available to it.
-- **Made to be called from your software.** `koi build` turns your agents into a typed npm package.
+- **Speaks the standards.** MCP servers for your systems, `SKILL.md` skills, Markdown subagents.
+- **Safe by design.** A role says what an agent may do (read, write, run commands, browse, call MCP,
+  delegate), and nothing else is available to it.
+- **Part of your TypeScript code.** `import` a `.koi` file and its agents are typed async functions.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/koi-language/Koi/main/install.sh | bash
+npm install @koi-language/koi        # in your project
+npm install -g @koi-language/koi     # the `koi` command
 ```
-
-Manual setup and troubleshooting: [Installation Guide](doc/00-installation.md).
 
 ## An agent that handles orders
 
@@ -55,7 +54,7 @@ servers give it the company's systems. This one reads the orders that arrive by 
 one is and leaves it in the ERP waiting for a person to approve it.
 
 ```python
-role OrderDesk { can execute, can call_mcp }
+role OrderDesk { can execute, can call_mcp, can delegate }
 
 // The company mailbox, through a local MCP server
 mcp mail = {
@@ -70,20 +69,22 @@ mcp erp = {
   headers: { Authorization: `Bearer ${process.env.ERP_TOKEN}` }
 }
 
-agent OrderClerk : OrderDesk {
+export agent OrderClerk : OrderDesk {
   uses mcp mail, erp
 
   on processInbox(args: { since: string, approvalLimit: number }) {
     affordance "Turn order emails into ERP orders pending approval"
     playbook """
       Read the emails received since {{args.since}} and keep only the purchase orders.
+      Follow the order-policy skill for every decision.
 
       For each order:
       1. Find the customer in the ERP by email or tax id. If there is none, do not create it:
          skip the order as "unknown customer".
       2. Match every line to a product of the ERP catalogue by name or reference.
          If a line is ambiguous, take the closest match and say why.
-      3. Check stock and the customer's credit, and note anything that does not fit.
+      3. Ask the creditChecker subagent whether the order fits the customer's credit,
+         check stock, and note anything that does not fit.
       4. Create the order in the ERP as "pending approval". Never confirm it yourself.
          Above {{args.approvalLimit}} EUR, assign it to a manager.
       5. Reply to the customer that the order was received and is being reviewed.
@@ -98,9 +99,44 @@ The agent works out the steps itself: which tools of each server to call, in wha
 when an email is not an order or a product does not match. The rules it must never break go in the
 playbook; what it may touch at all is the role and the servers it uses.
 
+## Skills and subagents
+
+Koi reads the same Markdown formats as Claude Code, from the project's `.koi/` folder:
+
+```
+.koi/
+├── skills/order-policy/SKILL.md     # a skill: knowledge any agent can activate
+└── agents/credit-checker.md         # a subagent: any agent that `can delegate` can use it
+```
+
+A **skill** is instructions an agent loads when it needs them:
+
+```markdown
+---
+name: order-policy
+description: Company rules for accepting customer orders.
+---
+- Never accept orders from customers with invoices overdue more than 30 days.
+- Orders with a delivery date in less than 48 hours go to the warehouse manager.
+- Prices come from the customer's price list, never from the email.
+```
+
+A **subagent** is an agent written in Markdown. Its `skills` are activated when it starts:
+
+```markdown
+---
+name: creditChecker
+description: Checks a customer's credit and payment history and says whether a new order fits.
+skills: [order-policy]
+---
+You decide whether a new order fits a customer's credit. Look at the credit limit, the open balance
+and the invoices overdue, and answer with { fits, available, reason }.
+```
+
 ## A team of agents
 
-An agent can lead a **team** and delegate to it. Routing is by capability, not by hardcoded names.
+An agent can also lead a **team** of Koi agents and delegate to it. Routing is by capability, not by
+hardcoded names.
 
 ```python
 role Analyst { can execute, can read, can web_access }
@@ -123,7 +159,7 @@ team Content {
   writer: Writer
 }
 
-agent Editor : Lead {
+export agent Editor : Lead {
   uses team Content
 
   on brief(args: { topic: string }) {
@@ -135,34 +171,18 @@ agent Editor : Lead {
 }
 ```
 
-## Code where it must be exact
-
-A handler can be plain code instead of a playbook. Agents call it like any other tool.
-
-```python
-agent PriceService : Analyst {
-  on price(args: { sku: string }) {
-    const res = await fetch(`https://api.example.com/prices/${args.sku}`)
-    return await res.json()
-  }
-}
-```
-
 ## Call your agents from TypeScript
 
-Build the `.koi` file into an npm package:
+`export agent` makes an agent importable. Start your app with the Koi loader and import the `.koi` file like
+any module: it is compiled when it is imported.
 
 ```bash
-koi build orders.koi                         # → dist/orders (package.json, index.js, index.d.ts)
-npm install --install-links ./dist/orders    # installs it with its dependencies (Koi)
+tsx --import @koi-language/koi/register main.ts      # or: node --import @koi-language/koi/register main.js
 ```
-
-Every agent is exported with one typed async method per public handler (`private on` handlers stay
-inside):
 
 ```ts
 import "dotenv/config";                       // IMAP_*, ERP_TOKEN and the model keys
-import { OrderClerk } from "orders";
+import { OrderClerk } from "./orders.koi";
 
 const orders = await OrderClerk.processInbox(
   { since: "2026-11-17", approvalLimit: 5000 },
@@ -179,9 +199,18 @@ for (const order of orders) {
 }
 ```
 
+Each import writes the types beside the file (`orders.d.koi.ts`), and `koi types orders.koi` writes them
+without running anything. TypeScript needs one line in `tsconfig.json`:
+
+```json
+{ "compilerOptions": { "allowArbitraryExtensions": true } }
+```
+
 A call never prints to the terminal and never waits for a user: questions go to `onQuestion`, and permissions
 (shell commands, file writes, paid media) are denied unless you pass `autoApprove: true`. Errors reject with a
 `code`: `KOI_TIMEOUT`, `KOI_ABORTED` (via `signal`), `KOI_MAX_STEPS`, `KOI_AGENT_FAILED`, `KOI_NO_PROVIDER`.
+
+To ship agents as their own npm package instead, `koi build orders.koi` writes one to `dist/orders`.
 
 ## Models
 
@@ -213,7 +242,7 @@ koi serve my-agent.koi      # serves an agent marked `expose mcp` as an MCP serv
 
 - [Getting Started](doc/00-getting-started.md) and [Core Concepts](doc/01-core-concepts.md)
 - [Agents](doc/03-agents.md), [Roles & Teams](doc/04-roles-and-teams.md), [Skills](doc/05-skills.md)
-- [LLM Integration](doc/06-llm-integration.md), [MCP](doc/10-mcp-integration.md), [TypeScript Imports](doc/11-typescript-imports.md)
+- [LLM Integration](doc/06-llm-integration.md), [MCP](doc/10-mcp-integration.md)
 - [Editor Setup](doc/00-editor-setup.md) (VS Code and Cursor) and [Examples](examples/)
 
 ## Contributing

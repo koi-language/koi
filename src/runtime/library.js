@@ -142,6 +142,13 @@ export async function callAgent(agent, event, args = {}, options = {}) {
   }
   if (signal?.aborted) throw new KoiAbortError(agent.name, String(signal.reason ?? ''));
 
+  // Markdown subagents (.koi/agents/*.md) are otherwise loaded only when a ROOT
+  // agent starts; a call from code runs in delegate mode, so load them here (once).
+  try {
+    const { initUserAgents } = await import('./agent/md-agent-loader.js');
+    await initUserAgents();
+  } catch { /* non-fatal: the agent still runs, without markdown subagents */ }
+
   const channel = new HeadlessChannel({ agentName: agent.name, onEvent, onQuestion });
   const answerParent = (question) => channel.ask({ kind: 'text', question: plain(question) });
   const limits = { maxSteps: maxSteps || null, autoApprove: !!autoApprove };

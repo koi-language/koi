@@ -13,6 +13,7 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'pac
 const COMMANDS = {
   compile: 'Compile Koi files to JavaScript',
   build: 'Build an npm package that TypeScript imports and calls (agents as async functions)',
+  types: 'Write the TypeScript types (<name>.d.koi.ts) of .koi files imported from TypeScript',
   run: 'Compile and run Koi files',
   serve: 'Start an agent as an MCP server (stdio)',
   init: 'Initialize a new Koi project',
@@ -536,7 +537,8 @@ async function buildPackage(sourcePath, flags) {
   for (const f of [tsPath, tsPath + '.map']) { try { fs.unlinkSync(f); } catch { /* absent */ } }
   fs.writeFileSync(jsPath, fs.readFileSync(jsPath, 'utf8').replace(/\n\/\/# sourceMappingURL=.*\s*$/, '\n'));
 
-  const agents = describeAgents(ast);
+  const marked = (ast.declarations || []).filter((d) => d.type === 'AgentDecl' && d.exported).map((d) => d.name.name);
+  const agents = describeAgents(ast).filter((a) => marked.length === 0 || marked.includes(a.name));
   fs.writeFileSync(path.join(outDir, 'index.d.ts'), generateDts(agents));
   fs.writeFileSync(path.join(outDir, 'package.json'), generatePackageJson({
     name, version: flags['pkg-version'] || '0.1.0', koiDependency, sourceFile: path.basename(sourcePath),
@@ -1165,6 +1167,27 @@ if (command === 'serve') {
     noCache: flags['no-cache'] || false,
     verbose: flags.verbose || false
   });
+}
+
+// Handle types: <name>.d.koi.ts beside each .koi file, for `import ... from "./<name>.koi"`
+if (command === 'types') {
+  const files = positional.slice(1);
+  if (files.length === 0) {
+    console.error('⚠️ Please provide one or more Koi files\n\nUsage: koi types <file.koi> [more.koi ...]');
+    process.exit(1);
+  }
+  const { compileKoiModule, typesPathFor } = await import('../compiler/compile-module.js');
+  let failed = false;
+  for (const f of files) {
+    try {
+      const { exported } = await compileKoiModule(path.resolve(f));
+      console.log(`✅ ${path.relative(process.cwd(), typesPathFor(path.resolve(f)))}  (${exported.join(', ') || 'no `export agent`'})`);
+    } catch (err) {
+      failed = true;
+      console.error(`❌ ${err.message}`);
+    }
+  }
+  process.exit(failed ? 1 : 0);
 }
 
 // Handle build: an npm package of the program's agents

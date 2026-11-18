@@ -203,8 +203,8 @@ ModelEntry
 // ============================================================
 
 AgentDecl
-  = "agent" _ name:Identifier _ ":" _ role:Identifier _ "{" _ body:AgentBody _ "}" _ {
-      return { type: 'AgentDecl', name, role, body, location: location() };
+  = exported:("export" _)? "agent" _ name:Identifier _ ":" _ role:Identifier _ "{" _ body:AgentBody _ "}" _ {
+      return { type: 'AgentDecl', name, role, body, exported: !!exported, location: location() };
     }
 
 AgentBody

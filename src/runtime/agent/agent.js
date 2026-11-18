@@ -1827,7 +1827,10 @@ export class Agent {
             } catch (err) {
               const cause = client.lastError || err.message;
               mcpErrors[mcpName] = cause;
-              console.error(`[Agent:${this.name}] ❌ MCP "${mcpName}" failed to connect: ${cause}`);
+              const _mcpMsg = `MCP "${mcpName}" failed to connect: ${cause}`;
+              // A call from code reports it through its channel (onEvent), never on the host's stderr.
+              if (getCallLimits()) channel.error(`${this.name}: ${_mcpMsg}`);
+              else console.error(`[Agent:${this.name}] ❌ ${_mcpMsg}`);
             }
           }
         }

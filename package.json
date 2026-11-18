@@ -8,6 +8,7 @@
     ".": "./src/runtime/index.js",
     "./runtime": "./src/runtime/index.js",
     "./router": "./src/runtime/router.js",
+    "./register": "./src/loader/register.js",
     "./src/*": "./src/*"
   },
   "bin": {

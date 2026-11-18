@@ -25,7 +25,9 @@ class MCPRegistry {
     }
 
     let client;
-    if (config.type === 'http') {
+    // Remote when it says so, or when it has a url and nothing to spawn.
+    const isHttp = config.type === 'http' || (!!config.url && !config.command);
+    if (isHttp) {
       client = new MCPHttpClient(name, config);
       if (process.env.KOI_DEBUG_LLM) {
         console.error(`[MCPRegistry] Registered MCP: ${name} (http ${config.url})`);

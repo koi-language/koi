@@ -27,6 +27,9 @@ export class KoiTranspiler {
     // as a package so the output can be shipped and imported from TypeScript.
     this.library = !!options.library;
     this.runtimeSpecifier = options.runtimeSpecifier || '@koi-language/koi';
+    // Which agents the module exports: given by the caller (an `import "./x.koi"`
+    // exports what x.koi marks `export agent`), else the `export agent`s, else all.
+    this.exportNames = options.exportNames || null;
   }
 
   transpile(ast) {
@@ -362,9 +365,12 @@ export class KoiTranspiler {
         : `await skillSelector.register('${skillName}', ${skillName}Functions);\n`);
     }
     code += this.emit(`\n// Public API: each agent is an object with one async method per public handler\n`);
+    const marked = agentDecls.filter((d) => d.exported).map((d) => d.name.name);
+    const wanted = this.exportNames || (marked.length > 0 ? marked : agentDecls.map((d) => d.name.name));
     const exported = [];
     for (const decl of agentDecls) {
       const agentName = decl.name.name;
+      if (!wanted.includes(agentName)) continue;
       const events = KoiTranspiler.publicHandlers(decl);
       if (events.length === 0) continue;
       code += this.emit(`const ${agentName}__api = createAgentApi(${agentName}, ${JSON.stringify(events)});\n`);
