@@ -3,9 +3,10 @@
  * Embeddings, and Search.
  */
 
-import { BaseLLM, BaseEmbedding, BaseSearch, BaseAudioGen, ProviderBlockedError } from './base.js';
+import { BaseLLM, BaseEmbedding, BaseSearch, ProviderBlockedError } from './base.js';
 import { getModelCaps } from '../cost-center.js';
 import { channel } from '../../io/channel.js';
+import { hasKoiApi } from '../../api/koi-api.js';
 
 // Per-request options for STREAMING calls. The SDK's `timeout` only covers
 // until the response HEADERS arrive (the timer is cleared once fetch
@@ -151,7 +152,7 @@ export class OpenAIChatLLM extends BaseLLM {
    */
   _cleanParams(params) {
     const p = super._cleanParams(params);
-    const _gateway = process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE;
+    const _gateway = hasKoiApi() && !process.env.KOI_OFFLINE_MODE;
     const _sid = process.env.KOI_SESSION_ID;
     if (_gateway && _sid && p.session_id === undefined) p.session_id = _sid;
     return p;
@@ -820,86 +821,6 @@ export class OpenAISearch extends BaseSearch {
     // OpenAI search models may include annotations/citations in the response
     const citations = completion.choices[0].message?.annotations || [];
     return { text, citations, usage };
-  }
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OpenAI Audio Generation (TTS + STT)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export class OpenAIAudioGen extends BaseAudioGen {
-  constructor(client, model = 'tts-1') {
-    super(client, model);
-  }
-
-  get providerName() { return 'openai'; }
-
-  async speech(text, opts = {}) {
-    const voice = opts.voice || 'alloy';
-    const outputFormat = opts.outputFormat || 'mp3';
-    const speed = opts.speed || 1.0;
-
-    channel.log('audio', `OpenAI TTS: model=${this.model}, voice=${voice}, format=${outputFormat}, chars=${text.length}`);
-    const _t0 = Date.now();
-
-    try {
-      const params = {
-        model: this.model,
-        input: text,
-        voice,
-        response_format: outputFormat,
-        speed,
-      };
-      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
-      const response = await this.client.audio.speech.create(params, options);
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      const _elapsed = Date.now() - _t0;
-      channel.log('audio', `OpenAI TTS completed in ${_elapsed}ms, ${buffer.length} bytes`);
-
-      return {
-        audio: buffer,
-        format: outputFormat,
-        usage: { characters: text.length },
-      };
-    } catch (err) {
-      channel.log('audio', `OpenAI TTS FAILED: ${err.message}`);
-      throw err;
-    }
-  }
-
-  async transcribe(audio, opts = {}) {
-    const language = opts.language;
-    const format = opts.format || 'json';
-
-    channel.log('audio', `OpenAI STT: model=whisper-1, format=${format}`);
-    const _t0 = Date.now();
-
-    try {
-      const params = {
-        model: 'whisper-1',
-        file: audio,
-        response_format: format,
-      };
-      if (language) params.language = language;
-
-      const options = opts.abortSignal ? { signal: opts.abortSignal } : {};
-      const response = await this.client.audio.transcriptions.create(params, options);
-
-      const _elapsed = Date.now() - _t0;
-      channel.log('audio', `OpenAI STT completed in ${_elapsed}ms`);
-
-      const text = typeof response === 'string' ? response : response.text;
-      return {
-        text,
-        segments: response.segments || undefined,
-        usage: { duration: response.duration || 0 },
-      };
-    } catch (err) {
-      channel.log('audio', `OpenAI STT FAILED: ${err.message}`);
-      throw err;
-    }
   }
 }
 

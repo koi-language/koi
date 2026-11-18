@@ -30,6 +30,7 @@ import { mcpRegistry } from '../../mcp/mcp-registry.js';
 import { channel } from '../../io/channel.js';
 import { fetchAssetBuffer } from '../../io/download-asset.js';
 import yaml from 'yaml';
+import { hasKoiApi } from '../../api/koi-api.js';
 
 const MAX_POLL_ATTEMPTS = 40; // ~40 × up-to-25s long-polls = generous ceiling
 
@@ -541,7 +542,7 @@ export class McpMediaProvider {
    * caller then proceeds with the MCP's default (auto) rather than failing.
    */
   async _pickHostSlug(opts) {
-    if (!process.env.KOI_AUTH_TOKEN) return null; // no gateway/catalog without login
+    if (!hasKoiApi()) return null; // no gateway/catalog without the Koi API
     try {
       const { fetchMediaCapabilities } = await import('./gateway.js');
       const caps = await fetchMediaCapabilities(this.kind);
@@ -949,7 +950,7 @@ export class McpMediaProvider {
     throw new MediaRouteUnavailable(
       `MCP media provider "${this.server}" does not support ${method}` +
       (why ? ` (${why})` : '') + ' and no backend fallback is available' +
-      (process.env.KOI_AUTH_TOKEN ? '.' : ' — sign in to Koi to use the backend.'),
+      (hasKoiApi() ? '.' : ' — set KOI_API_KEY to use the Koi API.'),
     );
   }
 

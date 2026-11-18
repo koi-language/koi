@@ -18,6 +18,8 @@
  * `isNonInteractive()` — never read the raw env vars at the call site.
  */
 
+import { getCallLimits } from '../agent/call-limits.js';
+
 /** Legacy headless one-shot mode (`--exit`): never-ask + exit + hide output. */
 export function isExitOnComplete() {
   return process.env.KOI_EXIT_ON_COMPLETE === '1';
@@ -34,7 +36,7 @@ export function isYoloMode() {
  * code paths consult; both `--exit` and YOLO turn it on.
  */
 export function isNonInteractive() {
-  return isExitOnComplete() || isYoloMode();
+  return isExitOnComplete() || isYoloMode() || !!getCallLimits();
 }
 
 /**
@@ -48,6 +50,10 @@ export function isNonInteractive() {
  * env at the call site.
  */
 export function isAutoApprove() {
+  // A call from code (runtime/library.js) never asks, but approves permissions
+  // only when the caller said so: never-ask must not mean allow-everything there.
+  const call = getCallLimits();
+  if (call) return process.env.KOI_YES === '1' || !!call.autoApprove;
   return process.env.KOI_YES === '1' || isNonInteractive();
 }
 

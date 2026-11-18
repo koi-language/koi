@@ -1,7 +1,7 @@
 /**
- * Gateway providers — used when the user is authenticated via a braxil.ai account.
+ * Gateway providers — used whenever the Koi API is configured (api/koi-api.js).
  *
- * All calls are routed through the braxil.ai backend gateway, which proxies
+ * All calls are routed through the Koi API gateway (KOI_API_URL), which proxies
  * to the actual providers server-side (OpenAI, Gemini, Kling, Seedance, etc.).
  *
  * The gateway exposes a UNIFIED API inspired by fal.ai's pattern:
@@ -24,6 +24,7 @@ import { BaseEmbedding, BaseSearch, BaseImageGen, BaseAudioGen, BaseVideoGen } f
 import { lookupModel } from '../cost-center.js';
 import { parseQuotaExceededResponse } from '../quota-exceeded-error.js';
 import { channel } from '../../io/channel.js';
+import { koiApiKey, koiApiUrl } from '../../api/koi-api.js';
 
 /**
  * Throw a QuotaExceededError if the response is HTTP 402. Callers should
@@ -123,12 +124,12 @@ function _isRouteableError(err) {
 // ── Gateway base URL ─────────────────────────────────────────────────────────
 
 export function getGatewayBase() {
-  return (process.env.KOI_API_URL || 'http://localhost:3000') + '/gateway';
+  return koiApiUrl() + '/gateway';
 }
 
 export function getAuthHeaders() {
   return {
-    'Authorization': `Bearer ${process.env.KOI_AUTH_TOKEN}`,
+    'Authorization': `Bearer ${koiApiKey()}`,
     'Content-Type': 'application/json',
   };
 }

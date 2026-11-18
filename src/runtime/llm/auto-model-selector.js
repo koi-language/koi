@@ -9,6 +9,7 @@
  */
 
 import { createRequire } from 'module';
+import { hasKoiApi, koiApiUrl } from '../api/koi-api.js';
 const _require = createRequire(import.meta.url);
 
 /**
@@ -24,7 +25,7 @@ function _getLocalFallback() {
 }
 
 /** Active models data — starts with local fallback, replaced by backend data when available. */
-let modelsData = process.env.KOI_AUTH_TOKEN ? {} : _getLocalFallback();
+let modelsData = hasKoiApi() ? {} : _getLocalFallback();
 
 /** ETag from last successful fetch — used for conditional requests. */
 let _remoteEtag = '';
@@ -78,7 +79,7 @@ export async function loadRemoteModels() {
 }
 
 async function _doLoadRemoteModels() {
-  const base = process.env.KOI_API_URL || 'http://localhost:3000';
+  const base = koiApiUrl();
   // Both gateway and API keys mode use /gateway/models.json (all models with scores).
   // In gateway mode, the backend filters by user plan; in API keys mode, all models are returned.
   const endpoint = '/gateway/models.json';
@@ -241,7 +242,7 @@ function _looksLikeApiKey(val) {
 
 export function getAvailableProviders() {
   // Gateway mode: return all providers from the backend model list
-  if (process.env.KOI_AUTH_TOKEN) {
+  if (hasKoiApi()) {
     return Object.keys(modelsData);
   }
 
@@ -275,7 +276,7 @@ function _buildCandidates(providers, taskType, difficulty, requiresImage, skipCo
       // These don't exist on the provider's native API:
       // - Suffixed variants (:free, :extended) — OpenRouter pricing tiers
       // - gpt-oss-* — open-source models served under openai/ namespace on OR
-      if (!process.env.KOI_AUTH_TOKEN) {
+      if (!hasKoiApi()) {
         if (modelName.includes(':')) continue;
         if (modelName.startsWith('gpt-oss')) continue;
       }
@@ -333,7 +334,7 @@ function _buildAllCandidates(providers, taskType, requiresImage, minContextK = 0
       if (requiresVideo && !caps.inputVideo) continue;
       if (requiresAudio && !caps.inputAudio) continue;
       if (requiresFile && !caps.inputFile) continue;
-      if (!process.env.KOI_AUTH_TOKEN) {
+      if (!hasKoiApi()) {
         if (modelName.includes(':')) continue;
         if (modelName.startsWith('gpt-oss')) continue;
       }

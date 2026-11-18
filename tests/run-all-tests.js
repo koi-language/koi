@@ -43,6 +43,7 @@ const HAS_LLM = Boolean(
   process.env.ANTHROPIC_API_KEY ||
   process.env.GEMINI_API_KEY ||
   process.env.GOOGLE_API_KEY ||
+  process.env.KOI_API_KEY ||
   process.env.KOI_AUTH_TOKEN,
 );
 
@@ -51,7 +52,7 @@ async function runTest(testFile, testsDir) {
   const testPath = join(testsDir, testFile);
 
   if (LLM_REQUIRED_TESTS.has(testName) && !HAS_LLM) {
-    return { name: testName, skipped: true, reason: 'No LLM provider configured (set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)' };
+    return { name: testName, skipped: true, reason: 'No LLM provider configured (set KOI_API_KEY, or OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)' };
   }
 
   try {

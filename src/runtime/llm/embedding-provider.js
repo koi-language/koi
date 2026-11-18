@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { isNetworkError } from './is-network-error.js';
+import { hasKoiApi } from '../api/koi-api.js';
 
 /**
  * EmbeddingProvider — extracted from LLMProvider.
@@ -97,7 +98,7 @@ export class EmbeddingProvider {
    * Used by ContextMemory to initialize SQLite with the correct schema.
    */
   getEmbeddingDim() {
-    if (process.env.KOI_AUTH_TOKEN) return 1536; // gateway uses text-embedding-3-small
+    if (hasKoiApi()) return 1536; // gateway uses text-embedding-3-small
     if (process.env.OPENAI_API_KEY) return this._getEmbeddingDimension('openai');
     if (process.env.GEMINI_API_KEY) return this._getEmbeddingDimension('gemini');
     return this._getEmbeddingDimension('openai'); // fallback default
@@ -154,7 +155,7 @@ export class EmbeddingProvider {
     // gateway to a couple of slow failures, then fast-fails — so we get
     // resilience WITHOUT false-failing healthy-but-slow embeddings.
     const TIMEOUT_MS = 15000;
-    const _provider = process.env.KOI_AUTH_TOKEN ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
+    const _provider = hasKoiApi() ? 'koi-gateway' : process.env.OPENAI_API_KEY ? 'openai' : process.env.GEMINI_API_KEY ? 'gemini' : 'none';
     // Fail fast when no credentials are configured — retrying the same 'none'
     // provider with backoff just wastes the startup window while the
     // agent is blocked on memory restore / semantic index warmup.
@@ -188,8 +189,8 @@ export class EmbeddingProvider {
       this._log('memory', `Embedding request: provider=${_provider}, textLen=${text.length}, attempt=${attempt}, preview="${text.substring(0, 80).replace(/\n/g, ' ')}..."`);
 
       try {
-        // Gateway mode: use braxil.ai backend for embeddings
-        if (process.env.KOI_AUTH_TOKEN) {
+        // Koi API mode: embeddings through the gateway
+        if (hasKoiApi()) {
           if (!this._gatewayEmbeddingInstance) {
             const { GatewayEmbedding } = await import('./providers/gateway.js');
             this._gatewayEmbeddingInstance = new GatewayEmbedding();
@@ -309,7 +310,7 @@ export class EmbeddingProvider {
 
   async _doEmbeddingBatch(texts) {
     // Gateway mode: always use batch API — never fall back to individual calls.
-    if (process.env.KOI_AUTH_TOKEN) {
+    if (hasKoiApi()) {
       if (!this._gatewayEmbeddingInstance) {
         const { GatewayEmbedding } = await import('./providers/gateway.js');
         this._gatewayEmbeddingInstance = new GatewayEmbedding();

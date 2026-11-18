@@ -32,6 +32,7 @@ import { isAutoApprove } from '../../util/interactivity.js';
 import { getAuthHeaders, fetchMediaCapabilities } from '../../llm/providers/gateway.js';
 import { channel } from '../../io/channel.js';
 import { runPermissionDialog } from '../../code/permission-queue.js';
+import { koiApiUrl } from '../../api/koi-api.js';
 
 // One flag for ALL media kinds — per the product spec, enabling auto-approve
 // on any media confirmation suppresses the prompt for every subsequent media
@@ -95,7 +96,7 @@ export function resetMediaAutoApprove() {
 // generation on a balance lookup.
 async function fetchAvailableBalance(abortSignal) {
   try {
-    const base = process.env.KOI_API_URL || 'http://localhost:3000';
+    const base = koiApiUrl();
     const res = await fetch(`${base}/users/me`, {
       headers: getAuthHeaders(),
       signal: abortSignal,

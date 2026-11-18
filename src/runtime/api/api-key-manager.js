@@ -7,6 +7,8 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { hasKoiApi } from './koi-api.js';
+import { getCallLimits } from '../agent/call-limits.js';
 
 const GLOBAL_ENV_PATH = path.join(os.homedir(), '.koi', '.env');
 
@@ -102,9 +104,9 @@ async function _promptForApiKey(executor, { provider, keyName, providerName, all
  * @param {Agent} agent - The agent instance to use for executing the prompt action
  */
 export async function promptMissingApiKeys(agent) {
-  // When authenticated via braxil.ai account, API keys are not needed —
+  // With the Koi API configured (KOI_API_KEY / a signed-in session), provider keys are not needed —
   // the gateway proxies LLM calls using the auth token.
-  if (process.env.KOI_AUTH_TOKEN) return;
+  if (hasKoiApi()) return;
 
   // In GUI mode, the welcome dialog and Settings > Models tab handle
   // API keys. The runtime must NEVER print "No API key found, please
@@ -182,8 +184,8 @@ export async function ensureApiKey(provider, agent) {
 
   if (process.env[keyName]) return process.env[keyName];
 
-  // When authenticated via braxil.ai account, the gateway handles provider access.
-  if (process.env.KOI_AUTH_TOKEN) return '__KOI_ACCOUNT__';
+  // With the Koi API configured, the gateway handles provider access.
+  if (hasKoiApi()) return '__KOI_ACCOUNT__';
 
   const providerName = PROVIDER_NAMES[provider] || provider;
 
@@ -192,12 +194,13 @@ export async function ensureApiKey(provider, agent) {
   // point with no key and no auth token, fail with a clear error so the
   // caller can surface it appropriately (and the GUI can re-show the welcome
   // flow if needed).
-  const isGuiMode = process.env.KOI_GUI_MODE === '1' || !!process.env.KOI_GUI_PORT;
+  // A call from code (library.js) has nobody to ask either: fail at once, like the GUI.
+  const isGuiMode = process.env.KOI_GUI_MODE === '1' || !!process.env.KOI_GUI_PORT || !!getCallLimits();
   if (isGuiMode) {
     throw new Error(
       `${keyName} is required but not configured. ` +
       `Open Settings → Models and add your ${providerName} API key, ` +
-      `or sign in with a Braxil account.`
+      `or set KOI_API_KEY to use the Koi API.`
     );
   }
 

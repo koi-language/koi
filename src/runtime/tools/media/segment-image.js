@@ -17,6 +17,7 @@ import { slugFromSourcePath, buildDescribedFilename } from './util/slugify-descr
 import { downloadAssetToFile } from '../../io/download-asset.js';
 
 import { docDir } from '../../state/doc-root.js';
+import { hasKoiApi, koiApiKey } from '../../api/koi-api.js';
 // SAM 3 — text-prompted for precompute, point+text for fallback clicks.
 const SAM3_MODEL = 'fal-ai/sam-3/image';
 
@@ -92,8 +93,8 @@ const segmentImageAction = {
         if (selected) {
           // In gateway mode, all providers use the gateway client
           const OpenAI = (await import('openai')).default;
-          const client = process.env.KOI_AUTH_TOKEN
-            ? new OpenAI({ apiKey: process.env.KOI_AUTH_TOKEN, baseURL: `${base.replace('/gateway', '')}/gateway`, maxRetries: 0 })
+          const client = hasKoiApi()
+            ? new OpenAI({ apiKey: koiApiKey(), baseURL: `${base.replace('/gateway', '')}/gateway`, maxRetries: 0 })
             : null;
 
           channel.log('image', `segment_image: client=${client ? 'OK' : 'NULL (no KOI_AUTH_TOKEN)'}, base=${base}`);

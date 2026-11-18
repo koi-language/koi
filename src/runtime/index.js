@@ -9,6 +9,10 @@ export { SkillSelector, skillSelector } from './skills/skill-selector.js';
 export { registry, getRegistry } from './skills/registry.js';
 export { mcpRegistry } from './mcp/mcp-registry.js';
 export { lspManager } from './lsp/lsp-manager.js';
+export {
+  callAgent, createAgentApi, HeadlessChannel, DEFAULT_ANSWER,
+  KoiCallError, KoiStepLimitError, KoiTimeoutError, KoiAbortError,
+} from './library.js';
 
 // Global registry for skill functions (for tool calling)
 export const SkillRegistry = {

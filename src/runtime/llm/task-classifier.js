@@ -1,6 +1,7 @@
 import path from 'path';
 import { getAllCandidates, DEFAULT_TASK_PROFILE } from './providers/factory.js';
 import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH } from './constants.js';
+import { hasKoiApi } from '../api/koi-api.js';
 
 /**
  * Task and interaction classifier — extracted from LLMProvider.
@@ -318,8 +319,8 @@ ${taskDescription}`;
         break;
       }
       try {
-        const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
-        const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
+        const effectiveProvider = hasKoiApi() ? 'openai' : candidate.provider;
+        const client = hasKoiApi() ? this._getClient('openai') : candidate.client;
         const llm = this._createLLMFn(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens, useThinking: false });
         const { text: content, usage: _u } = await llm.complete(
           [{ role: 'user', content: prompt }],
@@ -426,8 +427,8 @@ ${taskDescription}`;
       try {
         // Use the correct adapter for each provider (OpenAI Chat/Responses, Anthropic, Gemini).
         // In gateway mode, all providers route through the OpenAI-compatible gateway.
-        const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : candidate.provider;
-        const client = process.env.KOI_AUTH_TOKEN ? this._getClient('openai') : candidate.client;
+        const effectiveProvider = hasKoiApi() ? 'openai' : candidate.provider;
+        const client = hasKoiApi() ? this._getClient('openai') : candidate.client;
         const llm = this._createLLMFn(effectiveProvider, client, candidate.model, { temperature: 0, maxTokens: 800, useThinking: false });
         const { text: content, usage: _u } = await llm.complete([{ role: 'user', content: prompt }], { timeoutMs: 5000, responseFormat: 'json_object' });
         consecutiveFailures = 0; // reset on success

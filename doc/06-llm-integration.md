@@ -50,6 +50,21 @@ OPENAI_API_KEY=sk-proj-...your-key...
 ANTHROPIC_API_KEY=sk-ant-...your-key...
 ```
 
+### Or: use the Koi API
+
+Instead of a key per provider, every model call can go through one server that speaks the Koi API
+(`<url>/gateway/...`). braxil.ai is the default; api.brabier.com serves the same API.
+
+```bash
+KOI_API_URL=https://api.brabier.com   # optional, default https://api.braxil.ai
+KOI_API_KEY=brb_...                     # the key that server issued you
+```
+
+With `KOI_API_KEY` set, chat, embeddings and search go through it. **Image, video and audio are
+only ever generated through the Koi API**: without it, those tools fail with a message saying so,
+even if `OPENAI_API_KEY` is set. `KOI_AUTH_TOKEN` (the signed-in session an app such as the Koi CLI
+stores) is accepted as an alias; `KOI_API_KEY` wins when both are set.
+
 ### Step 3: Test It
 
 ```bash

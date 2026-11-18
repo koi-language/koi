@@ -18,7 +18,7 @@
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { getModelCaps, getFirstModelForProvider } from '../cost-center.js';
-import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch, OpenAIAudioGen } from './openai.js';
+import { OpenAIChatLLM, OpenAIResponsesLLM, OpenAIEmbedding, OpenAISearch } from './openai.js';
 import { AnthropicLLM, AnthropicSearch } from './anthropic.js';
 import { GeminiLLM, GeminiEmbedding } from './gemini.js';
 import { BraveSearch } from './brave.js';
@@ -38,6 +38,7 @@ import { McpMediaProvider } from './mcp-media.js';
 export { markProviderTimeout, markModelTimeout, clearProviderCooldown, getAvailableProviders, loadRemoteModels, forceRefreshRemoteModels, DEFAULT_TASK_PROFILE, getAllCandidates } from '../auto-model-selector.js';
 import { selectAutoModel } from '../auto-model-selector.js';
 import { channel } from '../../io/channel.js';
+import { hasKoiApi, koiApiRequiredMessage } from '../../api/koi-api.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // resolve() — the main entry point
@@ -108,7 +109,7 @@ function _resolveLLM(req) {
     // and direct providers in the same session bypasses credit accounting.
     // Only when the user is NOT signed in (or explicitly offline) do we
     // fall through to direct clients built from local env vars.
-    const _isSignedIn = !!process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE;
+    const _isSignedIn = hasKoiApi() && !process.env.KOI_OFFLINE_MODE;
     let client;
     if (_isSignedIn) {
       client = clients[provider];
@@ -191,8 +192,8 @@ function _resolveLLM(req) {
   // In gateway mode, all providers route through the OpenAI-compatible gateway.
   // Force effectiveProvider to 'openai' so createLLM uses the OpenAI SDK wrapper,
   // but keep the original provider name for tracking/exclusion purposes.
-  const effectiveProvider = process.env.KOI_AUTH_TOKEN ? 'openai' : provider;
-  const client = process.env.KOI_AUTH_TOKEN ? clients.openai : clients[provider];
+  const effectiveProvider = hasKoiApi() ? 'openai' : provider;
+  const client = hasKoiApi() ? clients.openai : clients[provider];
   if (!client) throw new Error(`No SDK client for provider: ${provider}`);
 
   const reasoningEffort = req.profile?.reasoningEffort ?? (useThinking ? 'medium' : 'none');
@@ -212,8 +213,8 @@ function _resolveLLM(req) {
 function _resolveEmbedding(req) {
   const { clients } = req;
 
-  // Gateway mode: route through braxil.ai backend
-  if (process.env.KOI_AUTH_TOKEN) {
+  // Koi API mode: route through the gateway
+  if (hasKoiApi()) {
     const instance = new GatewayEmbedding();
     return { instance, provider: 'koi-gateway', model: 'text-embedding-3-small', useThinking: false };
   }
@@ -239,9 +240,9 @@ function _resolveEmbedding(req) {
 function _resolveSearch(req) {
   const { clients } = req;
 
-  // Gateway mode: route through braxil.ai backend (skip if forced model is set —
+  // Koi API mode: route through the gateway (skip if forced model is set —
   // forced mode means we're bypassing the gateway for direct API access)
-  if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_DEFAULT_MODEL) {
+  if (hasKoiApi() && !process.env.KOI_DEFAULT_MODEL) {
     const instance = new GatewaySearch();
     return { instance, provider: 'koi-gateway', model: 'gateway-search', useThinking: false };
   }
@@ -286,7 +287,7 @@ function _resolveImage(req) {
   // See docs/mcp-media-facade.md.
   const mcp = mcpMediaActiveFor('image');
   if (mcp) {
-    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayImageGen(model) : null;
+    const fallback = hasKoiApi() ? new GatewayImageGen(model) : null;
     const instance = new McpMediaProvider({ kind: 'image', server: mcp.server, media: mcp.media, fallback });
     return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
   }
@@ -294,10 +295,10 @@ function _resolveImage(req) {
   // Otherwise image generation goes through the backend gateway. The per-model
   // adapters (fal nano-banana / qwen / seedream / openai-gpt-image / etc.) live
   // in backend/src/modules/gateway/adapters/image/ — never in the client.
-  // KOI_AUTH_TOKEN is the proof the user is logged in to Braxil; without it
-  // there is no gateway and no image generation.
-  if (!process.env.KOI_AUTH_TOKEN) {
-    throw new Error('Image generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
+  // Image, video and audio are only ever generated through the Koi API
+  // (KOI_API_URL + KOI_API_KEY, see api/koi-api.js): there is no direct-to-provider path.
+  if (!hasKoiApi()) {
+    throw new Error(koiApiRequiredMessage('Image generation'));
   }
   const instance = new GatewayImageGen(model);
   return { instance, provider: 'koi-gateway', model, useThinking: false };
@@ -308,7 +309,7 @@ function _resolveImage(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _resolveAudio(req) {
-  const { clients, model: requestedModel } = req;
+  const { model: requestedModel } = req;
 
   // Media facade: route TTS/music through a connected media MCP when one
   // declares audio capabilities. Uncovered methods (sfx, voice cloning,
@@ -316,25 +317,18 @@ function _resolveAudio(req) {
   const mcp = mcpMediaActiveFor('audio');
   if (mcp) {
     const model = requestedModel || 'auto';
-    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayAudioGen(model) : null;
+    const fallback = hasKoiApi() ? new GatewayAudioGen(model) : null;
     const instance = new McpMediaProvider({ kind: 'audio', server: mcp.server, media: mcp.media, fallback });
     return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
   }
 
-  // Gateway mode
-  if (process.env.KOI_AUTH_TOKEN) {
-    const model = requestedModel || 'auto';
-    const instance = new GatewayAudioGen(model);
-    return { instance, provider: 'koi-gateway', model, useThinking: false };
+  // Otherwise through the Koi API, like image and video: never straight to a provider.
+  if (!hasKoiApi()) {
+    throw new Error(koiApiRequiredMessage('Audio generation'));
   }
-
-  // Only OpenAI has TTS/STT via SDK
-  if (clients?.openai && process.env.OPENAI_API_KEY) {
-    const model = requestedModel || 'tts-1';
-    const instance = new OpenAIAudioGen(clients.openai, model);
-    return { instance, provider: 'openai', model, useThinking: false };
-  }
-  throw new Error('No audio generation provider available (need OPENAI_API_KEY)');
+  const model = requestedModel || 'auto';
+  const instance = new GatewayAudioGen(model);
+  return { instance, provider: 'koi-gateway', model, useThinking: false };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,15 +346,15 @@ function _resolveVideo(req) {
   // docs/mcp-media-facade.md.
   const mcp = mcpMediaActiveFor('video');
   if (mcp) {
-    const fallback = process.env.KOI_AUTH_TOKEN ? new GatewayVideoGen(model) : null;
+    const fallback = hasKoiApi() ? new GatewayVideoGen(model) : null;
     const instance = new McpMediaProvider({ kind: 'video', server: mcp.server, media: mcp.media, fallback });
     return { instance, provider: `mcp:${mcp.server}`, model, useThinking: false };
   }
 
   // Otherwise video generation goes through the backend gateway, same
   // reasoning as _resolveImage.
-  if (!process.env.KOI_AUTH_TOKEN) {
-    throw new Error('Video generation requires KOI_AUTH_TOKEN (Braxil login). Direct-to-provider client adapters were removed — all media calls go through the backend gateway.');
+  if (!hasKoiApi()) {
+    throw new Error(koiApiRequiredMessage('Video generation'));
   }
   const instance = new GatewayVideoGen(model);
   return { instance, provider: 'koi-gateway', model, useThinking: false };
@@ -472,7 +466,7 @@ export function createLLM(provider, client, model, opts = {}) {
       // OpenRouter accepts any model on this endpoint and converts
       // internally. The 'responses' variant is only needed for direct
       // OpenAI API calls with codex models (which reject chat/completions).
-      if (caps.api === 'responses' && !process.env.KOI_AUTH_TOKEN) {
+      if (caps.api === 'responses' && !hasKoiApi()) {
         return new OpenAIResponsesLLM(client, model, fullOpts);
       }
       return new OpenAIChatLLM(client, model, fullOpts);
@@ -526,11 +520,9 @@ export function createImageGen(provider, _client, model) {
 /**
  * Create an AudioGen instance directly.
  */
-export function createAudioGen(provider, client, model) {
-  switch (provider) {
-    case 'openai':  return new OpenAIAudioGen(client, model || 'tts-1');
-    default: throw new Error(`No audio generation support for provider: ${provider}`);
-  }
+export function createAudioGen(provider, _client, model) {
+  if (provider === 'koi-gateway') return new GatewayAudioGen(model || 'auto');
+  throw new Error(`createAudioGen: only "koi-gateway" is supported (got "${provider}"). Audio is generated through the Koi API.`);
 }
 
 /**

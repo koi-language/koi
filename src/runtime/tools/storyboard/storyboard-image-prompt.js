@@ -44,6 +44,7 @@ import {
 } from '../../llm/providers/factory.js';
 import { costCenter } from '../../llm/cost-center.js';
 import { getAuthHeaders, getGatewayBase } from '../../llm/providers/gateway.js';
+import { hasKoiApi } from '../../api/koi-api.js';
 
 const _SYSTEM_PROMPT = `You are briefing an illustrator. They will draw exactly ONE storyboard panel from your words. They have never read the storyboard JSON — only your brief. Your job: produce ONE compact English image prompt in the classic storyboard-panel format, tight and concrete.
 
@@ -380,7 +381,7 @@ export default {
     //    selectAutoModel to pick a model name from the same catalog,
     //    then POST directly to the gateway's /chat/completions —
     //    same model selection logic, no agent runtime needed.
-    if (!process.env.KOI_AUTH_TOKEN) {
+    if (!hasKoiApi()) {
       return {
         success: false,
         error:

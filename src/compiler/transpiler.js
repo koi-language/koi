@@ -22,6 +22,11 @@ export class KoiTranspiler {
     this.outputPath = options.outputPath || null;
     this.runtimePath = options.runtimePath || null;
     this.externalImports = options.externalImports || []; // TypeScript/JavaScript imports
+    // Library mode (`koi build`): a module that EXPORTS its agents as async APIs,
+    // with no main function, no `run` and no process.exit, importing the runtime
+    // as a package so the output can be shipped and imported from TypeScript.
+    this.library = !!options.library;
+    this.runtimeSpecifier = options.runtimeSpecifier || '@koi-language/koi';
   }
 
   transpile(ast) {
@@ -106,7 +111,12 @@ export class KoiTranspiler {
     let runtimeImportPath;
     let routerImportPath;
 
-    if (koiRuntimePath) {
+    if (this.library) {
+      runtimeImportPath = this.runtimeSpecifier;
+      routerImportPath = this.runtimeSpecifier === '@koi-language/koi'
+        ? '@koi-language/koi/router'
+        : this.runtimeSpecifier.replace(/index\.js$/, 'router.js');
+    } else if (koiRuntimePath) {
       // Development mode: use local runtime
       const runtimeIndexPath = path.join(koiRuntimePath, 'index.js');
       const routerPath = path.join(koiRuntimePath, 'router.js');
@@ -124,7 +134,7 @@ export class KoiTranspiler {
     // Store routerImportPath for later use
     this.routerImportPath = routerImportPath;
 
-    code += this.emit(`import { Agent, Team, Skill, Role, Runtime, SkillRegistry, skillSelector, registry, mcpRegistry } from '${runtimeImportPath}';\n`);
+    code += this.emit(`import { Agent, Team, Skill, Role, Runtime, SkillRegistry, skillSelector, registry, mcpRegistry${this.library ? ', createAgentApi' : ''} } from '${runtimeImportPath}';\n`);
 
     // Add CommonJS compatibility for require() in ES modules
     code += this.emit(`import { createRequire } from 'module';\n`);
@@ -225,6 +235,11 @@ export class KoiTranspiler {
 
     this.skipAgentRegistration = false;
 
+    if (this.library) {
+      code += this.generateLibraryExports(agentDecls, skillDecls, runStatements);
+      return code;
+    }
+
     // Generate main async function that coordinates everything
     if (agentDecls.length > 0 || skillDecls.length > 0 || runStatements.length > 0) {
       code += this.emit(`\n// Main execution function\n`);
@@ -304,6 +319,60 @@ export class KoiTranspiler {
       code += this.emit(`});\n`);
     }
 
+    return code;
+  }
+
+  /** Public handlers of an agent: every `on <event>` not marked `private`. */
+  static publicHandlers(agentDecl) {
+    return (agentDecl.body || [])
+      .filter((b) => b.type === 'EventHandler' && !b.isPrivate)
+      .map((b) => (typeof b.event === 'string' ? b.event : b.event?.name))
+      .filter(Boolean);
+  }
+
+  /**
+   * Library mode tail: register agents and skills at import time (top-level
+   * await; registering is local, no model call) and export one async API per
+   * agent. `run` statements belong to scripts and are left out.
+   */
+  generateLibraryExports(agentDecls, skillDecls, runStatements) {
+    let code = '';
+    if (runStatements.length > 0) {
+      code += this.emit(`\n// ${runStatements.length} \`run\` statement(s) left out: a library is called, not run.\n`);
+    }
+    if (agentDecls.length > 0) {
+      code += this.emit(`\n// Register agents with router (local, no model call)\n`);
+      code += this.emit(`const { agentRouter } = await import('${this.routerImportPath}');\n`);
+      for (const decl of agentDecls) {
+        const agentName = decl.name.name;
+        const cached = this.cacheData?.affordances?.[agentName];
+        code += this.emit(cached
+          ? `await agentRouter.register(${agentName}, CACHED_AFFORDANCES['${agentName}']);\n`
+          : `await agentRouter.register(${agentName});\n`);
+      }
+    }
+    for (const decl of skillDecls) {
+      const skillName = decl.name.name;
+      const functionNames = decl.functions ? decl.functions.filter(f => f.isExport).map(f => f.name.name) : [];
+      if (functionNames.length === 0) continue;
+      const cached = this.cacheData?.skillAffordances?.[skillName];
+      code += this.emit(`const ${skillName}Functions = [${functionNames.map(fn => `{ name: '${fn}', fn: ${fn}, description: SkillRegistry.get('${skillName}', '${fn}')?.metadata?.affordance || 'Function from ${skillName}' }`).join(', ')}];\n`);
+      code += this.emit(cached
+        ? `await skillSelector.register('${skillName}', ${skillName}Functions, CACHED_SKILL_AFFORDANCES['${skillName}']);\n`
+        : `await skillSelector.register('${skillName}', ${skillName}Functions);\n`);
+    }
+    code += this.emit(`\n// Public API: each agent is an object with one async method per public handler\n`);
+    const exported = [];
+    for (const decl of agentDecls) {
+      const agentName = decl.name.name;
+      const events = KoiTranspiler.publicHandlers(decl);
+      if (events.length === 0) continue;
+      code += this.emit(`const ${agentName}__api = createAgentApi(${agentName}, ${JSON.stringify(events)});\n`);
+      exported.push(`${agentName}__api as ${agentName}`);
+    }
+    if (exported.length > 0) {
+      code += this.emit(`export { ${exported.join(', ')} };\n`);
+    }
     return code;
   }
 

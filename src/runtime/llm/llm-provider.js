@@ -40,6 +40,8 @@ import { StreamingPrintParser } from './streaming-print.js';
 import { optimizeImage, resolveAttachments, injectMcpImages, pruneOldImages, injectCacheControl } from './message-builder.js';
 import { isQuotaExceededError, toQuotaExceededError } from './quota-exceeded-error.js';
 import { attachmentTypeFromPath } from '../state/attachment-registry.js';
+import { hasKoiApi, isFixedKoiApiKey, koiApiKey, koiApiUrl } from '../api/koi-api.js';
+import { getCallLimits } from '../agent/call-limits.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
@@ -109,17 +111,17 @@ export class LLMProvider {
     this.maxTokens = config.max_tokens || 16000; // Fallback; per-model limit set in BaseLLM via caps.maxOutputTokens
     this._useThinking = false; // Set to true by auto-selector when thinking variant wins
 
-    // ── braxil.ai account mode: route all LLM calls through the gateway ──────
+    // ── Koi API mode: route all LLM calls through the gateway (api/koi-api.js) ──
     // The gateway is OpenAI-compatible and handles provider selection server-side.
     // No need to hardcode providers — they come dynamically from GET /gateway/models.
-    // Production: https://api.braxil.ai/gateway  Local: http://localhost:3000/gateway
-    if (process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
-      const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
+    // KOI_API_URL picks the server (default https://api.braxil.ai); KOI_API_KEY the key.
+    if (hasKoiApi() && !process.env.KOI_OFFLINE_MODE) {
+      const apiBase = koiApiUrl();
       const gatewayBase = apiBase + '/gateway';
       channel.log('llm', `[gateway] baseURL=${gatewayBase} (KOI_API_URL=${process.env.KOI_API_URL || '(not set)'})`);
       this._koiGatewayApiBase = apiBase;
       this._koiGateway = new OpenAI({
-        apiKey: process.env.KOI_AUTH_TOKEN,
+        apiKey: koiApiKey(),
         baseURL: gatewayBase,
         maxRetries: 2, // Retry connection errors (concurrent agents can saturate the pool)
       });
@@ -194,12 +196,12 @@ export class LLMProvider {
   // =========================================================================
 
   /**
-   * Fetch available providers from the braxil.ai gateway and update
+   * Fetch available providers from the Koi API gateway and update
    * _availableProviders accordingly. Called at startup and on 400 errors
    * (e.g. "key not configured") to re-sync.
    */
   async syncGatewayProviders() {
-    if (!process.env.KOI_AUTH_TOKEN) return;
+    if (!hasKoiApi()) return;
 
     // Load models from backend — this populates the auto-model-selector with
     // the actual active models. getAvailableProviders() then returns providers
@@ -257,14 +259,14 @@ export class LLMProvider {
    * Safe to call repeatedly — no-op when the state is already correct.
    */
   _maybeLateInitFromEnv() {
-    // (a) Gateway upgrade: token appeared → route through braxil.ai
-    if (!this._koiGateway && process.env.KOI_AUTH_TOKEN && !process.env.KOI_OFFLINE_MODE) {
-      const apiBase = process.env.KOI_API_URL || 'http://localhost:3000';
+    // (a) Gateway upgrade: key appeared → route through the Koi API
+    if (!this._koiGateway && hasKoiApi() && !process.env.KOI_OFFLINE_MODE) {
+      const apiBase = koiApiUrl();
       const gatewayBase = apiBase + '/gateway';
       channel.log('llm', `[gateway] late-init: baseURL=${gatewayBase}`);
       this._koiGatewayApiBase = apiBase;
       this._koiGateway = new OpenAI({
-        apiKey: process.env.KOI_AUTH_TOKEN,
+        apiKey: koiApiKey(),
         baseURL: gatewayBase,
         maxRetries: 2,
       });
@@ -339,13 +341,13 @@ export class LLMProvider {
       await this._modelsReady;
     }
     if (this._availableProviders.length > 0) return;
-    // Gateway mode: all providers are available via the braxil.ai backend
+    // Gateway mode: all providers are available via the Koi API
     if (this._koiGateway) return;
     // GUI mode: never prompt via CLI. Throw a structured error so the
     // main loop can catch it and surface a "configure your keys" prompt
     // instead of crashing downstream when the SDK client is null.
-    if (process.env.KOI_GUI_MODE === '1') {
-      const err = new Error('No LLM provider configured. Open Settings → Models and add an API key, or sign in with Braxil.');
+    if (process.env.KOI_GUI_MODE === '1' || getCallLimits()) {
+      const err = new Error('No LLM provider configured. Open Settings → Models and add an API key, or set KOI_API_KEY to use the Koi API.');
       err.code = 'NO_PROVIDER';
       throw err;
     }
@@ -388,8 +390,8 @@ export class LLMProvider {
                       (p === 'gemini' && this._gc);
     if (hasClient) return;
     // GUI mode: never prompt for keys via CLI. See _ensureAnyProvider.
-    if (process.env.KOI_GUI_MODE === '1') {
-      const err = new Error(`No ${p} API key configured. Open Settings → Models and add an API key, or sign in with Braxil.`);
+    if (process.env.KOI_GUI_MODE === '1' || getCallLimits()) {
+      const err = new Error(`No ${p} API key configured. Open Settings → Models and add an API key, or set KOI_API_KEY to use the Koi API.`);
       err.code = 'NO_PROVIDER';
       throw err;
     }
@@ -414,8 +416,8 @@ export class LLMProvider {
     if (this._koiGateway) return;
     if (this.openai || this.anthropic) return;
     // GUI mode: never prompt for keys via CLI. See _ensureAnyProvider.
-    if (process.env.KOI_GUI_MODE === '1') {
-      const err = new Error(`No ${this.provider} API key configured. Open Settings → Models and add an API key, or sign in with Braxil.`);
+    if (process.env.KOI_GUI_MODE === '1' || getCallLimits()) {
+      const err = new Error(`No ${this.provider} API key configured. Open Settings → Models and add an API key, or set KOI_API_KEY to use the Koi API.`);
       err.code = 'NO_PROVIDER';
       throw err;
     }
@@ -2767,6 +2769,9 @@ CRITICAL RULES:
         if (_is401 && this._gatewayMode) {
           if (!session._gateway401Providers) session._gateway401Providers = new Set();
           session._gateway401Providers.add(this.provider);
+          if (session._gateway401Providers.size >= 2 && isFixedKoiApiKey()) {
+            throw new Error(`KOI_API_KEY was rejected by ${koiApiUrl()} (401). Check the key, or that KOI_API_URL points at the server that issued it.`);
+          }
           if (session._gateway401Providers.size >= 2) {
             const _s = globalThis.__koiStrings || {};
             channel.log('llm', `[auto] AUTH_EXPIRED — ${session._gateway401Providers.size} distinct providers returned 401 (${[...session._gateway401Providers].join(', ')}); JWT is dead`);

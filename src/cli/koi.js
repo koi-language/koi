@@ -12,6 +12,7 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'pac
 
 const COMMANDS = {
   compile: 'Compile Koi files to JavaScript',
+  build: 'Build an npm package that TypeScript imports and calls (agents as async functions)',
   run: 'Compile and run Koi files',
   serve: 'Start an agent as an MCP server (stdio)',
   init: 'Initialize a new Koi project',
@@ -155,6 +156,24 @@ function showCommandHelp(command) {
       console.log('  koi cache clear src/main.koi');
       break;
 
+    case 'build':
+      console.log('koi build - Build an npm package that TypeScript imports and calls\n');
+      console.log('Every agent becomes an exported object with one async method per public');
+      console.log('`on <event>` handler. The package depends on @koi-language/koi.\n');
+      console.log('Usage:');
+      console.log('  koi build <file.koi> [-o <dir>] [--name <pkg>] [--pkg-version <v>] [--koi <spec>]\n');
+      console.log('Options:');
+      console.log('  -o, --output <dir>    Package folder (default: ./dist/<name>)');
+      console.log('  --name <pkg>          npm package name (default: from the file name)');
+      console.log('  --pkg-version <v>     Package version (default: 0.1.0)');
+      console.log('  --koi <spec>          Dependency spec for @koi-language/koi (default: ^<version> when Koi came from npm, file:<clone> otherwise)');
+      console.log('  --precalculate        Pre-generate handler descriptions with a model (off by default)');
+      console.log('\nThen, from TypeScript:');
+      console.log('  npm install --install-links ./dist/<name>');
+      console.log('  import { MyAgent } from "<name>";');
+      console.log('  const result = await MyAgent.myHandler({ ... }, { timeoutMs: 300_000 });');
+      break;
+
     case 'serve':
       console.log('koi serve - Start an agent as an MCP server\n');
       console.log('Compiles a .koi file and starts an MCP server over stdio (JSON-RPC 2.0).');
@@ -268,6 +287,7 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
   const importResolver = new ImportResolver(parse);
   try {
     ast = await importResolver.resolveImports(ast, sourcePath);
+    options.onAst?.(ast);
 
     if (verbose) {
       const counts = {
@@ -415,8 +435,9 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
     cliLogger.progress('🔨 Transpiling...');
   }
   // Ensure KOI_RUNTIME_PATH is set so the transpiler emits absolute file:// imports
-  // instead of @koi-language/koi package imports (which require the package in node_modules)
-  if (!process.env.KOI_RUNTIME_PATH) {
+  // instead of @koi-language/koi package imports (which require the package in node_modules).
+  // Not in library mode: a built package imports the runtime as a package.
+  if (!options.library && !process.env.KOI_RUNTIME_PATH) {
     process.env.KOI_RUNTIME_PATH = path.resolve(__dirname, '../runtime');
   }
 
@@ -425,7 +446,9 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
     cacheData,
     outputPath: path.resolve(outputPath),
     runtimePath: path.resolve(runtimePath),
-    externalImports: importResolver.externalImports
+    externalImports: importResolver.externalImports,
+    library: !!options.library,
+    runtimeSpecifier: options.runtimeSpecifier
   });
   let code, map;
   try {
@@ -483,6 +506,51 @@ async function compileFile(sourcePath, outputPath = null, options = {}) {
     console.log('✅ Compilation complete!\n');
   }
   return outputPath;
+}
+
+async function buildPackage(sourcePath, flags) {
+  const { describeAgents, generateDts, generatePackageJson, packageNameFrom } = await import('../compiler/package-builder.js');
+  const { TypeScriptTranspiler } = await import('../compiler/typescript-transpiler.js');
+
+  const name = flags.name || packageNameFrom(path.basename(sourcePath));
+  const outDir = path.resolve(flags.output || flags.o || path.join('dist', name.replace(/^@[^/]+\//, '')));
+  const koiRoot = path.resolve(__dirname, '..', '..');
+  // Koi installed from npm → depend on the published version; run from a clone → on that clone.
+  const fromNpm = koiRoot.split(path.sep).includes('node_modules');
+  const koiDependency = flags.koi || (fromNpm ? `^${VERSION}` : `file:${koiRoot}`);
+
+  let ast = null;
+  fs.mkdirSync(outDir, { recursive: true });
+  const tsPath = path.join(outDir, 'index.ts');
+  await compileFile(sourcePath, tsPath, {
+    library: true,
+    noPrecalculate: !flags.precalculate,
+    noCache: flags['no-cache'] || false,
+    verbose: flags.verbose || false,
+    onAst: (a) => { ast = a; },
+  });
+
+  // index.ts -> index.js: handler bodies may carry TypeScript syntax
+  const jsPath = path.join(outDir, 'index.js');
+  new TypeScriptTranspiler().transpile(tsPath, jsPath);
+  for (const f of [tsPath, tsPath + '.map']) { try { fs.unlinkSync(f); } catch { /* absent */ } }
+  fs.writeFileSync(jsPath, fs.readFileSync(jsPath, 'utf8').replace(/\n\/\/# sourceMappingURL=.*\s*$/, '\n'));
+
+  const agents = describeAgents(ast);
+  fs.writeFileSync(path.join(outDir, 'index.d.ts'), generateDts(agents));
+  fs.writeFileSync(path.join(outDir, 'package.json'), generatePackageJson({
+    name, version: flags['pkg-version'] || '0.1.0', koiDependency, sourceFile: path.basename(sourcePath),
+  }));
+
+  console.log(`✅ Built ${name} in ${path.relative(process.cwd(), outDir) || '.'}`);
+  if (agents.length === 0) {
+    console.log('   ⚠️ No agent has a public `on` handler: the package exports nothing callable.');
+  }
+  for (const a of agents) {
+    console.log(`   ${a.name}: ${a.handlers.map((h) => `${h.name}()`).join(', ')}`);
+  }
+  console.log(`\n   npm install --install-links ${path.relative(process.cwd(), outDir) || '.'}`);
+  console.log(`   import { ${agents[0]?.name || 'Agent'} } from '${name}';`);
 }
 
 async function runFile(sourcePath, options = {}) {
@@ -913,9 +981,9 @@ function parseArgs(argv) {
   const positional = [];
 
   // Define which flags are boolean (don't take values)
-  const booleanFlags = ['no-precalculate', 'no-cache', 'verbose', 'debug', 'help', 'h', 'version', 'v'];
+  const booleanFlags = ['no-precalculate', 'precalculate', 'no-cache', 'verbose', 'debug', 'help', 'h', 'version', 'v'];
   // Define which flags take values
-  const valuedFlags = ['output', 'o'];
+  const valuedFlags = ['output', 'o', 'name', 'pkg-version', 'koi'];
   // Flags that optionally take a value (boolean if no value follows)
   const optionalValueFlags = ['log'];
 
@@ -1097,6 +1165,17 @@ if (command === 'serve') {
     noCache: flags['no-cache'] || false,
     verbose: flags.verbose || false
   });
+}
+
+// Handle build: an npm package of the program's agents
+if (command === 'build') {
+  const file = positional[1];
+  if (!file || !fs.existsSync(file)) {
+    console.error(file ? `⚠️ File not found: ${file}` : '⚠️ Please provide a Koi file\n\nUsage: koi build <file.koi> [-o <dir>]');
+    process.exit(1);
+  }
+  await buildPackage(file, flags);
+  process.exit(0);
 }
 
 // Handle compile and run

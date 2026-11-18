@@ -13,6 +13,8 @@ import { initSessionTracker, sessionTracker, setConversationIndexProvider } from
 import { ContextMemory, classifyFeedback } from '../state/context-memory.js';
 import { channel } from '../io/channel.js';
 import { isNonInteractive, isExitOnComplete } from '../util/interactivity.js';
+import { isFixedKoiApiKey, koiApiUrl } from '../api/koi-api.js';
+import { getCallLimits, KoiCallError, KoiStepLimitError } from './call-limits.js';
 
 // Per-async-context call stack: each parallel branch has its own isolated stack,
 // so concurrent delegates to the same agent don't produce false "infinite loop" errors.
@@ -1564,6 +1566,8 @@ export class Agent {
     });
     this._activeSession = session; // Expose to actions (e.g. read_file image vision)
     session.actionContext.args = args;
+    // A call from code (runtime/library.js) may cap the steps of every session it starts.
+    session.maxSteps = getCallLimits()?.maxSteps || null;
 
     // Inject images propagated from parent agent (e.g. user attached a screenshot,
     // System consumed it, then delegated to developer — developer should see the image too)
@@ -2042,6 +2046,11 @@ export class Agent {
     // Users can run /init manually when they want.
 
     while (!session.isTerminated) {
+      if (session.maxSteps && session.iteration >= session.maxSteps) {
+        session._stepLimitHit = true;
+        break;
+      }
+
       // ── Drain the inbox: apply classified messages to this agent's
       // work queue / context memory. Non-blocking: the classifier runs
       // in the background, we only consume whatever finished. See
@@ -2295,7 +2304,12 @@ export class Agent {
         // Concurrent 401s (delegates, background classifiers, rapid retries)
         // all await the SAME in-flight welcome-screen request so the user
         // only sees it once.
-        if (error.message?.startsWith('AUTH_EXPIRED:')) {
+        // A fixed KOI_API_KEY cannot be refreshed: a 401 on it means the key is
+        // wrong, so there is nothing to re-login and the host's saved session
+        // (~/.koi/.token) must not be deleted. It falls through as a plain error.
+        if (error.message?.startsWith('AUTH_EXPIRED:') && isFixedKoiApiKey()) {
+          channel.log('agent', `${this.name}: KOI_API_KEY rejected by ${koiApiUrl()} — not re-authenticating`);
+        } else if (error.message?.startsWith('AUTH_EXPIRED:')) {
           const msg = error.message.replace('AUTH_EXPIRED: ', '');
           const _reauth = Agent._cliHooks?.onAuthExpired;
           if (typeof _reauth === 'function') {
@@ -2323,7 +2337,7 @@ export class Agent {
               // carry the fresh Authorization header.
               if (this.llmProvider?._koiGateway) {
                 const { default: OpenAI } = await import('openai');
-                const _apiBase = this.llmProvider._koiGatewayApiBase || (process.env.KOI_API_URL || 'http://localhost:3000');
+                const _apiBase = this.llmProvider._koiGatewayApiBase || koiApiUrl();
                 this.llmProvider._koiGateway = new OpenAI({
                   apiKey: _newToken,
                   baseURL: _apiBase + '/gateway',
@@ -2363,6 +2377,10 @@ export class Agent {
             ? error.message
             : error.message.replace('NO_PROVIDERS: ', '');
           channel.log('agent', `${this.name}: No LLM providers`);
+          // A call from code cannot configure a key mid-run: the caller gets the error.
+          if (getCallLimits()) {
+            throw new KoiCallError(msg, 'KOI_NO_PROVIDER', { agentName: this.name });
+          }
           const _isGuiMode = process.env.KOI_GUI_MODE === '1';
           if (_isGuiMode) {
             // Wait for the user to supply credentials via the GUI. When
@@ -4119,6 +4137,12 @@ export class Agent {
 
     if (process.env.KOI_DEBUG_LLM) {
       console.error(`[Agent:${this.name}] 🔄 Reactive loop finished after ${session.iteration} iterations`);
+    }
+
+    // The step cap of a call from code is a hard stop: the caller gets the error,
+    // never a recovery turn that waits for a user who is not there.
+    if (session._stepLimitHit) {
+      throw new KoiStepLimitError(this.name, session.maxSteps);
     }
 
     // Save context memory state — only for non-delegate (main) agents.

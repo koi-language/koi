@@ -3,491 +3,222 @@
 </p>
 
 # Koi - Next-Generation Programming Language for AI Agents
-Build multi-agent systems with roles, teams, skills, playbooks, and MCP integration.
 
-## Why Koi?
+Koi is a programming language for building **agents that do real work**: they take a complex task, reason
+about it, plan, use tools, delegate to other agents and return a result. You write what the agent must do in
+plain language and what must be exact in code, in the same file.
 
-Most AI agent systems today are built by stitching together prompts, tools, routing logic, and framework glue.  
-It works — but it quickly becomes messy.
-
-**Koi is the first language designed specifically for agentic systems.**
-
-It provides native primitives for building agents:
-
-- **Agents** — autonomous workers with behavior  
-- **Roles** — define what an agent is allowed to do (e.g. delegate tasks, use tools, access external resources)  
-- **Teams** — structured collaboration between agents  
-- **Skills** — reusable capabilities  
-- **Playbooks** — natural-language behavior embedded in code  
-- **MCP** — consume or expose agents as MCP tools  
-
-**Less framework glue. More native agent architecture.**
-
----
-
-## What makes Koi different?
-
-### 1. Program AI agents with natural-language playbooks
+Then you **call those agents from TypeScript**, as async functions, to build agentic software for your
+business.
 
 ```python
-role Researcher { can execute, can web_access }
+agent OrderClerk : OrderDesk {
+  uses mcp mail, erp
 
-agent WebResearcher : Researcher {
-  on analyzeUrl(args: Json) {
-
+  on processInbox(args: { since: string }) {
     playbook """
-
-Analyze the webpage at {{args.url}} and display the following information to the user on the screen:
-
-1. A one-sentence summary
-2. The 3 most important insights
-3. A conclusion
-
-Do not return the data as structured output. Instead, present the information directly to the user.
-
-Use Markdown format and structure the response with clear sections and titles.
-
-    """
-  }
-}
-
-run WebResearcher.analyzeUrl({
-  url: "https://es.wikipedia.org/wiki/Amalia_Navarro"
-})
-
-```
-
-### 2. Multi-agent orchestration
-
-```python
-
-role Lead { can execute, can delegate }
-
-...
-
-team Development {
-  analyzer: Analyzer,
-  reviewer: Reviewer
-}
-
-agent Orchestrator : Lead {
-
-  uses team Development
-
-  on start(args: Json) {
-    playbook """
-    Task: {{args.task}}
-
-    Work with the team to complete the task.
-    Route work to the right collaborators based on their capabilities.
-
+      Read the emails since {{args.since}}, keep the purchase orders, match each one to a customer
+      and to the ERP catalogue, check stock and credit, and create it in the ERP as "pending approval".
     """
   }
 }
 ```
 
-### 3. Natural language for behavior, code for execution
+```ts
+import { OrderClerk } from "orders";
 
-A core Koi idea is:
-- **Playbooks** define behavior
-- **Code** handles technical operations
-
-```python
-
-  xxx
-
+const orders = await OrderClerk.processInbox({ since: "2026-11-17" });
 ```
 
-## Installation
+## Why Koi
 
-**Quick install (recommended):**
+- **Agents are a language primitive.** Agents, roles, teams and playbooks are part of the syntax, not glue
+  around prompts.
+- **Built for complex tasks.** Every agent runs a reasoning loop: it decides one step at a time, sees the
+  result and adapts until the task is done.
+- **Safe by design.** A role says what an agent may do (read, write, run commands, browse, delegate), and
+  nothing else is available to it.
+- **Made to be called from your software.** `koi build` turns your agents into a typed npm package.
+
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/koi-language/Koi/main/install.sh | bash
 ```
 
-This will install KOI to `~/.koi` and add the `koi` command to your PATH.
+Manual setup and troubleshooting: [Installation Guide](doc/00-installation.md).
 
-**For manual installation, development setup, and troubleshooting:** See the [Installation Guide](doc/00-installation.md).
+## An agent that handles orders
 
-## Usage
+A **role** grants capabilities, an **agent** handles events, a **playbook** tells it what to do, and **MCP**
+servers give it the company's systems. This one reads the orders that arrive by email, decides what each
+one is and leaves it in the ERP waiting for a person to approve it.
 
-### With Global Installation
+```python
+role OrderDesk { can execute, can call_mcp }
 
-If you installed Koi globally, use the `koi` command directly:
+// The company mailbox, through a local MCP server
+mcp mail = {
+  command: "node",
+  args: ["./mcp/mail-server.js"],
+  env: { IMAP_USER: process.env.IMAP_USER, IMAP_PASSWORD: process.env.IMAP_PASSWORD }
+}
 
-```bash
-koi compile examples/simple.koi
-koi run examples/simple.koi
-koi init my-project
-```
+// The ERP, through a remote MCP server
+mcp erp = {
+  url: "https://erp.example.com/mcp",
+  headers: { Authorization: `Bearer ${process.env.ERP_TOKEN}` }
+}
 
-### With Local Development
+agent OrderClerk : OrderDesk {
+  uses mcp mail, erp
 
-If working on Koi itself, use `node src/cli/koi.js`:
-
-```bash
-node src/cli/koi.js compile examples/simple.koi
-node src/cli/koi.js run examples/simple.koi
-```
-
-Or use npm scripts:
-
-```bash
-npm run compile examples/simple.koi
-npm run run examples/simple.koi
-```
-
-### Debugging
-
-To run with Node.js inspector:
-
-```bash
-npm run dev examples/simple.koi
-# or
-node --inspect src/cli/koi.js run examples/simple.koi
-```
-
-Then open Chrome DevTools at `chrome://inspect`.
-
-## Syntax
-
-### Define Roles
-
-```koi
-role Worker   { can execute, can propose }
-role Reviewer { can critique, can approve }
-role Lead     { can delegate, can decide }
-```
-
-### Define Agents
-
-Agents describe their behavior in natural language using **playbooks**:
-
-```koi
-Agent Analyzer : Worker {
-  uses Skill DataAnalysis
-  llm default = { provider: "openai", model: "gpt-4o-mini" }
-
-  on analyze(args: Json) {
+  on processInbox(args: { since: string, approvalLimit: number }) {
+    affordance "Turn order emails into ERP orders pending approval"
     playbook """
-    Analyze the data: ${args.data}
+      Read the emails received since {{args.since}} and keep only the purchase orders.
 
-    Look for patterns, trends, and anomalies.
-    Provide actionable insights.
+      For each order:
+      1. Find the customer in the ERP by email or tax id. If there is none, do not create it:
+         skip the order as "unknown customer".
+      2. Match every line to a product of the ERP catalogue by name or reference.
+         If a line is ambiguous, take the closest match and say why.
+      3. Check stock and the customer's credit, and note anything that does not fit.
+      4. Create the order in the ERP as "pending approval". Never confirm it yourself.
+         Above {{args.approvalLimit}} EUR, assign it to a manager.
+      5. Reply to the customer that the order was received and is being reviewed.
+
+      Return [{ email, customer, orderId, total, status, issues }].
     """
   }
 }
 ```
 
-**For technical operations** (like fetching data), use procedural code:
-```koi
-Agent DataFetcher : Worker {
-  on fetch(args: Json) {
-    const response = await fetch(args.url)
-    const data = await response.json()
-    return { data: data }
+The agent works out the steps itself: which tools of each server to call, in what order, and what to do
+when an email is not an order or a product does not match. The rules it must never break go in the
+playbook; what it may touch at all is the role and the servers it uses.
+
+## A team of agents
+
+An agent can lead a **team** and delegate to it. Routing is by capability, not by hardcoded names.
+
+```python
+role Analyst { can execute, can read, can web_access }
+role Lead    { can execute, can delegate }
+
+agent Researcher : Analyst {
+  on research(args: { topic: string }) {
+    playbook "Research {{args.topic}} on the web and return the key facts with their sources."
   }
 }
-```
 
-### Define Teams
-
-```koi
-Team Development {
-  analyzer   = Analyzer
-  calculator = Calculator
+agent Writer : Analyst {
+  on write(args: { facts: Json }) {
+    playbook "Write a one-page brief from these facts: {{args.facts}}. Return it as Markdown."
+  }
 }
-```
 
-### Role-based Routing
+team Content {
+  researcher: Researcher,
+  writer: Writer
+}
 
-```koi
-Agent Orchestrator : Lead {
-  uses Team Development
-  llm default = { provider: "openai", model: "gpt-4o-mini" }
+agent Editor : Lead {
+  uses team Content
 
-  on start(args: Json) {
+  on brief(args: { topic: string }) {
     playbook """
-    Task: ${args.task}
-
-    Work with the development team to complete this task.
-    Coordinate with team members based on their capabilities.
+      Produce a one-page brief about {{args.topic}}.
+      Delegate the research and the writing to your team, check the result and return it.
     """
   }
 }
 ```
 
-Agents automatically route to appropriate team members - no hardcoded names needed!
+## Code where it must be exact
 
-### MCP (Model Context Protocol) Support
+A handler can be plain code instead of a playbook. Agents call it like any other tool.
 
-Reference remote agents and services using MCP addresses:
-
-```koi
-Team HybridTeam {
-  local = LocalAgent
-  remote = mcp://agent.local/processor
-  skill = mcp://skills.local/sentiment
-}
-
-Agent Orchestrator : Worker {
-  uses Team HybridTeam
-
-  on start(args: Json) {
-    // Executes on local or remote agent transparently
-    const result =
-      await send peers.event("process").role(Worker).any()(args)
-    return result
+```python
+agent PriceService : Analyst {
+  on price(args: { sku: string }) {
+    const res = await fetch(`https://api.example.com/prices/${args.sku}`)
+    return await res.json()
   }
 }
 ```
 
-#### Expose agents as MCP servers
+## Call your agents from TypeScript
 
-Use `expose mcp` to make an agent's handlers available as MCP tools for external clients (Claude Code, Cursor, etc.):
+Build the `.koi` file into an npm package:
 
-```koi
-agent CodeReviewer : Reviewer {
-  expose mcp
+```bash
+koi build orders.koi                         # → dist/orders (package.json, index.js, index.d.ts)
+npm install --install-links ./dist/orders    # installs it with its dependencies (Koi)
+```
 
-  on review(args: Json) {
-    affordance "Review code for quality and bugs"
-    playbook "Review this code: ${args.code}"
-  }
+Every agent is exported with one typed async method per public handler (`private on` handlers stay
+inside):
 
-  private on internal_step(args: Json) {
-    // Not exposed — private handlers are excluded
-    playbook "Internal logic"
-  }
+```ts
+import "dotenv/config";                       // IMAP_*, ERP_TOKEN and the model keys
+import { OrderClerk } from "orders";
+
+const orders = await OrderClerk.processInbox(
+  { since: "2026-11-17", approvalLimit: 5000 },
+  {
+    timeoutMs: 10 * 60_000,                   // reject and stop the agent after 10 minutes
+    maxSteps: 150,                            // cap the reasoning loop
+    onEvent: (e) => console.log(e.type, e),   // progress, actions, output
+    onQuestion: (q) => null,                  // answer the agent, or let it decide (null)
+  },
+);
+
+for (const order of orders) {
+  if (order.issues?.length) await notifySales(order);   // your code takes it from here
 }
 ```
 
-Serve it with `koi serve agent.koi` and add to any `.mcp.json`:
+A call never prints to the terminal and never waits for a user: questions go to `onQuestion`, and permissions
+(shell commands, file writes, paid media) are denied unless you pass `autoApprove: true`. Errors reject with a
+`code`: `KOI_TIMEOUT`, `KOI_ABORTED` (via `signal`), `KOI_MAX_STEPS`, `KOI_AGENT_FAILED`, `KOI_NO_PROVIDER`.
 
-```json
-{ "mcpServers": { "reviewer": { "command": "koi", "args": ["serve", "agent.koi"] } } }
-```
+## Models
 
-See [MCP Integration Guide](doc/10-mcp-integration.md) for complete documentation.
-
-### Define Skills
-
-```koi
-Skill SentimentAnalysis {
-  affordance """
-  Analyzes text sentiment and returns positive/neutral/negative.
-  """
-
-  Agent Analyst : Worker {
-    llm default = { provider: "openai", model: "gpt-4o-mini" }
-
-    on analyze(args: Json) {
-      playbook """
-      Text: ${args.text}
-
-      Analyze the sentiment of this text:
-      - Determine overall tone (positive, neutral, negative)
-      - Rate emotional intensity (0.0 to 1.0)
-      - Identify key emotional indicators
-      """
-    }
-  }
-
-  Team Internal {
-    analyst = Analyst
-  }
-
-  export async function run(input: any): Promise<any> {
-    const result = await send Internal.event("analyze").role(Worker).any()(input)
-    return result
-  }
-}
-```
-
-### Using Skills in Agents
-
-Agents can use skills for technical operations while keeping behavior in natural language:
-
-```koi
-import "./skills/email-reader.koi"  // Skill for IMAP email operations
-
-Agent EmailAssistant : Worker {
-  uses Skill EmailReader
-  llm default = { provider: "openai", model: "gpt-4o-mini" }
-
-  on processInbox(args: Json) {
-    playbook """
-    Lee los últimos mensajes de correo y contesta aquellos que
-    vengan de proveedores automáticamente.
-
-    Para cada email de proveedor:
-    - Analiza el contenido y el remitente
-    - Genera una respuesta profesional apropiada
-    - Marca como procesado
-
-    Ignora emails personales o de clientes.
-    """
-  }
-}
-```
-
-**Skills** = Technical operations (IMAP, databases, APIs)
-**Playbooks** = Natural language behavior
-
-### Execute
-
-```koi
-run EmailAssistant.processInbox({ email: "user@company.com", since: "2024-01-01" })
-```
-
-## Examples
-
-### 🆕 Task Chaining (Recommended Start)
-
-Shows how outputs automatically chain into inputs between tasks:
+Put the keys in `.env`. Either your providers' own keys:
 
 ```bash
-koi run examples/task-chaining-demo.koi
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...
+GEMINI_API_KEY=...
 ```
 
-Example: "Translate to French and count words"
-- Action 1: Translate → `{ translated: "bonjour monde" }`
-- Action 2: Count words on `${previousResult.translated}` → `{ wordCount: 2 }`
-
-See [Task Chaining Guide](doc/08-task-chaining.md) for details.
-
-### Simple
-
-Minimal example showing agent communication:
+or one key for the **Koi API**, a single gateway for every model (chat, image, video and audio):
 
 ```bash
-koi run examples/simple.koi
+KOI_API_URL=https://api.braxil.ai   # default; any server that speaks the Koi API works
+KOI_API_KEY=...
 ```
 
-### Counter
+Image, video and audio generation always go through the Koi API. More in [LLM Integration](doc/06-llm-integration.md).
 
-Stateful agent with counter operations:
+## Run from the terminal
 
 ```bash
-koi run examples/counter.koi
-```
-
-### Calculator
-
-Basic calculator with multiple operations:
-
-```bash
-koi run examples/calculator.koi
-```
-
-### Pipeline
-
-Multi-stage data processing pipeline:
-
-```bash
-koi run examples/pipeline.koi
-```
-
-### Sentiment Analysis
-
-Sentiment analysis skill with 2 internal agents:
-
-```bash
-koi run examples/sentiment.koi
-```
-
-### MCP Integration
-
-Example showing MCP (Model Context Protocol) address support:
-
-```bash
-koi run examples/mcp-example.koi
-```
-
-See [MCP Integration Guide](doc/10-mcp-integration.md) and [Planning System Guide](doc/09-planning.md) for more details on advanced features.
-
-## Source Maps
-
-Koi generates source maps automatically. Runtime errors show the location in the original `.koi` source, not the generated JavaScript.
-
-## Project Structure
-
-```
-.
-├── package.json
-├── README.md
-├── src/
-│   ├── grammar/
-│   │   └── koi.pegjs              # PEG grammar
-│   ├── compiler/
-│   │   ├── parser.js              # Generated parser (auto)
-│   │   └── transpiler.js          # Transpiler to JS + source maps
-│   ├── runtime/
-│   │   ├── agent.js               # Agent runtime
-│   │   ├── team.js                # Team runtime
-│   │   ├── skill.js               # Skill runtime
-│   │   ├── role.js                # Role runtime
-│   │   ├── runtime.js             # Main runtime
-│   │   └── index.js               # Exports
-│   └── cli/
-│       └── koi.js                 # Main CLI
-└── examples/
-    ├── simple.koi                 # Simple example
-    ├── counter.koi                # Counter example
-    ├── calculator.koi             # Calculator example
-    ├── pipeline.koi               # Pipeline example
-    └── sentiment.koi              # Sentiment analysis
+koi run my-agent.koi        # runs the `run` statements of the file
+koi serve my-agent.koi      # serves an agent marked `expose mcp` as an MCP server
 ```
 
 ## Documentation
 
-Comprehensive documentation is available in the [doc/](doc/) directory:
-
-- **[Installation Guide](doc/00-installation.md)** - Complete installation instructions, manual setup, and troubleshooting
-- **[Getting Started](doc/00-getting-started.md)** - Your first agent and basic workflow
-- **[Core Concepts](doc/01-core-concepts.md)** - Understanding Roles, Agents, Teams, Skills
-- **[Syntax Basics](doc/02-syntax-basics.md)** - Variables, types, control flow
-- **[Agents Guide](doc/03-agents.md)** - Creating and using agents
-- **[Roles & Teams](doc/04-roles-and-teams.md)** - Multi-agent systems
-- **[Skills](doc/05-skills.md)** - Reusable capabilities
-- **[LLM Integration](doc/06-llm-integration.md)** - Using real LLMs with playbooks
-- **[Automatic Routing](doc/07-routing.md)** - Intelligent agent selection
-- **[Task Chaining](doc/08-task-chaining.md)** - Output-to-input chaining
-- **[Planning System](doc/09-planning.md)** - Automatic task decomposition
-- **[MCP Protocol](doc/10-mcp-integration.md)** - Consume and expose MCP servers
-- **[TypeScript Imports](doc/11-typescript-imports.md)** - Using npm packages
-- **[Testing](doc/12-testing.md)** - Unit testing with Jest
-- **[Caching](doc/13-caching.md)** - Persistent LLM response caching
-- **[Examples](doc/14-examples.md)** - Complete working examples
-- **[Advanced Topics](doc/15-advanced.md)** - Debugging, performance, production
-- **[Registry](doc/16-registry.md)** - Shared data store for agent coordination
+- [Getting Started](doc/00-getting-started.md) and [Core Concepts](doc/01-core-concepts.md)
+- [Agents](doc/03-agents.md), [Roles & Teams](doc/04-roles-and-teams.md), [Skills](doc/05-skills.md)
+- [LLM Integration](doc/06-llm-integration.md), [MCP](doc/10-mcp-integration.md), [TypeScript Imports](doc/11-typescript-imports.md)
+- [Editor Setup](doc/00-editor-setup.md) (VS Code and Cursor) and [Examples](examples/)
 
 ## Contributing
 
-Contributions are welcome! Here are some ways you can help:
-
-- 🐛 Report bugs and issues
-- 💡 Suggest new features or improvements
-- 📝 Improve documentation
-- 🎨 Help with GitHub Linguist PR (see [LINGUIST.md](LINGUIST.md))
-- 🔧 Submit pull requests
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Resources
-
-- **Documentation**: [doc/](doc/) - Comprehensive guides
-- **Quick Start**: [QUICKSTART.md](QUICKSTART.md) - 2-minute setup
-- **Editor Setup**: [doc/00-editor-setup.md](doc/00-editor-setup.md) - VS Code & Cursor
-- **Examples**: [examples/](examples/) - Working code samples
-- **AI Assistant Guide**: [CLAUDE.md](CLAUDE.md) - Architecture and patterns
-- **Syntax Highlighting**: [LINGUIST.md](LINGUIST.md) - GitHub support status
-
-## Community
-
-- **Issues**: [github.com/koi-language/Koi/issues](https://github.com/koi-language/Koi/issues)
-- **Discussions**: [github.com/koi-language/Koi/discussions](https://github.com/koi-language/Koi/discussions)
+Issues and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
