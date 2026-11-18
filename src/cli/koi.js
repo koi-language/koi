@@ -965,7 +965,7 @@ Koi project - Agent-first language. Calm orchestration.
 
 ## Documentation
 
-- [Koi Language Docs](https://github.com/yourusername/koi)
+- [Koi Language Docs](https://github.com/koi-language/koi)
 `;
 
   fs.writeFileSync(path.join(projectPath, 'README.md'), readme);

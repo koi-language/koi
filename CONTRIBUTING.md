@@ -4,73 +4,26 @@ Thank you for your interest in contributing to Koi!
 
 ## Development Setup
 
-### 1. Clone and Install
-
 ```bash
-git clone https://github.com/yourusername/koi.git
+git clone https://github.com/koi-language/koi.git
 cd koi
 npm install
-npm run build:grammar
+npm link            # the `koi` command now runs this clone
 ```
 
-### 2. Configure Development Environment
-
-Copy the development environment template:
-
-```bash
-cp .env.development .env
-```
-
-Edit `.env` and update `KOI_RUNTIME_PATH` to your local Koi path:
-
-```bash
-# .env
-KOI_RUNTIME_PATH=/absolute/path/to/koi/src/runtime
-OPENAI_API_KEY=your-key-here
-```
-
-### 3. Test Your Changes
-
-```bash
-# Run examples with your local runtime
-koi run examples/hello-world.koi
-
-# Or test on external projects
-cd /path/to/test-project
-koi run src/main.koi
-# Will use your local runtime from KOI_RUNTIME_PATH
-```
-
-## How KOI_RUNTIME_PATH Works
-
-When `KOI_RUNTIME_PATH` is set:
-- The transpiler generates imports pointing to your local runtime
-- Changes to runtime code are immediately reflected without reinstalling
-- Perfect for iterating on runtime/compiler changes
-
-When `KOI_RUNTIME_PATH` is NOT set:
-- The transpiler uses package imports (`koi-lang`)
-- Production behavior - uses installed npm package
+Put a model key in `.env` (see `.env.example`): a provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`) or `KOI_API_KEY` for the Koi API.
 
 ## Development Workflow
 
-1. Make changes to compiler/runtime
-2. Run `npm run build:grammar` if you modified the grammar
-3. Test with `koi run examples/...`
-4. Changes are live - no reinstall needed!
-
-## Testing
+1. Change the compiler or the runtime. `koi` runs your clone, so changes are live: nothing to reinstall.
+2. If you changed the grammar (`src/grammar/koi.pegjs`), regenerate the parser: `npm run build:grammar`.
+3. Try it:
 
 ```bash
-# Run test suite
-npm test
-
-# Run specific example
-koi run examples/calculator.koi
-
-# Compile and inspect output
-koi compile examples/simple.koi
-cat examples/.build/simple.js
+npm test                                   # the test suite
+koi run examples/hello-world.koi           # an example
+koi compile examples/hello-world.koi       # see the generated code in examples/.build/
 ```
 
 ## Releasing to npm
