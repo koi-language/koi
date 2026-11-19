@@ -12,7 +12,7 @@ import { resolveImpacts } from './_ragdoll.js';
 import { requestStrips } from './scene3d-live.js';
 import { normalizeScene, readScene, writeScene, renderScene, summarize, buildReview, cleanId, timingReport } from './_store.js';
 import { withPhotoCheck } from './_photo-check.js';
-import { applyCardModels } from './_card-models.js';
+import { applyCardModels, savePhotoCameras } from './_card-models.js';
 import { insertSceneTime } from './_clock.js';
 import { SCENE3D_SHAPE } from './_schema-doc.js';
 import { stampSources, refreshPrevizFlags, previzDirective } from './_previz-sync.js';
@@ -171,6 +171,8 @@ export default {
     }
     await resolveImpacts(scene, existing);
     stampSources(scene, touched);
+    // A card's photo cameras moved on the stage: they are the model's.
+    if (scene.cardPreview) savePhotoCameras(scene, touched ? new Set(touched) : null);
     applyCardModels(scene); // the cards' models, always
     writeScene(scene);
     // Filmstrips of the changed shots from the live session, when it already

@@ -11,8 +11,10 @@
  */
 
 import fs from 'fs';
+import path from 'path';
 import { listScenes, readScene, writeScene, storyboardPath, scenePath } from './_store.js';
-import { readModel, modelStamps } from './_models.js';
+import { readModel, writeModel, modelStamps } from './_models.js';
+import { projectRoot } from '../../state/doc-root.js';
 import { readObject } from '../../state/object-registry.js';
 import { readLocation } from '../../state/location-registry.js';
 import { readDocJson } from '../../state/project-paths.js';
@@ -62,6 +64,7 @@ export function applyCardModels(scene) {
       }
     }
   }
+  if (pv?.id && _syncPhotoShots(scene)) changed = true;
   const { sb, sc } = _storyScene(scene);
   if (sb && sc) {
     for (const id of _locationIds(sb, sc)) {
@@ -85,6 +88,143 @@ export function applyCardModels(scene) {
     if (revs) scene.modelRevs = revs; else delete scene.modelRevs;
     changed = true;
   }
+  return changed;
+}
+
+// ── photo cameras ─────────────────────────────────────────────────────
+// A card's 3D view carries one shot camera per reference photo of its model
+// (`photo-<i>`, the camera the modeler estimated that photo was taken from):
+// the view looks through it as through any shot camera, with its viewfinder,
+// and moving it or changing its lens there corrects that photo's camera in
+// the model (savePhotoCameras), which the next build reviews from.
+
+const PHOTO_SHOT = /^photo-(\d+)$/;
+const SHOT_MS = 4000;
+const ASPECT_RATIOS = { '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1, '4:5': 4 / 5, '4:3': 4 / 3, '3:4': 3 / 4, '21:9': 21 / 9, '2.39:1': 2.39 };
+
+function _absImage(p) {
+  return typeof p === 'string' && p ? (path.isAbsolute(p) ? p : path.join(projectRoot(), p)) : null;
+}
+
+/** [w, h] of a PNG / JPEG from its header, null when unreadable. */
+export function imageSize(file) {
+  return _imageSize(file);
+}
+
+function _imageSize(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(65536);
+    const n = fs.readSync(fd, b, 0, b.length, 0);
+    if (n > 24 && b.readUInt32BE(0) === 0x89504e47) return [b.readUInt32BE(16), b.readUInt32BE(20)];
+    if (b[0] === 0xff && b[1] === 0xd8) {
+      for (let i = 2; i + 9 < n;) {
+        if (b[i] !== 0xff) { i++; continue; }
+        const m = b[i + 1];
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
+        i += 2 + b.readUInt16BE(i + 2);
+      }
+    }
+  } catch { /* unreadable */ } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  return null;
+}
+
+/** The modeler's lens runs along the photo's long side; a shot camera's
+ *  along its width. Factor from the first to the second. */
+function _lensFactor(size) {
+  const [w, h] = size || [16, 9];
+  return w >= h ? 1 : h / w;
+}
+
+/** A shot's camera now: its first key, else its camera. */
+function _shotCam(sh) {
+  const k = Array.isArray(sh?.keyframes) && sh.keyframes.length ? sh.keyframes[0] : null;
+  const c = sh?.camera || {};
+  const lk = Array.isArray(c.lensKeys) && c.lensKeys.length ? c.lensKeys[0] : null;
+  const lens = Number(k?.lens) || Number(lk?.lens ?? lk?.mm) || Number(c.lens) || 35;
+  const position = k?.position || c.position;
+  const target = k?.target || c.target;
+  return Array.isArray(position) && Array.isArray(target) ? { position, target, lens } : null;
+}
+
+const _near = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length >= 3 && b.length >= 3
+  && a.slice(0, 3).every((v, i) => Math.abs(Number(v) - Number(b[i])) < 1e-3);
+
+/** Puts the model's photo cameras on a card's scene. True when changed. */
+function _syncPhotoShots(scene) {
+  const model = readModel(scene.set?.model || scene.set?.props?.[0]?.model);
+  const refs = (model?.references || []).map((r, i) => ({ r, i })).filter(({ r }) => r?.camera?.position && r?.camera?.target);
+  let changed = false;
+  const shots = Array.isArray(scene.shots) ? scene.shots : (scene.shots = []);
+  const keep = new Set(refs.map(({ i }) => `photo-${i}`));
+  for (let j = shots.length - 1; j >= 0; j--) {
+    const m = PHOTO_SHOT.exec(shots[j]?.id || '');
+    if (m && !keep.has(shots[j].id)) { shots.splice(j, 1); changed = true; }
+  }
+  let sized = null;
+  for (const { r, i } of refs) {
+    const size = _imageSize(_absImage(r.image));
+    if (!sized && size) sized = size;
+    const c = r.camera;
+    const want = { position: c.position.slice(0, 3), target: c.target.slice(0, 3), lens: Math.round((Number(c.lens) || 35) * _lensFactor(size) * 1000) / 1000 };
+    const id = `photo-${i}`;
+    let sh = shots.find((x) => x?.id === id);
+    if (!sh) {
+      sh = { id, durationMs: SHOT_MS, move: { type: 'static' }, camera: {}, photo: r.image };
+      shots.push(sh);
+      changed = true;
+    }
+    if (sh.photo !== r.image) { sh.photo = r.image; changed = true; }
+    const now = _shotCam(sh);
+    if (!now || !_near(now.position, want.position) || !_near(now.target, want.target) || Math.abs(now.lens - want.lens) > 1e-3) {
+      // Exactly the photo's camera: no lens kit, zoom or focus keys left over.
+      sh.camera = { ...want };
+      delete sh.keyframes;
+      sh.move = { type: 'static' };
+      changed = true;
+    }
+  }
+  // The scene's frame takes the master photo's shape.
+  if (sized) {
+    const ratio = sized[0] / sized[1];
+    const best = Object.entries(ASPECT_RATIOS).sort((a, b) => Math.abs(Math.log(a[1] / ratio)) - Math.abs(Math.log(b[1] / ratio)))[0][0];
+    if (scene.aspect !== best) { scene.aspect = best; changed = true; }
+  }
+  // One after the other on the scene clock.
+  let t = 0;
+  for (const sh of shots) {
+    const d = Number(sh.durationMs) || SHOT_MS;
+    if (sh.startMs !== t) { sh.startMs = t; changed = true; }
+    t += d;
+  }
+  if (scene.durationMs !== t) { scene.durationMs = t; changed = true; }
+  return changed;
+}
+
+/**
+ * The card scene's photo cameras, edited on the stage, written back as the
+ * model's photo cameras ([shotIds]: only those, else every photo shot).
+ */
+export function savePhotoCameras(scene, shotIds = null) {
+  if (!scene?.cardPreview?.id) return false;
+  const model = readModel(scene.set?.model || scene.set?.props?.[0]?.model);
+  if (!model || !Array.isArray(model.references)) return false;
+  let changed = false;
+  for (const sh of scene.shots || []) {
+    const m = PHOTO_SHOT.exec(sh?.id || '');
+    if (!m || (shotIds && !shotIds.has(sh.id))) continue;
+    const r = model.references[Number(m[1])];
+    const cam = _shotCam(sh);
+    if (!r?.camera || !cam) continue;
+    const lens = Math.round(cam.lens / _lensFactor(_imageSize(_absImage(r.image))) * 1000) / 1000;
+    if (_near(r.camera.position, cam.position) && _near(r.camera.target, cam.target) && Math.abs((Number(r.camera.lens) || 35) - lens) < 1e-3) continue;
+    r.camera = { ...r.camera, position: cam.position.slice(0, 3), target: cam.target.slice(0, 3), lens };
+    changed = true;
+  }
+  if (changed) writeModel(model);
   return changed;
 }
 

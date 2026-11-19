@@ -416,6 +416,14 @@ export default {
       syncCardModels();
     } catch { /* best effort */ }
     const next = model3dNext(normalized);
+    // Its 3D model is ordered now: the card shows "modeling" from this moment.
+    if (next && !normalized.modelBuilding) {
+      try {
+        const { readObject, saveObject } = await import('../../state/object-registry.js');
+        const cur = readObject(normalized.id);
+        if (cur && !cur.model) saveObject({ ...cur, modelBuilding: { pending: true, updatedAt: new Date().toISOString() } });
+      } catch { /* best effort: only the card's "modeling" state */ }
+    }
     return {
       ...(previz3d.length ? { previz3d } : {}),
       success: true,

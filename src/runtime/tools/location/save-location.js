@@ -344,12 +344,22 @@ export default {
       const { syncCardModels } = await import('../scene3d/_card-models.js');
       syncCardModels();
     } catch { /* best effort */ }
+    // Its 3D set is ordered now: the card shows "modeling" from this moment,
+    // not only from the modeler's first build minutes later.
+    const next3d = setModel3dNext(normalized);
+    if (next3d && !normalized.modelBuilding) {
+      try {
+        const { readLocation, saveLocation } = await import('../../state/location-registry.js');
+        const cur = readLocation(normalized.id);
+        if (cur && !cur.model) saveLocation({ ...cur, modelBuilding: { pending: true, updatedAt: new Date().toISOString() } });
+      } catch { /* best effort: only the card's "modeling" state */ }
+    }
     return {
       ...(previz3d.length ? { previz3d } : {}),
       success: true,
       filePath,
       location: normalized,
-      ...(setModel3dNext(normalized) ? { next: setModel3dNext(normalized) } : {}),
+      ...(next3d ? { next: next3d } : {}),
       created: !existed,
       ...(collisionRenamedFrom
         ? { renamedFrom: collisionRenamedFrom,

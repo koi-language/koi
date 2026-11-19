@@ -409,6 +409,8 @@ def import_model(ref, name, parent=None):
             o.parent = holder
         for sl in getattr(o, "material_slots", []):
             m_ = sl.material
+            if m_ is not None:
+                m_["model_mat"] = True  # a modeled material keeps its own shine
             if m_ and m_.node_tree:  # Workbench shows diffuse_color
                 b_ = m_.node_tree.nodes.get("Principled BSDF")
                 if b_:
@@ -429,6 +431,15 @@ def import_model(ref, name, parent=None):
     inv = holder.matrix_world.inverted()
     for o in new:
         if o.type != "MESH":
+            continue
+        # A model's sky dome (photo_sky) is background: no shadow, no clicks,
+        # never part of the model's size.
+        if o.name.startswith("sky_dome"):
+            try:
+                o.visible_shadow = False
+                o.hide_select = True
+            except Exception:
+                pass
             continue
         for c in o.bound_box:
             w = inv @ (o.matrix_world @ Vector(c))
@@ -2629,11 +2640,12 @@ def override_material(mat):
             slot.material = mat
 
 
-# Everything matte: highlights slide over the surfaces whenever the camera
-# moves and read as flicker. Covers imported / built models too. Not on an
-# object card's own view: there the object must look as it is (a patent
-# leather hat shines, its highlights are what show its shape).
-for m_ in ([] if CARD_OBJ else bpy.data.materials):
+# The scene's own shapes are matte (mannequins, library props). A MODEL's
+# materials keep the shine its modeler measured on the photo: a highlight
+# laid in the texture stays put as the camera moves and reads as a stain;
+# a real one moves like the photo's. Object cards keep everything as is.
+_MODEL_SHINE = any(m_.get("model_mat") for m_ in bpy.data.materials)
+for m_ in ([] if CARD_OBJ else [m_ for m_ in bpy.data.materials if not m_.get("model_mat")]):
     try:
         m_.roughness, m_.metallic, m_.specular_intensity = 1.0, 0.0, 0.0
         b_ = m_.node_tree.nodes.get("Principled BSDF") if m_.use_nodes else None
@@ -2645,8 +2657,8 @@ for m_ in ([] if CARD_OBJ else bpy.data.materials):
                     b_.inputs[k_].default_value = 0.0
     except Exception:
         pass
-# Lights give no highlights either.
-for ld_ in ([] if CARD_OBJ else bpy.data.lights):
+# Lights give no highlights either, unless a model has shine of its own.
+for ld_ in ([] if CARD_OBJ or _MODEL_SHINE else bpy.data.lights):
     try:
         ld_.specular_factor = 0.0
     except Exception:
@@ -2759,6 +2771,12 @@ if args.flat_surfaces and PASS == "beauty":
     for ob in bpy.data.objects:
         if ob.type != "MESH" or ob.name.startswith(keep):
             continue
+        # A model's photo sky (photo_sky) is a picture: gone, the plain
+        # background below shows instead.
+        if ob.name.startswith("sky_dome"):
+            ob.hide_render = True
+            ob.hide_viewport = True
+            continue
         if ob.material_slots and all(_emits(sl.material) for sl in ob.material_slots):
             continue
         if not ob.material_slots:
@@ -2766,6 +2784,26 @@ if args.flat_surfaces and PASS == "beauty":
         for slot in ob.material_slots:
             slot.link = "OBJECT"
             slot.material = flat
+
+    # The background seen by the camera is plain too: an HDRI is a photo
+    # (sky, skyline, a room) the video model would copy. It still lights the
+    # scene; only what the camera sees directly turns flat.
+    try:
+        wt = scn.world.node_tree if scn.world and scn.world.use_nodes else None
+        outn = next((n for n in wt.nodes if n.type == "OUTPUT_WORLD"), None) if wt else None
+        if outn is not None and outn.inputs["Surface"].links:
+            src_ = outn.inputs["Surface"].links[0].from_socket
+            lp = wt.nodes.new("ShaderNodeLightPath")
+            plain = wt.nodes.new("ShaderNodeBackground")
+            plain.inputs["Color"].default_value = (0.32, 0.32, 0.31, 1.0)
+            plain.inputs["Strength"].default_value = 1.0
+            mix = wt.nodes.new("ShaderNodeMixShader")
+            wt.links.new(lp.outputs["Is Camera Ray"], mix.inputs["Fac"])
+            wt.links.new(src_, mix.inputs[1])
+            wt.links.new(plain.outputs["Background"], mix.inputs[2])
+            wt.links.new(mix.outputs["Shader"], outn.inputs["Surface"])
+    except Exception as e_:
+        print(f"[scene3d] flat background failed: {e_}", file=sys.stderr)
 
 # ───────────────────────────────────────────────────────────── output ──
 
@@ -2942,7 +2980,8 @@ if args.live:
             return LIVE["boxes"]
         out = []
         for ob in scn.objects:
-            if ob.type != "MESH" or ob.name in ("floor",) or any(ob.name.startswith(f"{cid}_") for cid in CHARS):
+            if ob.type != "MESH" or ob.name in ("floor",) or ob.name.startswith("sky_dome") \
+                    or any(ob.name.startswith(f"{cid}_") for cid in CHARS):
                 continue
             vs = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
             lo = Vector((min(v.x for v in vs), min(v.y for v in vs), min(v.z for v in vs)))
@@ -3425,7 +3464,7 @@ if args.live:
             with gpu.matrix.push_pop_projection():
                 gpu.matrix.load_projection_matrix(Matrix.Identity(4))
                 _FILL.bind()
-                _FILL.uniform_float("color", (0.0, 0.0, 0.0, 0.3))
+                _FILL.uniform_float("color", (0.0, 0.0, 0.0, float(LIVE.get("stage_dim") or 0.3)))
                 batch_for_shader(_FILL, "TRIS", {"pos": tris}).draw(_FILL)
                 # Hairlines: one physical pixel, whatever the screen's density.
                 _lines(guides, (1.0, 1.0, 1.0, 0.22), 1.0 / px, w, h)
@@ -4333,6 +4372,10 @@ if args.live:
             LIVE["track_recentre"] = not c.get("keep") or LIVE.get("track_recentre", False)
         elif k == "stage_pov":  # the stage looks through the active camera, live
             LIVE["stage_pov"] = bool(c.get("on"))
+            LIVE["cut_dirty"] = True
+            LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
+        elif k == "stage_dim":  # how dark outside the viewfinder (a card's photo: much darker)
+            LIVE["stage_dim"] = max(0.0, min(1.0, float(c.get("value") or 0.3)))
             LIVE["cut_dirty"] = True
             LIVE["dirty"] = max(LIVE.get("dirty", 0), 1)
         elif k == "stage_frame_hover":  # the pointer is on the frame's edge
