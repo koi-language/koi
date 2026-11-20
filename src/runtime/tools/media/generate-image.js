@@ -79,7 +79,7 @@ export async function applyMasterEditMode(savedImages, refPathsIn, action, agent
 // The user's image edit mode (chat options, `imageEditMode` in ~/.koi/config.json, owned by
 // koi-cli's config-manager.js): 'master' (default) or 'normal'. Read per call so a change in the
 // chat options applies to the very next edit.
-function _imageEditMode() {
+export function imageEditMode() {
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.koi', 'config.json'), 'utf8'));
     return cfg?.imageEditMode === 'normal' ? 'normal' : 'master';
@@ -1784,7 +1784,7 @@ const generateImageAction = {
     // savedTo; the whole edit stays available as wholeEdit. Left to the agent it
     // was skipped and the user got the redrawn image. A different size is a
     // resolution change: the whole edit is the result (the new master).
-    if (action._internalDelegate !== true && action.label !== 'storyboard_card' && _imageEditMode() === 'master') {
+    if (action._internalDelegate !== true && action.label !== 'storyboard_card' && imageEditMode() === 'master') {
       await applyMasterEditMode(savedImages, Object.keys(_savedRefIds), action, agent);
     }
 

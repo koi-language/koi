@@ -4,11 +4,14 @@
  * result as .glb, and renders the review the agent checks it with:
  * a turnaround sheet; per reference photo, the model seen from that
  * photo's camera next to the photo, blended over it and where they differ
- * (with a match score); a set seen from inside; and a close-up
+ * (with a match score); orbit views round it; and a close-up
  * [photo | model] of each checklist item.
  *
  * NOTE: plain Python inside String.raw — never use backticks or ${ in it.
  */
+import { MODEL_KIT_PY } from './_model-kit-py.js';
+import { MODEL_TEXTURES_PY } from './_model-textures-py.js';
+
 export const BUILD_MODEL_PY = String.raw`
 """
 Braxil 3D modeler — Blender side.
@@ -37,6 +40,9 @@ ap.add_argument("--kind", default="object")
 ap.add_argument("--refs", default=None)
 ap.add_argument("--size", type=int, default=640)
 ap.add_argument("--checklist", default=None)
+ap.add_argument("--models-dir", default=None)
+ap.add_argument("--no-dress", action="store_true")
+ap.add_argument("--clay", action="store_true")
 args = ap.parse_args(argv)
 
 KIND = "set" if args.kind == "set" else "object"
@@ -69,10 +75,17 @@ def _set_input(bsdf, names, value):
 
 
 def pbr(name, color="#888888", rough=0.5, metal=0.0, coat=0.0, transmission=0.0, ior=1.45,
-        emission=None, emission_strength=3.0, alpha=1.0):
+        emission=None, emission_strength=3.0, alpha=1.0, texture=None):
     """Principled material with only scalar inputs, so it survives the glTF
-    export exactly (clearcoat, transmission and emission included)."""
+    export exactly (clearcoat, transmission and emission included).
+    texture: the kind of surface it is, LOOKED UP ON THE PHOTO ("wood",
+    "planks", "brick", "tiles", "plaster", "stone", "cobble", "metal",
+    "fabric", "earth", "grass", "leaves", "roof_tiles"): on the materials
+    pass it gets that pattern generated in 'color' (measure it with
+    photo_color), repeated at its real size. Never the photo's pixels."""
     m = bpy.data.materials.new(name)
+    if texture:
+        m["tex_kind"] = str(texture)
     m.use_nodes = True
     b = m.node_tree.nodes.get("Principled BSDF")
     col = hex_rgba(color)
@@ -236,7 +249,21 @@ def _box_axes(n):
     return Vector((1, 0, 0)), Vector((0, 0, 1))
 
 
-def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle=60, min_px=60, shiny=False):
+def photo_project(objs, ref=0, fallback=None, **_ignored):
+    """RETIRED (19/11/2026): the photo's pixels on 3D surfaces carried
+    whatever stood in front of them in the photo (the chair painted on the
+    table, smears on the floor). Now it only gives the objects 'fallback'
+    (a pbr() with texture= and the colour measured by photo_color), which
+    the materials pass textures. Give materials with pbr(texture=...)."""
+    for ob in (objs if isinstance(objs, (list, tuple)) else [objs]):
+        if ob is not None and ob.type == "MESH" and fallback is not None:
+            ob.data.materials.clear()
+            ob.data.materials.append(fallback)
+    return fallback
+
+
+def _photo_project_pixels(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle=60, min_px=60, shiny=False,
+                  patch_only=False, _camera_pass=False):
     """Paint objects with the reference photo itself, projected from the
     camera it was taken from (REF_CAMS[ref]). A face takes the photo's own
     pixels only where the photo shows it WELL: facing the camera (within
@@ -268,7 +295,7 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
     import numpy as np
     if not REF_CAMS:
         return
-    max_angle = min(float(max_angle), 60.0)
+    max_angle = min(float(max_angle), 88.0 if _camera_pass else 60.0)
     rc = REF_CAMS[ref]
     cam = rc["obj"]
     if ref not in _PROJ_MATS:
@@ -339,6 +366,31 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
             if not in_frame(q, -0.02):
                 continue
             cands.append((facing / max(to_cam.length, 0.2), c, n))
+        # Where the photo really sees the object: rays through a grid of the
+        # photo (a huge ground or a roof has few faces, their centres often
+        # hidden under a house or off the frame).
+        try:
+            fr = [cam.matrix_world @ v_ for v_ in cam.data.view_frame(scene=scn)]
+            # view_frame: top-right, bottom-right, bottom-left, top-left
+            tr, br, bl, tl = fr
+            for gy in range(18):
+                for gx in range(28):
+                    u, v = (gx + 0.5) / 28, (gy + 0.5) / 18
+                    top = tl.lerp(tr, u)
+                    bot = bl.lerp(br, u)
+                    pt = top.lerp(bot, v)
+                    dv = (pt - cpos).normalized()
+                    hit, loc, hn, _i, hob, _m = scn.ray_cast(dg, cpos, dv, distance=5000)
+                    if not hit or hob is None or hob.original != ob:
+                        continue
+                    hn = hn.normalized()
+                    to_cam = cpos - loc
+                    facing = hn.dot(to_cam.normalized())
+                    if facing < 0.12:
+                        continue
+                    cands.append((facing / max(to_cam.length, 0.2), loc - hn * 0.002, hn))
+        except Exception as e:
+            print("[model3d] patch probe grid:", e, file=sys.stderr)
         cands.sort(key=lambda t: -t[0])
         for L in (0.9, 0.6, 0.4, 0.25):
             for _score, c, n in cands[:60]:
@@ -397,7 +449,8 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
     for ob in (objs if isinstance(objs, (list, tuple)) else [objs]):
         if ob is None or ob.type != "MESH":
             continue
-        _subdivide_world(ob, piece)
+        if not patch_only:
+            _subdivide_world(ob, piece)
         me = ob.data
         for uv in list(me.uv_layers):
             me.uv_layers.remove(uv)
@@ -415,24 +468,36 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
         for p_ in me.polygons:
             for ek in p_.edge_keys:
                 by_edge.setdefault(ek, []).append(p_.index)
-        region = [-1] * len(me.polygons)
+        # One SURFACE = faces joined across a gentle bend (a barrel's staves,
+        # a turned leg; never across a step's 90 deg edge) OR lying on the
+        # same plane (a facade cut into strips by its doors and windows is
+        # still one big wall, not a row of narrow slivers).
+        par = list(range(len(me.polygons)))
+
+        def find(i):
+            while par[i] != i:
+                par[i] = par[par[i]]
+                i = par[i]
+            return i
+
+        for p_ in me.polygons:
+            for ek in p_.edge_keys:
+                for j in by_edge.get(ek, ()):
+                    if j != p_.index and nrm[j].dot(nrm[p_.index]) > 0.9:
+                        par[find(j)] = find(p_.index)
+        planes = {}
+        for p_ in me.polygons:
+            n_ = nrm[p_.index]
+            key = (round(n_.x, 2), round(n_.y, 2), round(n_.z, 2), round(n_.dot(mw @ p_.center) / 0.02))
+            if key in planes:
+                par[find(p_.index)] = find(planes[key])
+            else:
+                planes[key] = p_.index
+        groups = {}
+        for p_ in me.polygons:
+            groups.setdefault(find(p_.index), []).append(p_.index)
         narrow = set()
-        for p0 in me.polygons:
-            if region[p0.index] >= 0:
-                continue
-            rid = p0.index
-            stack, members = [p0.index], []
-            region[p0.index] = rid
-            while stack:
-                k = stack.pop()
-                members.append(k)
-                for ek in me.polygons[k].edge_keys:
-                    for j in by_edge.get(ek, ()):
-                        # one SURFACE: across a gentle bend (a barrel's staves,
-                        # a turned leg) yes, across a step's edge (90 deg) no
-                        if region[j] < 0 and nrm[j].dot(nrm[k]) > 0.9:
-                            region[j] = rid
-                            stack.append(j)
+        for members in groups.values():
             pts2, area2 = [], 0.0
             for k in members:
                 qq = [world_to_camera_view(scn, cam, mw @ me.vertices[v].co) for v in me.polygons[k].vertices]
@@ -461,7 +526,7 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
             c = mw @ poly.center
             n = (nmat @ poly.normal).normalized()
             uvs = None
-            if not shiny and poly.index not in narrow and n.dot((cpos - c).normalized()) > cos_max:
+            if not shiny and not patch_only and poly.index not in narrow and n.dot((cpos - c).normalized()) > cos_max:
                 pts = [c] + [mw @ me.vertices[me.loops[li].vertex_index].co for li in poly.loop_indices]
                 qs = [world_to_camera_view(scn, cam, p_) for p_ in pts]
                 if all(in_frame(q_) for q_ in qs) and all(sees(ob, p_) for p_ in pts):
@@ -477,6 +542,23 @@ def photo_project(objs, ref=0, fallback=None, max_px=2048, piece=0.25, max_angle
                     w = mw @ me.vertices[me.loops[li].vertex_index].co
                     uvl.data[li].uv = (w.dot(a1) / L, w.dot(a2) / L)
                 poly.material_index = 1
+        # Camera pass: an object with no clean piece of itself to repeat takes
+        # the mean colour the photo gives it (never the script's guess, grey).
+        if _camera_pass and not patch:
+            PH_, PW_ = photo.shape[0], photo.shape[1]
+            acc, n_ = [0.0, 0.0, 0.0], 0
+            for poly in me.polygons:
+                if poly.material_index != 0:
+                    continue
+                for li in poly.loop_indices:
+                    u_, v_ = uvl.data[li].uv
+                    xi = int(max(0, min(PW_ - 1, u_ * (PW_ - 1))))
+                    yi = int(max(0, min(PH_ - 1, (1.0 - v_) * (PH_ - 1))))
+                    c_ = photo[yi, xi]
+                    acc[0] += float(c_[0]); acc[1] += float(c_[1]); acc[2] += float(c_[2]); n_ += 1
+            if n_:
+                col = "#%02x%02x%02x" % tuple(int(max(0, min(1, v / n_)) * 255 + 0.5) for v in acc)
+                me.materials[1] = pbr(f"{ob.name}_photo_mean", col, rough=0.9)
     r_.resolution_x, r_.resolution_y, r_.pixel_aspect_x, r_.pixel_aspect_y = old_res
     return pm
 
@@ -582,6 +664,10 @@ def photo_sky(ref=0, clear=0.35, radius=None):
     return ob
 
 
+${MODEL_TEXTURES_PY}
+
+${MODEL_KIT_PY}
+
 # Reference photos with the camera each one was taken from (estimated by
 # the agent). The review renders the model from these cameras.
 REFS = []
@@ -625,9 +711,84 @@ _ns = {
     "photo_material": photo_material, "photo_color": photo_color, "photo_project": photo_project,
     "photo_sky": photo_sky,
 }
+_ns.update(KIT)
 import bmesh  # noqa: E402
 _ns["bmesh"] = bmesh
 exec(compile(_src, args.script, "exec"), _ns)
+bpy.context.view_layer.update()
+
+# An open-air set always gets the photo's sky, even when the script forgot
+# photo_sky: straight up from the first photo's camera nothing is in the way.
+if KIND == "set" and REF_CAMS and not any(o.get("sky") for o in bpy.data.objects):
+    _dg = bpy.context.evaluated_depsgraph_get()
+    _P = REF_CAMS[0]["obj"].matrix_world.translation.copy()
+    _open = all(not scn.ray_cast(_dg, _P, Vector(d).normalized(), distance=500)[0]
+                for d in ((0, 0, 1), (0.3, 0, 1), (-0.3, 0, 1), (0, 0.3, 1), (0, -0.3, 1)))
+    if _open:
+        try:
+            photo_sky(ref=0)
+            print("[model3d] open-air set: photo_sky added")
+        except Exception as e:
+            print("[model3d] photo_sky skipped:", e, file=sys.stderr)
+        bpy.context.view_layer.update()
+OPEN_AIR = any(o.get("sky") for o in bpy.data.objects)
+
+# CAMERA PROJECTION (19/11/2026: a set built by hand never looked like its
+# photo, and the stage re-lit the photo's own light into dark orange). At the
+# end, EVERY surface of a set the photo camera sees takes the photo's own
+# pixel, whatever its angle, pieces included: from the photo's point of view
+# the set IS the photo, and near it it holds. What the camera does not see
+# takes a clean piece of that object repeated at real size. Then the photo
+# materials are UNLIT (they show the photo's light as it is; the stage's
+# lights never darken or tint them). The video references never carry these
+# textures (flat_surfaces), so only the user's 3D view is concerned.
+def _is_emitter(o):
+    for m in o.data.materials:
+        if m is None or not m.use_nodes:
+            continue
+        b = m.node_tree.nodes.get("Principled BSDF")
+        if b is None:
+            continue
+        es = b.inputs.get("Emission Strength")
+        ec = b.inputs.get("Emission Color") or b.inputs.get("Emission")
+        if es is not None and float(es.default_value) > 0.5 and ec is not None and not ec.is_linked and max(ec.default_value[:3]) > 0.05:
+            return True
+    return False
+
+
+def _unlit(m):
+    if m is None or not m.use_nodes:
+        return
+    texs = [n for n in m.node_tree.nodes if n.type == "TEX_IMAGE"]
+    b = m.node_tree.nodes.get("Principled BSDF")
+    if not texs or b is None:
+        return
+    em = b.inputs.get("Emission Color") or b.inputs.get("Emission")
+    if em is None:
+        return
+    m.node_tree.links.new(texs[0].outputs["Color"], em)
+    if "Emission Strength" in b.inputs:
+        b.inputs["Emission Strength"].default_value = 1.0
+    b.inputs["Base Color"].default_value = (0, 0, 0, 1)
+    b.inputs["Roughness"].default_value = 1.0
+    for k in ("Specular IOR Level", "Specular"):
+        if k in b.inputs:
+            b.inputs[k].default_value = 0.0
+
+
+# SHAPES FIRST, THEN MATERIALS (19/11/2026). The shapes passes (blocks,
+# shapes, detail, assembly) build in plain clay: the review shows only the
+# forms. The materials pass generates each material's texture in the colour
+# measured on the photo; nothing is painted with the photo's own pixels.
+_dressable = [o for o in bpy.data.objects if o not in _wrapper_objs and o.type == "MESH" and o.data.polygons]
+try:
+    if args.clay:
+        _clay_pass(_dressable)
+        print("[model3d] clay build: shapes only")
+    else:
+        print("[model3d] materials textured:", _texture_pass(_dressable))
+except Exception as e:
+    print("[model3d] materials pass failed:", e, file=sys.stderr)
 bpy.context.view_layer.update()
 
 model = [o for o in bpy.data.objects if o not in _wrapper_objs and o.type in ("MESH", "CURVE", "EMPTY", "FONT", "SURFACE", "META")]
@@ -793,6 +954,11 @@ def _stretched_textures(objs, ratio=3.0, min_area=0.05, cap=12):
         """(image, uv map name or None) feeding the material's colour."""
         if not mat or not mat.use_nodes or not mat.node_tree:
             return None
+        # The set's camera projection lays the photo on surfaces seen at an
+        # angle ON PURPOSE (from the photo's point of view the set is the
+        # photo): not a defect to fix.
+        if KIND == "set" and mat.name.startswith("photo_proj_") and not args.no_dress:
+            return None
         for n_ in mat.node_tree.nodes:
             if n_.type == "TEX_IMAGE" and n_.image is not None and n_.image.size[0] > 1:
                 uvn = None
@@ -871,6 +1037,33 @@ except Exception as e_:
     print(f"[model3d] z-fighting check failed: {e_}", file=sys.stderr)
     Z_FIGHT = []
 
+
+# Anchors ON the model: each anchor's 3D point must lie on a surface of the
+# model (a room corner, the arch's key, a table corner), never a number
+# made up to fit the photo. Distance to the nearest surface, metres.
+ANCHORS_OFF = []
+try:
+    _dg_a = bpy.context.evaluated_depsgraph_get()
+    for _ri, _r in enumerate(REFS):
+        for _a in (_r.get("anchors") or []):
+            _w = _a.get("world")
+            if not isinstance(_w, (list, tuple)) or len(_w) < 3:
+                continue
+            _p = Vector((float(_w[0]), float(_w[1]), float(_w[2]))) + offset  # the script's frame
+            _best = 1e9
+            for _o in meshes:
+                if _o.type != "MESH":
+                    continue
+                _ev = _o.evaluated_get(_dg_a)
+                _inv = _ev.matrix_world.inverted()
+                _ok, _loc, _n, _fi = _ev.closest_point_on_mesh(_inv @ _p)
+                if _ok:
+                    _best = min(_best, ((_ev.matrix_world @ _loc) - _p).length)
+            if _best > 0.12:
+                ANCHORS_OFF.append({"ref": _ri, "label": str(_a.get("label") or ""), "offModelM": round(_best, 2) if _best < 1e8 else None})
+except Exception as e_:
+    print(f"[model3d] anchor check failed: {e_}", file=sys.stderr)
+
 # ───────────────────────────────────────────────────────────── export ──
 
 for o in bpy.data.objects:
@@ -908,6 +1101,11 @@ for m in list(bpy.data.materials):
         bpy.data.materials.remove(m)
 bpy.ops.import_scene.gltf(filepath=glb)
 bpy.context.view_layer.update()
+if args.clay:
+    try:
+        _clay_shade()
+    except Exception as e:
+        print("[model3d] clay shading:", e, file=sys.stderr)
 
 r = scn.render
 for n in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
@@ -917,7 +1115,7 @@ for n in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
     except TypeError:
         continue
 try:
-    scn.eevee.taa_render_samples = 32
+    scn.eevee.taa_render_samples = 16  # review images: shapes and colours, not final quality
 except Exception:
     pass
 try:
@@ -1159,36 +1357,6 @@ for i, rc in enumerate(REF_CAMS):
     review["references"].append({"index": i, "image": rc["path"], "compare": out,
                                  "match": round(match, 3), "worstAreas": cells[:4]})
 
-# A set seen from INSIDE, from where the first photo was taken: wider than
-# the photo, then turned left, right, back, down and up. Everything the
-# photo's frame does not show (the floor at the feet, the ceiling, the
-# sides) is checked here: the user walks round it in the card.
-if KIND == "set" and REF_CAMS:
-    c0 = REF_CAMS[0]["obj"]
-    P = c0.matrix_world.translation.copy()
-    fwd = (c0.matrix_world.to_3x3() @ Vector((0, 0, -1))).normalized()
-    yaw0 = math.atan2(fwd.y, fwd.x)
-    pitch0 = math.asin(max(-1.0, min(1.0, fwd.z)))
-
-    def dir_(yaw, pitch):
-        return Vector((math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch)))
-
-    inside = [
-        ("wide", dir_(yaw0, pitch0)),
-        ("left", dir_(yaw0 + math.radians(75), 0)),
-        ("right", dir_(yaw0 - math.radians(75), 0)),
-        ("back", dir_(yaw0 + math.pi, 0)),
-        ("down", dir_(yaw0, math.radians(-55))),
-        ("up", dir_(yaw0, math.radians(55))),
-    ]
-    cells_ = []
-    for name, dv in inside:
-        cam = look_cam(f"inside_{name}", P, P + dv, 14)
-        cells_.append(pixels(render_to(cam, CW, CH, os.path.join(OUT, "review", f"inside-{name}.png"))))
-    W3, H3, px3 = tile(cells_, 3, CW, CH)
-    review["inside"] = os.path.join(OUT, "review", "inside.png")
-    save_canvas(review["inside"], W3, H3, px3)
-
 # Turning round what each photo looks at. From the photo's own point the
 # projected photo hides depth errors (a wall too near, a flat chair, a
 # floor at the wrong height all still "look right"); a few degrees away
@@ -1206,6 +1374,13 @@ for i, rc in enumerate(REF_CAMS[:3]):
         d0 = 0
     if d0 < 0.3:
         d0 = max(1.0, span * 0.4)
+    # Turn round what the photo really SEES: the first surface ahead when it
+    # is nearer than the estimated target (inside a room the target often
+    # lies behind a wall or inside the stair).
+    dg_ = bpy.context.evaluated_depsgraph_get()
+    hit, loc, _n, _i, _o, _m = scn.ray_cast(dg_, P, fwd, distance=d0)
+    if hit:
+        d0 = max(0.3, (loc - P).length)
     T = P + fwd * d0
     lens = cam0.data.lens
     cells_ = [pixels(rc["path"], CW, CH)]
@@ -1220,12 +1395,17 @@ for i, rc in enumerate(REF_CAMS[:3]):
             side = v.cross(Vector((0, 0, 1)))
             if side.length > 1e-6:
                 v = Matrix.Rotation(math.radians(pitch), 3, side.normalized()) @ v
-        # Never through a wall or the ceiling: stop just before what is in the way.
-        dg_ = bpy.context.evaluated_depsgraph_get()
-        hit, loc, _n, _i, _o, _m = scn.ray_cast(dg_, T, v.normalized(), distance=v.length)
-        if hit:
-            v = v.normalized() * max(0.3, (loc - T).length - 0.25)
-        cam = look_cam(f"orbit_{i}_{name}", T + v, T, lens)
+        # Always in free air: walk from the photo's own point (which is in the
+        # open) towards the wanted point and stop 25 cm before anything in the
+        # way. Never inside a wall, the stair or a piece of furniture.
+        want = T + v
+        step = want - P
+        C = want
+        if step.length > 1e-4:
+            hit, loc, _n, _i, _o, _m = scn.ray_cast(dg_, P, step.normalized(), distance=step.length + 0.25)
+            if hit:
+                C = P + step.normalized() * max(0.0, (loc - P).length - 0.25)
+        cam = look_cam(f"orbit_{i}_{name}", C, T, lens)
         cells_.append(pixels(render_to(cam, CW, CH, os.path.join(OUT, "review", f"orbit-{i}-{name}.png"))))
     W4, H4, px4 = tile(cells_, 3, CW, CH)
     out = os.path.join(OUT, "review", f"orbit-{i}.png")
@@ -1303,7 +1483,10 @@ stats = {
     "objects": len(meshes),
     "materials": sorted(mats),
     "triangles": tris,
+    "openAir": OPEN_AIR,
+    "pieces": PIECES,
     "zFighting": Z_FIGHT,
+    "anchorsOffModel": ANCHORS_OFF,
     "stretchedTextures": STRETCHED,
     "review": review,
 }

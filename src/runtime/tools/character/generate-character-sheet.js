@@ -31,7 +31,7 @@ import path from 'path';
 import { channel } from '../../io/channel.js';
 import { readCharacter } from '../../state/character-registry.js';
 import generateImage from '../media/generate-image.js';
-import { buildPartialComposite } from '../media/composite-partial-edit.js';
+import { buildPartialComposite, surgicalZooms, SURGICAL_NOTE, normRegions } from '../media/composite-partial-edit.js';
 
 function _err(msg) { return { success: false, error: `generate_character_sheet: ${msg}` }; }
 function _isStr(v) { return typeof v === 'string'; }
@@ -190,11 +190,21 @@ async function _editSheet({ action, agent, characterId, change }) {
   }
   const outPath = editPath.replace(/\.[^.]+$/, '') + '-sheet.png';
   const checkImage = path.join(os.tmpdir(), path.basename(outPath).replace(/\.[^.]+$/, '') + '.check.jpg');
-  const regions = (Array.isArray(action?.regions) ? action.regions : [])
-    .map((q) => ({ x: Number(q?.x), y: Number(q?.y), w: Number(q?.w), h: Number(q?.h) }))
-    .filter((q) => [q.x, q.y, q.w, q.h].every(Number.isFinite) && q.w > 0 && q.h > 0);
-  const built = await buildPartialComposite({ masterPath: sheet, editPath, outPath, previewPath: checkImage, regions });
-  if (built.error) return _err(`sheet edit: ${built.error}`);
+  const regions = normRegions(action?.regions);
+  // The user's edit mode rules every edit (Antonio, 19/11/2026): "normal" →
+  // the model's whole edit IS the new sheet; "master" (default) → only what
+  // changed is pasted onto the sheet, surgically for small boxes.
+  const { imageEditMode } = await import('../media/generate-image.js');
+  let built;
+  let regionZooms = [];
+  if (imageEditMode() === 'normal') {
+    fs.copyFileSync(editPath, outPath);
+    built = { regions: [], coverage: 1, width: e.width, height: e.height };
+  } else {
+    built = await buildPartialComposite({ masterPath: sheet, editPath, outPath, previewPath: checkImage, regions });
+    if (built.error) return _err(`sheet edit: ${built.error}`);
+    if (built.surgical) regionZooms = await surgicalZooms({ masterPath: sheet, editPath, outPath, regions, width: built.width, height: built.height });
+  }
   try {
     const { default: saveComposite } = await import('../media/save-composite-image.js');
     await saveComposite.execute({ path: outPath, masterImage: sheet, editImage: editPath, summary: `${existing.name}: ${change}` }, agent);
@@ -205,7 +215,10 @@ async function _editSheet({ action, agent, characterId, change }) {
   channel.log('generate_character_sheet', `edited ${characterId}: ${built.regions.length} region(s), ${(built.coverage * 100).toFixed(1)}% of the sheet repainted`);
   return {
     success: true, mode: 'edit', sheet: outPath, previousSheet: sheet, sheetCells: existing.sheetCells, views: SHEET_VIEWS,
-    characterId, attached: !!(res && res.success !== false), coverage: built.coverage, regions: built.regions, checkImage,
+    characterId, attached: !!(res && res.success !== false), coverage: built.coverage, regions: built.regions,
+    editMode: imageEditMode(),
+    ...(imageEditMode() === 'normal' ? {} : { checkImage }),
+    ...(regionZooms.length ? { surgical: true, regionZooms, regionNote: SURGICAL_NOTE } : {}),
     note: 'Look at checkImage (the repainted area tinted magenta) and at the sheet: only the asked change may be tinted. A stray area: pass `regions`; a missed one: say the change more precisely. If wrong, the previousSheet is untouched: save nothing else, edit again from it.',
   };
 }
@@ -233,7 +246,7 @@ export default {
       photos: { type: 'array', items: { type: 'string' }, description: 'OPTIONAL absolute file paths to one or more reference photos of the character, used to preserve identity across the 7 views.' },
       characterId: { type: 'string', description: 'OPTIONAL id of a saved character (<project>/characters/<id>.json). When description/photos are omitted they are sourced from this character.' },
       change: { type: 'string', description: 'OPTIONAL edit mode: what to change on the character\'s CURRENT sheet (needs characterId). Only the changed areas are repainted.' },
-      regions: { type: 'array', items: { type: 'object' }, description: 'OPTIONAL with `change`: normalised boxes {x,y,w,h} around where the change goes; changed areas elsewhere are not pasted.' },
+      regions: { type: 'array', items: { type: 'object' }, description: 'OPTIONAL with `change`: normalised boxes {x,y,w,h} of the sheet around where the change goes; changed areas elsewhere are not pasted. A SMALL change (an iris, a badge, a button): one TIGHT box round exactly that thing in every panel that shows it; small boxes are a SURGICAL cut (aligned, the whole box pasted, feather ~12 % of the box). Read the returned regionZooms.' },
       detail: { type: 'string', description: 'OPTIONAL the wardrobe detail the close-up cell must show (an insignia, an emblem, a buckle, a print). Omitted: the most distinctive one.' },
       model: { type: 'string', description: 'OPTIONAL image model slug. Omit to auto-pick a reference-capable (image-editing) model.' },
       aspectRatio: { type: 'string', description: 'OPTIONAL aspect ratio for the sheet. Defaults to 16:9 (a wide sheet).' },

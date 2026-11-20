@@ -418,29 +418,33 @@ function _release() {
  * (`--scene`, `--shot`, `--out`, …). Resolves with the tail of the log;
  * rejects with the Python traceback when the script fails.
  */
-export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000, heavy = false, script = null } = {}) {
+export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 * 60 * 1000, heavy = false, script = null, pool = 'render' } = {}) {
   const { bin } = await ensureBlender({ onProgress });
   script ??= builderScriptPath();
   // Long renders (video bakes) go one at a time: several Blenders rendering
   // whole clips at once saturate the GPU the live previz and the app's own
   // UI draw on, and everything froze for half a minute.
   const releaseHeavy = heavy ? await _heavySlot() : null;
-  await _slot();
+  // Model builds have their own pool slots and skip the renders' queue.
+  const local = pool !== 'model';
+  if (local) await _slot();
   // A slot of THE Blender pool (live + renders never pass its cap).
   let releasePool = null;
   try {
-    releasePool = await takeSlot('render');
+    releasePool = await takeSlot(pool === 'model' ? 'model' : 'render');
     return await new Promise((resolve, reject) => {
       const argv = ['-b', '--factory-startup', '-noaudio', '--python-exit-code', '1', '-P', script, '--', ...args];
       // macOS: utility QoS — the scheduler (CPU, I/O, GPU queue) serves the
       // interactive app first; a plain nice only lowers CPU priority.
-      const bg = process.platform === 'darwin' && fs.existsSync('/usr/sbin/taskpolicy');
+      // Model builds are what an agent (and the user) is waiting on, short and
+      // light: normal priority. Throttled to utility QoS a 40 s build took 4 min.
+      const bg = pool !== 'model' && process.platform === 'darwin' && fs.existsSync('/usr/sbin/taskpolicy');
       const p = spawn(bg ? '/usr/sbin/taskpolicy' : bin, bg ? ['-c', 'utility', bin, ...argv] : argv, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       releasePool.launched();
       // Renders run behind the live previz: never steal its time slices.
-      try { os.setPriority(p.pid, 10); } catch { /* not permitted */ }
+      if (pool !== 'model') { try { os.setPriority(p.pid, 10); } catch { /* not permitted */ } }
       let log = '';
       let pending = '';
       const onData = (d) => {
@@ -483,7 +487,7 @@ export async function runBuilder(args, { onProgress, onShotDone, timeoutMs = 15 
     });
   } finally {
     releasePool?.();
-    _release();
+    if (local) _release();
     releaseHeavy?.();
   }
 }

@@ -237,8 +237,20 @@ export function cardPreviewScene(kind, cardId) {
   if (!modelId) return null;
   const id = `card-${kind}-${cardId}`.replace(/[^A-Za-z0-9_-]/g, '-');
   let scene = readScene(id);
+  const model = readModel(modelId);
+  // An exterior (under the open sky) is shown in daylight on open ground; a
+  // room as a room. An exterior shown as a warm-lit room came out dark brown,
+  // nothing like its photo (19/11/2026).
+  const openAir = kind === 'location' && (model?.openAir ?? (Array.isArray(model?.dims) && Math.max(model.dims[0], model.dims[1]) > 60));
+  const setType = openAir ? 'exterior' : 'room';
+  const light = kind === 'location' ? (openAir ? 'overcast' : 'interior_warm') : 'studio';
+  let relit = false;
+  if (scene && kind === 'location' && scene.set && (scene.set.type !== setType || scene.lighting !== light)) {
+    scene.set = { ...scene.set, type: setType };
+    scene.lighting = light;
+    relit = true;
+  }
   if (!scene) {
-    const model = readModel(modelId);
     const [w, d, h] = Array.isArray(model?.dims) ? model.dims : [4, 4, 2.6];
     scene = {
       id,
@@ -247,9 +259,9 @@ export function cardPreviewScene(kind, cardId) {
       aspect: '16:9',
       style: 'lit',
       set: kind === 'location'
-        ? { type: 'room', size: [Math.max(1, w), Math.max(1, d), Math.max(2, h)], model: modelId }
+        ? { type: setType, size: [Math.max(1, w), Math.max(1, d), Math.max(2, h)], model: modelId }
         : { type: 'empty', props: [{ id: 'object', shape: 'box', position: [0, 0], model: modelId }] },
-      lighting: kind === 'location' ? 'interior_warm' : 'studio',
+      lighting: light,
       characters: [],
       actions: [],
       shots: [{ id: 'view', durationMs: 4000, startMs: 0, move: { type: 'static' },
@@ -258,7 +270,7 @@ export function cardPreviewScene(kind, cardId) {
       durationMs: 4000,
     };
   }
-  if (applyCardModels(scene) || !fs.existsSync(scenePath(id))) writeScene(scene);
+  if (applyCardModels(scene) || relit || !fs.existsSync(scenePath(id))) writeScene(scene);
   return id;
 }
 

@@ -5272,6 +5272,18 @@ void main() {
             _sp.show_gizmo = False
         except Exception as e:
             print(f"[scene3d] live shading: {e}", flush=True)
+    # Never outlive the app: a live Blender whose engine died (crash, quit,
+    # restart) was left running for hours, holding a slot of the machine's
+    # Blender cap, until no model build could start (19/11/2026).
+    _PARENT0 = os.getppid()
+
+    def _parent_watch():
+        if os.getppid() != _PARENT0:
+            print("[scene3d] parent gone: live Blender exits", flush=True)
+            os._exit(0)
+        return 2.0
+
+    bpy.app.timers.register(_parent_watch, first_interval=2.0, persistent=True)
     print(f"[scene3d] live on 127.0.0.1:{args.live}", flush=True)
 
 elif args.export_glb:
