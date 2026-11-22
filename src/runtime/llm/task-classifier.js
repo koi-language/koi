@@ -143,16 +143,27 @@ ${taskDescription}`;
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'interaction', agentName);
   }
 
-  async classifyTaskDifficulty(playbookText, args, agentName) {
-    const _taskText = args
+  async classifyTaskDifficulty(playbookText, args, agentName, opts = {}) {
+    const _named = args
       ? (args.userRequest || args.answer || args.description || args.instruction ||
          args.subject || args.question || args.agentRole ||
-         (args.pendingTasks ? `Pending tasks: ${args.pendingTasks}` : null) ||
-         JSON.stringify(args).substring(0, 500))
+         (args.pendingTasks ? `Pending tasks: ${args.pendingTasks}` : null))
       : null;
+    // A handler's arguments are usually data (ids, dates, flags), not a description of the work: classifying their
+    // JSON alone told the classifier nothing, so it fell back on «pick the higher one». When none of them describes
+    // the task, the handler's own instructions (its playbook) do, with the arguments beside them as inputs.
+    const _playbook = typeof opts.playbook === 'string' && opts.playbook.trim() ? opts.playbook.trim() : null;
+    const _taskText = _named
+      || (_playbook ? `Instructions given to the agent:\n${_playbook.length > 1600 ? `${_playbook.substring(0, 1000)}\n[…]\n${_playbook.slice(-600)}` : _playbook}${args ? `\n\nInputs: ${JSON.stringify(args).substring(0, 300)}` : ''}` : null)
+      || (args ? JSON.stringify(args).substring(0, 500) : null);
     const taskDescription = _taskText
-      ? `Task: ${_taskText.substring(0, 1000)}`
+      ? `Task: ${_taskText.substring(0, 2000)}`
       : (playbookText ? `Role: ${playbookText.substring(0, 300)}` : 'No task provided');
+
+    // An agent whose role cannot touch code (no `write`, no `use_lsp`) is classified with a table of GENERAL work:
+    // every category of the software table below is programming, so a travel planner or a text writer could only
+    // land on «implement a feature touching 2-3 files» and was sent to the most expensive model for it.
+    if (opts.kind === 'general') return this._classifyGeneralTask(taskDescription, args, agentName);
 
     // Project context — helps the classifier gauge complexity relative to project size.
     // e.g. "rename userId" in a 5-file project ≠ "rename userId" in a 500-file monorepo.
@@ -269,6 +280,102 @@ ${taskDescription}`;
     };
 
     return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName);
+  }
+
+  /**
+   * The table for an agent that does not program: it reads, looks things up through its tools, decides, plans and
+   * writes prose. Code scores stay low (a tool call needs valid JSON, not software engineering) and the reasoning
+   * score carries the difficulty. No project file list: the repository the backend lives in says nothing about how
+   * hard it is to plan a day or write a paragraph.
+   */
+  async _classifyGeneralTask(taskDescription, args, agentName) {
+    const discoveryContext = args?.recentDiscovery || null;
+    const escalation = args?.escalationReason ? `\nESCALATION: ${args.escalationReason}\n` : '';
+    const prompt = `Pick the ONE category that best matches the work this agent has to do. Return ONLY json: {"cat":"XX"}
+
+This agent does NOT write software: it reads, looks things up through its tools, decides, plans and writes text.
+Judge the difficulty of THAT work. Pick the category that fits; do not inflate it. Long instructions or many rules do
+not make a task hard by themselves: what matters is how much judgement the result needs. When the work has several
+steps, classify the hardest step it really needs, not the sum of them.
+${escalation}${discoveryContext ? `\nWHAT THE AGENT FOUND SO FAR:\n${discoveryContext}\n` : ''}
+CATEGORIES (code: example)
+
+TRANSFORM (the answer is already in the input)
+X1: Reformat or normalise: dates, numbers, names, casing, units ("pass these dates to dd/mm/yyyy")
+X2: Extract fields from a text into a fixed shape ("take the hotel, the nights and the meal plan out of this paragraph")
+X3: Translate a short text, or keep a text and change only its language ("translate this title into English")
+X4: Fill a template or a fixed structure with given data ("put these values into the day's JSON")
+X5: Split, merge, sort or deduplicate a given list ("remove the repeated places of this list")
+
+LOOK UP (the answer is in a catalogue, a library or a database reached through tools)
+L1: Fetch one known record by its id or exact name ("get the day 3 of the reservation")
+L2: Search by name and pick the obvious match ("find the Alhambra in the library")
+L3: Match several items to a catalogue, with spelling variants and near names ("match each stop of the day to a point of interest")
+L4: Match with ambiguity that needs context to settle: same name in two cities, a place known by two names, partial data
+L5: Find what is missing: compare what was asked with what exists and list the gaps
+
+DECIDE
+D1: Yes/no or one label from a short fixed list ("is this a complaint or a question?")
+D2: Choose the best of a few given options with a simple criterion ("which of these three photos is the cover?")
+D3: Rank or score items against several criteria
+D4: Check a result against explicit rules and say what breaks them ("does this plan respect the opening hours?")
+
+WRITE (prose a person reads)
+W1: One line: a title, a label, a caption, a short name
+W2: A short paragraph from given facts: a description, a notice, a reply
+W3: Several paragraphs with structure and a given tone: a section of a guide, an introduction, an email
+W4: A long document with sections that must agree with each other
+W5: Rewrite or correct an existing text: style, tone, length, house rules
+
+PLAN
+P1: Order a few steps that have an obvious order
+P2: A day or a schedule with times, distances and opening hours ("plan the visits of the day in a sensible order")
+P3: Several days or resources with constraints between them ("split the trip into days by city and travel time")
+P4: An allocation or a plan with many competing constraints and trade-offs
+
+TOOL WORK (several tool calls with a result to deliver)
+T1: Call one tool with the right arguments and return what it says
+T2: Read, look up and submit a result, once
+T3: Submit, read the validation and correct until it is accepted ("resolve the day: find its places, submit the plan and fix it until it is written")
+T4: A long workflow with branches, retries and state across many calls
+
+ANALYSE
+A1: Summarise one document or one record
+A2: Compare two versions or two sources and list the differences
+A3: Reconcile many documents or records, find contradictions and consolidate them
+A4: Investigate why something is wrong from scattered evidence
+
+COORDINATE
+C1: Hand a clear piece of work to one other agent and pass back its answer
+C2: Split work among several agents, check and merge what they return
+
+HIGH STAKES
+H1: Expert judgement: legal, financial, medical, contractual
+H2: An action with irreversible consequences for a person: pay, send, sign, delete, publish
+
+${taskDescription}`;
+
+    const p = (code, reasoning, risk, reasoningEffort) => ({ code, reasoning, risk, reasoningEffort });
+    const CATEGORY_PROFILES = {
+      X1: p(0, 10, 0, EFFORT_NONE),  X2: p(0, 20, 0, EFFORT_NONE),  X3: p(0, 25, 0, EFFORT_NONE),
+      X4: p(10, 15, 0, EFFORT_NONE), X5: p(0, 15, 0, EFFORT_NONE),
+      L1: p(15, 15, 0, EFFORT_NONE), L2: p(15, 30, 0, EFFORT_LOW),  L3: p(20, 45, 10, EFFORT_LOW),
+      L4: p(20, 60, 10, EFFORT_MEDIUM), L5: p(15, 50, 10, EFFORT_LOW),
+      D1: p(0, 20, 0, EFFORT_NONE),  D2: p(0, 35, 0, EFFORT_LOW),   D3: p(0, 50, 10, EFFORT_LOW),
+      D4: p(10, 55, 10, EFFORT_LOW),
+      W1: p(0, 20, 0, EFFORT_NONE),  W2: p(0, 35, 0, EFFORT_LOW),   W3: p(0, 50, 10, EFFORT_LOW),
+      W4: p(0, 65, 10, EFFORT_MEDIUM), W5: p(0, 35, 0, EFFORT_LOW),
+      P1: p(0, 30, 0, EFFORT_LOW),   P2: p(10, 55, 10, EFFORT_MEDIUM), P3: p(10, 65, 20, EFFORT_MEDIUM),
+      P4: p(10, 80, 20, EFFORT_HIGH),
+      T1: p(20, 20, 10, EFFORT_NONE), T2: p(20, 40, 10, EFFORT_LOW), T3: p(25, 55, 20, EFFORT_MEDIUM),
+      T4: p(30, 70, 20, EFFORT_MEDIUM),
+      A1: p(0, 35, 0, EFFORT_LOW),   A2: p(0, 45, 10, EFFORT_LOW),  A3: p(10, 75, 30, EFFORT_MEDIUM),
+      A4: p(10, 75, 20, EFFORT_MEDIUM),
+      C1: p(10, 30, 10, EFFORT_LOW), C2: p(15, 60, 20, EFFORT_MEDIUM),
+      H1: p(10, 85, 60, EFFORT_HIGH), H2: p(20, 75, 80, EFFORT_MEDIUM),
+    };
+
+    return this._runClassifier(prompt, CATEGORY_PROFILES, 'task-general', agentName);
   }
 
   /**
@@ -440,7 +547,7 @@ ${taskDescription}`;
         // Optional language detection — only present when classifying
         // an interaction (classifyUserRequest). Normalized and validated.
         const _lang = _normalizeLanguage(json.lang || json.language || null);
-        // Category format: { cat: "A"-"Z" }
+        // Category format: { cat: "A"-"Z" }, or a family code like "L3" from the general table
         if (json.cat) {
           const cat = String(json.cat).toUpperCase();
           const catProfile = CATEGORY_PROFILES[cat];

@@ -632,7 +632,7 @@ export class LLMProvider {
     return this._classifier;
   }
   async classifyUserRequest(userMessage, agentName) { return this._getClassifier().classifyUserRequest(userMessage, agentName); }
-  async classifyTaskDifficulty(playbookText, args, agentName) { return this._getClassifier().classifyTaskDifficulty(playbookText, args, agentName); }
+  async classifyTaskDifficulty(playbookText, args, agentName, opts) { return this._getClassifier().classifyTaskDifficulty(playbookText, args, agentName, opts); }
 
   /**
    * Lightweight JSON call: send a prompt, get parsed JSON back.
@@ -772,6 +772,8 @@ export class LLMProvider {
 
     if (isFirstCall || !contextMemory.hasHistory() || playbookResolver) {
       const freshPlaybook = playbookResolver ? await playbookResolver() : playbook;
+      // Kept for the task classifier: the rendered instructions describe the work, a handler's arguments rarely do.
+      if (typeof freshPlaybook === 'string') session._classifyPlaybook = freshPlaybook;
       const systemPromptResult = await this._buildReactiveSystemPrompt(agent, freshPlaybook);
       // DEBUG: detect [object Object] contamination
       if (process.env.KOI_DEBUG_LLM) {
@@ -1450,8 +1452,14 @@ CRITICAL RULES:
             _classifyArgs = { agentRole: agent.description.substring(0, 500) };
           }
           if (_classifyArgs) {
-            session._autoProfile = await this.classifyTaskDifficulty(agent?.description, _classifyArgs, agentName);
-            channel.log('llm', `[classify] task classifier took ${Date.now() - _clsT0}ms`);
+            // Which table: an agent that can touch code (write files, use the language server) gets the software one;
+            // any other gets the general one, with its playbook as the description of the work.
+            const _codeAgent = !!(agent?.role?.can?.('write') || agent?.role?.can?.('use_lsp'));
+            session._autoProfile = await this.classifyTaskDifficulty(agent?.description, _classifyArgs, agentName, {
+              kind: _codeAgent ? 'code' : 'general',
+              playbook: session._classifyPlaybook || (typeof playbook === 'string' ? playbook : null),
+            });
+            channel.log('llm', `[classify] task classifier (${_codeAgent ? 'code' : 'general'} table) took ${Date.now() - _clsT0}ms`);
           }
         }
         // Only fall back to DEFAULT if we truly have zero context AND the LLM call failed
