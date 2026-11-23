@@ -271,6 +271,9 @@ class ActionRegistry {
       // simple, so surface the brief descriptions inline instead of hiding them
       // behind the `agenda` toolset + a get_tool_info round-trip.
       'agenda_add', 'agenda_list', 'agenda_update', 'agenda_remove',
+      // Deciding, labelling and scoring is part of almost any job, and a decision model does it in a fraction of a
+      // second for a fraction of a cent (23/11/2026): every agent sees `classify` inline, whatever its role grants.
+      'classify',
     ]);
 
     // Mode-aware core. A truly UNATTENDED scheduled task (headless, exit-on-
@@ -392,6 +395,20 @@ class ActionRegistry {
     doc += '### Core\n';
     for (const action of coreActions) {
       doc += _renderActionLine(action);
+    }
+
+    // ── classify: its own section, WHEN and HOW (23/11/2026) ──────────────
+    // As a one-liner in Core it was cut at its first sentence: the agent saw what it was but not when to reach for
+    // it nor the shape of `questions`, and being "safe to call directly" it had no get_tool_info to learn it. In a
+    // real run (opfh's import assistant, 37 steps deciding crop codes and name spellings) it was never called.
+    if (coreActions.some(a => (a.intent || a.type) === 'classify')) {
+      doc += '\n### Decide, label, score — use `classify`\n';
+      doc += '**WHENEVER YOU HAVE TO DECIDE BETWEEN SEVERAL OPTIONS, OR ANSWER YES/NO, OR RATE SOMETHING ON A SCALE: CALL `classify`. Do not decide it yourself.**\n';
+      doc += '**RULE**: every JUDGEMENT on a closed set of options is a `classify` call, never your own reasoning. Your instructions trigger it whenever they say things like «if there is a reasonable candidate», «if it clearly corresponds», «pick the one that fits», «decide whether», «check if», «is it…?», «how urgent / how likely / how much», «tag», «label», «categorise». The tools that FETCH data (a catalogue search, a lookup, a read) do not decide: you fetch with them, then you decide on what they returned with `classify`. `classify` is a dedicated classifier, ~0.3 s and a fraction of a cent, and gives each answer WITH its probability.\n';
+      doc += 'How: put every question about the same content in ONE call; a batch of items is one call with one question per item. Act on an answer only when its probability is high (>= 0.6); below that the content is unclear: leave it for a person or look again. Question types: `choice` (one label of a closed list, add a label like "none" when none may fit; `criteria`: {label: "when it applies"}), `score` (a level on an ordered scale; `criteria`: ["lowest", ..., "highest"]), `noul` (a yes/no statement; optional `criteria`: {true: "...", false: "..."}).\n';
+      doc += 'Example, deciding on what a lookup returned (a catalogue search gave candidates for «ALMENRO»): {"intent": "classify", "state": {"written": "ALMENRO", "context": "a crop name typed by a farmer"}, "questions": {"crop": {"type": "choice", "instructions": "Which catalogue entry is the written crop?", "criteria": {"3101": "Almendro (almond tree)", "3102": "Pistacho", "none": "none of them is the written crop"}}}}\n';
+      doc += 'Example, several kinds at once: {"intent": "classify", "state": {"ticket": "Checkout shows a blank page"}, "questions": {"team": {"type": "choice", "instructions": "Which team owns it?", "criteria": {"payments": "Checkout and billing", "account": "Login and permissions"}}, "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Can wait", "This week", "Blocking sales"]}, "is_bug": {"type": "noul", "instructions": "Is it broken behaviour?"}}}\n';
+      doc += 'Returns: {"answers": {"crop": {"answer": "3101", "probabilities": {"3101": 0.97, ...}}, "urgency": {"answer": 2, "label": "Blocking sales", ...}, "is_bug": {"answer": true, "probability": 0.91}}}\n';
     }
 
     // ── Media tools (promoted from the `media` toolset) ────────────

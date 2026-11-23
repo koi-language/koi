@@ -1056,6 +1056,18 @@ content: "..."`);
   return openDocumentsBlock;
 }
 
+/** The fixed rules for a phase that cannot `return`: finishing the phase is `phase_done`, and `return` is never named. */
+function _withoutReturn(text) {
+  return text
+    .replace(/Only emit this when the full task is complete:\nactionType: direct\nintent: return\ndata:\n  \.\.\.\n/,
+      'Only emit this when the work of THIS phase is complete (it moves the run on; you cannot end the task from this phase):\nactionType: direct\nintent: phase_done\n')
+    .replace('Do not return early.', 'Do not finish the phase early.')
+    .replace('You must complete all required follow-up actions before returning.', 'You must complete all required follow-up actions of this phase before calling phase_done.')
+    .replace('5. Never return before the whole task is done', '5. Never call phase_done before the work of this phase is done')
+    .replace('emit analysis, summary, print, or return content based on that result', 'emit analysis, summary or print content based on that result')
+    .replace('- a print, answer, summary, conclusion, or return payload that depends on that retrieval', '- a print, answer, summary or conclusion that depends on that retrieval');
+}
+
 export async function buildSystemPrompt(agent) {
   const hasTeams = agent && agent.usesTeams && agent.usesTeams.length > 0;
   const resourceSection = await buildSmartResourceSection(agent);
@@ -1418,7 +1430,14 @@ ${_sessionId ? `* **Session working dir**: write every intermediate / process fi
 ${openDocumentsBlock}${mentionVocabularyBlock}${nonInteractiveBlock}${expandedToolsBlock}
 REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new intents. Descriptions go in query / other fields.`;
 
-  return { static: staticPart, dynamic, koiMd };
+  // A phase that denies `return` (`cant return`) must not see it anywhere (Antonio, 23/11/2026): the action list
+  // already hid it, but the fixed rules above still taught «intent: return … when the task is complete», and an
+  // agent in a middle phase followed them. In such a phase every mention of returning becomes `phase_done`.
+  const _phaseCfg = statusPhase ? agent?.phases?.[statusPhase] : null;
+  const _cantReturn = Array.isArray(_phaseCfg?.deniedPermissions) && _phaseCfg.deniedPermissions.includes('return');
+  const staticOut = _cantReturn ? _withoutReturn(staticPart) : staticPart;
+
+  return { static: staticOut, dynamic, koiMd };
 }
 
 /**

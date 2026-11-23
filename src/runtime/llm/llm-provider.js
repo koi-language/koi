@@ -1339,15 +1339,29 @@ CRITICAL RULES:
       // Reclassify when the user sent a new message — flag is set by prompt_user action in agent.js
       const _isNewUserMessage = !!session._needsReclassify;
       if (_isNewUserMessage) session._needsReclassify = false;
+      // A phase transition: classify the new phase's work (set by reactions.js when the phase changes).
+      const _phaseChanged = session._phaseChanged || null;
+      if (_phaseChanged) session._phaseChanged = null;
       channel.log('llm', `[classify] Reclassify check: needsReclassify=${_isNewUserMessage}, hasProfile=${!!session._autoProfile}, isFirstCall=${isFirstCall}, isDelegateReturn=${_isDelegateReturn}`);
       // reclassify_complexity is disabled (hidden). Keep the variable for
       // compatibility but never trigger agent-requested reclassification.
       const _agentRequestedReclassify = false;
       // Detect loops: same action repeated 3+ times → model is too weak, reclassify with escalation context
       const _recentActions = (session.actionHistory || []).slice(-3);
-      const _isLoop = _recentActions.length >= 3 && _recentActions.every(e => e.action?.intent === _recentActions[0]?.action?.intent);
+      // A loop is the SAME action with the SAME data three times, not the same intent name (23/11/2026): an agent sending
+      // batch after batch of different `proponer` calls was recorded as `_parallel_done` ×3, taken for stuck, and
+      // escalated to a stronger model while it was making progress. A parallel batch is compared by what it ran.
+      const _signature = (e) => {
+        const a = e?.action || {};
+        const what = a.intent === '_parallel_done'
+          ? (e?.result?._parallelSubActions || []).map(x => ({ i: x?.intent, d: x?.data ?? x?.input ?? x?.args ?? null, t: x?.tool ?? null }))
+          : { i: a.intent, d: a.data ?? a.input ?? a.args ?? null, t: a.tool ?? null, q: a.query ?? a.path ?? null };
+        try { return JSON.stringify(what).slice(0, 4000); } catch { return String(a.intent); }
+      };
+      const _isLoop = _recentActions.length >= 3 && _recentActions.every(e => _signature(e) === _signature(_recentActions[0]));
       // Always reclassify: on first call, new user message, delegate return, agent request, or loop.
-      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || _isNewUserMessage || _agentRequestedReclassify || _isLoop;
+      const _shouldReclassify = !session._autoProfile || isFirstCall || _isDelegateReturn || _isNewUserMessage || _agentRequestedReclassify || _isLoop || !!_phaseChanged;
+      if (_phaseChanged) channel.log('llm', `[classify] Phase changed to «${_phaseChanged}»: reclassifying on its instructions`);
 
       if (_shouldReclassify) {
         // Coordinators just route tasks to delegates — they never need
@@ -2889,8 +2903,27 @@ CRITICAL RULES:
       return { actionType: 'direct', intent: 'print', message: '', _refused: true };
     }
 
-    // Parse the response into a single action
-    const action = await this._parseReactiveResponse(responseText, agent);
+    // Parse the response into a single action. A response that hit max_tokens was CUT, not written badly
+    // (23/11/2026: an agent batching 40 `proponer` calls hit a 3,000 cap nine times, lost every batch and was
+    // punished as if the model had failed). Cut + unparseable → double the cap for the rest of the session (up to the
+    // model's own maximum) and retry the same call, flagged so agent.js counts no failure and penalises nobody.
+    const _outUsed = (usage.output || 0) + (usage.thinking || 0);
+    const _capUsed = this.maxTokens || 0;
+    const _truncated = _capUsed > 0 && _outUsed >= _capUsed * 0.98;
+    let action;
+    try {
+      action = await this._parseReactiveResponse(responseText, agent);
+    } catch (_parseErr) {
+      if (!_truncated) throw _parseErr;
+      const _modelMax = getModelCaps(_effectiveModel)?.maxOutputTokens || 64000;
+      const _next = Math.min(_capUsed * 2, _modelMax, 64000);
+      if (session) session._maxTokensBump = Math.max(session._maxTokensBump || 0, _next);
+      this.maxTokens = _next;
+      channel.log('llm', `[truncated] response cut at max_tokens (${_outUsed}/${_capUsed} tokens, ${responseText.length} chars): retrying with max_tokens=${_next}, no penalty`);
+      const _err = new Error(`LLM response truncated at max_tokens=${_capUsed}; retrying with ${_next}`);
+      _err.koiTruncated = true;
+      throw _err;
+    }
 
     // If streaming print was active but the scalar wasn't terminated in-stream
     // (e.g. a block scalar that ends at EOF), flush the remaining buffered line

@@ -2296,6 +2296,14 @@ export class Agent {
           }
         }
 
+        // A response cut at max_tokens (llm-provider.js flags it and already raised the cap): not a failure of the
+        // model. Retry at once with the higher cap: no failure counted, no backoff, no cooldown, no model change.
+        if (error?.koiTruncated) {
+          session.consecutiveErrors = Math.max(0, (session.consecutiveErrors || 0) - 1);
+          channel.log('agent', `${this.name}: ${error.message}`);
+          continue;
+        }
+
         // Server errors (5xx) from the gateway — show in progress area (not persisted to history)
         const _httpStatus = error.status ?? error.statusCode;
         if (_httpStatus >= 500) {
@@ -2615,12 +2623,16 @@ export class Agent {
         // the same failing one indefinitely.
         if (session.consecutiveErrors >= 2) {
           session._needsReclassify = true;
-          // Mark the failing provider on cooldown so the selector avoids it
-          const _failedProvider = this.llmProvider?.provider;
-          if (_failedProvider) {
+          // Mark the failing MODEL on cooldown so the selector avoids it (23/11/2026): through the gateway every model
+          // speaks the OpenAI API, so `this.llmProvider.provider` is 'openai' for all of them and one model's bad
+          // answers put every OpenAI-compatible model on cooldown at once. Provider-wide cooldowns stay where the
+          // cause is provider-wide (policy blocks, rate limits, timeouts).
+          const _failedModel = session._autoModel || this.llmProvider?.model;
+          const _failedProvider = session._autoProvider || this.llmProvider?.provider;
+          if (_failedProvider && _failedModel) {
             try {
-              const { markProviderTimeout } = await import('../llm/providers/factory.js');
-              markProviderTimeout(_failedProvider);
+              const { markModelTimeout } = await import('../llm/providers/factory.js');
+              markModelTimeout(_failedProvider, _failedModel);
             } catch {}
           }
           channel.log('agent', `${this.name}: Forcing model reclassification after ${session.consecutiveErrors} consecutive failures`);

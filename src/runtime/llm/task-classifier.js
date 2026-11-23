@@ -1,6 +1,7 @@
 import path from 'path';
 import { getAllCandidates, DEFAULT_TASK_PROFILE } from './providers/factory.js';
 import { EFFORT_NONE, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH } from './constants.js';
+import { decide } from './decisions.js';
 import { hasKoiApi } from '../api/koi-api.js';
 
 /**
@@ -151,10 +152,11 @@ ${taskDescription}`;
       : null;
     // A handler's arguments are usually data (ids, dates, flags), not a description of the work: classifying their
     // JSON alone told the classifier nothing, so it fell back on «pick the higher one». When none of them describes
-    // the task, the handler's own instructions (its playbook) do, with the arguments beside them as inputs.
+    // the task, the handler's own instructions (its playbook) do, with the arguments beside them as inputs. The END
+    // weighs most: a compose playbook puts the current phase's own section last, after the shared rules.
     const _playbook = typeof opts.playbook === 'string' && opts.playbook.trim() ? opts.playbook.trim() : null;
     const _taskText = _named
-      || (_playbook ? `Instructions given to the agent:\n${_playbook.length > 1600 ? `${_playbook.substring(0, 1000)}\n[…]\n${_playbook.slice(-600)}` : _playbook}${args ? `\n\nInputs: ${JSON.stringify(args).substring(0, 300)}` : ''}` : null)
+      || (_playbook ? `Instructions given to the agent:\n${_playbook.length > 2000 ? `${_playbook.substring(0, 600)}\n[…]\n${_playbook.slice(-1400)}` : _playbook}${args ? `\n\nInputs: ${JSON.stringify(args).substring(0, 300)}` : ''}` : null)
       || (args ? JSON.stringify(args).substring(0, 500) : null);
     const taskDescription = _taskText
       ? `Task: ${_taskText.substring(0, 2000)}`
@@ -279,7 +281,7 @@ ${taskDescription}`;
       V: { code: 60,  reasoning: 70,  risk: 20, reasoningEffort: EFFORT_MEDIUM },
     };
 
-    return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName);
+    return this._runClassifier(prompt, CATEGORY_PROFILES, 'task', agentName, { state: taskDescription });
   }
 
   /**
@@ -375,7 +377,7 @@ ${taskDescription}`;
       H1: p(10, 85, 60, EFFORT_HIGH), H2: p(20, 75, 80, EFFORT_MEDIUM),
     };
 
-    return this._runClassifier(prompt, CATEGORY_PROFILES, 'task-general', agentName);
+    return this._runClassifier(prompt, CATEGORY_PROFILES, 'task-general', agentName, { state: taskDescription });
   }
 
   /**
@@ -454,12 +456,101 @@ ${taskDescription}`;
   /**
    * Shared classifier execution — sends prompt to cheapest capable model, parses category response.
    */
-  async _runClassifier(prompt, CATEGORY_PROFILES, classifierType, agentName) {
+  /**
+   * The difficulty of a task from the decision model: scales and yes/no questions in ONE call, turned into a profile
+   * by their probabilities. Returns null when no decision model answered (the caller falls back to the LLM).
+   * `kind` 'code' adds how much code the task writes; 'general' agents only call tools, which needs valid JSON, not
+   * software engineering.
+   */
+  async _profileFromDecisions(state, kind = 'general') {
+    const JUDGEMENT = [
+      'None: copy, reformat or extract data that is already given',
+      'Little: obvious matches or choices, the right answer is plain',
+      'Some: judgement on ambiguous cases, near names, partial data',
+      'A lot: weigh many constraints, sources or trade-offs together',
+      'Expert: legal, financial, medical or architectural reasoning',
+    ];
+    const WRITING = [
+      'No prose: only data, codes or tool calls',
+      'A line or two: a title, a label, a short message',
+      'Paragraphs: a description, an email, a section',
+      'A long document whose parts must agree',
+    ];
+    const CODE = [
+      'No code',
+      'A few lines: a rename, a value, a one-line fix',
+      'A function or one file',
+      'Several files that must fit together',
+      'Architecture, a new module, a hard bug across the system',
+    ];
+    const questions = {
+      judgement: { type: 'score', instructions: 'How much judgement does this task need to be done well?', criteria: JUDGEMENT },
+      writing: { type: 'score', instructions: 'How much prose for a person does this task have to write?', criteria: WRITING },
+      toolwork: { type: 'noul', instructions: 'Does the task need many tool calls in a row, checking results and correcting them?' },
+      stakes: { type: 'noul', instructions: 'Can a mistake here cause serious harm to a person: money, legal, health, an irreversible action?' },
+    };
+    if (kind === 'code') questions.code = { type: 'score', instructions: 'How much code does this task write or change?', criteria: CODE };
+
+    const r = await decide({ state, questions, timeoutMs: 5000 }).catch(() => null);
+    if (!r || r.source !== 'decision-model') return null;
+    const a = r.answers || {};
+    // The probability-weighted value of a scale (falls back to its level when the provider gave no probabilities).
+    const expected = (ans, values) => {
+      const probs = ans?.probabilities;
+      if (probs && Object.keys(probs).length) {
+        let sum = 0, w = 0;
+        for (const [k, p] of Object.entries(probs)) { const v = values[Number(k)]; if (v != null) { sum += v * p; w += p; } }
+        if (w > 0) return sum / w;
+      }
+      return Number.isInteger(ans?.answer) ? values[ans.answer] ?? null : null;
+    };
+    const judgement = expected(a.judgement, [10, 30, 50, 70, 90]);
+    if (judgement == null) return null;
+    const writing = expected(a.writing, [0, 20, 45, 65]) ?? 0;
+    const tools = typeof a.toolwork?.probability === 'number' ? a.toolwork.probability : 0;
+    const stakes = typeof a.stakes?.probability === 'number' ? a.stakes.probability : 0;
+    const codeLevel = kind === 'code' ? expected(a.code, [0, 40, 60, 75, 90]) : null;
+
+    let reasoning = Math.max(judgement, writing) + 10 * tools;
+    if (stakes > 0.6) reasoning = Math.max(reasoning, 75);
+    reasoning = Math.round(Math.min(100, Math.max(5, reasoning)));
+    // Tool calls are JSON: a floor that keeps models that cannot call tools reliably out of a tool-heavy task.
+    let code = kind === 'code' ? (codeLevel ?? 0) : 0;
+    if (tools > 0.5) code = Math.max(code, 25);
+    code = Math.round(Math.min(100, code));
+    const effort = reasoning >= 80 ? EFFORT_HIGH : reasoning >= 55 ? EFFORT_MEDIUM : reasoning >= 25 ? EFFORT_LOW : EFFORT_NONE;
+    return {
+      taskType: code >= reasoning ? 'code' : 'reasoning',
+      difficulty: Math.max(code, reasoning),
+      code, reasoning, thinking: effort === EFFORT_HIGH, risk: Math.round(stakes * 80), reasoningEffort: effort,
+      _model: r.model, _judgement: Math.round(judgement), _writing: Math.round(writing),
+      _tools: Math.round(tools * 100) / 100, _stakes: Math.round(stakes * 100) / 100,
+      _codeLevel: codeLevel == null ? null : Math.round(codeLevel),
+    };
+  }
+
+  async _runClassifier(prompt, CATEGORY_PROFILES, classifierType, agentName, decision = null) {
     const _debug = !!process.env.KOI_DEBUG_LLM;
     if (process.env.KOI_LOG_CLASSIFIER_PROMPTS) {
       this._log('classify-prompt', `--- ${classifierType.toUpperCase()} CLASSIFIER PROMPT ---\n${prompt}\n--- END ---`);
     }
     this._log('llm', `[classify] Using ${classifierType} classifier`);
+
+    // A decision model first (the same path as the `classify` tool, 23/11/2026): the categories are a closed list,
+    // which is exactly what a classifier answers, in ~250 ms for a fraction of a cent, where the LLM below took 5-7 s.
+    // Any failure, or an answer outside the table, falls through to the LLM classifier unchanged.
+    if (decision?.state) {
+      // Several small questions to the decision model, answered together (23/11/2026). One `choice` among 35
+      // overlapping categories spread its probability (0.2-0.4) and the winner alone decided; difficulty is a SCALE,
+      // so it is asked as scales and yes/no, and the profile is their probability-weighted value, never one label.
+      const _t0 = Date.now();
+      const profile = await this._profileFromDecisions(decision.state, classifierType === 'task' ? 'code' : 'general');
+      if (profile) {
+        this._log('llm', `[classify] Decision model ${profile._model ?? '?'}: judgement=${profile._judgement} writing=${profile._writing}${profile._codeLevel != null ? ` code=${profile._codeLevel}` : ''} toolwork=${profile._tools} stakes=${profile._stakes} → code=${profile.code} reasoning=${profile.reasoning} effort=${profile.reasoningEffort} risk=${profile.risk} in ${Date.now() - _t0}ms`);
+        return profile;
+      }
+      this._log('llm', '[classify] Decision model unavailable: falling back to the LLM classifier');
+    }
 
     // Wait for remote model list to finish loading (gateway mode) before
     // asking the factory for candidates. Without this, a cold-start message

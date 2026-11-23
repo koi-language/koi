@@ -187,6 +187,10 @@ function _applyPhase(agent, phaseName, eventName) {
       session._phaseProfile = _profileFromPhase(phaseProfile);
     }
   }
+  // Each phase is its own kind of work (reading a catalogue, writing names, reading SIGPAC…): the next model call
+  // classifies again, on the new phase's instructions, instead of keeping the first phase's profile for the whole
+  // run (Antonio, 23/11/2026).
+  if (oldPhase !== '(none)' && agent._activeSession) agent._activeSession._phaseChanged = phaseName;
 }
 
 function _applyEffort(agent, level) {
