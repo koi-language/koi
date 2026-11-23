@@ -1,6 +1,6 @@
 {
   "name": "@koi-language/koi",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Koi - Agent-first language. Calm orchestration.",
   "type": "module",
   "main": "src/runtime/index.js",

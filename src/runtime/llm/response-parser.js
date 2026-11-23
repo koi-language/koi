@@ -19,6 +19,46 @@ function _looksLikeAction(obj) {
   return Object.keys(obj).some(k => _ACTION_KEYS.has(k));
 }
 
+// A plain scalar that itself holds ": " («motivo: Nombre en mayúsculas: se escribe …») is not valid YAML, and one
+// such line threw away a whole 50-item batch (17 kB, ~40 s of generation) and made the model write it all again,
+// several times in a row (opfh, 23/11/2026). Quoting a value the model wrote is not guessing an action: the text is
+// kept character for character, only wrapped in quotes. Lines inside a block scalar (`|`, `>`) are left alone.
+const _KEY_LINE = /^([ \t]*(?:-[ \t]+)?)([A-Za-z_][\w.-]*)[ \t]*:[ \t]+(.*)$/;
+export function _quoteColonScalars(text) {
+  const lines = text.split('\n');
+  let blockIndent = -1; // inside a block scalar while a line is indented deeper than this
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const indent = line.length - line.trimStart().length;
+    if (blockIndent >= 0) {
+      if (line.trim() === '' || indent > blockIndent) continue;
+      blockIndent = -1;
+    }
+    const m = _KEY_LINE.exec(line);
+    if (!m) continue;
+    const value = m[3].replace(/[ \t]+$/, '');
+    if (/^[|>][+-]?\d*$/.test(value)) { blockIndent = m[1].replace(/-[ \t]+$/, '').length + (m[1].includes('-') ? 2 : 0); continue; }
+    if (!value || /^["'[{&*!#|>]/.test(value)) continue;
+    if (!/:[ \t]|:$/.test(value)) continue;
+    lines[i] = `${m[1]}${m[2]}: ${JSON.stringify(value)}`;
+  }
+  return lines.join('\n');
+}
+
+function _parseYamlTolerant(text) {
+  try {
+    return parseYaml(text, { uniqueKeys: false });
+  } catch (err) {
+    if (!/compact mappings|implicit key|nested mapping|mapping values are not allowed/i.test(err.message)) throw err;
+    const quoted = _quoteColonScalars(text);
+    if (quoted === text) throw err;
+    let repaired;
+    try { repaired = parseYaml(quoted, { uniqueKeys: false }); } catch { throw err; }
+    if (!_looksLikeAction(repaired)) throw err;
+    return repaired;
+  }
+}
+
 // Text that is a (malformed) YAML *action* attempt, not genuine prose. When a
 // response fails to parse, we must NOT dump it into the chat as a print — that
 // "vomits the raw YAML". If it carries action structure, throw to force a retry.
@@ -266,7 +306,7 @@ export async function parseReactiveResponse(responseText, agent = null, callUtil
     // which is our safety net during the migration. The `yaml` package uses
     // the 1.2 core schema, so `yes/no/on/off` stay strings (no "Norway
     // problem") and only true/false/null are booleans.
-    parsed = parseYaml(cleaned, { uniqueKeys: false });
+    parsed = _parseYamlTolerant(cleaned);
     if (parsed === undefined) throw new Error('empty YAML document');
     // A bare scalar (string/number/bool) means the model answered in PROSE,
     // not an action map/sequence. We used to surface it verbatim as a print;
