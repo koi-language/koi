@@ -19,15 +19,27 @@ import { hasKoiApi, koiApiKey, koiGatewayUrl } from '../api/koi-api.js';
 
 const TYPES = new Set(['choice', 'score', 'noul']);
 
-/** Throws on a malformed question set; returns it normalised. */
+const SHAPE_HINT = 'Expected: "questions": {"<name>": {"type": "choice", "instructions": "...", "criteria": {"<label>": "when it applies", "none": "none fits"}}, ...}, one question per item to judge (e.g. one per product, keyed by the product), types choice | score (criteria: ["lowest", ..., "highest"]) | noul (yes/no).';
+
+/** Throws on a malformed question set; returns it normalised. A list of questions is accepted and keyed by each one's
+ *  `name` / `id` / `key` (models often write a list): rejecting it cost a run a step to learn the object shape. */
 export function validateQuestions(questions) {
-  if (!questions || typeof questions !== 'object' || Array.isArray(questions) || Object.keys(questions).length === 0) {
-    throw new Error('classify: "questions" must be an object with at least one question');
+  if (Array.isArray(questions)) {
+    const keyed = {};
+    questions.forEach((q, i) => {
+      if (!q || typeof q !== 'object') return;
+      const { name, id, key, ...rest } = q;
+      keyed[String(name ?? id ?? key ?? `q${i + 1}`)] = rest;
+    });
+    questions = keyed;
+  }
+  if (!questions || typeof questions !== 'object' || Object.keys(questions).length === 0) {
+    throw new Error(`classify: "questions" is missing or empty. ${SHAPE_HINT}`);
   }
   for (const [name, q] of Object.entries(questions)) {
-    if (!q || !TYPES.has(q.type)) throw new Error(`classify: question "${name}" needs a type: choice, score or noul`);
+    if (!q || !TYPES.has(q.type)) throw new Error(`classify: question "${name}" needs a type: choice, score or noul. ${SHAPE_HINT}`);
     if (q.type === 'choice' && (!q.criteria || typeof q.criteria !== 'object' || Array.isArray(q.criteria) || Object.keys(q.criteria).length < 2)) {
-      throw new Error(`classify: choice question "${name}" needs criteria as { label: "meaning", ... } with at least two labels`);
+      throw new Error(`classify: choice question "${name}" needs criteria as { label: "meaning", ... } with at least two labels. ${SHAPE_HINT}`);
     }
     if (q.type === 'score' && (!Array.isArray(q.criteria) || q.criteria.length < 2)) {
       throw new Error(`classify: score question "${name}" needs criteria as an ordered list of at least two levels`);
@@ -118,7 +130,7 @@ ${typeof state === 'string' ? state : JSON.stringify(state).slice(0, 6000)}`;
  * @returns {Promise<{answers: Record<string, object>, model: string|null, source: 'decision-model'|'llm', cost: number|null} | null>}
  */
 export async function decide({ state, questions, model = null, llm = null, timeoutMs = 15000 }) {
-  validateQuestions(questions);
+  questions = validateQuestions(questions);
   if (state == null || state === '') throw new Error('classify: "state" (the content to judge) is required');
   return (await viaGateway({ state, questions, model, timeoutMs })) ?? (await viaLlm({ state, questions, llm }));
 }

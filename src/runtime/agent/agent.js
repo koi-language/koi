@@ -1118,6 +1118,11 @@ export class Agent {
           || '';
       }
       if (txt) this._currentTaskText = String(txt).slice(0, 800);
+      // What this run is doing, for the memory query of an agent with no person typing (23/11/2026): the handler and
+      // its arguments are stable for the whole run, unlike the last tool result.
+      this._currentHandler = eventName;
+      try { this._currentArgsText = typeof args === 'string' ? args.slice(0, 400) : JSON.stringify(args).slice(0, 400); }
+      catch { this._currentArgsText = ''; }
 
       // Pick up the workflow-run workspace dir when the delegate carries one.
       // run-workflow.js → agent.js delegate-site sets `args.workflowWorkspace`
@@ -1424,7 +1429,8 @@ export class Agent {
       // long video generations where a hot-reload / engine crash /
       // ws flap mid-poll would otherwise lose the job. See
       // pending-jobs-watcher.js for the full design.
-      import('../state/pending-jobs-watcher.js')
+      // Braxil's media-job recovery: never inside a backend (KOI_EMBEDDED), where no Braxil job exists (23/11/2026).
+      if (process.env.KOI_EMBEDDED !== '1') import('../state/pending-jobs-watcher.js')
         .then(({ startPendingJobsWatcher }) => startPendingJobsWatcher())
         .catch((err) => channel.log('jobs', `pending-jobs watcher init failed: ${err?.message || err}`));
     }

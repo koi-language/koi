@@ -1445,6 +1445,14 @@ REMINDER: intent must be one of AVAILABLE ACTIONS (enum). Never invent new inten
  * Similar to CLAUDE.md — project-specific instructions appended to the system prompt.
  */
 export function loadKoiMd() {
+  // Embedded in a backend, a BRAXIL.md / CLAUDE.md / KOI.md that happens to sit in the working directory is NOT injected
+  // into every agent's prompt (23/11/2026: a backend's CLAUDE.md became the first block of its agents' prompts). An
+  // explicit file still can be: KOI_PROJECT_MD=<path>.
+  if (process.env.KOI_EMBEDDED === '1') {
+    const explicit = process.env.KOI_PROJECT_MD;
+    if (!explicit) return '';
+    try { return fs.existsSync(explicit) ? `\n\n── PROJECT SPECIFICATIONS (from ${path.basename(explicit)}) ──\n${fs.readFileSync(explicit, 'utf8')}` : ''; } catch { return ''; }
+  }
   const candidates = [
     path.join(process.cwd(), 'BRAXIL.md'),
     path.join(process.cwd(), 'braxil.md'),
@@ -1977,7 +1985,14 @@ async function _runContextCompiler(agent) {
   //      agent was told to work on by the planner.
   // Concatenated, deduped, capped — RMH gets a rich semantic query
   // even when the user types a one-word follow-up.
-  const triggerInfo = await _buildTriggerTask(agent);
+  // B. Nothing to search: no note in the vault and no saved conversation → no embedding, no lookup (23/11/2026: every
+  // step of every headless run paid ~0.7 s to embed a question for an empty memory).
+  if (await _memoryIsEmpty(projectRoot)) return '';
+
+  // A. An agent with no person typing (a handler run in a backend) asks the memory about its TASK and PHASE, not
+  // about its last tool result: the question stays the same for the whole phase, so the cache below answers every
+  // step after the first instead of embedding a new question each time. A chat keeps the conversation trigger.
+  const triggerInfo = agent._lastUserMessage ? await _buildTriggerTask(agent) : _taskTrigger(agent);
   const triggerTask = triggerInfo.task;
   const trigger = { payload: { task: triggerTask } };
 
@@ -2255,6 +2270,40 @@ async function _buildTriggerTask(agent) {
     focus: pivotCandidate || mostRecentSubstantive || '',
     isPivot: !!pivotCandidate,
   };
+}
+
+/** The memory query of an agent working on a handler with no person typing: who, which handler, which phase, and
+ *  the task's own text or arguments. Stable for a whole phase. */
+function _taskTrigger(agent) {
+  const phase = agent?.state?.statusPhase;
+  const pieces = [
+    `${agent.name}${agent._currentHandler ? `.${agent._currentHandler}` : ''}`,
+    phase ? `phase: ${phase}` : '',
+    agent._currentTaskText || agent._currentArgsText || '',
+  ].filter(Boolean);
+  const task = pieces.join(' \n ').slice(0, 600);
+  return { task, focus: agent._currentTaskText || '', isPivot: false };
+}
+
+/** True when the memory has nothing to search: no note (.md) in the project vault nor in the global one, and no
+ *  saved conversation for this project. Filesystem listing plus one count; no embedding. */
+async function _memoryIsEmpty(projectRoot) {
+  const hasNotes = (dir) => {
+    try {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (e.isFile() && e.name.endsWith('.md')) return true;
+        if (e.isDirectory() && hasNotes(path.join(dir, e.name))) return true;
+      }
+    } catch { /* no such folder */ }
+    return false;
+  };
+  if (hasNotes(path.join(projectRoot, '.koi', 'memory', 'notes'))) return false;
+  if (hasNotes(path.join(os.homedir(), '.koi-memory', 'notes'))) return false;
+  try {
+    const { countPalaceDrawers } = await import('../state/palace.js');
+    if ((await countPalaceDrawers(projectRoot)) > 0) return false;
+  } catch { /* no conversations store: nothing to search there */ }
+  return true;
 }
 
 /** Best-effort lookup of the agent's contextMemory instance. The

@@ -20,9 +20,14 @@
 
 import fs from 'fs';
 import path from 'path';
-import { Readability } from '@mozilla/readability';
-import { parseHTML } from 'linkedom';
-import { gotScraping } from 'got-scraping';
+// The HTML stack (got-scraping, linkedom, Readability) loads on the first web_fetch, not when Koi starts
+// (23/11/2026): every agent imported it at boot whether it fetched pages or not.
+let Readability, parseHTML, gotScraping;
+async function _loadWebDeps() {
+  if (gotScraping) return;
+  const [r, l, g] = await Promise.all([import('@mozilla/readability'), import('linkedom'), import('got-scraping')]);
+  Readability = r.Readability; parseHTML = l.parseHTML; gotScraping = g.gotScraping;
+}
 import { channel } from '../../io/channel.js';
 
 /** Content types that are binary and should be saved to disk instead of returned as text. */
@@ -311,6 +316,7 @@ export default {
   ],
 
   async execute(action) {
+    await _loadWebDeps();
     const url = action.url || action.data?.url;
     const saveTo = action.saveTo || action.data?.saveTo;
     const mode = action.mode || action.data?.mode || 'readable';

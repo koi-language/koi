@@ -73,28 +73,33 @@ class ActionRegistry {
    * Load all actions from a directory (recursively scans subdirectories).
    */
   async loadFromDirectory(dirPath) {
-    if (!fs.existsSync(dirPath)) return;
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        await this.loadFromDirectory(fullPath);
-      } else if (entry.name.endsWith('.js')) {
-        try {
-          const module = await import(`file://${fullPath}`);
-          const action = module.default;
-
-          if (action && action.type) {
-            // Auto-assign toolset from parent directory name
-            if (!action.toolset) {
-              action.toolset = path.basename(path.dirname(fullPath));
-            }
-            this.register(action);
-          }
-        } catch (error) {
-          console.warn(`[ActionRegistry] Failed to load action from ${entry.name}: ${error.message}`);
+    // Every tool module is imported IN PARALLEL, then registered in the same depth-first order as before, so the
+    // prompt's tool order does not change (23/11/2026: ~180 modules imported one after another made every cold
+    // start of a worker or a Job wait for each in turn).
+    const files = [];
+    const walk = (dir) => {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(fullPath);
+        else if (entry.name.endsWith('.js')) files.push(fullPath);
+      }
+    };
+    walk(dirPath);
+    const loaded = await Promise.all(files.map(fullPath =>
+      import(`file://${fullPath}`).then(
+        module => ({ fullPath, module }),
+        error => { console.warn(`[ActionRegistry] Failed to load action from ${path.basename(fullPath)}: ${error.message}`); return null; },
+      )));
+    for (const item of loaded) {
+      if (!item) continue;
+      const action = item.module.default;
+      if (action && action.type) {
+        // Auto-assign toolset from parent directory name
+        if (!action.toolset) {
+          action.toolset = path.basename(path.dirname(item.fullPath));
         }
+        this.register(action);
       }
     }
   }
@@ -406,8 +411,12 @@ class ActionRegistry {
       doc += '**WHENEVER YOU HAVE TO DECIDE BETWEEN SEVERAL OPTIONS, OR ANSWER YES/NO, OR RATE SOMETHING ON A SCALE: CALL `classify`. Do not decide it yourself.**\n';
       doc += '**RULE**: every JUDGEMENT on a closed set of options is a `classify` call, never your own reasoning. Your instructions trigger it whenever they say things like «if there is a reasonable candidate», «if it clearly corresponds», «pick the one that fits», «decide whether», «check if», «is it…?», «how urgent / how likely / how much», «tag», «label», «categorise». The tools that FETCH data (a catalogue search, a lookup, a read) do not decide: you fetch with them, then you decide on what they returned with `classify`. `classify` is a dedicated classifier, ~0.3 s and a fraction of a cent, and gives each answer WITH its probability.\n';
       doc += 'How: put every question about the same content in ONE call; a batch of items is one call with one question per item. Act on an answer only when its probability is high (>= 0.6); below that the content is unclear: leave it for a person or look again. Question types: `choice` (one label of a closed list, add a label like "none" when none may fit; `criteria`: {label: "when it applies"}), `score` (a level on an ordered scale; `criteria`: ["lowest", ..., "highest"]), `noul` (a yes/no statement; optional `criteria`: {true: "...", false: "..."}).\n';
-      doc += 'Example, deciding on what a lookup returned (a catalogue search gave candidates for «ALMENRO»): {"intent": "classify", "state": {"written": "ALMENRO", "context": "a crop name typed by a farmer"}, "questions": {"crop": {"type": "choice", "instructions": "Which catalogue entry is the written crop?", "criteria": {"3101": "Almendro (almond tree)", "3102": "Pistacho", "none": "none of them is the written crop"}}}}\n';
-      doc += 'Example, several kinds at once: {"intent": "classify", "state": {"ticket": "Checkout shows a blank page"}, "questions": {"team": {"type": "choice", "instructions": "Which team owns it?", "criteria": {"payments": "Checkout and billing", "account": "Login and permissions"}}, "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Can wait", "This week", "Blocking sales"]}, "is_bug": {"type": "noul", "instructions": "Is it broken behaviour?"}}}\n';
+      // The examples are YAML because the agent ANSWERS in YAML (23/11/2026: a JSON example translated by a cheap model
+      // came out with `questions` as a list and the call failed).
+      doc += 'Example (YAML, as you write it), one question per item judged — here two crops matched against the candidates a lookup returned:\n';
+      doc += '```yaml\nactionType: direct\nintent: classify\nstate:\n  context: crop names typed by farmers, with catalogue candidates\nquestions:\n  CEREZOS:\n    type: choice\n    instructions: Which catalogue entry is the written crop «CEREZOS»?\n    criteria:\n      "1107": Cerezo (cherry tree)\n      "1101": Melocotonero (peach tree)\n      none: none of them is the written crop\n  ALMENRO:\n    type: choice\n    instructions: Which catalogue entry is the written crop «ALMENRO»?\n    criteria:\n      "3101": Almendro (almond tree)\n      none: none of them is the written crop\n```\n';
+      doc += 'Example with the three types at once:\n';
+      doc += '```yaml\nactionType: direct\nintent: classify\nstate:\n  ticket: Checkout shows a blank page after Pay\nquestions:\n  team:\n    type: choice\n    instructions: Which team owns it?\n    criteria:\n      payments: Checkout and billing\n      account: Login and permissions\n  urgency:\n    type: score\n    instructions: How urgent is it?\n    criteria: [Can wait, This week, Blocking sales]\n  is_bug:\n    type: noul\n    instructions: Does it describe broken behaviour?\n```\n';
       doc += 'Returns: {"answers": {"crop": {"answer": "3101", "probabilities": {"3101": 0.97, ...}}, "urgency": {"answer": 2, "label": "Blocking sales", ...}, "is_bug": {"answer": true, "probability": 0.91}}}\n';
     }
 

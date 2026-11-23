@@ -70,6 +70,46 @@ let _state = {
  * @param {boolean} [opts.create=true]     Auto-create project vault if missing.
  * @returns {Promise<{vaultRoot: string, vaultSource: string, created: boolean}>}
  */
+// ─── Snapshot cache ─────────────────────────────────────────────────────────
+// The retrieval snapshot (link graph, note index, graph metrics, BM25 index, vectors loaded from SQLite) is built
+// from the notes, held in memory and reused for every retrieve until the notes change (23/11/2026). It used to be
+// rebuilt from scratch on EVERY retrieve («For v1, snapshot is per-call… Cache later»), and the context compiler
+// retrieves before every model call. «Changed» is a signature of the notes folder: each .md file's path, size and
+// modification time (stat only, nothing is read), so a note written by this process or by any other is seen.
+const _snapshots = new Map(); // vaultRoot → { signature, snapshot }
+
+async function _notesSignature(notesDir) {
+  const parts = [];
+  const walk = async (dir) => {
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) await walk(full);
+      else if (e.name.endsWith('.md')) {
+        try { const st = await fs.stat(full); parts.push(`${full}:${st.size}:${st.mtimeMs}`); } catch { /* gone meanwhile */ }
+      }
+    }
+  };
+  await walk(notesDir);
+  parts.sort();
+  return parts.join('|');
+}
+
+async function _snapshotFor(vaultRoot) {
+  const signature = await _notesSignature(getVaultPaths(vaultRoot).notes);
+  const cached = _snapshots.get(vaultRoot);
+  if (cached && cached.signature === signature) return cached.snapshot;
+  const snapshot = await buildSnapshot({ vaultRoot });
+  _snapshots.set(vaultRoot, { signature, snapshot });
+  // The replaced snapshot's SQLite handle is closed a little later, so a retrieve still using it can finish.
+  if (cached?.snapshot?.db && cached.snapshot.db !== snapshot.db) {
+    const old = cached.snapshot.db;
+    setTimeout(() => { try { old.close(); } catch { /* already closed */ } }, 30_000).unref?.();
+  }
+  return snapshot;
+}
+
 export async function init({ projectRoot, sessionId, embeddingProvider, llmProvider, create = true }) {
   if (!projectRoot) throw new Error('memory.init: projectRoot required');
   if (!sessionId) throw new Error('memory.init: sessionId required');
@@ -180,6 +220,7 @@ export function isInitialized() { return _state.initialized; }
  */
 export async function write(note) {
   _ensureInit();
+  _snapshots.clear(); // a note is coming in: the next retrieve rebuilds the snapshot with it
   if (!note || !note.title) throw new Error('memory.write: title required');
 
   const scope = note.scope || 'project';
@@ -341,10 +382,7 @@ export async function retrieve(opts = {}) {
   const scope = opts.scope || 'project';
   const scopePaths = _resolveScopePaths(scope);
 
-  // For v1, snapshot is per-call against the chosen scope. Cache later.
-  const snapshot = await buildSnapshot({
-    vaultRoot: scope === 'project' ? _state.vaultRoot : scopePaths.root,
-  });
+  const snapshot = await _snapshotFor(scope === 'project' ? _state.vaultRoot : scopePaths.root);
   const results = await runRetrieve(snapshot, opts.query, {
     limit: opts.limit,
     filter: opts.filter,
@@ -582,9 +620,7 @@ export async function explore(opts = {}) {
   const scope = opts.scope || 'project';
   const scopePaths = _resolveScopePaths(scope);
 
-  const snapshot = await buildSnapshot({
-    vaultRoot: scope === 'project' ? _state.vaultRoot : scopePaths.root,
-  });
+  const snapshot = await _snapshotFor(scope === 'project' ? _state.vaultRoot : scopePaths.root);
 
   if (snapshot.titles.length === 0) {
     await eventLog.append(eventTypes.MemoryRetrieved, opts.agent || 'system', {

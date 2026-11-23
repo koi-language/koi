@@ -45,11 +45,15 @@ import { getCallLimits } from '../agent/call-limits.js';
 
 // Load .env files but don't override existing environment variables.
 // Priority: process.env > local .env > global ~/.koi/.env
-const originalWrite = process.stdout.write;
-process.stdout.write = () => {}; // Temporarily silence stdout
-dotenv.config({ path: path.join(os.homedir(), '.koi', '.env'), override: false });
-dotenv.config({ override: false }); // local .env takes priority over global
-process.stdout.write = originalWrite; // Restore stdout
+// Never inside a backend (KOI_EMBEDDED, set by the loader): Koi must not change the host's environment from a .env
+// the host did not choose to load (23/11/2026).
+if (process.env.KOI_EMBEDDED !== '1') {
+  const originalWrite = process.stdout.write;
+  process.stdout.write = () => {}; // Temporarily silence stdout
+  dotenv.config({ path: path.join(os.homedir(), '.koi', '.env'), override: false });
+  dotenv.config({ override: false }); // local .env takes priority over global
+  process.stdout.write = originalWrite; // Restore stdout
+}
 
 /**
  * Format prompt text with > prefix for each line (for debug output)

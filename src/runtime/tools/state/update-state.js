@@ -12,7 +12,8 @@ export default {
   intent: 'update_state',
   description: 'Update agent internal state (for agent memory/context). NOTE: "statusPhase" is read-only — phase transitions are driven by the agent\'s reactions block, not by the LLM.',
   thinkingHint: 'Updating state',
-  permission: 'execute',
+  // Any agent may end its phase and keep its state; neither needs `execute`, the SHELL permission (23/11/2026).
+  permission: null,
 
   schema: {
     type: 'object',

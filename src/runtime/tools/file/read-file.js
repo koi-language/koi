@@ -10,8 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
+// sharp (libvips) and tesseract.js load on first use, not at import: most agents never read an image or OCR a PDF,
+// and loading both made every worker's cold start slower (23/11/2026).
+let _sharpMod = null;
+let _tesseractMod = null;
+const _sharp = async () => (_sharpMod ??= (await import('sharp')).default);
+const _tesseract = async () => (_tesseractMod ??= (await import('tesseract.js')).default);
 
 import { t } from '../../i18n.js';
 import { getFilePermissions } from '../../code/file-permissions.js';
@@ -1304,7 +1308,7 @@ export default {
             });
           } catch { /* observability — banner is nice-to-have */ }
           try {
-            _ocrWorker = await Tesseract.createWorker(_tesseractLangStr, undefined, {
+            _ocrWorker = await (await _tesseract()).createWorker(_tesseractLangStr, undefined, {
               cachePath: _ocrCachePath,
               logger: () => { /* suppress per-page Tesseract progress spam */ },
             });
@@ -1342,7 +1346,7 @@ export default {
                 const image = images[imgIdx];
                 if (image.width < 50 || image.height < 50) continue;
                 const imgPath = path.join(_pdfImgDir, `pdf-p${pageNum}-img${imgIdx}-${Date.now()}.png`);
-                await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
+                await (await _sharp())(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
                   .png().toFile(imgPath);
                 _pdfImages.push({ page: pageNum, index: imgIdx, width: image.width, height: image.height, path: imgPath });
               }
@@ -1373,12 +1377,12 @@ export default {
                 }
               } else {
                 for (const image of images) {
-                  const pngBuffer = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
+                  const pngBuffer = await (await _sharp())(image.data, { raw: { width: image.width, height: image.height, channels: 4 } })
                     .png().withMetadata({ density: 300 }).toBuffer();
                   try {
                     const { data } = _ocrWorker
                       ? await _ocrWorker.recognize(pngBuffer)
-                      : await Tesseract.recognize(
+                      : await (await _tesseract()).recognize(
                           pngBuffer,
                           _tesseractLangStr,
                           { cachePath: _ocrCachePath || path.join(os.homedir(), '.koi', 'tesseract-data'), user_defined_dpi: '300' },

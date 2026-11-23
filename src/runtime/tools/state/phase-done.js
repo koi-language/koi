@@ -21,7 +21,8 @@ export default {
   intent: 'phase_done',
   description: 'Signal that you have finished the work of your current phase. The runtime will transition to the next phase based on the agent\'s declared reactions. You do NOT pick the next phase — just announce "I am done here".',
   thinkingHint: 'Advancing phase',
-  permission: 'execute',
+  // Any agent may end its phase and keep its state; neither needs `execute`, the SHELL permission (23/11/2026).
+  permission: null,
 
   schema: {
     type: 'object',
